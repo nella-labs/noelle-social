@@ -598,3 +598,203 @@ describe("runDiscoveryTick — keyword (search) lane", () => {
 
     expect(inserted).toBe(0);
     expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("records the search spend as engine='apify' actor 'linkedin-post-search'", async () => {
+    const record = vi.fn().mockResolvedValue(undefined);
+    const searchPosts = vi.fn().mockResolvedValue([searchPost("s1"), searchPost("s2"), searchPost("s3")]);
+
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      keywords: ["ai"],
+      keywordConfig: kwConfig,
+      postsSource: { profilePosts: vi.fn().mockResolvedValue([]), searchPosts, drainLastRunUsd: () => 0.01 },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+      recorder: { record },
+    });
+
+    const apifyRows = record.mock.calls.map((c) => c[0]).filter((r) => r.engine === "apify");
+    expect(apifyRows).toHaveLength(1);
+    expect(apifyRows[0]!.model).toBe("apify/linkedin-post-search");
+  });
+
+  it("dedupes across lanes — a post both watched + searched becomes ONE lead", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    // The watch lane returns post '1'; the search lane also surfaces post '1'.
+    const profilePosts = vi.fn().mockResolvedValue([post("1")]);
+    const searchPosts = vi.fn().mockResolvedValue([searchPost("1")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      keywords: ["startup"],
+      keywordConfig: kwConfig,
+      postsSource: { profilePosts, searchPosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not run the search lane when keywords are empty", async () => {
+    const searchPosts = vi.fn();
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      keywords: [],
+      keywordConfig: kwConfig,
+      postsSource: { profilePosts: vi.fn().mockResolvedValue([]), searchPosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+    });
+    expect(searchPosts).not.toHaveBeenCalled();
+  });
+
+  it("ICP author gate: drops a keyword post from a non-ICP author, keeps an ICP author as priority", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const good = {
+      ...searchPost("good"),
+      author: { ...searchPost("good").author, headline: "Founder & CEO at Acme" },
+    };
+    const bad = {
+      ...searchPost("bad"),
+      author: { ...searchPost("bad").author, headline: "Regional Sales Manager" },
+    };
+    const searchPosts = vi.fn().mockResolvedValue([good, bad]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      keywords: ["startup"],
+      keywordConfig: kwConfig,
+      postsSource: { profilePosts: vi.fn().mockResolvedValue([]), searchPosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+      icp: { headlineKeywords: ["founder"], minReactions: 10 },
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ externalId: "good", priority: true }),
+    );
+  });
+});
+
+describe("runDiscoveryTick — profile-first (ICP / Feeder A) lane", () => {
+  const icp = { headlineKeywords: ["founder", "building"], minReactions: 10, timeWindowHours: 24 };
+  const candidate = (publicId: string, headline: string) => ({
+    publicId,
+    name: "Cand",
+    headline,
+    url: `https://www.linkedin.com/in/${publicId}`,
+    fsdProfileId: null,
+  });
+  // postedAt "" → skips the recency window so these tests are clock-free.
+  const icpPost = (id: string, reactions = 50) => ({ ...post(id), postedAt: "", reactions });
+
+  it("harvests a qualified profile's posts as PRIORITY leads (source 'profile_search')", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const searchProfiles = vi.fn().mockResolvedValue([candidate("yc-founder", "Founder @ Startup")]);
+    const profilePosts = vi.fn().mockResolvedValue([icpPost("p1"), icpPost("p2")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      postsSource: { profilePosts, searchProfiles },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+      icp,
+    });
+
+    expect(searchProfiles).toHaveBeenCalledTimes(1);
+    expect(profilePosts).toHaveBeenCalledWith(
+      expect.objectContaining({ publicId: "yc-founder", maxPosts: 5 }),
+    );
+    expect(inserted).toBe(2);
+    const call = upsert.mock.calls[0]![0];
+    expect(call.priority).toBe(true);
+    expect(call.payload.source).toBe("profile_search");
+    expect(call.authorHandle).toBe("yc-founder");
+  });
+
+  it("skips a profile whose headline doesn't match the ICP (no posts fetched)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const searchProfiles = vi.fn().mockResolvedValue([candidate("recruiter", "Senior Technical Recruiter")]);
+    const profilePosts = vi.fn().mockResolvedValue([icpPost("p1")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      postsSource: { profilePosts, searchProfiles },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+      icp,
+    });
+
+    expect(profilePosts).not.toHaveBeenCalled();
+    expect(inserted).toBe(0);
+  });
+
+  it("drops a qualified profile's posts below the ICP reaction floor", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const searchProfiles = vi.fn().mockResolvedValue([candidate("founder", "Founder")]);
+    const profilePosts = vi.fn().mockResolvedValue([icpPost("lo", 3), icpPost("hi", 40)]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      postsSource: { profilePosts, searchProfiles },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+      icp,
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "hi" }));
+  });
+
+  it("records the profile-search spend (actor 'linkedin-profile-search')", async () => {
+    const record = vi.fn().mockResolvedValue(undefined);
+    const searchProfiles = vi
+      .fn()
+      .mockResolvedValue([candidate("a", "Founder"), candidate("b", "Building things")]);
+
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      postsSource: { profilePosts: vi.fn().mockResolvedValue([]), searchProfiles, drainLastRunUsd: () => 0.01 },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+      recorder: { record },
+      icp,
+    });
+
