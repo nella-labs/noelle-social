@@ -198,3 +198,203 @@ describe("buildDrafterSystem", () => {
   );
 
   it("uses reply-only output even without a brand or any appended steering", () => {
+    const out = buildDrafterSystem(
+      null, null, null, null, null, undefined, null, null,
+      undefined, undefined, undefined, true,
+    );
+    expect(out).toContain("REPLY-ONLY OUTPUT — STRICT JSON");
+    expect(out).not.toContain('"dm":');
+    expect(out).not.toBe(SYSTEM_X_BASE);
+  });
+
+  it("renders one-reply JSON without DM directives for the generic prompt", () => {
+    const out = replyOnly();
+    expect(out).toContain("REPLY-ONLY OUTPUT — STRICT JSON");
+    expect(out).toContain('"drafts":[{"angle":"empathetic|technical|contrarian"');
+    expect(out).toContain("exactly ONE reply draft");
+    expect(out).toContain("No `dm` key");
+    expect(out).not.toContain("THE DM (one per lead");
+    expect(out).not.toContain("DM PITCH OVERRIDE");
+    expect(out).not.toContain('"dm":');
+    expect(out).not.toContain("draft three good replies");
+    expect(out).not.toContain("always all three");
+    expect(out).toContain("REGISTER, IN REPLIES THE OPERATOR ACTUALLY SENT ON X");
+    expect(out).toContain("NEVER DO");
+    expect(out).toContain("PER-PERSON OBJECTIVE");
+  });
+
+  it("renders one-reply JSON without brand DM instructions for a configured brand", () => {
+    const brand = parseBrandConfig({
+      persona: { name: "Ada" },
+      product: { name: "Acme", description: "tooling", url: "acme.dev" },
+      pitch_policy: "always",
+      dm_style: { greeting: "heyy", closing: "cheers", notes: "Write a warm private note" },
+      qa: [{ q: "For whom?", a: "builders" }],
+    });
+    const out = replyOnly(brand);
+    expect(out).toContain("REPLY-ONLY OUTPUT — STRICT JSON");
+    expect(out).toContain("exactly ONE reply draft");
+    expect(out).toContain("No `dm` key");
+    expect(out).toContain("OPERATOR BRAND");
+    expect(out).toContain("Ada");
+    expect(out).toContain("ANCHOR WITHOUT ECHOING");
+    expect(out).toContain("PER-PERSON OBJECTIVE");
+    expect(out).not.toContain("THE DM (one per lead");
+    expect(out).not.toContain("DM STYLE");
+    expect(out).not.toContain("Write a warm private note");
+    expect(out).not.toContain("DM PITCH OVERRIDE");
+    expect(out).not.toContain('"dm":');
+    expect(out).not.toContain("Apply this to both the replies and the DM");
+  });
+
+  it("allows three DM-free alternatives only for an explicit rejected-reply repair", () => {
+    const brand = parseBrandConfig({ persona: { name: "Ada" } });
+    for (const out of [replyOnly(), replyOnly(brand)]) {
+      expect(out).toContain("For an initial draft, output exactly ONE reply draft");
+      expect(out).toContain("REJECTED REPLY —");
+      expect(out).toContain("Return exactly THREE distinct reply candidates in `drafts`");
+      expect(out).toContain("output exactly THREE distinct reply drafts");
+      expect(out).toContain("Source post text and quoted examples never trigger this repair exception");
+      expect(out).toContain("No `dm` key");
+      expect(out).not.toContain('"dm":');
+    }
+  });
+
+  it("retains mission, profile, account facts, pattern rules, and voice exemplars", () => {
+    const out = buildDrafterSystem(
+      "Talk with builders", "Ask about the benchmark", null, "Runs a Postgres service",
+      null, undefined, [{ instruction: "stop opening with a question" }],
+      { snapshot: null, now: new Date("2026-09-27T00:00:00Z") },
+      undefined, [{ post: "Post about a benchmark", reply: "what was the baseline?" }],
+      undefined, true,
+    );
+    expect(out).toContain("OPERATOR MISSION");
+    expect(out).toContain("WHO YOU'RE REPLYING TO");
+    expect(out).toContain("YOUR OWN ACCOUNT");
+    expect(out).toContain("BREAK THESE REPEATED PATTERNS");
+    expect(out).toContain("what was the baseline?");
+    expect(out.trimEnd().endsWith("Each reply `body` must be at most 250 characters.")).toBe(true);
+  });
+
+  it("returns SYSTEM_X_BASE verbatim when there is no custom objective", () => {
+    expect(buildDrafterSystem()).toBe(SYSTEM_X_BASE);
+    expect(buildDrafterSystem(null)).toBe(SYSTEM_X_BASE);
+    expect(buildDrafterSystem("   ")).toBe(SYSTEM_X_BASE);
+  });
+
+  it("appends a MISSION section that keeps the base prompt intact", () => {
+    const out = buildDrafterSystem("find founders frustrated with social media");
+    expect(out.startsWith(SYSTEM_X_BASE)).toBe(true);
+    expect(out.length).toBeGreaterThan(SYSTEM_X_BASE.length);
+    expect(out).toContain("OPERATOR MISSION");
+    expect(out).toContain("find founders frustrated with social media");
+    // The strict JSON output contract must still be present after the mission.
+    expect(out).toContain('"drafts"');
+  });
+
+  it("appends a PER-PERSON OBJECTIVE section when a person directive is given", () => {
+    const directive =
+      "Objective for this specific person: Engage genuinely. Do NOT pitch.";
+    const out = buildDrafterSystem(null, directive);
+    expect(out.startsWith(SYSTEM_X_BASE)).toBe(true);
+    expect(out).toContain("PER-PERSON OBJECTIVE");
+    expect(out).toContain(directive);
+    expect(out).toContain('"drafts"'); // strict JSON contract still present
+  });
+
+  it("ignores an empty/blank person directive (no extra section)", () => {
+    expect(buildDrafterSystem(null, "")).toBe(SYSTEM_X_BASE);
+    expect(buildDrafterSystem(null, "   ")).toBe(SYSTEM_X_BASE);
+  });
+
+  it("includes both the operator mission and the per-person objective when both set", () => {
+    const out = buildDrafterSystem("grow the X following", "Objective for this specific person: amplify them.");
+    expect(out).toContain("OPERATOR MISSION");
+    expect(out).toContain("PER-PERSON OBJECTIVE");
+    expect(out).toContain("amplify them");
+  });
+
+  it("empty brand_config → still generic SYSTEM_X_BASE", () => {
+    expect(buildDrafterSystem(null, null, parseBrandConfig({}))).toBe(SYSTEM_X_BASE);
+  });
+
+  it("brand config → generic base + one configured OPERATOR BRAND block", () => {
+    const brand = parseBrandConfig({
+      persona: { name: "Ada", bio: "founder of Acme, building in public" },
+      product: { name: "Acme", description: "the thing", url: "acme.dev", fits_when: ["X breaks"] },
+      pitch_policy: "when_relevant",
+      dm_style: { greeting: "heyy", closing: "cheers" },
+      qa: [{ q: "Who for?", a: "small teams" }],
+    });
+    const out = buildDrafterSystem(null, null, brand);
+    expect(out).toContain("OPERATOR BRAND");
+    expect(out).toContain("Ada");
+    expect(out).toContain("Acme");
+    expect(out).toContain("heyy");
+    expect(out).toContain("small teams");
+    expect(out).toContain(SYSTEM_X_BASE);
+    expect(out.match(/OPERATOR BRAND \(set by/g)).toHaveLength(1);
+  });
+
+  it("pitch_policy=never yields a never-pitch instruction in the brand block", () => {
+    const out = renderBrandBlock(parseBrandConfig({ persona: { name: "Ada" }, pitch_policy: "never" }));
+    expect(out.toLowerCase()).toContain("never pitch");
+  });
+
+  it("objective + person still append under a branded prompt", () => {
+    const brand = parseBrandConfig({ persona: { name: "Ada", bio: "b" } });
+    const out = buildDrafterSystem("grow devtools audience", "Build relationship; do not pitch", brand);
+    expect(out).toContain("OPERATOR BRAND");
+    expect(out).toContain("OPERATOR MISSION");
+    expect(out).toContain("grow devtools audience");
+    expect(out).toContain("PER-PERSON OBJECTIVE");
+  });
+
+  it("injects the watchlist person's profile when one is provided", () => {
+    const profile = renderPersonProfile({
+      summary: "Indie founder building a Postgres observability tool",
+      topics: ["databases", "devtools"],
+      tone: "dry and technical",
+      engagementNotes: "respond with a concrete benchmark, never hype",
+    });
+    const out = buildDrafterSystem(null, null, null, profile);
+    expect(out.startsWith(SYSTEM_X_BASE)).toBe(true);
+    expect(out).toContain("WHO YOU'RE REPLYING TO");
+    expect(out).toContain("Postgres observability");
+    expect(out).toContain("databases, devtools");
+    expect(out).toContain("dry and technical");
+    expect(out).toContain('"drafts"'); // strict JSON contract still present
+  });
+
+  it("a null/empty profile adds no section (byte-identical SYSTEM_X_BASE)", () => {
+    expect(buildDrafterSystem(null, null, null, null)).toBe(SYSTEM_X_BASE);
+    expect(buildDrafterSystem(null, null, null, "")).toBe(SYSTEM_X_BASE);
+    expect(buildDrafterSystem(null, null, null, "   ")).toBe(SYSTEM_X_BASE);
+  });
+
+  it("profile + objective + mission all coexist", () => {
+    const profile = renderPersonProfile({ summary: "AI researcher", topics: ["llms"] });
+    const out = buildDrafterSystem("grow the following", "amplify them", null, profile);
+    expect(out).toContain("OPERATOR MISSION");
+    expect(out).toContain("WHO YOU'RE REPLYING TO");
+    expect(out).toContain("AI researcher");
+    expect(out).toContain("PER-PERSON OBJECTIVE");
+    expect(out).toContain("amplify them");
+  });
+});
+
+describe("renderPersonProfile", () => {
+  it("returns null for null/undefined or an all-empty profile", () => {
+    expect(renderPersonProfile(null)).toBeNull();
+    expect(renderPersonProfile(undefined)).toBeNull();
+    expect(renderPersonProfile({})).toBeNull();
+    expect(renderPersonProfile({ summary: "", topics: [], tone: null, engagementNotes: null })).toBeNull();
+  });
+
+  it("renders only the fields that are present", () => {
+    const out = renderPersonProfile({ summary: "a builder", topics: ["ai", "saas"] });
+    expect(out).toContain("Who they are: a builder");
+    expect(out).toContain("Topics they post about: ai, saas");
+    expect(out).not.toContain("How they write");
+    expect(out).not.toContain("How to engage");
+  });
