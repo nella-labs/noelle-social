@@ -198,3 +198,203 @@ export function planDrainTimeline(o: DrainOpts): PlannedAction[] {
 // The inter-reply gap width above which the drawn gap is a COOLDOWN band — the
 // "stepped away between replies" pause the timing archetype deliberately left
 // long. = replyBaseGapMs + 0.62·replyRandGapMs, the exact floor drainGapMs uses
+// for its cooldown band, so this reads the same boundary the plan drew against.
+const DRAIN_COOLDOWN_GAP_MS =
+  REDDIT_DEFAULTS.replyBaseGapMs + Math.round(REDDIT_DEFAULTS.replyRandGapMs * 0.62);
+
+// Whether `nowMs` sits inside a drain gap the plan deliberately left QUIET.
+// Reddit schedules NO upvote slots (reply-only drain), so — unlike LinkedIn, where
+// a quiet gap is one with zero like slots between two comments — the quiet signal
+// here is the drawn TIMING band: an inter-reply gap in the COOLDOWN band
+// (≥ DRAIN_COOLDOWN_GAP_MS), i.e. a long "stepped away" pause (a cooldown-band gap
+// or a session long-break gap, which is longer still). Idle-UPVOTES consult this:
+// firing an upvote through such a pause would erase the very quiet the archetype
+// drew. Slot times are PLAN times, so the check is stable across the whole gap.
+// Mirrors the LinkedIn scheduler.inQuietDrainGap shape (prev/next comment scan);
+// only the quiet CRITERION differs (gap width vs like-slot presence), by design.
+export function inQuietDrainGap(
+  actions: readonly { kind: ActionKind; atMs: number }[],
+  nowMs: number,
+): boolean {
+  let prevComment = -Infinity;
+  let nextComment = Infinity;
+  for (const a of actions) {
+    if (a.kind !== "comment") continue;
+    if (a.atMs <= nowMs && a.atMs > prevComment) prevComment = a.atMs;
+    if (a.atMs > nowMs && a.atMs < nextComment) nextComment = a.atMs;
+  }
+  // Before the first reply or after the last one there is no enclosing inter-reply
+  // gap to be cooling down inside — not quiet.
+  if (prevComment === -Infinity || nextComment === Infinity) return false;
+  return nextComment - prevComment >= DRAIN_COOLDOWN_GAP_MS;
+}
+
+// Curfew check lives in ./curfew.ts (isWriteCurfew) — the single switch every
+// enforcement point shares. It is currently DISABLED (writes allowed any hour).
+
+// Density weight for an absolute time.
+// Reduces action probability for deep-night hours.
+// Strengthened: 01:00–06:00 band is now 0.05 (was 0.25).
+function densityWeight(_atMs: number, _taper: boolean): number {
+  // Deep-night taper DISABLED (operator: post any hour). Full density every hour.
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Hard-shift a curfew-landing action to the nearest allowed hour boundary.
+// Returns null if the entire window is in curfew (caller drops it).
+// ---------------------------------------------------------------------------
+function shiftOutOfCurfew(
+  atMs: number,
+  startMs: number,
+  endMs: number,
+): number | null {
+  if (!isWriteCurfew(atMs)) return atMs;
+
+  // Try to push forward to 06:00 of the same or next local day.
+  const d = new Date(atMs);
+  const h = d.getHours();
+
+  let candidate: number;
+  if (h >= 23) {
+    // Past 23:00 — advance to next day 06:00
+    const next6am = new Date(d);
+    next6am.setDate(next6am.getDate() + 1);
+    next6am.setHours(6, 0, 0, 0);
+    candidate = next6am.getTime();
+  } else {
+    // Before 06:00 — advance to 06:00 same day
+    const today6am = new Date(d);
+    today6am.setHours(6, 0, 0, 0);
+    candidate = today6am.getTime();
+  }
+
+  if (candidate >= startMs && candidate <= endMs) return candidate;
+
+  // Try to pull back to 23:00 of the previous local day.
+  const prev11pm = new Date(atMs);
+  if (h < 6) prev11pm.setDate(prev11pm.getDate() - 1);
+  prev11pm.setHours(22, 59, 0, 0); // 22:59 — just inside allowed
+  const back = prev11pm.getTime();
+  if (back >= startMs && back <= endMs) return back;
+
+  return null; // whole window is in curfew — drop
+}
+
+export function planTimeline(opts: PlanOpts): { actions: PlannedAction[]; clamps: ClampNote[] } {
+  const { params, approvedDms, caps, startMs, deepNightTaper, rng } = opts;
+  const maxWritesPerHour = opts.maxWritesPerHour ?? 0;
+  const windowMs = params.windowHours * HOUR;
+  const endMs = startMs + windowMs;
+
+  const clamps: ClampNote[] = [];
+  const clamp = (kind: ActionKind, requested: number, cap: number): number => {
+    if (requested > cap) { clamps.push({ kind, requested, allowed: cap }); return cap; }
+    return requested;
+  };
+
+  // ── 1. ±20% per-plan volume factor ────────────────────────────────────────
+  // Draw once per plan; scale requested counts before clamping to caps.
+  // Floor widened DOWN to 0.72 (fewer on average = safer); the 1.2 cap unchanged.
+  const volumeFactor = rng.float(0.72, 1.2);
+
+  const rawComments = Math.round(params.targetComments * volumeFactor);
+  const rawLikes    = Math.round(params.targetLikes    * volumeFactor);
+  const rawDms      = Math.round(approvedDms           * volumeFactor);
+
+  const nComments = clamp("comment", rawComments, caps.comments);
+  const nLikes    = clamp("like",    rawLikes,    caps.likes);
+  const nDms      = clamp("dm",      rawDms,      caps.dms);
+
+  // ── 2. Build kind-list ─────────────────────────────────────────────────────
+  const kinds: ActionKind[] = [];
+  for (let i = 0; i < nComments; i++) kinds.push("comment");
+  for (let i = 0; i < nLikes; i++) kinds.push("like");
+  // Fisher–Yates shuffle with seeded RNG so likes/comments interleave.
+  for (let i = kinds.length - 1; i > 0; i--) {
+    const j = rng.int(0, i);
+    [kinds[i], kinds[j]] = [kinds[j]!, kinds[i]!];
+  }
+  // DMs spaced widest: insert at evenly-distributed indices.
+  for (let d = 0; d < nDms; d++) {
+    const idx = Math.floor(((d + 1) / (nDms + 1)) * kinds.length);
+    kinds.splice(idx, 0, "dm");
+  }
+
+  const total = kinds.length;
+  if (total === 0) return { actions: [], clamps };
+
+  // ── 3. Per-burst Gamma intensity ───────────────────────────────────────────
+  // Burst count: ~1 burst per 36 min–2.2 h (widened from 45–90 min so session
+  // shapes differ more: some days are one long sitting, some are many spurts).
+  const burstCount = Math.max(1, Math.round(params.windowHours / rng.float(0.6, 2.2)));
+
+  // Draw a Gamma(k=1.5, θ=1) weight per burst so intensity varies across bursts
+  // (lower shape than the old k=2 ⇒ wider intensity spread, same mechanism).
+  const burstWeights: number[] = [];
+  for (let b = 0; b < burstCount; b++) {
+    burstWeights.push(rng.gamma(1.5, 1));
+  }
+  const totalWeight = burstWeights.reduce((s, w) => s + w, 0);
+
+  // Distribute total action count across bursts proportionally to gamma weights.
+  const burstSizes: number[] = burstWeights.map((w) =>
+    Math.round((w / totalWeight) * total),
+  );
+  // Correct rounding drift — assign remainder to heaviest burst.
+  const sizeSum = burstSizes.reduce((s, v) => s + v, 0);
+  const drift = total - sizeSum;
+  if (drift !== 0 && burstSizes.length > 0) {
+    const heaviest = burstWeights.indexOf(Math.max(...burstWeights));
+    burstSizes[heaviest] = (burstSizes[heaviest] ?? 0) + drift;
+  }
+
+  // Burst start times: evenly distributed across window with random jitter.
+  // A LONE burst (short windows, burstCount===1) anchors at the window OPEN, not
+  // its midpoint — otherwise the first half of a short window is dead and the
+  // first real action lands ~50% of the way in (the "nothing happens for 15 min"
+  // bug). Multi-burst windows keep the centered spacing unchanged.
+  const burstStarts: number[] = [];
+  for (let b = 0; b < burstCount; b++) {
+    const base = burstCount === 1
+      ? startMs
+      : startMs + ((b + 0.5) / burstCount) * windowMs;
+    const jitter = rng.float(-windowMs / burstCount / 3, windowMs / burstCount / 3);
+    burstStarts.push(Math.max(startMs, Math.min(endMs, base + jitter)));
+  }
+
+  // ── 4. AR(1) log-normal inter-action gaps within/across bursts ────────────
+  // Draw rho (autocorrelation) once per plan.
+  const rho = Math.min(0.6, Math.max(0.2, rng.normal(0.4, 0.1)));
+  // Personal tempo: a median gap in [150s, 320s] (widened per-session spread —
+  // floor UNCHANGED so the fastest sessions are no faster than before, only the
+  // ceiling raised so some sessions run slower; wider band ⇒ two sessions differ
+  // more). A fixed absolute gap
+  // tuned for multi-hour runs OVERFLOWS a short window — every action's cursor
+  // marches past the window end and piles at endMs, so a 30-min run does nothing
+  // for ~15 min then clusters. So cap the median at what actually FITS the
+  // window (windowMs / (total+1)), floored at a human minimum. For long windows
+  // idealGap > drawn, so this is a no-op and the drawn tempo (and the whole RNG
+  // stream) is unchanged; only short windows tighten.
+  const MIN_HUMAN_GAP = 40_000;
+  const drawnGapMs = rng.float(150_000, 320_000);
+  const idealGapMs = windowMs / (total + 1);
+  const medianGapMs = Math.max(MIN_HUMAN_GAP, Math.min(drawnGapMs, idealGapMs));
+  // Log-space params for logNormal: median = exp(mu) → mu = log(median).
+  const muLog = Math.log(medianGapMs);
+  const sigmaLog = 0.8; // fixed sigma gives CV ≈ sqrt(exp(sigmaLog^2)-1) ≈ 0.9–1.4 (widened spread)
+
+  // Occasional "stepped away" pause: at random, roughly 1 action in 5 gets an
+  // extra 0–300 s (0–5 min) layered on top of its inter-action gap. Modelled as
+  // an INTERMITTENT interruption (probability-gated) rather than a flat add on
+  // every action — a flat add homogenises the gaps (pulls the coefficient of
+  // variation below the human band and drops volume hard), whereas an occasional
+  // long pause is what real humans do: it keeps the gap distribution heavy-tailed
+  // and barely dents volume. Applied at plan time so it flows into every
+  // downstream pass (curfew shift, taper, hourly ceiling).
+  //
+  // The pause draws come from a SEPARATE rng seeded from plan-deterministic
+  // inputs (startMs/total/window), NOT the main stream, so the tempo/burst/volume
+  // RNG sequence stays byte-for-byte unchanged — this layer only ADDS the
+  // occasional pause, it never reshuffles the underlying plan. It still varies
+  // run-to-run in production (startMs is a ms timestamp) and stays deterministic
