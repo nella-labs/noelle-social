@@ -198,3 +198,203 @@ describe("selectRepliesToMe", () => {
   it("drops one already in the seen ring", () => {
     expect(selectRepliesToMe([item], { seen: [item.external_id], max: 5 })).toEqual([]);
   });
+
+  it("bounds the batch", () => {
+    const many = Array.from({ length: 10 }, (_, i) => ({ ...item, external_id: String(i) }));
+    expect(selectRepliesToMe(many, { seen: [], max: 3 })).toHaveLength(3);
+  });
+});
+
+// Safety property against the repo's REAL captured LinkedIn markup: the
+// notification harvester must produce NOTHING on any page that is not the
+// notifications page. `cardsIn` falls back to bare `article`/`li` selectors, so
+// without this a feed post could be mistaken for a notification card and filed
+// as a conversation lead.
+describe("harvestNotifications on real non-notification pages", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const fx = (name: string) => readFileSync(join(here, "..", "fixtures", name), "utf8");
+
+  for (const file of [
+    "feed-post.html",
+    "feed-2026-obfuscated.html",
+    "feed-drifted.html",
+    "commented-post.html",
+    "long-post.html",
+    "sponsored-post.html",
+  ]) {
+    it(`${file} yields no notifications`, () => {
+      document.body.innerHTML = fx(file);
+      expect(harvestNotifications(document.body)).toEqual([]);
+    });
+  }
+});
+
+// external_id has a 200-char cap in the contract, and the server parses a sweep
+// as ONE batch — so a single oversized id would 400 the whole request and lose
+// every other item with it. A real LinkedIn notification href carries
+// commentUrn/dashCommentUrn tracking params and runs past 270 chars, so the raw
+// href can never be part of the id.
+describe("external_id stability and length", () => {
+  const realisticHref =
+    "/feed/update/urn:li:activity:7300000000000000000/?commentUrn=urn%3Ali%3Acomment%3A%28activity%3A7300000000000000000%2C7300000000000000123%29&dashCommentUrn=urn%3Ali%3Afsd_comment%3A%287300000000000000123%2Curn%3Ali%3Aactivity%3A7300000000000000000%29";
+
+  const cardWithHref = (href: string) => `
+    <article class="nt-card">
+      <div class="nt-card__text--headline">Alice Smith commented on your post</div>
+      <p>great point</p>
+      <a href="/in/alice-smith"></a>
+      <a href="${href}"></a>
+    </article>`;
+
+  it("stays well under the 200-char contract limit on a real tracking-param href", () => {
+    document.body.innerHTML = cardWithHref(realisticHref);
+    const [item] = harvestNotifications(document.body);
+    expect(item).toBeDefined();
+    expect(item!.external_id.length).toBeLessThanOrEqual(200);
+    // The href exposes a real comment urn, so that is the id — it distinguishes
+    // two comments by the same person on the same post.
+    expect(item!.external_id).toBe("urn:li:comment:7300000000000000123");
+  });
+
+  it("is STABLE across the OTHER tracking params that vary between renders", () => {
+    document.body.innerHTML = cardWithHref(realisticHref);
+    const a = harvestNotifications(document.body)[0]!.external_id;
+    document.body.innerHTML = cardWithHref(realisticHref + "&trk=some_other_tracking_param&lipi=xyz");
+    expect(harvestNotifications(document.body)[0]!.external_id).toBe(a);
+  });
+
+  it("distinguishes two comments by the SAME person on the SAME post", () => {
+    // The old (post, person) key collapsed these into one, so the second
+    // comment was reported as a duplicate and never answered.
+    const other = realisticHref.replace("7300000000000000123", "7300000000000000999");
+    document.body.innerHTML = cardWithHref(realisticHref) + cardWithHref(other);
+    const ids = harvestNotifications(document.body).map((i) => i.external_id);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("skips a card whose activity urn cannot be derived rather than filing an unkeyable lead", () => {
+    document.body.innerHTML = cardWithHref("/feed/update/something-with-no-id/");
+    expect(harvestNotifications(document.body)).toEqual([]);
+  });
+});
+
+// REAL markup captured from a logged-in linkedin.com/notifications
+// (fixtures/notification-card.html). This one card disproved four assumptions;
+// each is locked below so a future edit cannot silently reintroduce them.
+describe("real captured LinkedIn notification card", () => {
+  const here2 = dirname(fileURLToPath(import.meta.url));
+  const card = () => readFileSync(join(here2, "..", "fixtures", "notification-card.html"), "utf8");
+  const el = () => {
+    document.body.innerHTML = card();
+    return document.querySelector("article.nt-card")!;
+  };
+
+  it("cardsIn finds it via data-view-name='notification-card-container'", () => {
+    document.body.innerHTML = card();
+    // The guessed value was "notification-card"; the real one has -container.
+    expect(document.querySelectorAll("[data-view-name='notification-card-container']").length).toBe(1);
+    expect(document.querySelectorAll("[data-view-name='notification-card']").length).toBe(0);
+  });
+
+  it("cardHeadline reads the real headline and drops the a11y text", () => {
+    // The real class is nt-card__headline, and the anchor contains a
+    // .visually-hidden "Unread notification." that must not pollute the match.
+    expect(cardHeadline(el())).toBe("Your comment has gained 371 impressions.");
+  });
+
+  it("cardHeadline is not fooled by the settings dropdown's *__headline items", () => {
+    expect(cardHeadline(el())).not.toMatch(/notification preferences|Delete notification/);
+  });
+
+  it("REJECTS it — an impressions notification is not a reply", () => {
+    expect(isReplyHeadline(cardHeadline(el()))).toBe(false);
+    document.body.innerHTML = card();
+    expect(harvestNotifications(document.body)).toEqual([]);
+  });
+
+  it("parses the PERCENT-ENCODED ugcPost urn the real link carries", () => {
+    const href = el().querySelector("a.nt-card__headline")!.getAttribute("href");
+    // The old /activity[-:](\d+)/ regex returned null here, which skipped every
+    // real card and made the LinkedIn sweep harvest nothing at all.
+    expect(activityUrnFrom(href)).toBe("urn:li:ugcPost:7486054278927835136");
+  });
+
+  it("extracts the REAL comment id from the link's commentUrn param", () => {
+    const href = el().querySelector("a.nt-card__headline")!.getAttribute("href");
+    expect(commentIdFrom(href)).toBe("7486091099183251456");
+  });
+
+  it("cardSnippet returns the COMMENT, not the much longer original post", () => {
+    const c = el();
+    const snippet = cardSnippet(c, cardHeadline(c));
+    expect(snippet).toMatch(/^a week to teach yourself advanced econometrics/);
+    expect(snippet).not.toMatch(/Happy to share that I finished first/);
+  });
+
+  it("cardPostContext returns the original post as free thread context", () => {
+    expect(cardPostContext(el())).toMatch(/^Happy to share that I finished first/);
+  });
+});
+
+// REAL full notifications page (fixtures/notifications-page.html), captured
+// from a logged-in linkedin.com/notifications. Three more assumptions died
+// here; each is locked below.
+describe("real captured LinkedIn notifications PAGE", () => {
+  const here3 = dirname(fileURLToPath(import.meta.url));
+  const page = () => readFileSync(join(here3, "..", "fixtures", "notifications-page.html"), "utf8");
+  const harvest = () => {
+    document.body.innerHTML = page();
+    return harvestNotifications(document.body);
+  };
+
+  it("harvests exactly the genuine replies and rejects everything else", () => {
+    // 6 real cards: a trending post, a reaction on our comment, a reply, an
+    // impressions card, a reaction on a comment mentioning us, and a comment
+    // written at us. Only the last two are somebody talking TO us.
+    expect(harvest().map((i) => i.public_id)).toEqual(["mara-lopez", "nathan-beck"]);
+  });
+
+  it("finds reply cards at all — their link is /feed/?highlightedUpdateUrn=, not /feed/update/", () => {
+    // The card filter used to require /feed/update/ or 'activity-', which no
+    // reply card carries, so it matched ZERO replies and the sweep harvested
+    // nothing. This asserts the shape that actually appears.
+    document.body.innerHTML = page();
+    const hrefs = Array.from(document.querySelectorAll("a.nt-card__headline")).map((a) => a.getAttribute("href") ?? "");
+    expect(hrefs.every((h) => !h.includes("/feed/update/"))).toBe(true);
+    expect(hrefs.some((h) => h.includes("highlightedUpdateUrn"))).toBe(true);
+    expect(harvest()).toHaveLength(2);
+  });
+
+  it("keys on THEIR reply id, never on our own comment id", () => {
+    // A reply link carries commentUrn (OURS) and replyUrn (THEIRS). Taking the
+    // first comment urn returned ours, so every different person replying to
+    // one comment of ours collided on a single external_id and only the first
+    // was ever answered.
+    const [reply] = harvest();
+    expect(reply!.external_id).toBe("urn:li:comment:7487199472029192192"); // replyUrn
+    expect(reply!.external_id).not.toContain("7486091099183251456"); // our commentUrn
+  });
+
+  it("roots the conversation on the POST, not the notification's own activity", () => {
+    // highlightedUpdateUrn is the notification's activity and differs per
+    // notification; using it would give a different 'root' for every
+    // notification on one thread and defeat the turn cap.
+    const [reply] = harvest();
+    expect(reply!.activity_urn).toBe("urn:li:ugcPost:7486054278927835136");
+    expect(reply!.activity_urn).not.toBe("urn:li:activity:7487199521425326080");
+  });
+
+  it("reads the commenter's percent-encoded profile id from the left rail", () => {
+    // The last open question from the single-card capture: reply cards DO carry
+    // a profile link, as a[data-view-name='notification-card-image'].
+    expect(harvest()[0]!.public_id).toBe("mara-lopez"); // from "/in/mara%2Dlopez"
+  });
+
+  it("uses LinkedIn's own notification type over the headline prose", () => {
+    expect(notificationTypeFrom("/feed/?highlightedUpdateType=REPLIED_TO_YOUR_COMMENT&x=1")).toBe("REPLIED_TO_YOUR_COMMENT");
+    expect(isReplyType("REPLIED_TO_YOUR_COMMENT")).toBe(true);
+    expect(isReplyType("MENTIONED_YOU_IN_THIS")).toBe(true);
+    expect(isReplyType("REACTED_TO_YOUR_COMMENT")).toBe(false);
+    expect(isReplyType("REACTED_TO_COMMENT_MENTIONING_YOU")).toBe(false);
+    expect(isReplyType("COMMENT_VIEWS")).toBe(false);
+    expect(isReplyType("TOPIC_TRENDING_CONVERSATION_IN_YOUR_NETWORK")).toBe(false);
