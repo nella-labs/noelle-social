@@ -198,3 +198,144 @@ export function locateCommentSubmit(root: ParentNode): LocateResult {
 }
 
 /**
+ * Explain a submit-not-found: which of the three failure buckets (no worded
+ * candidate / disabled / enabled-but-zero-rect) the page is in. Called by the
+ * background ONLY on the failure path, so it never costs the happy path. Uses a
+ * real getBoundingClientRect for the zero-rect test. Protocol name kept from
+ * the LinkedIn actuator ("comment" == X reply).
+ */
+export function diagnoseCommentSubmit(root: ParentNode): LocateResult {
+  const isZeroRect = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    return r.width <= 0 || r.height <= 0;
+  };
+  return { ok: true, observed: { ...selDiagnoseReplySubmit(root, isZeroRect) } };
+}
+
+/**
+ * Read the reply composer's current text so the background can CONFIRM a submit
+ * actually landed. X clears the inline composer (and unmounts the modal one) on
+ * a successful post, so:
+ *   observed.present=false  → the composer is gone (posted / navigated away)
+ *   observed.empty=true     → the box is present but cleared (posted)
+ *   observed.empty=false    → text still sitting there (submit did NOT land)
+ * ok is always true (this is a read, not an action); `present` distinguishes the
+ * two "posted" shapes from the "still populated" one.
+ */
+export function readCommentBox(root: ParentNode): LocateResult {
+  const text = selReplyBoxText(root);
+  if (text === null) return { ok: true, observed: { present: false, empty: true, text: "" } };
+  return { ok: true, observed: { present: true, empty: text.length === 0, text } };
+}
+
+/**
+ * In-viewport (or just below) tweets, mirroring the like-target heuristic so
+ * ambient clicks land on a tweet the reader can actually see. Falls back to all
+ * tweets when none are in view.
+ */
+function inViewTweets(tweets: Element[]): Element[] {
+  const vh = typeof window !== "undefined" ? window.innerHeight || 800 : 800;
+  const inView = tweets.filter((p) => {
+    const top = p.getBoundingClientRect().top;
+    return top > -200 && top < vh * 1.4;
+  });
+  return inView.length > 0 ? inView : tweets;
+}
+
+/**
+ * Ambient decoy: locate a truncated tweet's "Show more" expander so the loop
+ * can expand-and-read it (a strong human signal). Non-counted, read-only.
+ */
+export function locateAmbientExpand(root: ParentNode, rng: Rng): LocateResult {
+  const truncated = findFeedTweets(root).filter((p) => !isPromoted(p) && selIsTruncated(p));
+  if (truncated.length === 0) return { ok: false, skipReason: "no-truncated-tweet" };
+  const candidates = inViewTweets(truncated);
+  const pick = candidates[rng.int(0, candidates.length - 1)]!;
+  const btn = selFindSeeMore(pick);
+  if (!btn) return { ok: false, skipReason: "show-more-not-found" };
+  btn.scrollIntoView?.({ block: "center" });
+  const { x, y } = elementCenter(btn);
+  return {
+    ok: true, x, y, rect: elementRect(btn),
+    observed: {
+      tweet_id: tweetId(pick),
+      wordCount: selWordCount(pick),
+      hasMedia: selHasMedia(pick),
+    },
+  };
+}
+
+/**
+ * Ambient decoy: locate a tweet's reply affordance so the loop can open its
+ * discussion to read. Non-counted, read-only — never types or submits. On X
+ * the reply icon opens the reply composer overlay; dismissing it is the loop's
+ * job (LIVE-TUNE: confirm the loop's close gesture against the modal).
+ */
+export function locateAmbientComments(root: ParentNode, rng: Rng): LocateResult {
+  const withReplies = findFeedTweets(root).filter((p) => !isPromoted(p) && selHasReplies(p));
+  if (withReplies.length === 0) return { ok: false, skipReason: "no-replyable-tweet" };
+  const candidates = inViewTweets(withReplies);
+  const pick = candidates[rng.int(0, candidates.length - 1)]!;
+  const btn = selFindReplyAffordance(pick);
+  if (!btn) return { ok: false, skipReason: "reply-affordance-not-found" };
+  btn.scrollIntoView?.({ block: "center" });
+  const { x, y } = elementCenter(btn);
+  return {
+    ok: true, x, y, rect: elementRect(btn),
+    observed: { tweet_id: tweetId(pick), hasMedia: selHasMedia(pick) },
+  };
+}
+
+/**
+ * Locate an action-bar button on a SPECIFIC tweet (the one we just decided to
+ * engage, identified by the tweet_id the like-locate returned). A miss (tweet
+ * scrolled off, button absent, or already liked/bookmarked/reposted → the testid
+ * swapped) skips, and the background degrades safely — so an engagement-variety
+ * attempt never costs the budgeted like. Supports "like" so the background can
+ * RE-locate the heart for a FRESH rect after anything that scrolled or reflowed
+ * the page since the original like-locate (a "Show more" expansion, or this
+ * function's own scrollIntoView on an earlier bookmark/repost locate) — a
+ * trusted CDP click must never reuse a pre-scroll rect. Action-bar buttons are
+ * NOT a transient popup (unlike the repost confirm menu below), so
+ * scrollIntoView is safe here, and the returned rect is measured AFTER it.
+ */
+export function locateEngagement(root: ParentNode, kind: EngagementKind, id: string | null): LocateResult {
+  if (!id) return { ok: false, skipReason: `engagement-no-tweet-id(${kind})` };
+  const tweet = findFeedTweets(root).find((t) => tweetId(t) === id);
+  if (!tweet) return { ok: false, skipReason: `engagement-tweet-gone(${kind})` };
+  const btn =
+    kind === "bookmark" ? selFindBookmark(tweet)
+    : kind === "like" ? findLikeButton(tweet)
+    : selFindRetweet(tweet);
+  if (!btn) return { ok: false, skipReason: `engagement-not-found(${kind})` };
+  btn.scrollIntoView?.({ block: "center" });
+  const { x, y } = elementCenter(btn);
+  return { ok: true, x, y, rect: elementRect(btn), observed: { engagement: kind } };
+}
+
+/**
+ * Locate the "Repost" confirm item inside the transient menu X opens after the
+ * repost button is clicked (the background clicks retweet, gives it a beat, then
+ * calls this). A miss (menu not open yet, or the item drifted) skips → the
+ * background falls back to a plain Like, so a repost attempt never loses the like.
+ * Deliberately does NOT scrollIntoView: the menu is already in view and a scroll
+ * would dismiss it.
+ */
+export function locateRepostConfirm(root: ParentNode): LocateResult {
+  const btn = selFindRetweetConfirm(root);
+  if (!btn) return { ok: false, skipReason: "repost-confirm-not-found" };
+  const { x, y } = elementCenter(btn);
+  return { ok: true, x, y, rect: elementRect(btn) };
+}
+
+export function detectChallenge(root: ParentNode): boolean {
+  return findChallenge(root);
+}
+
+export function detectPostUnavailable(root: ParentNode): boolean {
+  return selIsPostUnavailable(root);
+}
+
+export function detectReplyRestricted(root: ParentNode): boolean {
+  return selIsReplyRestricted(root);
+}
