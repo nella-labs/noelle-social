@@ -2798,3 +2798,203 @@ describe("poolForFaithfulLead (faithful multi-voice rotation)", () => {
       const out = poolForFaithfulLead(pool, ["kaia", "henry"], `post number ${i}`, [1, 0]);
       expect((out[0] as { account_handle: string }).account_handle).toBe("kaia");
     }
+  });
+
+  it("fails open to the full pool when the chosen voice has no corpus", async () => {
+    const { poolForFaithfulLead } = await import("./drafter-tick.js");
+    // Only henry can be chosen (kaia weight 0) but the pool has no henry rows.
+    const kaiaOnly = [row("kaia", 1), row("kaia", 2)];
+    const out = poolForFaithfulLead(kaiaOnly, ["kaia", "henry"], "post", [0, 1]);
+    expect(out).toBe(kaiaOnly);
+  });
+});
+
+describe("runDmRequestTick — progressive DM ladder", () => {
+  const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+  const dmLead = {
+    id: "L1",
+    external_id: "x1",
+    payload: { text: "post text", url: "https://x.com/u/status/1" },
+    author_handle: "u",
+    author_id: "uid",
+    status: "drafting",
+    tier: null,
+    classifier_label: null,
+    classifier_score: null,
+    priority: false,
+  };
+  const runnerWithDm = () => ({
+    draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({
+        drafts: [{ angle: "empathetic", body: "r", char_count: 1 }],
+        dm: { body: "a dm body", char_count: 9 },
+      }),
+      engine: "codex",
+      model: "m",
+    }),
+  });
+
+  const ladderSql = (sent: number, fail = false) => ((strings: TemplateStringsArray, ...values: unknown[]) => {
+    const text = strings.join("?");
+    // postgres tags build fragments lazily; only a complete query executes.
+    if (!/\bfrom\s+noelle\.approvals\b/i.test(text)) return { strings, values };
+    if (fail) return Promise.reject(new Error("db down"));
+    return Promise.resolve(/count\(\*\)/i.test(text) ? [{ n: sent }] : []);
+  }) as never;
+
+  // sentCount -> the rung directive that must appear, and whether a call is allowed.
+  const cases: Array<[number, string, boolean]> = [
+    [0, "early, light first touch", false],
+    [1, "one layer deeper", false],
+    [2, "grounded overlap", false],
+    [5, "low-pressure, easy-to-decline quick call", true],
+  ];
+
+  for (const [sent, needle, callAllowed] of cases) {
+    it(`sends rung ${sent === 0 ? 1 : Math.min(sent + 1, 4)} after ${sent} prior DMs`, async () => {
+      const runner = runnerWithDm();
+      const sql = ladderSql(sent);
+      await runDmRequestTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [dmLead] as never,
+        runner: runner as never,
+        kb: { search: vi.fn().mockResolvedValue([]) } as never,
+        postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+        sql,
+      });
+      const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+      expect(prompt).toContain("DM RELATIONSHIP STAGE");
+      expect(prompt).toContain(needle);
+      if (callAllowed) {
+        expect(prompt).toContain("only rung that may propose a call");
+      } else {
+        expect(prompt).toContain("Do NOT propose a call");
+      }
+    });
+  }
+
+  it("starts at rung 1 when the ladder query fails (never cold-invites)", async () => {
+    const runner = runnerWithDm();
+    const sql = ladderSql(0, true);
+    await runDmRequestTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [dmLead] as never,
+      runner: runner as never,
+      kb: { search: vi.fn().mockResolvedValue([]) } as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      sql,
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("early, light first touch");
+    expect(prompt).toContain("Do NOT propose a call");
+  });
+
+  it("omits the ladder entirely with no sql handle (byte-identical fallback)", async () => {
+    const runner = runnerWithDm();
+    await runDmRequestTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [dmLead] as never,
+      runner: runner as never,
+      kb: { search: vi.fn().mockResolvedValue([]) } as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    // Still rung 1 (pickRung(0)) — the ladder is always on, just unfed.
+    expect(prompt).toContain("early, light first touch");
+  });
+});
+
+describe("decideOpus — engagement-tiered escalation", () => {
+  const base = { likesThreshold: 150, repliesThreshold: 40 };
+
+  it("escalates on real like traction", () => {
+    expect(decideOpus({ ...base, likes: 200, replies: 0, commentBait: false }).useOpus).toBe(true);
+    expect(decideOpus({ ...base, likes: 150, replies: 0, commentBait: false }).useOpus).toBe(false);
+  });
+
+  it("escalates on real reply traction", () => {
+    expect(decideOpus({ ...base, likes: 0, replies: 41, commentBait: false }).useOpus).toBe(true);
+  });
+
+  it("IGNORES the reply count on an engagement-bait post", () => {
+    // The whole point: a comment-farming CTA inflates replies with junk, so it
+    // must not buy itself the expensive model.
+    expect(decideOpus({ ...base, likes: 0, replies: 5000, commentBait: true }).useOpus).toBe(false);
+  });
+
+  it("still escalates a bait post on LIKES (likes stay reliable)", () => {
+    expect(decideOpus({ ...base, likes: 900, replies: 5000, commentBait: true }).useOpus).toBe(true);
+  });
+
+  it("treats missing / non-finite engagement as zero and never escalates", () => {
+    for (const v of [null, undefined, Number.NaN]) {
+      expect(decideOpus({ ...base, likes: v, replies: v, commentBait: false }).useOpus).toBe(false);
+    }
+  });
+});
+
+describe("writer and verifier factual evidence parity", () => {
+  const fact = "Oriole maps Atlas dependency graphs";
+  const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+  const brand = {
+    persona: { name: "Ari", bio: "Builds Oriole" },
+    product: { name: "Oriole", description: fact },
+    qa: [{ q: "Which manifests?", a: "Atlas manifests" }],
+    reply_style: { voice_notes: "Style-only Vega" },
+  };
+
+  async function run(options: {
+    brand?: typeof brand; thread?: boolean; retries?: number; siblings?: boolean; directives?: boolean;
+  }) {
+    const draftBodies = options.siblings ? [fact, "Oriole supports Atlas manifests"] : [fact];
+    const runner = { draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({ drafts: draftBodies.map((body) => ({ angle: "technical", body })) }),
+      engine: "codex", model: "fixture",
+    }) };
+    let reviews = 0;
+    const judge = vi.fn(async (_system: string, prompt: string) => {
+      reviews++;
+      const evidence = prompt.split("DRAFTS TO GRADE")[0]!;
+      const supported = evidence.includes(fact);
+      const firstRepair = options.retries && reviews === 1;
+      return JSON.stringify({ voice: firstRepair ? 0.3 : 0.9, grounding: supported ? 0.9 : 0.2, relevance: 0.9,
+        reasons: supported ? [] : ["Unsupported Oriole/Atlas claim"], fix: supported ? null : "Remove unsupported claim" });
+    });
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    await runDrafterTick({
+      log: log as never,
+      instance: {
+        id: "i", org_id: "o", ...(options.brand ? { brand_config: options.brand } : {}),
+        ...(options.directives ? { objective: "Objective-only Lyra" } : {}),
+      },
+      claimedLeads: [{
+        id: "L", external_id: "123", status: "drafting", priority: true,
+        author_handle: "author", author_id: "uid", tier: null, classifier_label: null, classifier_score: null,
+        payload: { text: "How do you inspect dependency graphs?", url: "https://x.com/author/status/123",
+          ...(options.directives ? { reply_request: {
+            request_key: "manual-evidence", instructions: "Request-only Vega", force_human_review: true,
+          } } : {}),
+          ...(options.thread ? { source: "notification", conversation: {
+            root_post_text: "Does Oriole map Atlas?", our_reply_text: fact,
+          } } : {}),
+        },
+      }],
+      runner: runner as never,
+      kb: { search: vi.fn().mockResolvedValue([{ snippet: "Plain spoken", score: 8, filePath: "voice.md", startLine: 1, endLine: 1 }]) } as never,
+      postOutbound, markStatus: vi.fn(), patternRules: [],
+      verify: { enabled: true, retries: options.retries ?? 0, makeCalls: () => [judge] },
+    });
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    return { runner, judge, outbound: postOutbound.mock.calls[0]![0] };
+  }
+
+  it("supplies configured identity/product/Q&A facts without voice or operator directives", async () => {
+    const result = await run({ brand });
+    const evidence = result.judge.mock.calls[0]![1].split("DRAFTS TO GRADE")[0]!;
+    expect(result.runner.draft.mock.calls[0]![0].system).toContain(fact);
+    expect(evidence).toContain(fact);
+    expect(evidence).toContain("Builds Oriole");
+    expect(evidence).toContain("Atlas manifests");
