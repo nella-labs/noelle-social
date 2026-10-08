@@ -398,3 +398,85 @@ describe("anti-ai rules do not contradict the assigned form variants", () => {
   });
   it("keeps genuinely asking a question allowed (QUESTION_ONLY)", () => {
     expect(SYSTEM_LINKEDIN_BASE).toMatch(/Genuinely ASKING them something you actually want to know/);
+  });
+  it("tells the writer how to satisfy DETAIL_ZOOM without a significance marker", () => {
+    expect(SYSTEM_LINKEDIN_BASE).toMatch(/ASSIGNED SHAPE asks you to zoom in on one detail/);
+    expect(SYSTEM_LINKEDIN_BASE).toMatch(/Show which part mattered by spending the words on it/);
+  });
+});
+
+// docs/linkedin-intern.md claims the rules reach "all five prose surfaces".
+// The three reply surfaces are asserted above; these are the two DM surfaces,
+// which were previously unpinned.
+describe("anti-ai rules reach both DM surfaces too", () => {
+  it("permits an optional rung-four call without inferring a warm relationship from outbound DMs", () => {
+    const prompt = buildLadderDmSystem({
+      index: 4, id: "invite", label: "Invite", proposesCall: true, directive: "Allow one optional invite",
+    });
+    const policy = prompt.split("\n").find((line) => line.startsWith("CALL POLICY:"));
+    expect(policy).toContain("Prior outbound DMs do not prove a response or relationship");
+    expect(policy).toContain("recorded received evidence");
+    expect(policy).toContain("ONE low-pressure, easy-to-decline quick call");
+    expect(policy).not.toContain("warm enough");
+  });
+
+  const LADDER = buildLadderDmSystem({
+    index: 1,
+    id: "open",
+    label: "Open",
+    proposesCall: false,
+    directive: "open the relationship",
+  });
+  for (const [name, prompt] of [
+    ["SYSTEM_LINKEDIN_INTRO", SYSTEM_LINKEDIN_INTRO],
+    ["buildLadderDmSystem", LADDER],
+  ] as const) {
+    it(`${name} carries the anti-ai rules`, () => {
+      expect(prompt).toMatch(/NEVER MARK SIGNIFICANCE/);
+      expect(prompt).toMatch(/TIER-1 VOCABULARY/);
+      expect(prompt).toContain("let that sink in");
+    });
+  }
+});
+
+// The house skeleton ("lift a detail out of their post, make it the subject,
+// attach a verdict") measured ~55% of Lyra's live drafts. The ban belongs on
+// every REPLY surface and on none of the DM surfaces: a DM is a different
+// register and the frames are not a tell there.
+describe("house-skeleton ban placement", () => {
+  for (const [name, prompt] of [
+    ["SYSTEM_LINKEDIN_BASE", SYSTEM_LINKEDIN_BASE],
+    ["SYSTEM_LINKEDIN_BASE", SYSTEM_LINKEDIN_BASE],
+    ["SYSTEM_LINKEDIN_LIGHT", SYSTEM_LINKEDIN_LIGHT],
+  ] as const) {
+    it(`${name} bans grading their detail`, () => {
+      expect(prompt).toContain("NEVER GRADE THEIR DETAIL");
+      expect(prompt).toContain("is the one/part/bit/line/detail");
+      // The no-dots rule rides the same reply surfaces.
+      expect(prompt).toContain("NO FULL STOPS");
+    });
+  }
+
+  for (const [name, prompt] of [
+    ["SYSTEM_LINKEDIN_INTRO", SYSTEM_LINKEDIN_INTRO],
+    ["buildLadderDmSystem", buildLadderDmSystem({
+      index: 1, id: "open", label: "Open", proposesCall: false, directive: "open the relationship",
+    })],
+  ] as const) {
+    it(`${name} does NOT carry the reply-only skeleton ban`, () => {
+      expect(prompt).not.toContain("NEVER GRADE THEIR DETAIL");
+      expect(prompt).not.toContain("NO FULL STOPS");
+    });
+  }
+});
+
+it("honors a policy-only never config instead of the legacy product prompt", () => {
+  expect(buildDrafterSystem(null, null, { pitch_policy: "never", qa: [] })).toContain("PITCH POLICY: never");
+});
+
+
+it("requires configured identity and product facts for unbranded drafting", () => {
+  const prompt = buildDrafterSystem();
+  expect(prompt).toContain("do not pitch without a verified product brief");
+  expect(prompt).not.toContain("OPERATOR BRAND (set by the operator");
+});
