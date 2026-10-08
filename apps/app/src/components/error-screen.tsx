@@ -198,3 +198,203 @@ export function ErrorScreen({
                   boxShadow: `0 0 0 3px color-mix(in oklch, ${tone} 22%, transparent)`,
                 }}
               />
+              {e.eyebrow}
+            </span>
+            <span
+              style={{
+                marginLeft: "auto",
+                fontFamily: "var(--mono, 'JetBrains Mono', ui-monospace, monospace)",
+                fontSize: 11,
+                color: "var(--ink-muted)",
+              }}
+              suppressHydrationWarning
+            >
+              trace · {trace ?? "··:··:··Z"}
+            </span>
+          </div>
+
+          <h1
+            className="serif"
+            style={{
+              margin: 0,
+              fontSize: 44,
+              lineHeight: 1.04,
+              letterSpacing: "-0.015em",
+              fontFamily: "var(--display, 'Instrument Serif', Georgia, serif)",
+              fontWeight: 400,
+              color: "var(--ink)",
+            }}
+          >
+            {e.title}
+          </h1>
+
+          <p
+            style={{
+              margin: 0,
+              fontSize: 15,
+              lineHeight: 1.55,
+              color: "var(--ink-2)",
+              maxWidth: "44ch",
+            }}
+          >
+            {e.sub}
+          </p>
+
+          <details
+            style={{
+              marginTop: 2,
+              padding: "12px 14px",
+              background: "var(--paper-2)",
+              borderRadius: 10,
+              boxShadow: "0 0 0 0.5px var(--rule)",
+            }}
+          >
+            <summary
+              style={{
+                cursor: "pointer",
+                listStyle: "none",
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                fontFamily:
+                  "var(--mono, 'JetBrains Mono', ui-monospace, monospace)",
+                fontSize: 10.5,
+                letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                color: "var(--ink-muted)",
+              }}
+            >
+              <span style={{ color: "var(--ink-soft)" }}>›</span>
+              Technical detail
+            </summary>
+            <pre
+              style={{
+                margin: "10px 0 0",
+                padding: 0,
+                fontFamily:
+                  "var(--mono, 'JetBrains Mono', ui-monospace, monospace)",
+                fontSize: 11.5,
+                lineHeight: 1.55,
+                color: "var(--ink-2)",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+              }}
+            >
+              {e.detail.join("\n")}
+              {traceId ? `\ntrace-id: ${traceId}` : ""}
+            </pre>
+          </details>
+
+          <div
+            className="error-actions"
+            style={{
+              display: "flex",
+              gap: 10,
+              marginTop: 6,
+              flexWrap: "wrap",
+              alignItems: "center",
+            }}
+          >
+            {primaryAction ? (
+              <ActionButton variant="accent" action={primaryAction} />
+            ) : null}
+            {secondaryAction ? (
+              <ActionButton variant="default" action={secondaryAction} />
+            ) : null}
+            {traceId ? (
+              <button
+                type="button"
+                onClick={() => {
+                  if (typeof navigator !== "undefined" && navigator.clipboard) {
+                    void navigator.clipboard.writeText(traceId);
+                  }
+                }}
+                style={{
+                  marginLeft: "auto",
+                  alignSelf: "center",
+                  background: "transparent",
+                  border: 0,
+                  padding: 0,
+                  fontFamily:
+                    "var(--mono, 'JetBrains Mono', ui-monospace, monospace)",
+                  fontSize: 11.5,
+                  color: "var(--ink-muted)",
+                  letterSpacing: "0.04em",
+                  cursor: "pointer",
+                }}
+              >
+                copy trace id ↗
+              </button>
+            ) : null}
+          </div>
+        </div>
+      </section>
+
+      <style>{`
+        @media (max-width: 768px) {
+          .error-screen { grid-template-columns: 1fr !important; min-height: 0 !important; }
+          .error-screen > :first-child { min-height: 200px !important; }
+          .error-screen > :nth-child(2) { border-left: 0 !important; border-top: 1px solid var(--rule); }
+          .error-screen h1 { font-size: 34px !important; }
+          .error-actions { flex-direction: column; align-items: stretch; }
+          .error-actions > * { width: 100%; margin-left: 0; }
+          .error-actions > a, .error-actions > button { height: 42px; }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+function ActionButton({
+  variant,
+  action,
+}: {
+  variant: "accent" | "default";
+  action: ErrorAction;
+}) {
+  const style: React.CSSProperties =
+    variant === "accent"
+      ? {
+          background: "var(--accent)",
+          color: "#fff",
+          boxShadow:
+            "0 0 0 0.5px var(--accent-deep), 0 6px 14px -8px color-mix(in oklch, var(--accent) 60%, transparent)",
+        }
+      : {
+          background: "var(--paper-2)",
+          color: "var(--ink)",
+          boxShadow: "0 0 0 0.5px var(--rule)",
+        };
+
+  const base: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    height: 36,
+    padding: "0 16px",
+    borderRadius: 10,
+    border: 0,
+    fontWeight: 500,
+    fontSize: 13,
+    fontFamily: "inherit",
+    cursor: "pointer",
+    ...style,
+  };
+
+  if (action.href) {
+    return (
+      <a href={action.href} style={{ ...base, textDecoration: "none" }}>
+        {action.label}
+      </a>
+    );
+  }
+  return (
+    <button type="button" onClick={action.onClick} style={base}>
+      {action.label}
+    </button>
+  );
+}
+
+function toneFor(severity: Severity): string {
+  switch (severity) {
+    case "danger":
