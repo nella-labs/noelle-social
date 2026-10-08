@@ -198,3 +198,104 @@ describe("sweepApifyTokenHealth", () => {
       }),
     );
     expect(markInvalid).not.toHaveBeenCalled();
+    expect(res).toEqual({ pruned: 0, checked: 1, invalidated: 0, alive: 0, inconclusive: 1 });
+  });
+
+  it("no-ops cleanly with an empty pool", async () => {
+    const res = await sweepApifyTokenHealth(deps({ listTokens: async () => [] }));
+    expect(res).toEqual({ pruned: 0, checked: 0, invalidated: 0, alive: 0, inconclusive: 0 });
+  });
+});
+
+describe("createThrottledApifyHealthSweep", () => {
+  it("runs once, then skips (returns null) until the interval elapses, per org", async () => {
+    let now = 1_000_000;
+    const run = vi.fn(async () => ({ pruned: 0, checked: 1, invalidated: 0, alive: 1, inconclusive: 0 }));
+    const throttled = createThrottledApifyHealthSweep({
+      intervalMs: 60_000,
+      now: () => now,
+      run,
+    });
+
+    expect(await throttled("org-1")).not.toBeNull(); // first run
+    expect(await throttled("org-1")).toBeNull(); // within interval → skipped
+    expect(await throttled("org-2")).not.toBeNull(); // different org → independent
+    now += 60_001;
+    expect(await throttled("org-1")).not.toBeNull(); // interval elapsed → runs again
+    expect(run).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not wedge the throttle if a run throws (next tick retries)", async () => {
+    const now = 0;
+    let calls = 0;
+    const run = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("transient");
+      return { pruned: 0, checked: 0, invalidated: 0, alive: 0, inconclusive: 0 };
+    });
+    const throttled = createThrottledApifyHealthSweep({ intervalMs: 1000, now: () => now, run });
+
+    await expect(throttled("org-1")).rejects.toThrow("transient");
+    // A throwing run must NOT stamp lastRun, so the very next tick retries.
+    await expect(throttled("org-1")).resolves.not.toBeNull();
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("retiring already-dead tokens", () => {
+  const base = {
+    sql: {} as never,
+    orgId: "org-1",
+    checkToken: async () => ({ alive: true, httpStatus: 200 }),
+    markInvalid: async () => true,
+    concurrency: 2,
+    log: { info: () => {}, warn: () => {} },
+  };
+
+  it("retires BEFORE probing, so a dead token leaves the active pool on the next sweep", async () => {
+    const order: string[] = [];
+    const r = await sweepApifyTokenHealth({
+      ...base,
+      pruneInvalid: async () => {
+        order.push("prune");
+        return 7;
+      },
+      listTokens: async () => {
+        order.push("list");
+        return [{ credentialId: "a", token: "t" }];
+      },
+    });
+    expect(order).toEqual(["prune", "list"]);
+    expect(r.pruned).toBe(7);
+  });
+
+  it("still reports the prune count when there is nothing left to probe", async () => {
+    const r = await sweepApifyTokenHealth({
+      ...base,
+      pruneInvalid: async () => 3,
+      listTokens: async () => [],
+    });
+    expect(r).toEqual({ pruned: 3, checked: 0, invalidated: 0, alive: 0, inconclusive: 0 });
+  });
+
+  it("is FAIL-SOFT: a prune error never stops the probing", async () => {
+    const r = await sweepApifyTokenHealth({
+      ...base,
+      pruneInvalid: async () => {
+        throw new Error("db down");
+      },
+      listTokens: async () => [{ credentialId: "a", token: "t" }],
+    });
+    expect(r.pruned).toBe(0);
+    expect(r.checked).toBe(1); // probing happened anyway
+  });
+
+  it("omitting pruneInvalid keeps the old flag-only behaviour", async () => {
+    const r = await sweepApifyTokenHealth({
+      ...base,
+      listTokens: async () => [{ credentialId: "a", token: "t" }],
+    });
+    expect(r.pruned).toBe(0);
+    expect(r.checked).toBe(1);
+  });
+});
