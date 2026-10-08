@@ -1398,3 +1398,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
           // not the sum. Otherwise a rewrite that fixes the blocking dimension
           // can be discarded for slightly lowering dimensions that already pass,
           // and the next retry receives stale feedback for the old draft.
+          if (betterVerdict(verdict, bestVerdict)) {
+            best = candidate;
+            bestVerdict = verdict;
+            selectedAttempt = attempts;
+          }
+          if (verdict.pass) break;
+        }
+        draftsData = best;
+        chosenVerdict = bestVerdict;
+        verifierMeta = toOutboundVerifierMeta(bestVerdict, attempts);
+        log.info(
+          { leadId: lead.id, pass: bestVerdict.pass, attempts, scores: bestVerdict.scores },
+          "draft verified",
+        );
+      }
+
+      // Hard emoji backstop: strip any emoji outside the {💀 😭 😛} allowlist the
+      // prompt asks for, and recompute charCount off the cleaned body. Done at row
+      // creation so the auto-send "longest body" reduction below sees what ships.
+      let replyRows = applyReplyEmojiPolicy(
+        draftsData.drafts.map((d) => ({
+          id: randomUUID(),
+          kind: "reply" as const,
+          angle: d.angle as "empathetic" | "technical" | "contrarian" | null,
+          body: stripEmDashes(d.body),
+        })),
+        postText,
+      ).map((r) => ({ ...r, charCount: [...r.body].length }));
+
+      // Nothing sendable survived the emoji policy. Handled HERE, explicitly,
+      // rather than falling through to the commitment guard's identical-looking
+      // "no replies left" branch below — that branch stamps
+      // skip_reason: "commitment-guard" and errors a priority lead, for a
+      // commitment that never existed. Vega was the one caller without this.
+      if (replyRows.length === 0) {
+        log.warn({ leadId: lead.id }, "every reply cleaned to empty; skipping the lead");
+        await markStatus({
+          leadId: lead.id,
+          status: "skipped",
+          meta: { skip_reason: "empty-after-emoji-policy" },
+        });
+        continue;
+      }
+
+      // COMMITMENT GUARD — always on, and deliberately NOT folded into the
+      // reply-diversity gate below, which is opt-in and skipped entirely when
+      // there are no priors. A safety rule that only runs when an unrelated
+      // feature flag happens to be on is not a safety rule.
+      //
+      // The model is told not to promise anything (NO_COMMITMENTS_RULE in the
+      // system prompt); this is the backstop for when it does anyway. A draft
+      // that binds the operator — a call, an intro, a deadline, a yes — is
+      // dropped rather than queued, because the cost of a false negative is a
+      // public promise they have to honour or walk back.
+      const committing = replyRows.filter((r) => makesCommitment(r.body));
+      if (committing.length > 0) {
+        for (const r of committing) {
+          log.warn(
+            { leadId: lead.id, reason: commitmentReason(detectCommitments(r.body)) },
+            "commitment guard dropped a reply variant",
+          );
+        }
+        replyRows = replyRows.filter((r) => !makesCommitment(r.body));
+      }
+      if (replyRows.length === 0) {
+        log.warn({ leadId: lead.id }, "commitment guard dropped every reply variant");
+        await markStatus({
+          leadId: lead.id,
+          status: lead.priority || replyRequest ? "errored" : "skipped",
+          meta: {
+            skip_reason: commitmentReason(detectCommitments(committing[0]?.body ?? "")) || "commitment-guard",
+            engine: res.engine,
+            model: res.model,
+          },
+        });
+        continue;
+      }
+      // Reply-diversity gate (NOELLE_REPLY_DIVERSITY_GATE, default off, fail-open).
+      // Drop reply variants that are near-duplicates of a recent send or read as
+      // AI-slop before they are queued. If every variant fails, skip the lead
+      // rather than fabricate one: a priority lead surfaces as errored (never
+      // silently lost), mirroring the model-skip handling above.
+      if (replyPriors && replyPriors.length > 0) {
+        const kept = replyRows.filter((r) => {
+          const g = gateReply(r.body, { priors: replyPriors });
+          if (!g.ok) {
+            log.info(
+              {
+                leadId: lead.id,
+                reason: g.reason,
+                similarity: Number(g.similarity.toFixed(3)),
+                tells: g.slopReasons.slice(0, 4),
+              },
+              "reply-diversity gate dropped a variant",
+            );
+          }
+          return g.ok;
+        });
+        if (kept.length === 0) {
+          log.info({ leadId: lead.id }, "reply-diversity gate dropped all variants");
+          await markStatus({
+            leadId: lead.id,
+            status: lead.priority || replyRequest ? "errored" : "skipped",
+            meta: { skip_reason: "reply-diversity-gate", engine: res.engine, model: res.model },
+          });
+          continue;
+        }
+        replyRows = kept;
+      }
+
+      // The set review drives regeneration. The send gate needs a genuine
+      // verdict for each EXACT final body, after emoji cleanup and local guards.
+      // A weak sibling must not hide a strong one behind the set's worst score.
+      const finalReplyRows: OutboundIn["drafts"] = [];
+      for (const row of replyRows) {
+        if (!verifyCtx) { finalReplyRows.push(row); continue; }
+        const reviewedRow = { ...row, reviewContext };
+        // The chosen set verdict already graded this exact reply when it was
+        // the sole candidate. A second stochastic call can reverse that same
+        // verdict without any change to the body being sent.
+        if (chosenVerdict && draftsData.drafts.length === 1 && replyRows.length === 1
+          && row.angle === draftsData.drafts[0]!.angle && row.body === draftsData.drafts[0]!.body) {
+          finalReplyRows.push({ ...reviewedRow, verifierMeta: toOutboundVerifierMeta(chosenVerdict, attempts) });
+          continue;
+        }
+        try {
+          const verdict = await verifyTiered([{ kind: "reply", angle: row.angle, body: row.body }], verifyCtx, calls);
+          recordVoiceVerdict(verdict, "final", attempts, finalReplyRows.length);
+          finalReplyRows.push({ ...reviewedRow, verifierMeta: toOutboundVerifierMeta(verdict, attempts) });
+        } catch (e) {
+          log.warn({ leadId: lead.id, angle: row.angle, err: e instanceof Error ? e.message : String(e) }, "individual reply verifier unavailable");
+          finalReplyRows.push({ ...reviewedRow, verifierMeta: {
+            pass: false, judgeOk: false, judgeProvider: "none",
+            scores: { voice: 0, grounding: 0, relevance: 0, format: 0 },
+            reasons: ["individual reply verifier unavailable"], attempts,
+          } });
+        }
+      }
+
+      // Preserve the old voice floor for wholly weak leads, using final-angle
+      // verdicts. A failed judge stays in human review; it is never a valid
+      // reason to silently discard a lead or to allow unattended sending.
+      if (verify?.voiceFloor && finalReplyRows.every((row) =>
+        row.verifierMeta?.judgeOk === true && row.verifierMeta.scores.voice < verify.voiceFloor!)) {
+        if (replyRequest || (payload as { source?: string }).source === "notification") {
+          log.info({ leadId: lead.id }, "requested/conversation replies below voice floor; keeping for review");
+        } else {
+          await markStatus({
+            leadId: lead.id, status: "skipped",
+            meta: {
+              skip_reason: "low-voice",
+              voice: Math.max(...finalReplyRows.map((row) => row.verifierMeta!.scores.voice)),
+              model: res.model,
+              voice_verifier_diagnostic: {
+                version: 1,
+                voice_floor: verify.voiceFloor,
+                selected_attempt: selectedAttempt,
+                verdicts: voiceVerdicts,
+                dropped_verdicts: diagnosticDropped,
+              },
+            },
+          });
+          continue;
+        }
+      }
+
+      // When eligible, one cold-outreach DM alongside the replies. A DM has no
+      // angle (it's a single message, not a per-angle variant). It is
+      // manual-send only: the founder copies it and sends it on X by hand,
+      // and the send worker is fenced from ever posting it as a reply.
+      //
+      // EXCEPT for watchlist (priority) people: Vega never auto-drafts a DM to
+      // someone on the watchlist — not a single AI-generated DM. Those are a
+      // relationship the founder manages by hand (a manual DM after the person
+      // engages back), so we drop the DM row entirely and keep only the reply.
+      const candidateDm = draftsData.dm ? stripEmDashes(stripDisallowedEmoji(draftsData.dm.body)) : null;
+      const dmCheck = dmEligible && candidateDm
+        ? await refineDmVoice({
+            body: candidateDm,
+            regenerate: async (feedback) => {
+              const r = await runner.draft({ ...draftArgs, prompt: `${prompt}\n\n${feedback}\nRewrite only the DM. Keep the strict JSON output shape.` });
+              const p = DrafterOutput.safeParse(safeJsonParse(r.text));
+              return p.success && "drafts" in p.data && p.data.dm
+                ? stripEmDashes(stripDisallowedEmoji(p.data.dm.body)) : null;
+            },
+          })
+        : null;
+      const dmBody = dmCheck?.body;
+      // Auto-DM is opt-in (0036_dm_autodraft_enabled, default false): replies
+      // only unless the operator turns it on. Watchlist/priority leads never
+      // get an AI DM regardless (relationship the founder manages by hand).
+      const dmRow =
+        dmEligible && dmBody
+        ? {
+            id: randomUUID(),
+            kind: "dm" as const,
+            angle: null,
+            body: dmBody,
+            charCount: [...dmBody].length,
+            dmVoiceCheck: { pass: true, attempts: dmCheck!.attempts, reasons: dmCheck!.reasons },
