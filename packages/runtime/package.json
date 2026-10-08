@@ -198,3 +198,203 @@
     },
     "./apify-pool-db": {
       "types": "./dist/apifyPoolDb.d.ts",
+      "import": "./dist/apifyPoolDb.js",
+      "default": "./src/apifyPoolDb.ts"
+    },
+    "./account-feeder-db": {
+      "types": "./dist/accountFeederDb.d.ts",
+      "import": "./dist/accountFeederDb.js",
+      "default": "./src/accountFeederDb.ts"
+    },
+    "./ideation-requests-db": {
+      "types": "./dist/ideationRequestsDb.d.ts",
+      "import": "./dist/ideationRequestsDb.js",
+      "default": "./src/ideationRequestsDb.ts"
+    },
+    "./leads-db-common": {
+      "types": "./dist/leadsDbCommon.d.ts",
+      "import": "./dist/leadsDbCommon.js",
+      "default": "./src/leadsDbCommon.ts"
+    },
+    "./intern-env": {
+      "types": "./dist/internEnv.d.ts",
+      "import": "./dist/internEnv.js",
+      "default": "./src/internEnv.ts"
+    },
+    "./classifier-plumbing": {
+      "types": "./dist/classifierPlumbing.d.ts",
+      "import": "./dist/classifierPlumbing.js",
+      "default": "./src/classifierPlumbing.ts"
+    },
+    "./intern-activation": {
+      "types": "./dist/internActivation.d.ts",
+      "import": "./dist/internActivation.js",
+      "default": "./src/internActivation.ts"
+    },
+    "./voice-sanitize": {
+      "types": "./dist/voiceSanitize.d.ts",
+      "import": "./dist/voiceSanitize.js",
+      "default": "./src/voiceSanitize.ts"
+    },
+    "./outbound-client": {
+      "types": "./dist/outboundClient.d.ts",
+      "import": "./dist/outboundClient.js",
+      "default": "./src/outboundClient.ts"
+    },
+    "./ready-cache": {
+      "types": "./dist/readyCache.d.ts",
+      "import": "./dist/readyCache.js",
+      "default": "./src/readyCache.ts"
+    },
+    "./classifier-routing": {
+      "types": "./dist/classifierRouting.d.ts",
+      "import": "./dist/classifierRouting.js",
+      "default": "./src/classifierRouting.ts"
+    },
+    "./pg-spend-recorder": {
+      "types": "./dist/pgSpendRecorder.d.ts",
+      "import": "./dist/pgSpendRecorder.js",
+      "default": "./src/pgSpendRecorder.ts"
+    },
+    "./gemini-backend-select": {
+      "types": "./dist/geminiBackendSelect.d.ts",
+      "import": "./dist/geminiBackendSelect.js",
+      "default": "./src/geminiBackendSelect.ts"
+    },
+    "./repoll-cooldown": {
+      "types": "./dist/repollCooldown.d.ts",
+      "import": "./dist/repollCooldown.js",
+      "default": "./src/repollCooldown.ts"
+    },
+    "./notifier": {
+      "types": "./dist/notifier.d.ts",
+      "import": "./dist/notifier.js",
+      "default": "./src/notifier.ts"
+    },
+    "./pg-budget-adapters": {
+      "types": "./dist/pgBudgetAdapters.d.ts",
+      "import": "./dist/pgBudgetAdapters.js",
+      "default": "./src/pgBudgetAdapters.ts"
+    },
+    "./worker-runs": {
+      "types": "./dist/workerRuns.d.ts",
+      "import": "./dist/workerRuns.js",
+      "default": "./src/workerRuns.ts"
+    },
+    "./voice-exemplars": {
+      "types": "./dist/voiceExemplars.d.ts",
+      "import": "./dist/voiceExemplars.js",
+      "default": "./src/voiceExemplars.ts"
+    },
+    "./source-values": {
+      "types": "./dist/sourceValues.d.ts",
+      "import": "./dist/sourceValues.js",
+      "default": "./src/sourceValues.ts"
+    },
+    "./pg-budget-holds": {
+      "types": "./dist/pgBudgetHolds.d.ts",
+      "import": "./dist/pgBudgetHolds.js",
+      "default": "./src/pgBudgetHolds.ts"
+    },
+    "./bounded-http": {
+      "types": "./dist/boundedHttp.d.ts",
+      "import": "./dist/boundedHttp.js",
+      "default": "./src/boundedHttp.ts"
+    },
+    "./gcs-http": {
+      "types": "./dist/gcsHttp.d.ts",
+      "import": "./dist/gcsHttp.js",
+      "default": "./src/gcsHttp.ts"
+    },
+    "./gcs-objects": {
+      "types": "./dist/gcsObjects.d.ts",
+      "import": "./dist/gcsObjects.js",
+      "default": "./src/gcsObjects.ts"
+    },
+    "./gcs-signer": {
+      "types": "./dist/gcsSigner.d.ts",
+      "import": "./dist/gcsSigner.js",
+      "default": "./src/gcsSigner.ts"
+    },
+    "./bounded-pg-session": {
+      "types": "./dist/boundedPgSession.d.ts",
+      "import": "./dist/boundedPgSession.js",
+      "default": "./src/boundedPgSession.ts"
+    },
+    "./apify-run-receipts": {
+      "types": "./dist/apifyRunReceipts.d.ts",
+      "import": "./dist/apifyRunReceipts.js",
+      "default": "./src/apifyRunReceipts.ts"
+    },
+    "./apify-transport": {
+      "types": "./dist/apifyTransport.d.ts",
+      "import": "./dist/apifyTransport.js",
+      "default": "./src/apifyTransport.ts"
+    },
+    "./apify-token-health": {
+      "types": "./dist/apifyTokenHealth.d.ts",
+      "import": "./dist/apifyTokenHealth.js",
+      "default": "./src/apifyTokenHealth.ts"
+    },
+    "./relationship-dm": {
+      "types": "./dist/relationshipDm.d.ts",
+      "import": "./dist/relationshipDm.js",
+      "default": "./src/relationshipDm.ts"
+    },
+    "./google-credentials": {
+      "types": "./dist/googleCredentials.d.ts",
+      "import": "./dist/googleCredentials.js",
+      "default": "./src/googleCredentials.ts"
+    },
+    "./apify-rotation": {
+      "types": "./dist/apifyRotation.d.ts",
+      "import": "./dist/apifyRotation.js",
+      "default": "./src/apifyRotation.ts"
+    },
+    "./apify-metering": {
+      "types": "./dist/apifyMetering.d.ts",
+      "import": "./dist/apifyMetering.js",
+      "default": "./src/apifyMetering.ts"
+    },
+    "./image-mime": {
+      "types": "./dist/imageMime.d.ts",
+      "import": "./dist/imageMime.js",
+      "default": "./src/imageMime.ts"
+    },
+    "./content-media-read": {
+      "types": "./dist/contentMediaRead.d.ts",
+      "import": "./dist/contentMediaRead.js",
+      "default": "./src/contentMediaRead.ts"
+    },
+    "./video-account-db": {
+      "types": "./dist/videoAccountDb.d.ts",
+      "import": "./dist/videoAccountDb.js",
+      "default": "./src/videoAccountDb.ts"
+    },
+    "./video-owner-db": {
+      "types": "./dist/videoOwnerDb.d.ts",
+      "import": "./dist/videoOwnerDb.js",
+      "default": "./src/videoOwnerDb.ts"
+    },
+    "./video-teardown-db": {
+      "types": "./dist/videoTeardownDb.d.ts",
+      "import": "./dist/videoTeardownDb.js",
+      "default": "./src/videoTeardownDb.ts"
+    },
+    "./video-teardown-claims-db": {
+      "types": "./dist/videoTeardownClaimsDb.d.ts",
+      "import": "./dist/videoTeardownClaimsDb.js",
+      "default": "./src/videoTeardownClaimsDb.ts"
+    },
+    "./video-generation-holds-db": {
+      "types": "./dist/videoGenerationHoldsDb.d.ts",
+      "import": "./dist/videoGenerationHoldsDb.js",
+      "default": "./src/videoGenerationHoldsDb.ts"
+    },
+    "./video-recording-brief-db": {
+      "types": "./dist/videoRecordingBriefDb.d.ts",
+      "import": "./dist/videoRecordingBriefDb.js",
+      "default": "./src/videoRecordingBriefDb.ts"
+    }
+  },
+  "scripts": {
