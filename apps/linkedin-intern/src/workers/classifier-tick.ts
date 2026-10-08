@@ -198,3 +198,86 @@ export async function classifyOneLead(deps: {
     isWatchlistConnection &&
     aboveOffTopicFloor;
   const replyKind = clamped ? "light" : cls.reply_kind;
+  const tier = clamped ? null : cls.tier;
+  const identityPending = observed && replyKind !== "skip" &&
+    !hasCanonicalObservedIdentity(lead, lead.payload);
+
+
+  // Normalise the 0-100 q into a 0-1 score before storing — the shared approval
+  // UI does Math.round(score * 100), so a raw q=78 rendered as "7800/100". Match
+  // the X intern, which stores 0-1. null when unscored (NULL, not a fake 0).
+  // VIP intro DM: the scout (gemini) decided WHO + WHETHER; draft the actual DM
+  // with Opus (claude -p → Bedrock) so it reads human, not like a flash one-shot.
+  // Fail-open — any miss leaves suggested_dm null and the banner still flags the VIP.
+  let vip = cls.vip;
+  if (vip?.dm_soon && deps.runner) {
+    const dm = await draftVipIntroDm({
+      runner: deps.runner,
+      orgId: inst.org_id,
+      instanceId: inst.id,
+      authorName: payload.authorName ?? lead.author_handle,
+      authorHeadline: payload.authorHeadline ?? null,
+      postText,
+      why: vip.reason,
+    });
+    vip = { ...vip, suggested_dm: dm };
+  }
+
+  await markLeadClassified(sql, {
+    leadId: lead.id,
+    replyKind,
+    score: cls.q == null ? null : cls.q / 100,
+    tier,
+    // Persist the engagement-bait verdict so the drafter can ignore an inflated
+    // comment count when deciding Opus. Defaults false on every fail-open path.
+    commentBait: cls.comment_bait,
+    // Relationship-scout verdict (null when the scout is off or the call
+    // fail-opened) → persisted to leads.vip_signal for the approvals banner.
+    // suggested_dm is now drafted above with Opus, not by the gemini scout.
+    vipSignal: vip,
+    identityPending,
+    classifierMeta: {
+      ...(cls.raw as Record<string, unknown>),
+      provider: cls.provider ?? "legacy",
+      q: cls.q,
+      reply_kind: replyKind,
+      tier,
+      comment_bait: cls.comment_bait,
+      reason: clamped ? `${cls.reason} (priority-clamped skip→light)` : cls.reason,
+      // The model's raw verdict before the priority clamp, for observability.
+      ...(clamped ? { raw_reply_kind: cls.reply_kind, priority_clamped: true } : {}),
+    },
+  });
+  if (observed && replyKind !== "skip" && !identityPending) {
+    // The drafter also polls, so a transient NOTIFY failure does not lose the
+    // qualified lead. Notification only removes avoidable poll latency.
+    await sql`select pg_notify(${'noelle_linkedin_priority'}, ${inst.id})`.catch((err) =>
+      log.warn({ leadId: lead.id, err: (err as Error).message }, "priority drafter wake failed"),
+    );
+  }
+  await bus?.emit({
+    topic: "lead.classified",
+    worker: "classifier",
+    summary: `classified ${tier ?? replyKind}`,
+    payload: { lead_id: lead.id, reply_kind: replyKind, tier, score: cls.q },
+    correlationId: lead.id,
+  });
+
+  // notify_low_confidence: ping when the classifier decided to SKIP a lead, so
+  // the operator can eyeball borderline drops. Best-effort; notifier.notify()
+  // returns status='no_channel' rather than throwing when no keys exist.
+  if (inst.notify_low_confidence && replyKind === "skip") {
+    await notifier
+      .notify({
+        orgId: inst.org_id,
+        title: `Skipped lead · ${lead.author_handle}`,
+        message: `Classifier skipped a post (q=${cls.q ?? "—"}).\n${cls.reason}`,
+      })
+      .catch((err) => {
+        log.warn(
+          { leadId: lead.id, err: (err as Error).message },
+          "notify low-confidence failed",
+        );
+      });
+  }
+}

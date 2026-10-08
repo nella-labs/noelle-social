@@ -198,3 +198,107 @@ async function main(): Promise<void> {
       for (const p of profiles.values()) {
         if (p.publicId && p.publicId.toLowerCase() === publicId && p.summary) {
           existingSummary = p.summary;
+          break;
+        }
+      }
+    } catch {
+      /* profile lookup is a bonus; ignore failures */
+    }
+
+    const person: FollowupPerson = {
+      name: rawPosts[0]?.author?.name ?? rawComments[0]?.authorName ?? null,
+      headline: rawPosts[0]?.author?.headline ?? rawComments[0]?.authorHeadline ?? null,
+      publicId,
+    };
+    const posts: FollowupPost[] = rawPosts.map((p) => ({
+      text: p.text,
+      postedAt: p.postedAt,
+      reactions: p.reactions,
+      comments: p.comments,
+    }));
+    const authoredComments = rawComments.map((c) => c.text).filter((t) => t.trim().length > 0);
+
+    if (posts.length === 0 && authoredComments.length === 0 && !existingSummary) {
+      console.error(
+        `followup: no public posts or comments found for "${publicId}". They may post rarely, the profile may be private, or the slug is wrong.`,
+      );
+      process.exit(1);
+    }
+
+    // Bedrock is the failover engine; the primary is rewritten to the local
+    // claude-cli subscription when the org selects it (llm_backend='claude'),
+    // exactly like the profiler. Missing Bedrock keys are non-fatal here as long
+    // as claude-cli serves the primary.
+    const engines: Record<string, EngineBackend> = {};
+    try {
+      const [accessKeyId, secretAccessKey] = await Promise.all([
+        secrets.get("noelle-worker-bedrock-aws-access-key-id"),
+        secrets.get("noelle-worker-bedrock-aws-secret-access-key"),
+      ]);
+      engines.bedrock = createBedrockBackend({ accessKeyId, secretAccessKey });
+    } catch (err) {
+      if (!(err instanceof SecretAccessError && /NOT_FOUND/.test(err.message))) throw err;
+      console.error(
+        "followup: no Bedrock AWS keys in Secret Manager; relying on the claude-cli backend for the primary.",
+      );
+    }
+
+    // Register the local Claude subscription so callAgentModel actually rewrites
+    // the bedrock primary AND fallback to claude-cli (flat-rate, ~$0) when the
+    // org is on llm_backend='claude'. Without a claude-cli backend in this map
+    // the rewrite silently no-ops and followup bills Bedrock — despite the
+    // comment above. This closes that leak.
+    if (process.env.NOELLE_CLAUDE_CLI === "1") {
+      const cliOpts: CreateClaudeCliBackendOptions = {};
+      if (process.env.NOELLE_CLAUDE_CLI_PATH) cliOpts.cliPath = process.env.NOELLE_CLAUDE_CLI_PATH;
+      if (process.env.NOELLE_CLAUDE_CLI_TIMEOUT_MS) {
+        cliOpts.timeoutMs = Number(process.env.NOELLE_CLAUDE_CLI_TIMEOUT_MS);
+      }
+      engines["claude-cli"] = createClaudeCliBackend(cliOpts);
+    }
+
+    const runner = createCodexRunner({
+      engines,
+      sql,
+      budget: { adapters: createPgBudgetAdapters(sql, { exemptEngines: CAP_EXEMPT_ENGINES_APIFY }) },
+      recorder,
+    });
+
+    console.error("followup: writing the connection brief with Opus …");
+    const brief = await buildConnectionBrief({
+      runner,
+      routing: opusOverrideRouting(linkedinInternRouting(inst)),
+      orgId: inst.org_id,
+      instanceId: inst.id,
+      person,
+      posts,
+      authoredComments,
+      existingSummary,
+    });
+
+    if (!brief) {
+      console.error(
+        "followup: couldn't generate a brief (model or budget error). Check the Budget panel and try again.",
+      );
+      process.exit(1);
+    }
+
+    const grounded = {
+      posts: posts.length,
+      comments: authoredComments.length,
+      usedSummary: Boolean(existingSummary),
+    };
+    if (args.json) {
+      process.stdout.write(JSON.stringify({ ...brief, groundedOn: grounded }, null, 2) + "\n");
+    } else {
+      printBrief(brief, grounded);
+    }
+  } finally {
+    await sql.end({ timeout: 5 }).catch(() => {});
+  }
+}
+
+main().catch((err) => {
+  console.error("followup fatal:", err instanceof Error ? err.message : err);
+  process.exit(1);
+});

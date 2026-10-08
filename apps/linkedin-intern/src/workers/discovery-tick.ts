@@ -598,3 +598,15 @@ export async function runDiscoveryTick(args: RunDiscoveryTickArgs): Promise<numb
       inserted,
       scanned,
       filtered,
+      extractedToday,
+      dailyExtractCap,
+      people: watchlistPeople.length,
+      keywords: keywordConfig ? keywords.length : 0,
+      icp: Boolean(icp),
+      profilesFound,
+      profilesQualified,
+    },
+    "discovery tick complete",
+  );
+  return inserted;
+}
