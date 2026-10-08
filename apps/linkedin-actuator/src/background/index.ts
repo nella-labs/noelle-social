@@ -1798,3 +1798,203 @@ async function doCommentInner(
 // Read the composer state: has the just-typed comment posted? LinkedIn clears the
 // box on a successful post, so an empty (or vanished) box = landed, a populated
 // box = did NOT land. Any read error is treated as "not confirmed" (caller retries
+// / falls back) rather than a false success.
+type CommentState = { ok: boolean; observed?: { present?: boolean; empty?: boolean; text?: string } };
+async function readCommentState(tabId: number, commentUrn?: string): Promise<CommentState | null> {
+  return send<CommentState>(tabId, commentUrn
+    ? { cmd: "readReplyComposer", commentUrn }
+    : { cmd: "readCommentBox" }).catch(() => null);
+}
+async function commentPosted(tabId: number, commentUrn?: string): Promise<boolean> {
+  const st = await readCommentState(tabId, commentUrn);
+  return st?.ok === true && st.observed?.empty === true && typeof st.observed.present === "boolean";
+}
+
+// Submit the just-typed comment and CONFIRM it actually landed. Returns true ONLY
+// when the composer clears — so a click that missed an off-viewport submit button,
+// or a submit that never fired, is reported as a failure (→ comment-failed, the
+// item is retried) instead of a phantom success that marks the draft sent with
+// nothing posted (the live symptom: replies typed but never landing).
+//
+// Order: (1) poll for the submit button to appear/enable — LinkedIn enables it a
+// beat after input — click it, confirm cleared; (2) keyboard chord fallback
+// (⌘/Ctrl+Enter) that works even when the button is off-viewport or disabled. The
+// empty-box guard makes the fallback safe from double-posting: once the click
+// posts and the box clears, a chord fires into an empty composer and no-ops.
+async function submitComment(
+  tabId: number, rng: ReturnType<typeof makeRng>, claim: () => Promise<CommentClaim>,
+  body: string,
+): Promise<{ ok: boolean; detail?: string; claim?: CommentClaim }> {
+  // 1) Button path: poll up to ~12s for a clickable submit, click, verify cleared.
+  //    Widened 6s→12s: the 2026 permalink composer's submit enables/lays-out a
+  //    beat after typing, and the SAME post lands on one attempt and reports
+  //    submit-not-found on another — a race the poll rides out. The extra time
+  //    is only ever spent on an attempt that would otherwise fail; a success
+  //    returns immediately. If it still fails, the diagnostic below (wf/en/vis)
+  //    names which stage never resolved.
+  const deadline = Date.now() + 12000;
+  let sawSubmit = false; // did a clickable submit button ever appear?
+  // Descriptor of the submit we actually clicked (locateCommentSubmit's
+  // observed via/aria/text/type) — stamped into the not-cleared detail below so
+  // a failure row in linkedin_activity names WHICH button the click landed on
+  // (the real submit vs a decoy) without a live DevTools session.
+  let clicked: SubmitObserved | undefined;
+  let reservation: CommentClaim | undefined;
+  const reserveOnce = async (): Promise<CommentClaim> => reservation ??= await claim();
+  while (Date.now() < deadline) {
+    if (stopped()) return { ok: false, detail: "stopped" };
+    const submit = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect; observed?: SubmitObserved }>(tabId, { cmd: "locateCommentSubmit" });
+    if (submit.ok && submit.x != null) {
+      sawSubmit = true;
+      clicked = submit.observed;
+      throwIfAborted(runAbort.signal);
+      const reserved = await reserveOnce();
+      if (reserved !== "claimed") return { ok: false, claim: reserved };
+      throwIfAborted(runAbort.signal);
+      await cdp.moveAndClick(tabId, rectFrom(submit), rng, sleep);
+      // Poll for the post to settle (~3.2s) before we conclude it missed —
+      // widened from ~1.6s: a real submit now gets clicked on 2026 surfaces
+      // where post latency can outlive a short window, and a false "missed"
+      // here costs a retry that re-types the whole comment on a fresh page
+      // load (a duplicate if the first one landed late).
+      for (let i = 0; i < 8; i++) {
+        await sleep(400);
+        if (await commentPosted(tabId)) return { ok: true, claim: reservation };
+      }
+      break; // button was there but nothing cleared → keyboard fallback
+    }
+    await sleep(400); // submit not ready yet — LinkedIn is still enabling it
+  }
+
+  // 2) Keyboard fallback: refocus the composer, then ⌘+Enter (macOS) / Ctrl+Enter.
+  //    Verify after each so we never fire the second chord once the first posted.
+  if (stopped()) return { ok: false, detail: "stopped" };
+  // One more posted-check before any chord: if the click's post landed just
+  // after the loop above gave up, chording now would fire into (or re-submit)
+  // a composer we no longer need to touch.
+  if (sawSubmit && (await commentPosted(tabId))) return { ok: true, claim: reservation };
+  const ownsDraft = (state: CommentState | null) => state?.ok === true &&
+    state.observed?.present === true && state.observed.empty === false &&
+    sameDraft(state.observed.text ?? "", body);
+  const locateDraft = async () => {
+    const box = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect }>(
+      tabId, { cmd: "locateCommentBox" },
+    ).catch(() => null);
+    return box?.ok && box.x != null && ownsDraft(await readCommentState(tabId)) ? box : null;
+  };
+  for (const mod of [4, 2]) { // 4 = Meta/⌘, 2 = Ctrl
+    if (stopped()) return { ok: false, detail: "stopped" };
+    throwIfAborted(runAbort.signal);
+    if (!(await locateDraft())) return { ok: false, detail: "fallback-draft-not-found", claim: reservation };
+    const reserved = await reserveOnce();
+    if (reserved !== "claimed") return { ok: false, claim: reserved };
+    throwIfAborted(runAbort.signal);
+    // Claim admission can await HTTP. Re-resolve the proper composer afterward
+    // and again after focusing; a vanished box must never send into a DM pane.
+    const box = await locateDraft();
+    if (!box) return { ok: false, detail: "fallback-draft-not-found", claim: reservation };
+    await cdp.moveAndClick(tabId, rectFrom(box), rng, sleep);
+    throwIfAborted(runAbort.signal);
+    if (!ownsDraft(await readCommentState(tabId))) {
+      return { ok: false, detail: "fallback-draft-not-found", claim: reservation };
+    }
+    await cdp.pressSubmitChord(tabId, mod);
+    for (let i = 0; i < 3; i++) {
+      await sleep(400);
+      if (await commentPosted(tabId)) return { ok: true, claim: reservation };
+    }
+  }
+  // Nothing landed. Name the stage so the DB skip row is diagnostic:
+  //   submit-not-found(box=…,empty=…,wf=…,en=…,vis=…,top=…) → no clickable submit
+  //                      ever appeared in the poll. The composer read + search
+  //                      diagnostic split the causes: box=present,empty=false =
+  //                      the reply is still sitting there; wf=0 = no worded
+  //                      submit exists (selector model wrong), en=0 = it never
+  //                      enabled (typing/state), en>0,vis=0 = enabled but no
+  //                      layout box yet, top=<label>_<why> names the candidate.
+  //   not-cleared(via=…,btn=…,type=…) → a submit was clicked/chorded but the
+  //                      composer never cleared (submit rejected — a live
+  //                      action-block — or the click hit a decoy; btn/via name
+  //                      the exact button so a decoy is visible in the row). A
+  //                      wall of `not-cleared` on the REAL submit across posts
+  //                      is the signature of a LinkedIn comment action-block.
+  let detail: string;
+  if (sawSubmit) {
+    detail = notClearedDetail(clicked);
+  } else {
+    const st = await send<{ ok: boolean; observed?: { present?: boolean; empty?: boolean } }>(
+      tabId, { cmd: "readCommentBox" },
+    ).catch(() => null);
+    // Why did the submit never resolve? diagnoseCommentSubmit re-walks the
+    // search and buckets the failure (an older content script without this
+    // command returns nothing → detail formats without the extra fields).
+    const dg = await send<{ ok: boolean; observed?: SubmitDiag }>(
+      tabId, { cmd: "diagnoseCommentSubmit" },
+    ).catch(() => null);
+    detail = submitNotFoundDetail(st?.observed, dg?.observed);
+  }
+  console.warn("[actuator] comment did not land", { detail });
+  return { ok: false, detail, claim: reservation };
+}
+
+// DM: open the profile, locate Message → compose → Send. Messaging locators
+// mirror the comment ones; see docs/linkedin-actuator.md. Browser-only (manual smoke).
+/** Same guard as doComment: a DM that did not send must not leave its text in
+ *  the message box for the next navigation to trip over. This is the ONE caller
+ *  that clears the message composer, because it is the one that typed into it —
+ *  see clearComposer's ownDmBody — which is also what keeps that clear from
+ *  touching a bubble whose draft it cannot prove it wrote. */
+async function doDm(tabId: number, item: PoolItem, rng: ReturnType<typeof makeRng>, wpm: number): Promise<ActionResult> {
+  let res: ActionResult | undefined;
+  try {
+    res = await doDmInner(tabId, item, rng, wpm);
+    return res;
+  } finally {
+    if (res?.kind !== "ok") await clearComposer(tabId, rng, item.body);
+  }
+}
+
+async function doDmInner(tabId: number, item: PoolItem, rng: ReturnType<typeof makeRng>, wpm: number): Promise<ActionResult> {
+  await navigateTab(tabId, item.url, rng);
+  await waitTabComplete(tabId);
+  // Read the profile like a human before messaging — same reading-dwell proxy.
+  await sleep(readingDwellMs(rng, Math.max(0, Math.round(rng.normal(60, 40))), {}, wpm));
+  // Deleted/unavailable profile → drop instead of retrying the dead permalink.
+  const state = await send<{ observed?: { unavailable?: boolean } }>(tabId, { cmd: "detectPostUnavailable" }).catch(() => null);
+  if (state?.observed?.unavailable) return { kind: "unavailable" };
+  const compose = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect; skipReason?: string }>(tabId, { cmd: "locateMessageCompose" });
+  // Carry the locator's own reason through: `compose-zero-rect` (a MINIMISED
+  // messaging overlay) is a different problem from a missing `.msg-form`, and
+  // collapsing both into compose-not-found makes them indistinguishable in
+  // linkedin_activity — the one channel this change exists to make readable.
+  if (!compose.ok || compose.x == null) {
+    return { kind: "failed", detail: compose.skipReason ?? "compose-not-found" };
+  }
+  await cdp.moveAndClick(tabId, rectFrom(compose), rng, sleep);
+  throwIfAborted(runAbort.signal); // STOP before we type anything
+  await cdp.typeText(tabId, item.body, rng, sleep);
+  await sleep(rng.float(500, 2400));
+  const sendBtn = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect; skipReason?: string }>(tabId, { cmd: "locateMessageSend" });
+  if (!sendBtn.ok || sendBtn.x == null) {
+    return { kind: "failed", detail: sendBtn.skipReason ?? "send-not-found" };
+  }
+  throwIfAborted(runAbort.signal); // STOP before we send the DM
+  await cdp.moveAndClick(tabId, rectFrom(sendBtn), rng, sleep);
+  // CONFIRM the text left the box. LinkedIn clears the message composer on a
+  // successful send, so text still visibly sitting there means the click missed
+  // and nothing was delivered.
+  //
+  // Until the review on #559 this returned ok unconditionally: a missed send was
+  // recorded as delivered, markSent fired, and nothing anywhere said otherwise.
+  // The draft left in the box was the only trace, and reading it is not
+  // something anything downstream does — so the miss was silent.
+  //
+  // But the check is deliberately ASYMMETRIC with submitComment's, because the
+  // costs are asymmetric. A failed DM is re-queued and re-sent from a later
+  // slot, so a false failure does not lose a message, it sends a duplicate one
+  // to a real person. Only text we can positively SEE still sitting there counts
+  // as a miss; an unreadable composer keeps the old assume-sent behaviour.
+  //
+  // Known gap, stated: a click that DISMISSED the overlay instead of sending
+  // also leaves no text, and still reads as sent. Closing that needs positive
+  // evidence of delivery (the message appearing in the thread), which this
