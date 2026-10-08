@@ -198,3 +198,86 @@ describe.skipIf(!url)("Playbook storage scope and provenance (native)", () => {
         return { wrote: true };
       },
       (error) => {
+        settled = true;
+        return { error };
+      },
+    );
+    try {
+      await waitForWriteLock();
+      expect(settled).toBe(false);
+    } finally {
+      unlock();
+      await writer;
+    }
+    expect(await writing).toHaveProperty("error");
+    expect(await rows()).toEqual([]);
+  });
+  it.each([[null], [[]]])(
+    "retains legacy %j provenance as style-only inputs",
+    async (references) => {
+      await sql`insert into noelle.watchlist_playbooks(org_id,agent_instance_id,author_handle,hook_patterns,sample_post_ids)
+      values (${org},${instance},'builder','["Legacy style"]',${references}::text[])`;
+      expect((await rows())[0]?.sample_post_ids).toEqual(references);
+      expect(await top()).toMatchObject([
+        { authorHandle: "builder", hookPatterns: ["Legacy style"] },
+      ]);
+      expect(await fresh()).toEqual(new Set(["builder"]));
+    },
+  );
+  it("stores all 100 source references and removes only duplicate references", async () => {
+    await sql`insert into noelle.leads(id,external_id,org_id,agent_instance_id,platform,author_handle,payload)
+      select gen_random_uuid(),'source-' || n,${org},${instance},'x','builder','{}'
+      from generate_series(1,100) n`;
+    const references = Array.from({ length: 100 }, (_, n) => `source-${n + 1}`);
+    await write(input(references));
+    expect((await rows())[0]?.sample_post_ids).toEqual(references);
+    await write(input([references[0]!, references[0]!]));
+    expect((await rows())[0]?.sample_post_ids).toEqual([references[0]]);
+  });
+  it("cancels a held parent timeout without a late write and recovers", async () => {
+    const id = await lead();
+    let unlock!: () => void;
+    let locked!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    const acquired = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const writer = sql.begin(async (tx) => {
+      await tx`select id from noelle.agent_instances where id=${instance} for no key update`;
+      locked();
+      await gate;
+    });
+    await acquired;
+    const started = performance.now();
+    let settled = false;
+    const writing = write(input([id])).then(
+      () => {
+        settled = true;
+        return { wrote: true };
+      },
+      (error: unknown) => {
+        settled = true;
+        return { error };
+      },
+    );
+    try {
+      await waitForWriteLock();
+      await vi.waitFor(() => expect(settled).toBe(true), { timeout: 3500, interval: 20 });
+      expect(await writing).toMatchObject({
+        error: { name: "PgOperationError", category: "deadline" },
+      });
+      expect(performance.now() - started).toBeLessThan(3500);
+      expect(await rows()).toEqual([]);
+      expect((await sql`select 1 as healthy`)[0]?.healthy).toBe(1);
+    } finally {
+      unlock();
+      await writer;
+    }
+    await writing;
+    expect(await rows()).toEqual([]);
+    await write(input([id]));
+    expect(await rows()).toHaveLength(1);
+  });
+});
