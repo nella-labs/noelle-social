@@ -998,3 +998,203 @@ describe("runDrafterTick", () => {
     const markStatus = vi.fn().mockResolvedValue(undefined);
     const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
     await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead(false)],
+      runner: runner as never, kb: mkKb() as never, postOutbound, markStatus,
+    });
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ leadId: "L", status: "errored" }),
+    );
+  });
+
+  it("NEVER stamps auto_send (X replies go to the actuator, not the X API) even with auto_send_enabled", async () => {
+    // Regression for the API-autosend removal: the drafter must never send an
+    // `autoSend` payload, so no approval gets auto_send_target_at stamped and
+    // the browser actuator (not the dead API send worker) drains every reply.
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
+      log, instance: { id: "i", org_id: "o", auto_send_enabled: true }, claimedLeads: [mkLead()],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.autoSend).toBeNull();
+  });
+
+  it("injects past sent replies as few-shot exemplars when provided", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead()],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      examples: ["sccache cut my builds in half, worth a look", "honestly the linker is the real bottleneck"],
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("Replies the operator actually sent before");
+    expect(prompt).toContain("sccache cut my builds in half");
+  });
+
+  it("no examples → no exemplars block", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead()],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("Replies the operator actually sent before");
+  });
+
+  it("verifier disabled → no judge calls, no verifierMeta", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead()],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.verifierMeta).toBeNull();
+  });
+
+  it("emits a kind='dm' draft (angle null) alongside the three replies", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e", char_count: 1 },
+            { angle: "technical", body: "t", char_count: 1 },
+            { angle: "contrarian", body: "c", char_count: 1 },
+          ],
+          dm: { body: "hellooo\n\nsaw your post\n\nexample.test", char_count: 36 },
+        }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    await runDrafterTick({
+      log,
+      // Auto-DM is opt-in (0036) — enable it to exercise the DM path.
+      instance: { id: "i", org_id: "o", dm_autodraft_enabled: true },
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "post text", url: "https://x.com/u/status/1" }, author_handle: "u", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.drafts).toHaveLength(4);
+    const dm = body.drafts.find((d: { kind: string }) => d.kind === "dm");
+    expect(dm).toBeDefined();
+    expect(dm.angle).toBeNull();
+    expect(dm.body).toContain("example.test");
+    expect(body.drafts.filter((d: { kind: string }) => d.kind === "reply")).toHaveLength(3);
+    const request = runner.draft.mock.calls[0]![0];
+    expect(request.prompt).toContain("AND one DM");
+    expect(request.prompt).toContain('"dm":{"body":"…","char_count":N}');
+    expect(request.system).not.toMatch(/REPLY.ONLY OVERRIDE/i);
+  });
+
+  it("requests reply-only output for an observed lead even when auto-DM is enabled", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({
+        drafts: [{ angle: "technical", body: "this benchmark makes the tradeoff clear", char_count: 39 }],
+        dm: { body: "the model ignored the reply-only instruction", char_count: 44 },
+      }),
+      engine: "codex", model: "gpt-5",
+    }) };
+    const kb = { search: vi.fn().mockResolvedValue([
+      { path: "p.md", snippet: "anchor", score: 8, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+    ]) };
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o", dm_autodraft_enabled: true },
+      claimedLeads: [{
+        id: "L", external_id: "x1", payload: { text: "post text", url: "https://x.com/u/status/1", source: "extension_observed" },
+        author_handle: "u", author_id: "uid", status: "drafting", tier: null,
+        classifier_label: "substantial", classifier_score: 0.7, priority: true,
+      }],
+      runner: runner as never, kb: kb as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+    });
+    const request = runner.draft.mock.calls[0]![0];
+    expect(request.system).toContain("REPLY-ONLY OUTPUT");
+    expect(request.prompt).toContain('{"drafts":[{"angle":"empathetic|technical|contrarian","body":"…","char_count":N}]}');
+    expect(request.prompt).not.toContain("AND one DM");
+    expect(request.prompt).not.toContain('"dm"');
+    expect(postOutbound.mock.calls[0]![0].drafts).toEqual([
+      expect.objectContaining({ kind: "reply", body: "this benchmark makes the tradeoff clear" }),
+    ]);
+  });
+
+  it("never drafts a DM for a watchlist (priority) person — replies only", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e", char_count: 1 },
+            { angle: "technical", body: "t", char_count: 1 },
+            { angle: "contrarian", body: "c", char_count: 1 },
+          ],
+          // The model still proposes a DM, but the drafter must drop it for a
+          // watchlist person — not a single AI-generated DM to them.
+          dm: { body: "hellooo\n\nsaw your post\n\nexample.test", char_count: 36 },
+        }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "post text", url: "https://x.com/u/status/1" }, author_handle: "u", author_id: "uid", status: "drafting", tier: "T1", classifier_label: "watchlist", classifier_score: 1, priority: true },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.drafts.filter((d: { kind: string }) => d.kind === "dm")).toHaveLength(0);
+    expect(body.drafts.filter((d: { kind: string }) => d.kind === "reply")).toHaveLength(3);
+  });
+
+
+  it("skips leads with empty post text", async () => {
+    const postOutbound = vi.fn();
+    const runner = { draft: vi.fn() };
+    const nella = { search: vi.fn().mockResolvedValue([]) };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
