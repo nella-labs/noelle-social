@@ -598,3 +598,8 @@ describe("renderOperatorFacts", () => {
     expect(buildDrafterSystem()).not.toContain("OPERATOR BRAND (set by the operator");
     expect(buildDrafterSystem()).toContain("do not pitch without a verified product brief");
   });
+
+  it("does not grant legacy product facts to a policy-only configured brand", () => {
+    expect(renderOperatorFacts(parseBrandConfig({ pitch_policy: "never" }))).toEqual([]);
+  });
+});
