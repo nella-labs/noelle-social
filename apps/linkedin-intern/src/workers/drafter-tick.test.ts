@@ -3598,3 +3598,132 @@ describe("runDrafterTick — F6b tiered reply batching (NOELLE_DRAFTER_BATCH)", 
     const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
     const runner = {
       draft: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("model timeout"))
+        .mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }),
+    };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+    });
+    // Batch call threw → fallback runs 2 single calls
+    expect(runner.draft).toHaveBeenCalledTimes(3); // 1 batch + 2 fallback
+    expect(n).toBe(2);
+    expect(postOutbound).toHaveBeenCalledTimes(2);
+  });
+
+  it("BATCH ON: substantial leads are NEVER batched — always single-call", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ id: "L1", external_id: "1", tier: "T2", classifier_label: "substantial" }),
+        lead({ id: "L2", external_id: "2", tier: "T2", classifier_label: "substantial" }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+    });
+    expect(n).toBe(2);
+    // Each substantial lead gets its own call — no BATCHED MODE in any system prompt
+    for (const c of runner.draft.mock.calls) {
+      expect((c[0] as { system: string }).system).not.toContain("BATCHED MODE");
+    }
+    // Two individual calls
+    expect(runner.draft).toHaveBeenCalledTimes(2);
+  });
+
+  it("BATCH ON: batchLightLeads=false in config → behaves like batch OFF (per-lead calls)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }),
+    };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      // env ON but instance config has batchLightLeads=false
+      batch: { enabled: true, batchLightLeads: false },
+    });
+    expect(n).toBe(2);
+    // Per-lead calls (batchLightLeads=false disables batch)
+    expect(runner.draft).toHaveBeenCalledTimes(2);
+    for (const c of runner.draft.mock.calls) {
+      expect((c[0] as { system: string }).system).not.toContain("BATCHED MODE");
+    }
+  });
+
+  it("BATCH ON: daily cap still works within a batch tick (light cap=1, 2 leads → 1 drafted, 1 deferred)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: batchOk([{ id: "L1" }]),
+        engine: "bedrock", model: "m",
+      }),
+    };
+    const sql = Object.assign(vi.fn(async () => []), { json: (x: unknown) => x });
+    const n = await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+      dailyLightCap: 1,
+      draftedTodayByKind: async () => 0,
+      sql: sql as never,
+    });
+    // Only 1 lead fits in the budget; L2 is deferred without hitting the model
+    expect(n).toBe(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+  });
+
+  it("BATCH ON: uses the LIGHT (non-Opus) routing for the batch call — never Opus", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: batchOk([{ id: "L1" }, { id: "L2" }]),
+        engine: "bedrock", model: "m",
+      }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+      opusLikesThreshold: 80,
+      opusCommentsThreshold: 30,
+      opusModel: "claude-opus-4-6",
+    });
+    // Batch call uses base routing (Sonnet), never Opus
+    const batchRouting = (runner.draft.mock.calls[0]![0] as { routing: { primary: { model: string } } }).routing;
+    expect(batchRouting.primary.model).toBe("claude-sonnet-4-6");
+    expect(batchRouting.primary.model).not.toBe("claude-opus-4-6");
+  });
+});
