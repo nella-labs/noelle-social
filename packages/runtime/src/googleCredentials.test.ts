@@ -198,3 +198,5 @@ describe("owned Google credential operations", () => {
     expect(await client.getAccessToken()).toBe("synthetic-token");
     await new Promise(resolve => setTimeout(resolve, 80));
     expect(await client.getAccessToken()).toBe("synthetic-token"); expect(requests).toBe(2);
+  });
+});

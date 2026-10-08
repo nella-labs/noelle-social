@@ -198,3 +198,17 @@ describe("pickFaithfulVoice", () => {
 
 describe("readFaithfulVoiceWeights", () => {
   it("returns the weights when parallel to faithfulVoices", () => {
+    expect(
+      readFaithfulVoiceWeights({ faithfulVoices: ["a", "b"], faithfulVoiceWeights: [0.6, 0.4] }),
+    ).toEqual([0.6, 0.4]);
+  });
+
+  it("returns undefined when weights are absent or length-mismatched", () => {
+    expect(readFaithfulVoiceWeights({ faithfulVoices: ["a", "b"] })).toBeUndefined();
+    expect(
+      readFaithfulVoiceWeights({ faithfulVoices: ["a", "b"], faithfulVoiceWeights: [1] }),
+    ).toBeUndefined();
+    expect(readFaithfulVoiceWeights({})).toBeUndefined();
+    expect(readFaithfulVoiceWeights(null)).toBeUndefined();
+  });
+});
