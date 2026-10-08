@@ -198,3 +198,177 @@ function buildDiscoveryConfig(form: {
   discPostsPerSource?: string;
   discMinFaves?: string;
   discMinReplies?: string;
+  discMinReactions?: string;
+  discMinComments?: string;
+  discExcludeRetweets: boolean;
+  discExcludeReplies: boolean;
+  discLang?: string;
+}): DiscoveryConfig {
+  const clamp = (v: string | undefined, lo: number, hi: number): number | null => {
+    if (v == null || v.trim() === "") return null;
+    const n = Math.round(Number(v));
+    if (!Number.isFinite(n)) return null;
+    return Math.max(lo, Math.min(hi, n));
+  };
+  const lc = (form.discLang ?? "").trim().toLowerCase();
+  const cfg: DiscoveryConfig = {
+    timeWindowHours: clamp(form.discWindowHours, 1, 168),
+    postsPerSource: clamp(form.discPostsPerSource, 5, 100) ?? 20,
+    // X keyword-search floors. Absent on the LinkedIn form (those fields don't
+    // render) → null, which the LinkedIn worker ignores anyway.
+    minFaves: clamp(form.discMinFaves, 0, 1_000_000),
+    minReplies: clamp(form.discMinReplies, 0, 1_000_000),
+    // LinkedIn (Lyra) engagement floors. Absent on the X form → null (the X
+    // worker ignores them). minReactions also seeds the keyword search floor.
+    minReactions: clamp(form.discMinReactions, 0, 1_000_000),
+    minComments: clamp(form.discMinComments, 0, 1_000_000),
+    excludeRetweets: form.discExcludeRetweets,
+    excludeReplies: form.discExcludeReplies,
+    lang: /^[a-z]{2}$/.test(lc) ? lc : null,
+  };
+  return DiscoveryConfigSchema.parse(cfg);
+}
+
+export async function updateAgentConfig(formData: FormData): Promise<void> {
+  const parsed = FormSchema.safeParse({
+    orgSlug: formData.get("orgSlug"),
+    instanceId: formData.get("instanceId"),
+    budgetCapCents: formData.get("budgetCapCents"),
+    classifierPrimary: formData.get("classifierPrimary"),
+    classifierFallback: formData.get("classifierFallback"),
+    drafterPrimary: formData.get("drafterPrimary"),
+    drafterFallback: formData.get("drafterFallback"),
+    budgetAlertPct: formData.get("budgetAlertPct"),
+    escalateOnCap: coerceBoolean(formData.get("escalateOnCap")),
+    pauseOn5xx: coerceBoolean(formData.get("pauseOn5xx")),
+    notifyLowConfidence: coerceBoolean(formData.get("notifyLowConfidence")),
+    autoSendEnabled: coerceBoolean(formData.get("autoSendEnabled")),
+    autoDeferDms: coerceBoolean(formData.get("autoDeferDms")),
+    dmAutodraft: coerceBoolean(formData.get("dmAutodraft")),
+    linkedinIntroDm: coerceBoolean(formData.get("linkedinIntroDm")),
+    autoSendMinDelaySec: formData.get("autoSendMinDelaySec"),
+    autoSendMaxDelaySec: formData.get("autoSendMaxDelaySec"),
+    autoSendMaxPerHour: formData.get("autoSendMaxPerHour"),
+    pendingDraftsCap: formData.get("pendingDraftsCap"),
+    leadBacklogCap: formData.get("leadBacklogCap"),
+    classifierThreshold: formData.get("classifierThreshold"),
+    discWindowHours: formData.get("discWindowHours") ?? undefined,
+    discPostsPerSource: formData.get("discPostsPerSource") ?? undefined,
+    discMinFaves: formData.get("discMinFaves") ?? undefined,
+    discMinReplies: formData.get("discMinReplies") ?? undefined,
+    discMinReactions: formData.get("discMinReactions") ?? undefined,
+    discMinComments: formData.get("discMinComments") ?? undefined,
+    discExcludeRetweets: coerceBoolean(formData.get("discExcludeRetweets")),
+    discExcludeReplies: coerceBoolean(formData.get("discExcludeReplies")),
+    discLang: formData.get("discLang") ?? undefined,
+  });
+  if (!parsed.success) {
+    throw new Error(`Invalid config payload: ${parsed.error.message}`);
+  }
+  const {
+    orgSlug,
+    instanceId,
+    budgetCapCents,
+    classifierPrimary,
+    classifierFallback,
+    drafterPrimary,
+    drafterFallback,
+    budgetAlertPct,
+    escalateOnCap,
+    pauseOn5xx,
+    notifyLowConfidence,
+    autoSendEnabled,
+    autoDeferDms,
+    dmAutodraft,
+    linkedinIntroDm,
+    autoSendMinDelaySec,
+    autoSendMaxDelaySec,
+    autoSendMaxPerHour,
+    pendingDraftsCap,
+    leadBacklogCap,
+    classifierThreshold,
+  } = parsed.data;
+
+  const discoveryConfig = buildDiscoveryConfig(parsed.data);
+
+  const user = await getCurrentUser();
+  if (!user) throw new Error("Sign in first.");
+
+  let org;
+  try {
+    org = await getOrgBySlug(orgSlug);
+  } catch (err) {
+    if (err instanceof OrgMembershipError) throw new Error("Not a member of this org.");
+    throw err;
+  }
+  if (!org) throw new Error("Org not found.");
+
+  const { isAdmin } = await checkAdmin();
+  if (!isAdmin) {
+    throw new Error("Admin required to change agent configuration.");
+  }
+
+  const drafterPrimaryHandle = parseHandle(drafterPrimary);
+  const drafterFallbackHandle = parseHandle(drafterFallback);
+  const classifierPrimaryHandle = parseHandle(classifierPrimary);
+  const classifierFallbackHandle = parseHandle(classifierFallback);
+  if (!drafterPrimaryHandle || !classifierPrimaryHandle) {
+    throw new Error(
+      "Primary models are required for both classifier and drafter.",
+    );
+  }
+
+  const modelOverrides: PersistedModelOverrides = {
+    primary: drafterPrimaryHandle as PersistedModelOverrides["primary"],
+    fallback: drafterFallbackHandle as PersistedModelOverrides["fallback"],
+    workers: {
+      drafter: {
+        primary: drafterPrimaryHandle as PersistedModelOverrides["primary"],
+        fallback:
+          drafterFallbackHandle as PersistedModelOverrides["fallback"],
+      },
+      classifier: {
+        primary:
+          classifierPrimaryHandle as PersistedModelOverrides["primary"],
+        fallback:
+          classifierFallbackHandle as PersistedModelOverrides["fallback"],
+      },
+    },
+  };
+  const overridesJson = JSON.stringify(modelOverrides);
+
+  const [updated] = await sql<{ display_name: string | null }[]>`
+    update noelle.agent_instances
+    set
+      budget_cap_cents         = ${budgetCapCents},
+      model_overrides          = ${overridesJson}::jsonb,
+      budget_alert_pct         = ${budgetAlertPct},
+      escalate_on_cap          = ${escalateOnCap},
+      pause_on_5xx             = ${pauseOn5xx},
+      notify_low_confidence    = ${notifyLowConfidence},
+      auto_send_enabled        = ${autoSendEnabled},
+      auto_defer_dms           = ${autoDeferDms},
+      dm_autodraft_enabled     = ${dmAutodraft},
+      linkedin_intro_dm_enabled = ${linkedinIntroDm},
+      auto_send_min_delay_sec  = ${autoSendMinDelaySec},
+      auto_send_max_delay_sec  = ${autoSendMaxDelaySec},
+      auto_send_max_per_hour   = ${autoSendMaxPerHour},
+      pending_drafts_cap       = ${pendingDraftsCap},
+      lead_backlog_cap         = ${leadBacklogCap},
+      classifier_threshold     = ${classifierThreshold},
+      discovery_config         = ${sql.json(discoveryConfig)},
+      updated_at               = now()
+    where id = ${instanceId}
+      and org_id = ${org.id}
+    returning display_name
+  `;
+
+  // Redirect back to the canonical slug URL (the form posts the UUID).
+  const slug = agentSlug(updated?.display_name, instanceId);
+  revalidatePath(`/app/${orgSlug}/agents/${slug}`);
+  revalidatePath(`/app/${orgSlug}/agents/${slug}/config`);
+  // Stay on /config so the user sees the values they just saved, with a
+  // ?saved=<unix-ms> query so the banner renders + a fresh value each
+  // save (prevents stale "Saved" lingering if you re-submit).
+  redirect(`/app/${orgSlug}/agents/${slug}/config?saved=${Date.now()}`);
+}
