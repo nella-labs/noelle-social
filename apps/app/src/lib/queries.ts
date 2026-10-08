@@ -4598,3 +4598,167 @@ const CHAT_HISTORY_LIMIT = 40;
 /** One persisted chat turn, shaped for the client transcript. */
 export interface ChatHistoryMessage {
   who: "agent" | "user";
+  /** Pre-formatted relative label ("just now", "2h ago") — computed server-side
+   *  to keep Date off the client render path (hydration safety). */
+  at: string;
+  body: string;
+  proposal: TargetingProposal | null;
+  vaultEdit: VaultEditProposal | null;
+  vaultEditReceipt: VaultEditClientReceipt | null;
+}
+
+export interface ChatConversation {
+  /** Null when this user has no messages for this instance yet. */
+  conversationId: string | null;
+  messages: ChatHistoryMessage[];
+}
+
+interface ChatMessageRow {
+  id: string;
+  role: "user" | "agent";
+  body: string;
+  proposal: TargetingProposal | null;
+  vault_edit: unknown;
+  created_at: string | Date;
+}
+
+/** Casual relative label matching the chat's existing "just now"/"now" voice. */
+function relativeChatTime(at: string | Date): string {
+  const then = new Date(at).getTime();
+  const secs = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (secs < 45) return "just now";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.round(hrs / 24);
+  return `${days}d ago`;
+}
+
+function toHistoryMessage(r: ChatMessageRow): ChatHistoryMessage {
+  const edit = r.role === "agent" ? parseStoredVaultEdit(r.vault_edit) : null;
+  return {
+    who: r.role === "agent" ? "agent" : "user",
+    at: relativeChatTime(r.created_at),
+    body: r.body,
+    proposal: r.proposal ?? null,
+    vaultEdit: edit?.proposal ?? null,
+    vaultEditReceipt: edit ? publicVaultEditReceipt(edit, r.id) : null,
+  };
+}
+
+/** The tail (oldest→newest) of a single conversation's rows. */
+async function loadConversationRows(
+  instanceId: string,
+  userId: string,
+  conversationId: string,
+  orgId: string,
+): Promise<ChatMessageRow[]> {
+  const rows = await readSql<ChatMessageRow[]>`
+    select c.id, c.role, c.body, c.proposal, c.vault_edit, c.created_at
+    from noelle.agent_chat_messages c
+    join noelle.agent_instances i on i.id = c.agent_instance_id and i.org_id = c.org_id
+    join noelle.org_members m on m.org_id = i.org_id and m.user_id = c.user_id
+    where c.agent_instance_id = ${instanceId}
+      and c.org_id = ${orgId}
+      and c.user_id = ${userId}
+      and c.conversation_id = ${conversationId}
+    order by c.seq desc
+    limit ${CHAT_HISTORY_LIMIT}
+  `;
+  // We pulled newest-first to cap cheaply; flip back to chronological order.
+  return rows.reverse();
+}
+
+/**
+ * Load the operator's most recent conversation for an agent instance (the
+ * thread the chat resumes into on mount). Returns an empty conversation when
+ * there's no history yet — the client then shows the persona greeting.
+ */
+export async function loadLatestChatConversation(
+  instanceId: string,
+): Promise<ChatConversation> {
+  const inst = await getAgentInstance(instanceId); // tenancy + existence
+  if (!inst) return { conversationId: null, messages: [] };
+  const userId = await getRequiredUserId();
+
+  const latest = await readSql<{ conversation_id: string }[]>`
+    select c.conversation_id
+    from noelle.agent_chat_messages c
+    join noelle.agent_instances i on i.id = c.agent_instance_id and i.org_id = c.org_id
+    join noelle.org_members m on m.org_id = i.org_id and m.user_id = c.user_id
+    where c.agent_instance_id = ${instanceId} and c.user_id = ${userId} and c.org_id = ${inst.org_id}
+    order by c.seq desc
+    limit 1
+  `;
+  const conversationId = latest[0]?.conversation_id ?? null;
+  if (!conversationId) return { conversationId: null, messages: [] };
+
+  const rows = await loadConversationRows(instanceId, userId, conversationId, inst.org_id);
+  return { conversationId, messages: rows.map(toHistoryMessage) };
+}
+
+/**
+ * Prior turns of a conversation, shaped for the model (alternating
+ * user/assistant, oldest first). Tenancy + user resolved here so the chat
+ * route can call it with just the ids. Returns [] for an unknown/new thread.
+ */
+export async function loadChatTurnsForModel(
+  instanceId: string,
+  conversationId: string,
+): Promise<ChatHistoryTurn[]> {
+  const inst = await getAgentInstance(instanceId); // tenancy
+  if (!inst) return [];
+  const userId = await getRequiredUserId();
+  const rows = await loadConversationRows(instanceId, userId, conversationId, inst.org_id);
+  return rows.map((r) => ({
+    role: r.role === "agent" ? ("assistant" as const) : ("user" as const),
+    content: r.body,
+  }));
+}
+
+/**
+ * Append a completed turn (the user message + the agent reply) to a
+ * conversation in one statement. Both rows share `created_at`; ordering is by
+ * the `seq` identity column, which the multi-row VALUES list assigns top-down
+ * (user before agent). Only called after a successful model reply, so user and
+ * agent rows always stay paired.
+ */
+export async function appendChatTurn(args: {
+  instanceId: string;
+  conversationId: string;
+  userBody: string;
+  agentBody: string;
+  proposal?: TargetingProposal | null;
+  vaultEdit?: StoredVaultEdit | null;
+  expectedOwner?: { orgId: string; role: string };
+}): Promise<string> {
+  const inst = await getAgentInstance(args.instanceId); // tenancy
+  if (!inst) throw new Error("agent instance not found");
+  const userId = await getRequiredUserId();
+  const proposalJson = args.proposal ? sql.json(args.proposal as never) : null;
+  const vaultEditJson = args.vaultEdit ? sql.json(args.vaultEdit as never) : null;
+  const rows = await sql<{ id: string; role: string }[]>`
+    with owner as materialized (
+      select i.id, i.org_id
+      from noelle.agent_instances i
+      join noelle.organizations o on o.id = i.org_id
+      join noelle.org_members m on m.org_id = o.id and m.user_id = ${userId}
+      where i.id = ${args.instanceId} and i.org_id = ${args.expectedOwner?.orgId ?? inst.org_id}
+        and i.role = ${args.expectedOwner?.role ?? inst.role}
+      for share of i, o, m
+    )
+    insert into noelle.agent_chat_messages
+      (org_id, agent_instance_id, user_id, conversation_id, role, body, proposal, vault_edit)
+    select owner.org_id, owner.id, ${userId}, ${args.conversationId}, turn.role, turn.body, turn.proposal, turn.vault_edit
+    from owner cross join (values
+      (1, 'user', ${args.userBody}, null::jsonb, null::jsonb),
+      (2, 'agent', ${args.agentBody}, ${proposalJson}::jsonb, ${vaultEditJson}::jsonb)
+    ) as turn(position, role, body, proposal, vault_edit)
+    order by turn.position
+    returning id, role
+  `;
+  const id = rows.find((row) => row.role === "agent")?.id;
+  if (!id) throw new Error("chat owner changed before persistence");
+  return id;
+}

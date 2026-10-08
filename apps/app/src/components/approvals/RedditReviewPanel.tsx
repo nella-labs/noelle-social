@@ -198,3 +198,39 @@ function Variant({
           onClick={() => copy(draft, view.approvalId)}
           title="Copy this draft to your clipboard"
         >
+          {copied ? "Copied ✓" : "Copy"}
+        </button>
+        {edited ? (
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={() => setDraft(original)}
+            title="Discard your edit and restore Orion's original draft"
+          >
+            Reset to draft
+          </button>
+        ) : null}
+        <span className="grow-phone" style={{ marginLeft: "auto" }}>
+          <MarkSentButton
+            orgSlug={orgSlug}
+            approvalId={view.approvalId}
+            nextHref={nextHref}
+            listHref={listHref}
+            beforeMarkSent={
+              edited && draft.trim()
+                ? async () => {
+                    const res = await saveDraftEdit({
+                      orgSlug,
+                      approvalId: view.approvalId,
+                      body: draft,
+                    });
+                    return res.ok;
+                  }
+                : undefined
+            }
+          />
+        </span>
+      </div>
+    </div>
+  );
+}
