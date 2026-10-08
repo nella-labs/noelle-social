@@ -398,3 +398,203 @@ describe("createFormVariantRotation", () => {
     }
   });
 
+  it("keeps independent state per rotation instance", () => {
+    const a = createFormVariantRotation();
+    const b = createFormVariantRotation();
+    const first = a.next(() => 0.0);
+    // b has no exclusion yet, so the same rng maps to the same first variant.
+    expect(b.next(() => 0.0).id).toBe(first.id);
+  });
+});
+
+describe("renderStyleBlock faithful + formVariant", () => {
+  const baseStyle: StyleForPrompt = {
+    exemplars: [
+      { body: "an exemplar post body", accountHandle: "kaia", likeCount: 10, commentCount: 2 },
+    ],
+    styleNotes: "",
+  };
+
+  it("without a formVariant keeps tight length but lets evidence define the shape", () => {
+    const block = renderStyleBlock(baseStyle, undefined, true);
+    expect(block).toContain("as actually shown in their examples and style notes");
+    expect(block).toContain("Keep it tight: one or two short sentences");
+    expect(block).toContain("Let the examples determine the exact shape");
+    expect(block).toContain("Borrow their VOICE and SHAPE");
+    expect(block).not.toContain("OPEN with a short, punchy reaction (roughly 3 to 8 words)");
+    expect(block).not.toContain("a hook, plus at most one aside");
+    expect(block).not.toContain("Borrow only the SHAPE");
+    expect(block).not.toContain("ASSIGNED SHAPE");
+  });
+
+  it("with a formVariant renders the assigned shape instead of the fixed recipe", () => {
+    const style: StyleForPrompt = {
+      ...baseStyle,
+      formVariant: { id: "RUN_ON", directive: "ONE longer run-on sentence, ~180 to 260 characters." },
+    };
+    const block = renderStyleBlock(style, undefined, true);
+    expect(block).toContain("THIS REPLY'S ASSIGNED SHAPE");
+    expect(block).toContain("ONE longer run-on sentence, ~180 to 260 characters.");
+    expect(block).toContain("Stick to the assigned shape's length exactly (comments only");
+    expect(block).not.toContain("OPEN with a short, punchy reaction (roughly 3 to 8 words)");
+    expect(block).not.toContain("Keep it tight: one or two short sentences");
+    // Voice + anti-plagiarism guidance survives the swap.
+    expect(block).toContain("do not plagiarize");
+    expect(block).toContain("WRITE THIS REPLY IN THE VOICE OF THE WRITER BELOW");
+  });
+
+  it("ignores formVariant outside faithful mode (blend paths unchanged)", () => {
+    const style: StyleForPrompt = {
+      ...baseStyle,
+      formVariant: { id: "MICRO", directive: "One tiny reaction." },
+    };
+    const block = renderStyleBlock(style, "neutral", false);
+    expect(block).not.toContain("ASSIGNED SHAPE");
+    expect(block).toContain("STYLE TO EMULATE");
+  });
+});
+
+describe("X_FORM_VARIANTS (Vega)", () => {
+  it("has exactly 12 variants with unique ids, non-empty directives, weights summing to 1", () => {
+    expect(X_FORM_VARIANTS).toHaveLength(12);
+    const ids = X_FORM_VARIANTS.map((v) => v.id);
+    expect(new Set(ids).size).toBe(12);
+    for (const v of X_FORM_VARIANTS) {
+      expect(v.directive.trim().length).toBeGreaterThan(0);
+      expect(v.weight).toBeGreaterThan(0);
+    }
+    const sum = X_FORM_VARIANTS.reduce((a, v) => a + v.weight, 0);
+    expect(Math.abs(sum - 1)).toBeLessThan(1e-9);
+  });
+
+  it("MICRO permits a ONE-word reply (the shape the operator asked for)", () => {
+    const micro = X_FORM_VARIANTS.find((v) => v.id === "MICRO");
+    expect(micro).toBeDefined();
+    // Falsifiable: Lyra's MICRO says "3 to 8 words" and would fail this.
+    expect(micro!.directive).toMatch(/\bONE and 8 words\b/);
+    expect(micro!.directive).not.toMatch(/3 to 8 words total/);
+  });
+
+  it("no X directive asks for a length X cannot hold (280-char reply ceiling)", () => {
+    // Every explicit "~N to M characters" upper bound must stay under 280.
+    for (const v of X_FORM_VARIANTS) {
+      for (const m of v.directive.matchAll(/(\d+)\s*(?:to|-)\s*(\d+)\s*characters/g)) {
+        expect(Number(m[2])).toBeLessThanOrEqual(260);
+      }
+    }
+  });
+
+  it("models no punctuation the verifier hard-zeros (em dash)", () => {
+    for (const v of X_FORM_VARIANTS) expect(v.directive).not.toContain("—");
+  });
+
+  // The two sets share MACHINERY, not a skeleton list. They used to be the same
+  // ten ids with different length bands, which is a large part of why Lyra's and
+  // Vega's feeds read as one writer.
+  it("shares the ten common shapes with Lyra but keeps two of its own", () => {
+    const lyra = new Set(FORM_VARIANTS.map((v) => v.id));
+    const vega = new Set(X_FORM_VARIANTS.map((v) => v.id));
+    const shared = [...vega].filter((id) => lyra.has(id));
+    expect(shared).toHaveLength(10);
+    expect([...vega].filter((id) => !lyra.has(id)).sort()).toEqual(["FLAT_DISAGREE", "RIFF"]);
+    expect([...lyra].filter((id) => !vega.has(id)).sort()).toEqual(["AGREE_EXTEND", "SELF_STORY"]);
+  });
+
+  // Same rationale in numbers: X leans shorter, LinkedIn leans longer, so the
+  // two feeds do not land in one character band.
+  it("weights the short shapes higher than Lyra's set does", () => {
+    const shortWeight = (set: readonly { id: string; weight: number }[]) =>
+      set
+        .filter((v) => ["MICRO", "ONE_SHORT", "HOOK_THEN_LINE"].includes(v.id))
+        .reduce((a, v) => a + v.weight, 0);
+    expect(shortWeight(X_FORM_VARIANTS)).toBeGreaterThan(shortWeight(FORM_VARIANTS));
+  });
+
+  it("pickFormVariant honours an explicit pool", () => {
+    const lcg = makeLcg(7);
+    for (let i = 0; i < 500; i++) {
+      const picked = pickFormVariant(lcg, null, X_FORM_VARIANTS);
+      expect(X_FORM_VARIANTS).toContain(picked);
+    }
+  });
+
+  it("a pool-bound rotation never repeats a shape back-to-back", () => {
+    const rot = createFormVariantRotation(X_FORM_VARIANTS);
+    const lcg = makeLcg(99);
+    let prev = "";
+    for (let i = 0; i < 500; i++) {
+      const v = rot.next(lcg);
+      expect(X_FORM_VARIANTS.some((x) => x.id === v.id)).toBe(true);
+      expect(v.id).not.toBe(prev);
+      prev = v.id;
+    }
+  });
+
+  it("defaults to the LinkedIn pool when no pool is passed (Lyra unchanged)", () => {
+    const rot = createFormVariantRotation();
+    const lcg = makeLcg(3);
+    for (let i = 0; i < 200; i++) expect(FORM_VARIANTS).toContain(rot.next(lcg));
+  });
+
+  it("no X shape may exceed the verifier's 250-char hard cap for an X reply", () => {
+    // drafter-tick.ts passes charLimit: 250 to the deterministic format scorer,
+    // which penalises OVER-length drafts. A directive that asks for more than
+    // that would score its own drafts down on every pick.
+    const X_REPLY_CHAR_LIMIT = 250;
+    for (const v of X_FORM_VARIANTS) {
+      for (const m of v.directive.matchAll(/(\d+)\s*(?:to|-)\s*(\d+)\s*characters/g)) {
+        expect(Number(m[2])).toBeLessThanOrEqual(X_REPLY_CHAR_LIMIT);
+      }
+      for (const m of v.directive.matchAll(/under (\d+) characters/g)) {
+        expect(Number(m[1])).toBeLessThanOrEqual(X_REPLY_CHAR_LIMIT);
+      }
+    }
+  });
+
+  it("MICRO permits standalone reactions without specificity padding", () => {
+    const micro = X_FORM_VARIANTS.find((v) => v.id === "MICRO")!;
+    expect(micro.directive).toContain("so real");
+    expect(micro.directive).not.toContain("bare agreement with no content");
+    expect(micro.directive).not.toContain("IF it reacts to something specific");
+    expect(X_FORM_VARIANTS.find((v) => v.id === "ONE_SHORT")!.directive).not.toContain("specific take");
+  });
+
+  it("the X pool actually spreads length — not one band (the whole point)", () => {
+    // The shortest shape must be able to produce a sub-40-char reply and the
+    // longest a 200+ one. A single-band set would fail this.
+    const micro = X_FORM_VARIANTS.find((v) => v.id === "MICRO")!;
+    const three = X_FORM_VARIANTS.find((v) => v.id === "THREE_BEAT")!;
+    expect(micro.directive).toMatch(/single line/);
+    expect(three.directive).toMatch(/190 to 240/);
+  });
+});
+
+describe("renderAssignedShapeBlock", () => {
+  it("renders the directive with an explicit override of the default length rules", () => {
+    const block = renderAssignedShapeBlock({ id: "MICRO", directive: "One tiny reaction, ONE to 8 words." });
+    expect(block).toContain("THIS REPLY'S ASSIGNED SHAPE");
+    expect(block).toContain("One tiny reaction, ONE to 8 words.");
+    expect(block).toMatch(/OVERRIDES the default reply length/);
+  });
+
+  it("keeps the NEVER-DO rules intact and forbids padding a short shape", () => {
+    const block = renderAssignedShapeBlock({ id: "MICRO", directive: "d" });
+    expect(block).toContain("no em dashes");
+    expect(block).toMatch(/do NOT pad it/);
+    expect(block).toMatch(/never applies to a DM/i);
+  });
+
+  it("stays platform-neutral so either intern can render it", () => {
+    const block = renderAssignedShapeBlock({ id: "RUN_ON", directive: "d" });
+    expect(block).not.toMatch(/LinkedIn/i);
+    expect(block).not.toMatch(/\btweet\b/i);
+  });
+
+  it("models no em dash of its own", () => {
+    expect(renderAssignedShapeBlock({ id: "X", directive: "d" })).not.toContain("—");
+  });
+});
+
+describe("SHAPES_WITH_FREE_OPENER", () => {
+  it("names only shapes that exist in the X pool", () => {
+    const ids = new Set(X_FORM_VARIANTS.map((v) => v.id));
