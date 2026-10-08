@@ -198,3 +198,34 @@ The KnowledgeBase's retrieval is lexical (BM25) by default. Setting
   BM25-scale number). In hybrid mode the reported `KbHit.score` *stays the BM25
   score* (dense-only chunks carry 0), and a guard keeps the top-BM25 chunk in
   the returned window — so `max(score)` is identical to the pure-BM25 path.
+  Dense **reorders and augments** the anchors (better answers, more recall in
+  the ungated knowledge pass); it never moves the skip bar. Letting dense also
+  drive the gate would be a deliberate, separate drafter change.
+- **Endpoint/key.** The lane calls Voyage **directly**
+  (`api.voyageai.com/v1/contextualizedembeddings`) — the MongoDB gateway used
+  by `rerank-2.5` / `voyage-3-large` is not assumed to proxy it. Key resolves
+  `VOYAGE_CONTEXT_API_KEY` then the shared `VOYAGE_API_KEY`; override the base
+  with `VOYAGE_CONTEXT_ENDPOINT` if your gateway does support the endpoint.
+
+## Verdict surfacing
+
+When the verifier runs, its verdict (`pass`, per-dimension scores, reasons,
+attempt count) rides the outbound payload as `verifierMeta` and is stored on
+each draft's `payload.verifier_meta`. It does **not** gate the queue — a
+failed-then-best draft is still queued, with the verdict attached, for the human.
+
+## Code map
+
+- `packages/runtime/src/drafting/draftVerifier.ts` — `verifyDrafts` / `verifyTiered` (judge injected).
+- `packages/runtime/src/drafting/contextAssembly.ts` — `synthesizeBrief` / `renderBriefBlock` (the optional distill).
+- `packages/runtime/src/drafting/visionCaption.ts` — `captionImages` / `createGeminiCaptionFn` (BYO key) / `createVertexCaptionFn` (Vertex ADC) / `createBedrockCaptionFn` (Claude vision on Bedrock — the self-host path where there's no `gemini-api-key` and Vertex ADC is dead).
+- `packages/x-apify/src/index.ts` — `normalizeTweet` sets `is_reply`; `apps/x-intern/src/workers/discovery-tick.ts` drops replies when `excludeReplies`.
+- `packages/runtime/src/{knowledgeBase,gcsAnchorSource,nellaClient}.ts` — `filterDirs` dir-scoped search; `knowledgeBase.ts` also hosts the hybrid dense lane (`hybridSearch`, `resolveKbDense`).
+- `packages/runtime/src/voyageContextEmbed.ts` — `voyage-context-4` contextualized-embedding client (`voyageContextEmbed` / `voyageContextEmbedQuery`), fail-open.
+- `packages/runtime/src/denseChunkIndex.ts` — pure in-memory cosine index (`buildDenseIndex`); `rrf.ts` provides the RRF fusion both lanes share.
+- `apps/{x,linkedin}-intern/src/workers/drafter-tick.ts` — retrieval passes + verify/regenerate loop.
+- `apps/x-intern/src/lib/own-account.ts` — the own-account snapshot type, bus read/write, staleness rule, and `renderOwnAccountBlock` (the YOUR OWN ACCOUNT block).
+- `apps/x-intern/src/workers/own-account-tick.ts` — the sweep (X API primary, Apify fallback), hosted in the ideation worker beside the own-POST sweep.
+- `apps/x-intern/src/lib/x-api-client-factory.ts` — shared `buildXApiClient` (used by content-publish + the own-account sweep).
+- `apps/api-vm/src/routes/drafts.ts` — `POST /api/drafts/:id/save-edit` (captures the edit).
+- `apps/app/src/components/approvals/*` — editable draft panels.
