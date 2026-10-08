@@ -1,0 +1,27 @@
+-- Archive retired management profiles without deleting their history.
+update noelle.agent_instances
+set status = 'retired',
+    discovery_enabled = false,
+    classifier_enabled = false,
+    drafter_enabled = false,
+    profiler_enabled = false,
+    watchlist_enabled = false,
+    dm_autodraft_enabled = false,
+    linkedin_intro_dm_enabled = false,
+    send_enabled = false,
+    auto_send_enabled = false,
+    reply_send_enabled = false,
+    x_api_write_enabled = false,
+    notifications_enabled = false,
+    goal_target = null,
+    goal_started_at = null,
+    run_config = null,
+    run_schedule = null,
+    run_schedule_next_at = null,
+    account_feeder_run_requested_at = null,
+    video_feeder_run_requested_at = null,
+    video_ideation_request = null,
+    actuator_desired_state = 'stopped',
+    actuator_command_at = now(),
+    updated_at = now()
+where role in ('ceo', 'cmo');

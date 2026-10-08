@@ -198,3 +198,29 @@ create table noelle.llm_calls (
   status       text not null default 'ok',
   started_at   timestamptz not null default now()
 );
+
+create index llm_calls_org_started_idx on noelle.llm_calls (org_id, started_at desc);
+create index llm_calls_bucket_idx      on noelle.llm_calls (bucket);
+
+-- ---------------------------------------------------------------------------
+-- Application role + permissions.
+-- The `noelle_app` role is what apps/api-vm and apps/app connect as via the
+-- Cloud SQL Auth Proxy. It can read/write noelle.* but cannot create or
+-- alter schema objects (DDL stays with the cloudsqlsuperuser role).
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  if not exists (select 1 from pg_roles where rolname = 'noelle_app') then
+    create role noelle_app login password 'placeholder-rotated-in-secret-manager';
+  end if;
+end $$;
+
+grant connect on database postgres to noelle_app;
+grant usage on schema noelle to noelle_app;
+grant select, insert, update, delete on all tables in schema noelle to noelle_app;
+grant usage, select on all sequences in schema noelle to noelle_app;
+
+alter default privileges in schema noelle
+  grant select, insert, update, delete on tables to noelle_app;
+alter default privileges in schema noelle
+  grant usage, select on sequences to noelle_app;
