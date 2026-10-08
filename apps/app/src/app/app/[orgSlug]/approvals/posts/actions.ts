@@ -398,3 +398,86 @@ export const replacePostIdea = withRateLimit(
   "posts.replace",
   { capacity: 40, refillPerSecond: 0.5, cost: 2 },
   async (input: ReplaceInput) => {
+    const parsed = ReplaceInput.parse(input);
+    try {
+      const res = await noelleFetch(`/api/posts/${encodeURIComponent(parsed.ideaId)}/replace`, {
+        method: "POST",
+        body: {},
+      });
+      PostReplaceOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/content`);
+      return { ok: true as const };
+    } catch (e) {
+      return toError(e);
+    }
+  },
+);
+
+// ---- Content media (Phase 2) -------------------------------------------------
+
+const UploadMediaInput = z.object({
+  orgSlug: z.string().min(1),
+  kind: z.enum(["image", "video", "other"]).default("image"),
+  mimeType: z.string().min(1).max(255),
+  /** Base64 of the file bytes (no data: URI prefix). ~15MB base64 ≈ ~11MB file
+   * — mirrors the server cap so oversize fails fast before the wire trip. */
+  dataBase64: z.string().min(1).max(15_000_000),
+  filename: z.string().max(255).optional(),
+  caption: z.string().max(2000).optional(),
+  platform: z.enum(["linkedin", "x", "reddit"]).optional(),
+  draftId: z.string().uuid().optional(),
+  ideaId: z.string().uuid().optional(),
+});
+export type UploadMediaInput = z.infer<typeof UploadMediaInput>;
+
+export const uploadMedia = withRateLimit(
+  "content.media_upload",
+  { capacity: 30, refillPerSecond: 0.5, cost: 3 },
+  async (input: UploadMediaInput) => {
+    const { orgSlug, ...wire } = UploadMediaInput.parse(input);
+    try {
+      const org = await getOrgBySlug(orgSlug);
+      if (!org) return { ok: false as const, error: { code: "not_found", message: "Organization not found", status: 404 } };
+      const res = ContentMediaCreatedSchema.parse(await noelleFetch("/api/content-media", {
+        method: "POST", body: { ...wire, orgId: org.id },
+      }));
+      revalidatePath(`/app/${orgSlug}/content`);
+      return { ok: true as const, media: res.media };
+    } catch (e) {
+      return toError(e);
+    }
+  },
+);
+
+const DeleteMediaInput = z.object({
+  orgSlug: z.string().min(1),
+  id: z.string().uuid(),
+});
+export type DeleteMediaInput = z.infer<typeof DeleteMediaInput>;
+
+export const deleteMedia = withRateLimit(
+  "content.media_delete",
+  { capacity: 60, refillPerSecond: 1, cost: 1 },
+  async (input: DeleteMediaInput) => {
+    const parsed = DeleteMediaInput.parse(input);
+    try {
+      await noelleFetch(`/api/content-media/${encodeURIComponent(parsed.id)}`, { method: "DELETE" });
+      revalidatePath(`/app/${parsed.orgSlug}/content`);
+      return { ok: true as const };
+    } catch (e) {
+      return toError(e);
+    }
+  },
+);
+
+/**
+ * Read a post's drafter thread + attached media — for the in-studio chat and
+ * media panes (lazy-loaded when a draft is opened, so the Drafts board stays
+ * cheap). Same exposure as the refine detail page (keyed by ideaId).
+ */
+export async function loadPostThread(input: { orgSlug: string; ideaId: string }) {
+  const ideaId = z.string().uuid().parse(input.ideaId);
+  const thread = await getPostThread(ideaId);
+  if (!thread) return { ok: false as const };
+  return { ok: true as const, notes: thread.notes, media: thread.media };
+}
