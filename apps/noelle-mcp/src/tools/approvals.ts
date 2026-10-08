@@ -198,3 +198,203 @@ const tools: Tool[] = [
       properties: {
         org: ORG_PROP,
         approvalId: APPROVAL_ID_PROP,
+        tweetUrl: {
+          type: "string",
+          description: "Optional URL of the posted tweet; its status id is extracted and recorded.",
+        },
+      },
+      required: ["approvalId"],
+    },
+  },
+  {
+    name: "noelle_bulk_skip",
+    description:
+      "Skip many approvals at once by id (1..200). Skips all pending reply angles (not DMs) for the leads behind the given approval ids. Returns how many rows were skipped.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        org: ORG_PROP,
+        approvalIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "Approval row ids to skip (1..200).",
+        },
+        reason: { type: "string", description: "Optional skip reason (default 'bulk-skip')." },
+      },
+      required: ["approvalIds"],
+    },
+  },
+];
+
+async function listApprovals(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const platform = approvalPlatform(args);
+  const status = optStr(args, "status") ?? "pending";
+  const watchlist = optStr(args, "watchlist") ?? "all";
+  const minScore = optNum(args, "minScore") ?? null;
+  const limit = limitOf(args);
+
+  const rows = await ctx.sql<Array<ApprovalRow>>`
+    select a.id a_id, a.status a_status, a.decided_by a_decided_by, a.auto_send_target_at a_auto,
+      a.created_at::text a_created_at, a.lead_id a_lead_id, a.draft_id a_draft_id,
+      coalesce(d.payload->>'edited_body', d.payload->>'body') as body,
+      coalesce(d.payload->>'kind','reply') as kind,
+      coalesce(l.platform,'x') as platform,
+      coalesce(l.payload->>'url', l.payload->>'original_post_url') as source_url,
+      d.payload->'verifier_meta'->>'pass' as review_pass,
+      d.payload->'verifier_meta'->'reasons' as review_reasons,
+      d.payload->'verifier_meta'->>'attempts' as review_attempts,
+      d.payload->'dm_voice_check'->>'pass' as dm_writing_pass,
+      coalesce(d.payload->>'edited_body', d.payload->>'body') is distinct from d.payload->>'body' as dm_writing_stale,
+      d.payload->'dm_voice_check'->'reasons' as dm_writing_reasons,
+      d.payload->'dm_voice_check'->>'attempts' as dm_writing_attempts,
+      l.external_id l_external_id, l.author_handle l_author_handle, l.tier l_tier,
+      l.classifier_label l_label, l.classifier_score l_score, l.priority l_priority,
+      l.payload->>'text' as lead_text
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    where a.org_id = ${org.orgId}
+      and (${platform} = 'all' or coalesce(l.platform,'x') = ${platform})
+      and (${status} = 'all' or a.status = ${status})
+      and (${watchlist} = 'all' or (${watchlist}='only' and l.priority = true)
+           or (${watchlist}='exclude' and (l.priority is null or l.priority = false)))
+      and (${minScore}::numeric is null or l.classifier_score is null or l.classifier_score >= ${minScore}::numeric)
+    order by case when a.status='pending' then 0 else 1 end, l.classifier_score desc nulls last, a.created_at desc
+    limit ${limit}`;
+
+  const table = mdTable(
+    ["approval_id", "platform", "author", "lead score", "kind", "status", "snippet", "check"],
+    rows.map((r) => [
+      r.a_id,
+      r.platform ?? "x",
+      r.l_author_handle ? `@${r.l_author_handle}` : "—",
+      r.l_score ?? "—",
+      r.kind,
+      r.a_status,
+      truncate(r.body, 80),
+      renderReview(r),
+    ]),
+  );
+  return text(
+    `**${org.name}** — ${rows.length} approval(s) [platform=${platform}, status=${status}]\n\n${table}`,
+  );
+}
+
+async function getApproval(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const approvalId = reqStr(args, "approvalId");
+
+  const rows = await ctx.sql<Array<ApprovalRow>>`
+    select a.id a_id, a.status a_status, a.decided_by a_decided_by, a.auto_send_target_at a_auto,
+      a.created_at::text a_created_at, a.lead_id a_lead_id, a.draft_id a_draft_id,
+      coalesce(d.payload->>'edited_body', d.payload->>'body') as body,
+      coalesce(d.payload->>'kind','reply') as kind,
+      coalesce(l.platform,'x') as platform,
+      coalesce(l.payload->>'url', l.payload->>'original_post_url') as source_url,
+      d.payload->'verifier_meta'->>'pass' as review_pass,
+      d.payload->'verifier_meta'->'reasons' as review_reasons,
+      d.payload->'verifier_meta'->>'attempts' as review_attempts,
+      d.payload->'dm_voice_check'->>'pass' as dm_writing_pass,
+      coalesce(d.payload->>'edited_body', d.payload->>'body') is distinct from d.payload->>'body' as dm_writing_stale,
+      d.payload->'dm_voice_check'->'reasons' as dm_writing_reasons,
+      d.payload->'dm_voice_check'->>'attempts' as dm_writing_attempts,
+      l.external_id l_external_id, l.author_handle l_author_handle, l.tier l_tier,
+      l.classifier_label l_label, l.classifier_score l_score, l.priority l_priority,
+      l.payload->>'text' as lead_text
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    where a.id = ${approvalId} and a.org_id = ${org.orgId}`;
+
+  const main = rows[0];
+  if (!main) throw new NoelleError(`Approval ${approvalId} not found in ${org.name}.`);
+
+  let angles: ApprovalRow[] = rows;
+  if (main.a_lead_id) {
+    angles = await ctx.sql<Array<ApprovalRow>>`
+      select a.id a_id, a.status a_status, a.decided_by a_decided_by, a.auto_send_target_at a_auto,
+        a.created_at::text a_created_at, a.lead_id a_lead_id, a.draft_id a_draft_id,
+        coalesce(d.payload->>'edited_body', d.payload->>'body') as body,
+        coalesce(d.payload->>'kind','reply') as kind,
+        d.payload->'verifier_meta'->>'pass' as review_pass,
+        d.payload->'verifier_meta'->'reasons' as review_reasons,
+        d.payload->'verifier_meta'->>'attempts' as review_attempts,
+        d.payload->'dm_voice_check'->>'pass' as dm_writing_pass,
+      coalesce(d.payload->>'edited_body', d.payload->>'body') is distinct from d.payload->>'body' as dm_writing_stale,
+        d.payload->'dm_voice_check'->'reasons' as dm_writing_reasons,
+        d.payload->'dm_voice_check'->>'attempts' as dm_writing_attempts,
+        l.external_id l_external_id, l.author_handle l_author_handle, l.tier l_tier,
+        l.classifier_label l_label, l.classifier_score l_score, l.priority l_priority,
+        l.payload->>'text' as lead_text
+      from noelle.approvals a
+      left join noelle.drafts d on d.id = a.draft_id
+      left join noelle.leads  l on l.id = d.lead_id
+      where a.org_id = ${org.orgId} and a.lead_id = ${main.a_lead_id}
+      order by a.created_at asc`;
+  }
+
+  const header = [
+    `## Approval ${main.a_id}`,
+    `- **platform:** ${main.platform ?? "x"}`,
+    `- **author:** ${main.l_author_handle ? `@${main.l_author_handle}` : "—"}`,
+    `- **lead score:** ${main.l_score ?? "—"} · **tier:** ${main.l_tier ?? "—"} · **label:** ${main.l_label ?? "—"}`,
+    `- **lead:** ${main.l_external_id ?? "—"}`,
+    `- **source:** ${main.source_url ?? "—"}`,
+    "",
+    `**Lead text:**`,
+    main.lead_text ?? "_none_",
+    "",
+    `### Angles (${angles.length})`,
+  ].join("\n");
+
+  const angleBlocks = angles
+    .map((a) =>
+      [
+        `#### ${a.kind} — ${a.a_status}  (approval_id: ${a.a_id})`,
+        renderReview(a),
+        a.body ?? "_no body_",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    )
+    .join("\n\n");
+
+  return text(`${header}\n\n${angleBlocks}`);
+}
+
+interface SendFetchRow {
+  lead_id: string | null;
+  status: string;
+  kind: string;
+  draft_id: string | null;
+  external_id: string | null;
+  body: string | null;
+  platform: string | null;
+}
+
+async function sendDraft(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("send a draft");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const approvalId = reqStr(args, "approvalId");
+  const providedBody = optStr(args, "body");
+  const provided = providedBody !== undefined;
+
+  const fetched = await ctx.sql<Array<SendFetchRow>>`
+    select a.lead_id, a.status, coalesce(d.payload->>'kind','reply') as kind, d.id as draft_id,
+      l.external_id, coalesce(d.payload->>'edited_body', d.payload->>'body') as body,
+      coalesce(l.platform,'x') as platform
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads l on l.id = d.lead_id
+    where a.id = ${approvalId} and a.org_id = ${org.orgId}`;
+  const row = fetched[0];
+  if (!row) throw new NoelleError(`Approval ${approvalId} not found in ${org.name}.`);
+  if (row.status !== "pending")
+    throw new NoelleError(`Approval ${approvalId} is ${row.status}, not pending — cannot send.`);
+  if ((row.platform ?? "x") !== "x") {
+    throw new NoelleError(
+      "noelle_send_draft only queues or sends X drafts. Use the platform review UI/manual send flow, then noelle_mark_sent if you need to record it.",
