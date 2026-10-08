@@ -198,3 +198,67 @@ export function readFaithfulVoices(config: unknown): string[] {
 export function pickFaithfulVoice(
   voices: string[],
   seed: string,
+  weights?: number[],
+): string | null {
+  if (!voices || voices.length === 0) return null;
+  if (voices.length === 1) return voices[0]!;
+  const r = makeSeededRng(seed)();
+  if (weights && weights.length === voices.length) {
+    const safe = weights.map((w) => (Number.isFinite(w) && w > 0 ? w : 0));
+    const total = safe.reduce((s, w) => s + w, 0);
+    if (total > 0) {
+      const target = r * total;
+      let acc = 0;
+      for (let i = 0; i < voices.length; i++) {
+        acc += safe[i]!;
+        if (target < acc) return voices[i]!;
+      }
+      return voices[voices.length - 1]!; // float-rounding guard
+    }
+  }
+  const idx = Math.min(voices.length - 1, Math.floor(r * voices.length));
+  return voices[idx]!;
+}
+
+/**
+ * The per-voice weights parallel to readFaithfulVoices, or undefined when unset
+ * or length-mismatched (pickFaithfulVoice then draws uniformly). Only meaningful
+ * alongside an explicit faithfulVoices list of the same length.
+ */
+export function readFaithfulVoiceWeights(config: unknown): number[] | undefined {
+  const parsed = AccountFeederConfigSchema.safeParse(
+    config && typeof config === "object" ? config : {},
+  );
+  if (!parsed.success) return undefined;
+  const voices = parsed.data.faithfulVoices;
+  const weights = parsed.data.faithfulVoiceWeights;
+  if (!voices || !weights || weights.length !== voices.length) return undefined;
+  return weights;
+}
+
+/** Read the pinned handle off an instance's account_feeder_config (or null). */
+export function readPinnedHandle(config: unknown): string | null {
+  if (!config || typeof config !== "object") return null;
+  const parsed = AccountFeederConfigSchema.safeParse(config);
+  const handle = parsed.success ? parsed.data.pinnedStyleHandle : undefined;
+  return handle && handle.trim() ? handle.trim() : null;
+}
+
+/**
+ * Shape the feeder config for the PINNED selection: parse the base config (bad /
+ * missing → schema defaults) and floor maxStyleExemplars at PIN_MIN_EXEMPLARS so the
+ * named voice actually transfers. Variety drops to 0 — with the pool already
+ * restricted to one account we want its best-fit posts, not a shuffled sample.
+ * Returns a plain object the selector re-parses cleanly.
+ */
+export function pinnedSelectConfig(config: unknown): Record<string, unknown> {
+  const base = AccountFeederConfigSchema.safeParse(
+    config && typeof config === "object" ? config : {},
+  );
+  const cfg = base.success ? base.data : AccountFeederConfigSchema.parse({});
+  return {
+    ...cfg,
+    maxStyleExemplars: Math.max(cfg.maxStyleExemplars, PIN_MIN_EXEMPLARS),
+    varietyTemperature: 0,
+  };
+}
