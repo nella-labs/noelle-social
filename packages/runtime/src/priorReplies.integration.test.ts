@@ -198,3 +198,39 @@ describe.skipIf(!url)("reply memory isolation (PostgreSQL)", () => {
   it("uses the trimmed replacement edit", async () => {
     await save({ body: "old reply", edited: "  new reply  " });
     expect(await memory()).toEqual({ perAuthor: ["new reply"], feed: ["new reply"], voice: [{ post: "post target", reply: "new reply" }] });
+  });
+
+  it("filters cleared edits before limiting so they cannot starve older replies", async () => {
+    await save({ body: "older reply", at: "2026-10-04T12:00:00Z" });
+    await save({ edited: "\n\u00a0", at: "2026-10-05T12:00:00Z" });
+    expect(await memory(instance, 1)).toEqual({ perAuthor: ["older reply"], feed: ["older reply"], voice: [{ post: "post target", reply: "older reply" }] });
+  });
+
+  it("filters empty source posts before the voice limit", async () => {
+    await save({ body: "older reply", at: "2026-10-04T12:00:00Z" });
+    const blankPost = await addLead(org, instance, "target", "\n\u00a0");
+    await save({ draftLead: blankPost, approvalLead: blankPost, body: "no source" });
+    expect(await getVoiceExemplars(sql, { agentInstanceId: instance, limit: 1 })).toEqual([{ post: "post target", reply: "older reply" }]);
+  });
+
+  it("preserves sent priority for a person and pure recency for the feed", async () => {
+    await save({ body: "sent reply", at: "2026-10-04T12:00:00Z" });
+    await save({ body: "pending reply", status: "pending", at: "2026-10-05T12:00:00Z" });
+    expect((await memory(instance, 1)).perAuthor).toEqual(["sent reply"]);
+    expect((await memory(instance, 1)).feed).toEqual(["pending reply"]);
+    expect((await memory(instance, 1)).voice).toEqual([{ post: "post target", reply: "sent reply" }]);
+  });
+
+  it("preserves kind, human review, author, and excluded lead selection", async () => {
+    await save({ body: "dm reply", kind: "dm" });
+    await save({ body: "auto reply", via: "api" });
+    await save({ body: "edited reply", via: "api", edited: "human edit" });
+    await save({ draftLead: otherAuthorLead, approvalLead: otherAuthorLead, body: "another reply" });
+    expect((await memory()).perAuthor).toEqual(expect.arrayContaining(["auto reply", "human edit"]));
+    expect((await memory()).perAuthor).not.toContain("another reply");
+    expect((await memory()).feed).not.toContain("dm reply");
+    expect((await memory()).voice.map((row) => row.reply)).not.toContain("auto reply");
+    expect((await memory()).voice.map((row) => row.reply)).toContain("human edit");
+    expect(await getRecentRepliesToAuthor(sql, { agentInstanceId: instance, authorHandle: "target", excludeLeadId: lead, limit: 10 })).toEqual([]);
+  });
+});
