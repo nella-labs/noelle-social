@@ -398,3 +398,203 @@ describe("findReplySubmit — anchored fallback + decoy rejection (ports #407/#4
       <button id="before">Comment</button>
       <comment-composer-host>
         <div contenteditable="true" name="body" role="textbox"></div>
+        <button id="after">Comment</button>
+      </comment-composer-host>`);
+    expect(findReplySubmit(root, "new")!.id).toBe("after");
+  });
+  it("WAIT-NEVER-WIDEN: a disabled real submit is returned (→ reply-submit-disabled) over an enabled decoy elsewhere", () => {
+    const root = mount(`
+      <comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox"></div>
+        <button type="submit" slot="submit-button" disabled id="real">Comment</button>
+      </comment-composer-host>
+      <div><button id="decoy">Post</button></div>`);
+    // The climb resolves at the composer level and returns the DISABLED real
+    // submit — the locator reports reply-submit-disabled and the background
+    // waits; it must never widen to the enabled bare-word decoy outside.
+    expect(findReplySubmit(root, "new")!.id).toBe("real");
+  });
+  it("WORD GATE: a non-worded, non-slotted button never qualifies", () => {
+    const root = mount(`
+      <div contenteditable="true" name="body" role="textbox"></div>
+      <button>Share</button><button>Award</button>`);
+    expect(findReplySubmit(root, "new")).toBeNull();
+  });
+  it("bare 'Reply' qualifies only when slot/type submit-styled (hook-less opener protection)", () => {
+    const root = mount(`
+      <div contenteditable="true" name="body" role="textbox"></div>
+      <button id="bare">Reply</button>`);
+    expect(findReplySubmit(root, "new")).toBeNull();
+    const root2 = mount(`
+      <div contenteditable="true" name="body" role="textbox"></div>
+      <button type="submit" id="styled">Reply</button>`);
+    expect(findReplySubmit(root2, "new")!.id).toBe("styled");
+  });
+});
+
+describe("diagnoseReplySubmit — failure-bucket telemetry (ports #444)", () => {
+  const never0 = () => false; // every button "has a rect"
+
+  it("a disabled real submit buckets as wf=1,en=0 with top=<label>_dis", () => {
+    const root = mount(`
+      <comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox"></div>
+        <button type="submit" slot="submit-button" disabled>Comment</button>
+      </comment-composer-host>`);
+    const d = diagnoseReplySubmit(root, "new", never0);
+    expect(d).toMatchObject({ box: true, wf: 1, en: 0, vis: 0, slots: 1 });
+    expect(d.top).toBe("Comment_dis");
+  });
+
+  it("an enabled submit with a ZERO rect buckets as en=1,vis=0 with top=<label>_zr", () => {
+    const root = mount(`
+      <comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox"></div>
+        <button type="submit" slot="submit-button">Comment</button>
+      </comment-composer-host>`);
+    const d = diagnoseReplySubmit(root, "new", () => true); // everything zero-rect
+    expect(d).toMatchObject({ box: true, wf: 1, en: 1, vis: 0 });
+    expect(d.top).toBe("Comment_zr");
+  });
+
+  it("no worded submit at all → wf=0; the only worded button is a PRECEDING toggle → top=_pre", () => {
+    const root = mount(`
+      <button>Comment</button>
+      <div contenteditable="true" name="body" role="textbox"></div>`);
+    const d = diagnoseReplySubmit(root, "new", never0);
+    expect(d).toMatchObject({ box: true, wf: 0, en: 0, slots: 0 });
+    expect(d.top).toBe("Comment_pre");
+  });
+
+  it("counts slotted submits inside the TARGET comment's composer scope (scoped=)", () => {
+    const root = mount(`
+      <comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox"></div>
+        <button type="submit" slot="submit-button">Comment</button>
+      </comment-composer-host>
+      <shreddit-comment thingid="t1_c1">
+        <comment-composer-host>
+          <div contenteditable="true" name="body" role="textbox"></div>
+          <button type="submit" slot="submit-button">Comment</button>
+        </comment-composer-host>
+      </shreddit-comment>`);
+    const d = diagnoseReplySubmit(root, "new", never0, "c1");
+    expect(d).toMatchObject({ slots: 2, scoped: 1 });
+  });
+
+  it("no composer at all → box=false, top=<label>_nobox", () => {
+    const root = mount(`<button type="submit" slot="submit-button">Comment</button>`);
+    const d = diagnoseReplySubmit(root, "new", never0);
+    expect(d.box).toBe(false);
+    expect(d.top).toBe("Comment_nobox");
+  });
+
+  it("region dump names each button's shape (pos/type/flags/group) — a disabled real submit", () => {
+    const root = mount(`
+      <comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox"></div>
+        <button type="submit" slot="submit-button" disabled>Comment</button>
+      </comment-composer-host>`);
+    const d = diagnoseReplySubmit(root, "new", never0);
+    // FOLLOWS the box (f), slot-styled (s), disabled(1) + rect-ok(0) + worded(1),
+    // no decoy group (n).
+    expect(d.region).toContain("Comment_fs_101_gn");
+  });
+
+  it("region exposes a reply-opener DECOY as group=o so it can't be mistaken for the submit", () => {
+    const root = mount(`
+      <shreddit-comment-action-row><button>Reply</button></shreddit-comment-action-row>
+      <comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox"></div>
+        <button type="submit" slot="submit-button">Comment</button>
+      </comment-composer-host>`);
+    const d = diagnoseReplySubmit(root, "new", never0);
+    // the action-row "Reply" PRECEDES the box (p) and is grouped as an opener (o)…
+    expect(d.region).toMatch(/Reply_p._\d\d\d_go/);
+    // …while the real FOLLOWING submit shows slot-styled (s), group none (n).
+    expect(d.region).toContain("Comment_fs");
+    expect(d.region).toContain("_gn");
+  });
+});
+
+describe("chat-drawer exclusion (ports #442) — never type/submit into Reddit chat", () => {
+  const CHAT = `
+    <rs-message-composer>
+      <div contenteditable="true" name="body" role="textbox" id="chat-box"></div>
+      <button type="submit" id="chat-send">Post</button>
+    </rs-message-composer>`;
+  it("findReplyBox skips the chat composer entirely", () => {
+    expect(findReplyBox(mount(CHAT), "new")).toBeNull();
+  });
+  it("findReplyBox picks the real composer even when the chat drawer mounts FIRST in the DOM", () => {
+    const root = mount(CHAT + `<div contenteditable="true" name="body" role="textbox" id="real-box"></div>`);
+    expect(findReplyBox(root, "new")!.id).toBe("real-box");
+  });
+  it("findReplySubmit never returns a chat-drawer button", () => {
+    expect(findReplySubmit(mount(CHAT), "new")).toBeNull();
+  });
+  it("aria backstop: an editable named 'Message …' is skipped even outside known chat tags", () => {
+    const root = mount(`
+      <div contenteditable="true" role="textbox" aria-label="Message ada_lovelace" id="dm"></div>
+      <div contenteditable="true" name="body" role="textbox" id="real-box"></div>`);
+    expect(findReplyBox(root, "new")!.id).toBe("real-box");
+  });
+});
+
+describe("composer + reply box + submit (old Reddit)", () => {
+  it("entry === box === the visible textarea (no expand step); submit is button.save", () => {
+    const root = mount(OLD_COMPOSER);
+    const entry = findComposerEntry(root, "old")!;
+    expect(entry.tagName.toLowerCase()).toBe("textarea");
+    expect(entry.getAttribute("name")).toBe("text");
+    expect(findReplyBox(root, "old")).toBe(entry);
+    expect(findReplySubmit(root, "old")!.className).toContain("save");
+  });
+  it("prefers an open child reply box over the always-present post box", () => {
+    const root = mount(`
+      ${OLD_COMPOSER}
+      <div class="thing comment"><div class="child">
+        <div class="usertext-edit"><textarea name="text" id="child-box"></textarea></div>
+        <div class="usertext-buttons"><button class="save" id="child-save">save</button></div>
+      </div></div>`);
+    expect(findReplyBox(root, "old")!.id).toBe("child-box");
+    expect(findReplySubmit(root, "old")!.id).toBe("child-save");
+  });
+});
+
+// ── Ambient decoys ───────────────────────────────────────────────────────────
+
+describe("ambient decoys", () => {
+  it("finds a post's comments link to open (old Reddit)", () => {
+    const root = mount(`<div class="thing link" data-url="u"><a class="comments" href="/r/x/comments/1/">42 comments</a></div>`);
+    const found = findAmbientComments(root, "old");
+    expect(found).toBeTruthy();
+    expect((found!.el.textContent ?? "").trim()).toBe("42 comments");
+  });
+});
+
+// ── Upvote (operator opt-in; UPVOTE-ONLY, never a downvote) ──────────────────
+
+/** Build a new-Reddit shreddit-post with its action bar in an OPEN shadow root. */
+function newPostWithUpvote(opts: { pressed?: boolean; id?: string } = {}): Element {
+  const post = document.createElement("shreddit-post");
+  post.setAttribute("id", opts.id ?? "t3_abc123");
+  post.setAttribute("permalink", "/r/SaaS/comments/abc123/how-we-hit-10k-mrr/");
+  const shadow = post.attachShadow({ mode: "open" });
+  shadow.innerHTML = `
+    <button data-action-bar-action="upvote" aria-pressed="${opts.pressed ? "true" : "false"}">Upvote</button>
+    <button data-action-bar-action="downvote" aria-pressed="false">Downvote</button>`;
+  document.body.appendChild(post);
+  return post;
+}
+
+describe("findUpvoteButton (UPVOTE-ONLY)", () => {
+  it("new Reddit: reaches into shreddit-post's OPEN shadow root for the upvote button", () => {
+    const post = newPostWithUpvote();
+    const btn = findUpvoteButton(post, "new")!;
+    expect(btn).toBeTruthy();
+    expect(btn.getAttribute("data-action-bar-action")).toBe("upvote"); // NEVER 'downvote'
+  });
+  it("new Reddit: skips an already-upvoted post (aria-pressed='true')", () => {
+    const post = newPostWithUpvote({ pressed: true });
+    expect(findUpvoteButton(post, "new")).toBeNull();
