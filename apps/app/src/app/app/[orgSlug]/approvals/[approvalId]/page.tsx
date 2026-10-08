@@ -198,3 +198,203 @@ export default async function ApprovalDetailPage({
     filters;
   const filterQuery = approvalFilterQuery(filters);
   const inFilterScope =
+    filterStatus === "all" || filterStatus === approval.status;
+  // Match the list's "Last batch" scope so the stepper walks the same set.
+  const lastBatchSince =
+    inFilterScope && batch === "last"
+      ? ((await listAgentInstancesForOrg(approval.org_id).catch(() => []))
+          .find((i) => i.role === "x_intern")?.last_goal_started_at ?? null)
+      : null;
+  const scopeRows = inFilterScope
+    ? await listPendingApprovalsForOrg(
+        approval.org_id,
+        filterStatus === "pending" ? 300 : 50,
+        { minScore, status: filterStatus, source, watchlist, sort, lastBatchSince },
+      ).catch(() => [])
+    : [];
+  const pendingIds = dedupeApprovalsByLead(
+    latestPerWatchlisted
+      ? keepLatestPostPerWatchlistedPerson(scopeRows)
+      : scopeRows,
+  ).map((r) => r.approval.id);
+  // The clicked approval may not be the per-lead representative; anchor the
+  // pager on whichever representative shares this lead so prev/next still work.
+  const pagerAnchor =
+    pendingIds.find((id) => row.siblings.some((s) => s.approval.id === id)) ??
+    approval.id;
+  const pager = pagerNeighbors(pendingIds, pagerAnchor);
+  const showPager = pager.index !== -1 && pager.total > 1;
+  const nextHref = pager.nextId
+    ? `/app/${orgSlug}/approvals/${pager.nextId}${filterQuery}`
+    : null;
+
+  const lp = leadPayload(lead);
+
+  // Assemble the WHOLE lead onto one page: every reply angle (each its own
+  // approval row) plus the DM. The clicked approval is just the entry point.
+  const replyDrafts = row.siblings
+    .filter((s) => s.draft && draftPayload(s.draft).kind !== "dm")
+    .map((s) => ({
+      approvalId: s.approval.id,
+      status: s.approval.status,
+      payload: draftPayload(s.draft),
+    }));
+  const dmSibling = row.siblings.find(
+    (s) => s.draft && draftPayload(s.draft).kind === "dm",
+  );
+  const dmPayload = dmSibling ? draftPayload(dmSibling.draft) : null;
+  const dmBody = dmPayload ? bodyForSelectedAngle(dmPayload) ?? "" : "";
+  const dmPending = dmSibling?.approval.status === "pending";
+  const dmApprovalId = dmSibling?.approval.id ?? approval.id;
+
+  const handle = lp.author_handle ? `@${lp.author_handle}` : "—";
+  const handleUrl = lp.originalPostUrl ?? null;
+  // Internal contact page (profile + every reply/DM drafted for them). Contacts
+  // is the single person surface, so this links into /contacts/[id] — present
+  // only when the author is a known contact (i.e. watchlisted at some point).
+  const personId =
+    approval.org_id && lp.author_handle
+      ? await getPersonIdForHandle(approval.org_id, lp.author_handle)
+      : null;
+  const personHref = personId ? `/app/${orgSlug}/contacts/${personId}` : null;
+  // Real watchlist membership for the VIP banner's "On watchlist ✓" state —
+  // `lead.priority` only flags leads that CAME from the watchlist lane, so a
+  // person added via the banner (whose existing lead isn't priority) would
+  // otherwise show "Add to watchlist" again after a reload. Check the actual
+  // x_watchlist_people table for this author's handle instead.
+  const authorWatched =
+    (lead?.priority ?? false) ||
+    (!!lp.author_handle &&
+      (await getWatchlistPeopleForInstance(approval.agent_instance_id).catch(() => [])).some(
+        (p) => p.handle.toLowerCase() === lp.author_handle!.toLowerCase(),
+      ));
+  const followers = lp.author_followers;
+  const followerLabel =
+    followers != null ? `${(followers / 1000).toFixed(1)}k followers` : null;
+  const postText = lp.post_text;
+  const postedAt = lp.posted_at;
+  // Real classifier columns (cloudsql/0005) trump the payload mirror — the
+  // discovery worker doesn't populate them.
+  const tier = lead?.tier ?? lp.tier ?? null;
+  const classifierScore = lead?.classifier_score ?? null;
+  const classifierLabel = lead?.classifier_label ?? null;
+  const trigger = lp.matched_trigger_id ?? null;
+  // Voice anchors the drafter used to ground this lead's drafts (persisted via
+  // the outbound payload). Empty when the lead predates anchor persistence.
+  const anchors = lp.anchors ?? [];
+
+  // Reply angles still pending (the picker) vs. all of them (for the actioned
+  // banner). Each angle carries its own approvalId so "approve" sends the
+  // selected one; the send handler auto-skips the other reply siblings.
+  const withQuality = <T extends { quality?: number | null }>(a: T): T => ({
+    ...a,
+    quality: a.quality ?? classifierScore,
+  });
+  const angles = buildAnglesFromDrafts(
+    replyDrafts.filter((d) => d.status === "pending"),
+  ).map(withQuality);
+  const bannerAngles = buildAnglesFromDrafts(replyDrafts).map(withQuality);
+
+  // Lead-level disposition: act while anything is pending; otherwise show the
+  // banner reflecting what already happened (sent wins over skipped).
+  const anyPending = angles.length > 0 || dmPending;
+  const sentSibling = row.siblings.find((s) => s.approval.status === "sent");
+  const leadStatus = sentSibling
+    ? "sent"
+    : row.siblings.some((s) => s.approval.status === "skipped")
+      ? "skipped"
+      : approval.status;
+  const isActioned = !anyPending;
+  const postedUrl = sentSibling
+    ? sentReplyUrl({
+        sentUrl: draftPayload(sentSibling.draft).sent_url,
+        authorHandle: lp.author_handle,
+      })
+    : null;
+
+  // The classifier mirrors tier, classifier_score, classifier_label onto
+  // noelle.leads — if any landed we consider the classifier "synced".
+  const classifierKnown =
+    classifierScore != null || tier != null || classifierLabel != null;
+  const pushed = approval.created_at ? timeAgo(approval.created_at) : "—";
+
+  return (
+    <>
+      <PageHeader
+        eyebrow={`X Intern · lead · ${approval.id.slice(0, 8)}`}
+        title={
+          <>
+            Engage{" "}
+            {personHref ? (
+              <Link href={personHref} style={{ color: "inherit" }} title="View this contact">
+                <em>{handle}</em>
+              </Link>
+            ) : (
+              <em>{handle}</em>
+            )}
+          </>
+        }
+        sub={
+          anyPending ? (
+            <>
+              {angles.length > 0
+                ? `Pick one of ${angles.length} reply angle${angles.length === 1 ? "" : "s"}`
+                : "No reply angle left"}
+              {dmPending ? " and/or send the DM" : ""}, then approve. Pushed{" "}
+              {pushed}.
+            </>
+          ) : (
+            <>This lead has been actioned. Pushed {pushed}.</>
+          )
+        }
+        right={
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            {postedUrl ? (
+              <a
+                href={postedUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="btn btn-sm btn-primary"
+                style={{ textDecoration: "none" }}
+                title="Open Vega's posted reply on X"
+              >
+                View reply on X ↗
+              </a>
+            ) : null}
+            {showPager ? (
+              <ReviewPager
+                orgSlug={orgSlug}
+                index={pager.index}
+                total={pager.total}
+                prevId={pager.prevId}
+                nextId={pager.nextId}
+                query={filterQuery}
+              />
+            ) : null}
+            <Link
+              href={`/app/${orgSlug}/approvals${filterQuery}`}
+              className="btn btn-sm btn-ghost"
+              style={{ textDecoration: "none" }}
+            >
+              ← All drafts
+            </Link>
+          </div>
+        }
+      />
+
+      <div className={styles.grid}>
+        {/* LEFT — reply angle picker + the DM, both on one page; or, once the
+            whole lead is actioned, a single post-action banner. */}
+        {isActioned ? (
+          <ActionedBanner
+            status={leadStatus}
+            postedUrl={postedUrl}
+            skipReason={approval.skip_reason}
+            decidedAt={approval.decided_at}
+            angles={bannerAngles}
+            isDM={false}
+            dmBody={dmBody}
+          />
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            {row.vipSignal?.vip ? (
