@@ -198,3 +198,112 @@ export function createActorPanel(
       const event = state?.lastEvent ?? "";
       const eventError = state?.status === "halted-challenge"
         ? event || "Challenge detected; actor stopped"
+        : /\b(fail(?:ed|ure)?|error|challenge|blocked|unavailable)\b|\berr:/i.test(event) ? event : "";
+      showError(eventError);
+    },
+  };
+}
+
+/** Backend-only status polling; it never causes a LinkedIn or X page visit. */
+export function watchActorReplyCap(
+  view: ActorPanelView,
+  bridge: {
+    read(): Promise<{ ok?: boolean; cap?: ActorReplyCap; error?: string } | null>;
+    write(cap: number | null, minimum?: number | null): Promise<{ ok?: boolean; cap?: ActorReplyCap; error?: string } | null>;
+  },
+): void {
+  let inFlight = false;
+  let revision = 0;
+  const timebox = <T>(request: Promise<T>): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("actor response timed out")), 8_000);
+    });
+    return Promise.race([request, timeout]).finally(() => { if (timer) clearTimeout(timer); });
+  };
+  const valid = (value: ActorReplyCap | undefined): value is ActorReplyCap => !!value &&
+    Number.isSafeInteger(value.sent) && value.sent >= 0 &&
+    (value.cap === null || Number.isSafeInteger(value.cap) && value.cap >= 0 && value.cap <= 500) &&
+    (value.remaining === null || Number.isSafeInteger(value.remaining) && value.remaining >= 0);
+  const poll = async () => {
+    if (inFlight) return;
+    inFlight = true;
+    const startedAtRevision = revision;
+    try {
+      const result = await timebox(bridge.read());
+      if (startedAtRevision !== revision) return;
+      view.setReplyCap(result?.ok && valid(result.cap) ? result.cap : null,
+        result?.ok && valid(result.cap) ? "" : `Reply count unavailable: ${result?.error ?? "check the API"}`);
+    } catch (error) {
+      if (startedAtRevision !== revision) return;
+      view.setReplyCap(null, `Reply count unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    } finally { inFlight = false; }
+  };
+  view.query<HTMLButtonElement>("#na-cap-save").addEventListener("click", () => {
+    void (async () => {
+      const input = view.query<HTMLInputElement>("#na-cap-input");
+      const raw = input.value.trim();
+      const cap = raw === "" ? null : Number(raw);
+      if (cap !== null && (!Number.isInteger(cap) || cap < 0 || cap > 500)) {
+        view.query("#na-cap-status").textContent = "Enter a whole number from 0 to 500";
+        return;
+      }
+      const settings = view.query<HTMLDetailsElement>("#na-cap");
+      const vary = settings.querySelector<HTMLInputElement>("#na-cap-vary");
+      const minimumInput = settings.querySelector<HTMLInputElement>("#na-cap-minimum");
+      const varyChecked = vary?.checked;
+      const minimumRaw = minimumInput?.value.trim();
+      const minimum = varyChecked ? Number(minimumRaw) : undefined;
+      if (minimum !== undefined && (minimumRaw === "" || cap === null || !Number.isInteger(minimum) || minimum < 0 || minimum > cap)) {
+        view.query("#na-cap-status").textContent = "Enter a daily minimum from 0 to the configured ceiling";
+        return;
+      }
+      const save = view.query<HTMLButtonElement>("#na-cap-save");
+      save.disabled = true;
+      revision++;
+      try {
+        const result = await timebox(bridge.write(cap, minimum));
+        if (!result?.ok || !valid(result.cap)) throw new Error(result?.error ?? "API did not save the cap");
+        revision++;
+        const unchanged = input.value.trim() === raw && vary?.checked === varyChecked
+          && minimumInput?.value.trim() === minimumRaw;
+        view.setReplyCap(result.cap, "Saved", unchanged);
+      } catch (error) {
+        revision++;
+        view.query("#na-cap-status").textContent = `Could not confirm save: ${error instanceof Error ? error.message : String(error)}`;
+      } finally {
+        save.disabled = false;
+      }
+    })();
+  });
+  void poll();
+  setInterval(() => { void poll(); }, 15_000);
+}
+
+/** One backend-only count read per minute; the feed navigation cadence is untouched. */
+export function watchActorLeadCapacity(
+  view: ActorPanelView,
+  query: () => Promise<{ ok?: boolean; capacity?: { occupied: number; limit: number }; error?: string } | null>,
+): void {
+  let inFlight = false;
+  const poll = async () => {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      const result = await query();
+      const capacity = result?.capacity;
+      if (result?.ok && capacity && Number.isSafeInteger(capacity.occupied) &&
+          Number.isSafeInteger(capacity.limit) && capacity.occupied >= 0 && capacity.limit > 0) {
+        view.setLeadCapacity(capacity);
+      } else {
+        view.setLeadCapacity(null, `Lead count unavailable: ${result?.error ?? "reload the extension or check the API"}`);
+      }
+    } catch (error) {
+      view.setLeadCapacity(null, `Lead count unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      inFlight = false;
+    }
+  };
+  void poll();
+  setInterval(() => { void poll(); }, 60_000);
+}
