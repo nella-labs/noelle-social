@@ -198,3 +198,203 @@ async function loadVideoCurrentDraft(
   // scripter crash fix in docs). Best-effort: a failure just drops the grounding.
   const ids = Array.isArray(r.inspiration_clip_ids) ? r.inspiration_clip_ids.filter(Boolean) : [];
   let inspirations: ChatVideoInspiration[] = [];
+  if (ids.length) {
+    const clipRows = await sql<Array<{
+      author_handle: string;
+      views: string | null;
+      author_follower_count: string | null;
+      why_it_worked: string | null;
+      hook_text: string | null;
+    }>>`
+      select c.author_handle,
+             c.views::text as views,
+             c.author_follower_count::text as author_follower_count,
+             t.teardown->>'whyItWorked'        as why_it_worked,
+             t.teardown->'hook'->>'text'        as hook_text
+      from noelle.video_clips c
+      left join noelle.video_teardowns t on t.clip_id = c.id
+      where c.agent_instance_id = ${inst.id} and c.org_id = ${inst.org_id}
+        and c.id::text = any(${ids})
+      order by c.views desc nulls last
+    `;
+    inspirations = clipRows.map((c) => {
+      const views = readSourceCount(c.views);
+      const followers = readSourceCount(c.author_follower_count);
+      const reach = measuredSourceRatio(views, followers);
+      return {
+        handle: normaliseHandle(c.author_handle) ?? c.author_handle,
+        views,
+        reachMultiple: reach,
+        hook: c.hook_text?.trim() || undefined,
+        whyItWorked: c.why_it_worked?.trim() || undefined,
+      };
+    });
+  }
+  const inspiredBy = [...new Set(inspirations.map((c) => c.handle).filter(Boolean))];
+
+  return {
+    hook: (r.idea_hook ?? "").trim(),
+    status: r.status ?? "draft",
+    beats: beats.map((b) => ({
+      tStart: numVal(b.tStart),
+      tEnd: numVal(b.tEnd),
+      purpose: String(b.purpose ?? "").trim(),
+      line: String(b.line ?? "").trim(),
+    })),
+    script: (r.final_script ?? r.script ?? "").trim(),
+    visuals: specs.map(specLabel).filter((v): v is string => !!v),
+    sounds: sounds
+      .map((s) => String(s.name ?? s.trackName ?? "").trim())
+      .filter((v): v is string => !!v),
+    inspiredBy,
+    inspirations,
+  };
+}
+
+/** Coerce a possibly-string/undefined JSON number to a finite number (0 fallback). */
+function numVal(v: unknown): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** A short human label for an on-screen visual spec (chart title / kind). */
+function specLabel(raw: Record<string, unknown>): string {
+  const title = typeof raw.title === "string" ? raw.title.trim() : "";
+  const kind = typeof raw.kind === "string" ? raw.kind.trim() : "";
+  if (title && kind) return `${title} (${kind})`;
+  return title || kind || "visual";
+}
+
+/** Nova's targeting: enabled watched creators + enabled niche lanes. */
+async function loadVideoTargeting(inst: NoelleAgentInstance): Promise<ChatTargeting> {
+  const [creators, niches] = await Promise.all([
+    sql<Array<{ handle: string }>>`
+      select handle from noelle.video_watchlist_sources
+      where agent_instance_id = ${inst.id} and org_id = ${inst.org_id} and enabled = true
+      order by created_at asc
+      limit 40
+    `,
+    sql<Array<{ query: string }>>`
+      select query from noelle.video_watchlist_niches
+      where agent_instance_id = ${inst.id} and org_id = ${inst.org_id} and enabled = true
+      order by created_at asc
+      limit 40
+    `,
+  ]);
+  return {
+    handles: creators.map((r) => r.handle),
+    keywords: niches.map((r) => r.query),
+  };
+}
+
+/** The distilled Brand Guide + the strongest harvested clips by views. */
+async function loadVideoIntel(inst: NoelleAgentInstance): Promise<ChatVideoIntel> {
+  const [guides, clips] = await Promise.all([
+    // The distiller stores the human-readable "what performs" line under
+    // profile->>'whatPerforms' (apps/video-intern/src/lib/distill.ts), not
+    // 'summary' — read the real key so the Brand Guide isn't silently empty.
+    sql<Array<{ scope: string; subject: string; summary: string | null; clips_analyzed: number | null }>>`
+      select scope, subject, profile->>'whatPerforms' as summary, clips_analyzed
+      from noelle.video_ultra_profiles
+      where agent_instance_id = ${inst.id} and org_id = ${inst.org_id}
+      order by refreshed_at desc nulls last
+      limit 8
+    `,
+    // Bigint text preserves nullable measurements for the shared count reader.
+    sql<Array<{ author_handle: string; views: string | null; caption: string | null }>>`
+      select author_handle, views::text as views, caption
+      from noelle.video_clips
+      where agent_instance_id = ${inst.id} and org_id = ${inst.org_id}
+      order by views desc nulls last
+      limit 6
+    `,
+  ]);
+  return {
+    brandGuide: guides
+      .filter((g) => g.summary && g.summary.trim())
+      .map((g) => ({
+        scope: g.scope === "niche" ? "niche" : g.scope === "account" ? "account" : "creator",
+        subject: g.subject === "me" ? "your account" : g.subject,
+        summary: (g.summary ?? "").trim(),
+        clipsAnalyzed: g.clips_analyzed ?? null,
+      })),
+    topClips: clips.map((c) => ({
+      handle: normaliseHandle(c.author_handle) ?? c.author_handle,
+      views: readSourceCount(c.views),
+      caption: (c.caption ?? "").replace(/\s+/g, " ").trim().slice(0, 140),
+    })),
+  };
+}
+
+async function loadReplyInternContext(
+  inst: NoelleAgentInstance,
+): Promise<AgentChatContext> {
+  const [approvals, totals, freshness, targeting, bestLeads] = await Promise.all([
+    loadTopPendingApprovals(inst).catch((err) => {
+      console.warn("[agent-chat] failed to load pending approvals", err);
+      return undefined;
+    }),
+    loadApprovalTotals(inst).catch((err) => {
+      console.warn("[agent-chat] failed to load approval totals", err);
+      return { pending: undefined, sentLifetime: undefined };
+    }),
+    loadWorkerFreshness(inst.role === "x_intern" ? X_INTERN_WORKERS : ["discovery", "classifier", "drafter"]).catch((err) => {
+      console.warn("[agent-chat] failed to load worker freshness", err);
+      return [] as ChatWorkerFreshness[];
+    }),
+    (inst.role === "x_intern" ? loadTargeting(inst) : loadInternWatchlist(inst).then((handles) => ({ handles, keywords: [] }))).catch((err) => {
+      console.warn("[agent-chat] failed to load targeting", err);
+      return undefined;
+    }),
+    loadBestLeads(inst).catch((err) => {
+      console.warn("[agent-chat] failed to load best leads", err);
+      return undefined;
+    }),
+  ]);
+
+  const ctx: AgentChatContext = { pendingApprovals: approvals };
+  if (totals.pending !== undefined) ctx.totalPendingCount = totals.pending;
+  if (totals.sentLifetime !== undefined) ctx.totalSentLifetime = totals.sentLifetime;
+  if (freshness.length > 0) ctx.workerFreshness = freshness;
+  // Custom objective only — the chat profile phrases the "no custom mission"
+  // case itself (it knows the default brief).
+  if (inst.objective && inst.objective.trim()) ctx.objective = inst.objective.trim();
+  ctx.targeting = targeting;
+  ctx.bestLeads = bestLeads;
+  return ctx;
+}
+
+/**
+ * The best current leads straight off `noelle.leads` — broader than the
+ * approvals queue (includes leads not yet drafted), ranked tier → score →
+ * recency, scoped to today. Gives the chat a real answer to "show me the
+ * best leads", with the available source-platform link per lead.
+ */
+async function loadBestLeads(inst: NoelleAgentInstance): Promise<ChatLeadSummary[]> {
+  type LeadRow = {
+    l_author_handle: string | null;
+    l_tier: string | null;
+    l_classifier_score: string | null;
+    l_post_id: string | null;
+    l_post_text: string | null;
+    l_payload: unknown;
+    has_draft: boolean;
+  };
+  // The tweet id lives in the `external_id` column and the post body in
+  // `payload->>'text'` (the discovery worker never writes post_id/post_text
+  // into payload) — coalesce so links/text are real. Same fallback chain the
+  // speedrun path uses (apps/app/src/lib/to-speedrun-draft.ts).
+  //
+  // Window = last 24h ("today's" leads); status past the classifier so every
+  // row has a tier/score worth ranking. Leads already drafted AND waiting in
+  // the approval queue are excluded here — they show in the queue snapshot
+  // (with a prefilled reply link) instead, so the two lists don't overlap.
+  const rows = await sql<LeadRow[]>`
+    select
+      l.author_handle                                       as l_author_handle,
+      l.tier                                                as l_tier,
+      l.classifier_score                                    as l_classifier_score,
+      coalesce(l.payload->>'post_id', l.external_id)        as l_post_id,
+      coalesce(l.payload->>'post_text', l.payload->>'text') as l_post_text,
+      l.payload as l_payload,
+      exists(select 1 from noelle.drafts d where d.lead_id = l.id and d.org_id=l.org_id) as has_draft
