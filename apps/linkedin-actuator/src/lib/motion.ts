@@ -1,0 +1,200 @@
+import type { Rng } from "./rng.js";
+
+export type Point = { x: number; y: number };
+
+// ===========================================================================
+// LEGACY PLANNERS — still imported by the CDP layer. Do NOT delete yet.
+// (mousePath / planScrollSteps will be removed once cdp.ts is rewired onto the
+//  new mousePlan / planScrollGestures planners below.)
+// ===========================================================================
+
+// Jittered quadratic-Bézier path with a randomized control point so the cursor
+// arcs toward the target like a hand, not a straight teleport. Ends exactly at `to`.
+export function mousePath(from: Point, to: Point, rng: Rng): Point[] {
+  const steps = rng.int(8, 18);
+  const cx = (from.x + to.x) / 2 + rng.float(-60, 60);
+  const cy = (from.y + to.y) / 2 + rng.float(-60, 60);
+  const pts: Point[] = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const mt = 1 - t;
+    const x = mt * mt * from.x + 2 * mt * t * cx + t * t * to.x + (i === steps ? 0 : rng.float(-1.5, 1.5));
+    const y = mt * mt * from.y + 2 * mt * t * cy + t * t * to.y + (i === steps ? 0 : rng.float(-1.5, 1.5));
+    pts.push({ x: Math.round(x), y: Math.round(y) });
+  }
+  pts[pts.length - 1] = { x: to.x, y: to.y };
+  return pts;
+}
+
+export function planScrollSteps(rng: Rng, totalPx: number): number[] {
+  const steps: number[] = [];
+  let done = 0;
+  while (done < totalPx) {
+    const delta = Math.round(rng.float(120, 420));
+    steps.push(delta);
+    done += delta;
+    if (rng.next() < 0.12) {
+      const back = -Math.round(rng.float(40, 160));
+      steps.push(back);
+      done += back;
+    }
+  }
+  return steps;
+}
+
+export function typingDelays(rng: Rng, length: number): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < length; i++) {
+    // Inter-key gap as a right-skewed logNormal (median ~68 ms) instead of a flat
+    // uniform(35,110): real keystroke timing IS log-normal, and the heavy right
+    // tail gives per-key hesitation for free. Mean (~74 ms) ≈ the old center, so
+    // the base cadence is not faster; the floor (38 ms) ≥ the old effective min.
+    const base = clamp(rng.logNormal(Math.log(68), 0.42), 38, 320);
+    // Two-tier "thinking" pauses layered on top: a frequent short word-boundary
+    // hesitation and a rare long distraction. Net effect is slightly SLOWER and
+    // much wider than the old single 6%×uniform(300,900) pause.
+    let pause = 0;
+    if (rng.next() < 0.1) pause += clamp(rng.logNormal(Math.log(220), 0.5), 90, 700);
+    if (rng.next() < 0.02) pause += clamp(rng.logNormal(Math.log(900), 0.5), 400, 2500);
+    out.push(Math.round(base + pause));
+  }
+  return out;
+}
+
+// ===========================================================================
+// MOUSE MODEL (§3c) — sigma-lognormal velocity envelope + overshoot/correct +
+// micro-tremor + variable point density + 2D-Gaussian click point.
+// All pure, all seeded by an injected Rng.
+// ===========================================================================
+
+function clamp(v: number, lo: number, hi: number): number {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+/**
+ * A 2D-Gaussian click point biased toward the element center (NOT the exact
+ * geometric center). The σ FRACTION is itself drawn per click (median ~0.20,
+ * spread 0.13–0.30 of the rect's width/height) so the positional scatter is
+ * hierarchical — a fixed σ is its own fingerprint. Clamped inside the rect.
+ * Kept sub-pixel (no rounding) so it essentially never equals the exact
+ * center — humans never hit the same pixel and never hit dead-center.
+ */
+export function clickPoint(
+  rect: { x: number; y: number; width: number; height: number },
+  rng: Rng,
+): Point {
+  const cx = rect.x + rect.width / 2;
+  const cy = rect.y + rect.height / 2;
+  // σ fraction is drawn PER CLICK (median ~0.20, was a fixed 0.18) so some
+  // clicks land tighter and some looser instead of every click sharing one
+  // identical Gaussian. The Gaussian stays centered on the geometric center, so
+  // the *mean* is still biased to the middle and the clamp keeps it in the rect.
+  const sigFracX = clamp(rng.normal(0.2, 0.04), 0.13, 0.3);
+  const sigFracY = clamp(rng.normal(0.2, 0.04), 0.13, 0.3);
+  const sx = rng.normal(cx, rect.width * sigFracX);
+  const sy = rng.normal(cy, rect.height * sigFracY);
+  return {
+    x: clamp(sx, rect.x, rect.x + rect.width),
+    y: clamp(sy, rect.y, rect.y + rect.height),
+  };
+}
+
+/**
+ * 7–13 Hz sinusoidal micro-tremor added to a base coordinate. Amplitude is an
+ * RMS draw `normal(0.4,0.28)` clamped [0.1,1.6] px (peak = RMS·√2 ≈ ≤2.3 px),
+ * with phase and frequency taken from the rng. Median amplitude is unchanged;
+ * only the spread (σ) and ceiling are widened so tremor excursions vary more.
+ * A human never holds a pixel perfectly still, so this is layered onto EVERY
+ * dispatched coordinate (moves + holds).
+ */
+export function tremor(base: Point, tMs: number, rng: Rng): Point {
+  const tSec = tMs / 1000;
+  const ampX = clamp(rng.normal(0.4, 0.28), 0.1, 1.6) * Math.SQRT2;
+  const ampY = clamp(rng.normal(0.4, 0.28), 0.1, 1.6) * Math.SQRT2;
+  const freqX = rng.float(7, 13);
+  const freqY = rng.float(7, 13);
+  const phaseX = rng.float(0, 2 * Math.PI);
+  const phaseY = rng.float(0, 2 * Math.PI);
+  return {
+    x: base.x + ampX * Math.sin(2 * Math.PI * freqX * tSec + phaseX),
+    y: base.y + ampY * Math.sin(2 * Math.PI * freqY * tSec + phaseY),
+  };
+}
+
+/** Pre-click hover dwell: logNormal with median ~220 ms, clamped [80,650].
+ *  σ_log widened 0.45→0.55 and the ceiling raised 450→650 so the occasional
+ *  longer "settle before the click" hover survives instead of piling up on a
+ *  hard wall. Median (central tendency) unchanged; the floor is not lowered. */
+export function hoverDwellMs(rng: Rng): number {
+  // median of a lognormal is exp(muLog); exp(5.394) ≈ 220.
+  return clamp(rng.logNormal(Math.log(220), 0.55), 80, 650);
+}
+
+// --- sigma-lognormal velocity envelope -------------------------------------
+
+type Impulse = { weight: number; mode: number; sigma: number };
+
+/**
+ * Lognormal "velocity" bump in normalized time τ∈(0,1], peaking at `mode`.
+ * (A lognormal pdf re-centered so its peak lands at the impulse mode.)
+ */
+function lognormalBump(tau: number, imp: Impulse): number {
+  if (tau <= 0) return 0;
+  // shift so the lognormal's natural mode (at t=1) lands at `imp.mode`.
+  const t = tau / imp.mode;
+  if (t <= 0) return 0;
+  const s = imp.sigma;
+  // lognormal pdf with median 1, scaled — peak occurs near t≈exp(-s²) ≈ 1.
+  const lt = Math.log(t);
+  return (imp.weight / (t * s)) * Math.exp(-(lt * lt) / (2 * s * s));
+}
+
+/** Build a 2–3 impulse sigma-lognormal velocity profile (primary peak 40–55%). */
+function buildEnvelope(rng: Rng): Impulse[] {
+  const primaryMode = rng.float(0.4, 0.55);
+  const impulses: Impulse[] = [
+    // σ (velocity-bump width) spread widened so the profile shape — sharp vs
+    // broad acceleration — varies far more move-to-move. Peak LOCATION (mode) is
+    // untouched, so the mid-path velocity-peak invariant holds.
+    { weight: 1, mode: primaryMode, sigma: clamp(rng.normal(0.5, 0.13), 0.3, 0.9) },
+  ];
+  // antagonist (deceleration) impulse, later and lighter
+  impulses.push({
+    weight: clamp(rng.normal(0.5, 0.18), 0.2, 0.9),
+    mode: clamp(primaryMode + rng.float(0.18, 0.34), 0.55, 0.92),
+    sigma: clamp(rng.normal(0.45, 0.13), 0.3, 0.85),
+  });
+  // optional 3rd (small early agonist) ~50% of the time
+  if (rng.next() < 0.5) {
+    impulses.push({
+      weight: clamp(rng.normal(0.3, 0.14), 0.1, 0.6),
+      mode: clamp(primaryMode - rng.float(0.18, 0.3), 0.08, 0.4),
+      sigma: clamp(rng.normal(0.4, 0.12), 0.28, 0.7),
+    });
+  }
+  return impulses;
+}
+
+function envelopeAt(tau: number, impulses: Impulse[]): number {
+  let v = 0;
+  for (const imp of impulses) v += lognormalBump(tau, imp);
+  // small velocity floor so the cursor never fully stalls mid-flight
+  return v + 0.04;
+}
+
+/**
+ * Plan a full human mouse move from `from` to `to` against a target of size W.
+ *
+ * - Cubic-Bézier spatial curve, both control points jittered 40–70px off the
+ *   chord and biased to ONE side (curvature ratio > 1.1).
+ * - Time re-parameterized by a sigma-lognormal velocity envelope (2–3 lognormal
+ *   impulses, primary peak at ~40–55% of the travel).
+ * - Movement time from Fitts: MT = a + b·log2(D/W+1), a=normal(150,40),
+ *   b=normal(140,30), clamped [180,900] ms.
+ * - Variable point density (≈18–40 pts for a 300–600px move): points are denser
+ *   near the endpoints (where velocity is low) via a cosine ease on arc-length.
+ * - `sleepsMs[i]` is the (non-uniform) time to traverse segment i, = Δarc / v.
+ * - `overshoot` lands `normal(7,4)` px beyond `to` along the travel direction;
+ *   `correctFrom` == overshoot (the dense low-velocity correction back to the
+ *   click point is dispatched by the CDP layer). `points` END at `to`.
+ */
