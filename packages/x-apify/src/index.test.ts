@@ -198,3 +198,203 @@ describe("createApifyXClient.userTweets", () => {
   it("dedupes repeated ids", async () => {
     const h = harness(() => ({ items: [SAMPLE, SAMPLE] }));
     const res = await h.client.userTweets({ handle: "x", limit: 40 });
+    expect(res.tweets).toHaveLength(1);
+    expect(res.resultCount).toBe(2);
+  });
+
+  it("appends server-side operators (replies/retweets/window) to the from: query", async () => {
+    // from: is a search query, so it honours the same advanced-search operators
+    // the keyword lane already uses. Excluding server-side matters because the
+    // actor bills per RETURNED item: a reply or out-of-window tweet fetched here
+    // is paid for and then dropped client-side.
+    const h = harness(() => ({ items: [] }));
+    const sinceISO = "2026-06-10T06:00:00.000Z";
+    await h.client.userTweets({
+      handle: "@DevBuilder",
+      limit: 20,
+      sinceISO,
+      excludeReplies: true,
+      excludeRetweets: true,
+    });
+    expect(h.body().searchTerms).toEqual([
+      `from:DevBuilder -filter:replies -filter:nativeretweets since_time:${Math.floor(new Date(sinceISO).getTime() / 1000)}`,
+    ]);
+    expect(h.body().maxItems).toBe(20);
+  });
+
+  it("keeps the bare from: query when no operator flags are set", async () => {
+    const h = harness(() => ({ items: [] }));
+    await h.client.userTweets({ handle: "devbuilder", limit: 20 });
+    expect(h.body().searchTerms).toEqual(["from:devbuilder"]);
+  });
+});
+
+describe("createApifyXClient.searchTimeline", () => {
+  it("passes the query through as searchTerms", async () => {
+    const h = harness(() => ({ items: [SAMPLE] }));
+    const res = await h.client.searchTimeline({ query: "ai agents min_faves:10", limit: 30 });
+    expect(h.body().searchTerms).toEqual(["ai agents min_faves:10"]);
+    expect(h.body().maxItems).toBe(30);
+    expect(res.tweets).toHaveLength(1);
+  });
+});
+
+describe("error handling", () => {
+  it("throws ApifyXError with the status on a non-ok response", async () => {
+    const h = harness(() => ({ status: 402, text: "nope" }));
+    await expect(h.client.userTweets({ handle: "x" })).rejects.toMatchObject({
+      name: "ApifyXError",
+      status: 402,
+    });
+  });
+
+  it("wraps a network failure as ApifyXError status 0", async () => {
+    const client = createApifyXClient({
+      token: "t",
+      fetchImpl: (async () => {
+        throw new Error("ECONNRESET");
+      }) as unknown as typeof fetch,
+    });
+    await expect(client.userTweets({ handle: "x" })).rejects.toBeInstanceOf(ApifyXError);
+  });
+});
+
+describe("checkApifyToken", () => {
+  it("returns alive + usage + the real cycle reset on a 200", async () => {
+    let calledUrl = "";
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      calledUrl = input.toString();
+      return new Response(
+        JSON.stringify({
+          data: {
+            plan: "FREE",
+            current: { monthlyUsageUsd: 3.5 },
+            limits: { maxMonthlyUsageUsd: 5 },
+            monthlyUsageCycle: { startAt: "2026-06-20T00:00:00.000Z", endAt: "2026-07-19T23:59:59.999Z" },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const h = await checkApifyToken("apify_api_good", { fetchImpl });
+    expect(h.alive).toBe(true);
+    expect(h.httpStatus).toBe(200);
+    expect(h.remainingUsd).toBe(1.5);
+    expect(h.cycleEndAt).toBe("2026-07-19T23:59:59.999Z");
+    expect(calledUrl).toContain("/v2/users/me/limits");
+    expect(calledUrl).toContain("token=apify_api_good");
+  });
+
+  it("omits cycleEndAt when the cycle isn't reported", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ data: { current: { monthlyUsageUsd: 1 } } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const h = await checkApifyToken("t", { fetchImpl });
+    expect(h.alive).toBe(true);
+    expect(h.cycleEndAt).toBeUndefined();
+  });
+
+  it("returns not-alive with httpStatus 401 on a genuinely bad/banned token", async () => {
+    const fetchImpl = (async () =>
+      new Response("token-not-found", { status: 401 })) as unknown as typeof fetch;
+    const h = await checkApifyToken("apify_api_dead", { fetchImpl });
+    expect(h.alive).toBe(false);
+    expect(h.httpStatus).toBe(401);
+  });
+
+  it("returns not-alive httpStatus 0 on a network error (never throws)", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("ENOTFOUND");
+    }) as unknown as typeof fetch;
+    const h = await checkApifyToken("t", { fetchImpl });
+    expect(h.alive).toBe(false);
+    expect(h.httpStatus).toBe(0);
+    expect(h.error).toContain("request failed");
+  });
+});
+
+describe("runActorSync real cost capture (drainLastRunUsd)", () => {
+  it("captures the run's real usageTotalUsd and drains it (reset to null on re-read)", async () => {
+    const h = harness(() => ({ items: [SAMPLE], usageTotalUsd: 0.37 }));
+    await h.client.userTweets({ handle: "devbuilder", limit: 25 });
+    expect(h.client.drainLastRunUsd?.()).toBe(0.37);
+    // Drained: a second read (no new run) is null → caller falls back to estimate.
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("is null when the run object reports no usage", async () => {
+    const h = harness(() => ({ items: [SAMPLE] })); // no usageTotalUsd
+    await h.client.userTweets({ handle: "devbuilder" });
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("polls a still-running run to completion, then returns its items + cost", async () => {
+    const h = harness(() => ({ items: [SAMPLE], usageTotalUsd: 0.02, runStatus: "RUNNING" }));
+    const res = await h.client.userTweets({ handle: "devbuilder" });
+    expect(res.tweets).toHaveLength(1);
+    expect(h.client.drainLastRunUsd?.()).toBe(0.02);
+  });
+
+  it("throws (and records no cost) when the run finishes not-SUCCEEDED", async () => {
+    const h = harness(() => ({ items: [SAMPLE], runStatus: "FAILED" }));
+    await expect(h.client.userTweets({ handle: "devbuilder" })).rejects.toBeInstanceOf(ApifyXError);
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("surfaces a token-fatal status on the run start so the rotator can retire it", async () => {
+    const h = harness(() => ({ status: 403, text: "Monthly usage hard limit exceeded" }));
+    await expect(h.client.userTweets({ handle: "devbuilder" })).rejects.toMatchObject({ status: 403 });
+  });
+});
+
+describe("scrapeFollowers (person discovery)", () => {
+  const person = (over: Record<string, unknown> = {}) => ({
+    userName: "cand",
+    id: "9",
+    name: "A Candidate",
+    description: "founder, devtools",
+    followers: 1200,
+    ...over,
+  });
+
+  // Minimal fake of the run lifecycle: POST /runs -> GET run -> GET dataset.
+  function fakeApify(items: unknown[]) {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const fetchImpl = (async (url: string, init?: { method?: string; body?: string }) => {
+      calls.push({ url, body: init?.body ? JSON.parse(init.body) : undefined });
+      if (init?.method === "POST") {
+        return new Response(
+          JSON.stringify({ data: { id: "r1", status: "SUCCEEDED", defaultDatasetId: "d1", usageTotalUsd: 0.03 } }),
+          { status: 201 },
+        );
+      }
+      if (url.includes("/datasets/")) return new Response(JSON.stringify(items), { status: 200 });
+      return new Response(
+        JSON.stringify({ data: { id: "r1", status: "SUCCEEDED", defaultDatasetId: "d1", usageTotalUsd: 0.03 } }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    return { fetchImpl, calls };
+  }
+
+  it("targets the FOLLOWER actor, not the tweet actor", async () => {
+    const { fetchImpl, calls } = fakeApify([person()]);
+    const c = createApifyXClient({ token: "t", fetchImpl });
+    await c.scrapeFollowers({ seedHandles: ["seed"], maxUsers: 5 });
+    const post = calls.find((x) => x.body);
+    expect(post!.url).toContain("kaitoeasyapi~premium-x-follower-scraper-following-data");
+  });
+
+  it("normalises a person, keeping the BIO the ICP gate needs", async () => {
+    const { fetchImpl } = fakeApify([person()]);
+    const c = createApifyXClient({ token: "t", fetchImpl });
+    const { people } = await c.scrapeFollowers({ seedHandles: ["seed"], maxUsers: 5 });
+    expect(people[0]).toEqual({
+      handle: "cand",
+      id: "9",
+      displayName: "A Candidate",
+      bio: "founder, devtools",
+      followers: 1200,
