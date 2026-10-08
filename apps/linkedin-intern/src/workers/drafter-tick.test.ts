@@ -1198,3 +1198,203 @@ describe("runDrafterTick — reaction-based Opus model override", () => {
         lead({ tier: "T1", comment_bait: false, payload: { text: "post", reactions: 5, comments: 40 } }),
       ] as never,
       runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      ...opusArgs,
+    });
+    expect(routingOf(runner).primary.model).toBe("claude-opus-4-6");
+  });
+
+  it("does NOT override to Opus when comments > 30 but comment_bait=true and likes below threshold", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ tier: "T1", comment_bait: true, payload: { text: "post", reactions: 10, comments: 1158 } }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      ...opusArgs,
+    });
+    // bait comment count ignored + likes under threshold → tiering does NOT fire,
+    // so the draft runs on the un-tiered base routing (sonnet primary, opus
+    // fallback) rather than being upgraded to Opus.
+    expect(routingOf(runner).primary.model).toBe("claude-sonnet-4-6");
+    expect(routingOf(runner).fallback?.model).toBe("claude-opus-4-6");
+  });
+
+  it("uses the default model (sonnet) for a normal low-engagement lead", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { text: "post", reactions: 10, comments: 3 } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      ...opusArgs,
+    });
+    // Sonnet is the everyday floor; Opus only via reaction tiering.
+    expect(routingOf(runner).primary.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("applies Opus tiering on the LIGHT path too (high-engagement win post)", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ classifier_label: "light", tier: null, payload: { text: "we shipped!", reactions: 240, comments: 5 } }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      ...opusArgs,
+    });
+    expect((runner.draft.mock.calls[0]![0] as { routing: { primary: { model: string } } }).routing.primary.model).toBe(
+      "claude-opus-4-6",
+    );
+  });
+
+  it("uses browser-observed reactions for light model tiering", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null, payload: { text: "we shipped!", source: "extension_observed", reactionCount: 104, commentCount: 2 } })] as never,
+      runner: runner as never, kb: kb as never, postOutbound, markStatus, ...opusArgs,
+    });
+    expect((runner.draft.mock.calls[0]![0] as { routing: { primary: { model: string } } }).routing.primary.model).toBe("claude-opus-4-6");
+  });
+
+  it("Opus tiering never trips when thresholds are left at default (omitted) — defensive", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { text: "post", reactions: 999999, comments: 999999 } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      // no opus* args → thresholds default to MAX_SAFE_INTEGER, tiering never trips.
+    });
+    // Tiering doesn't trip and the DEFAULT routing primary is sonnet, so the
+    // draft runs on sonnet (the everyday floor).
+    expect(routingOf(runner).primary.model).toBe("claude-sonnet-4-6");
+  });
+});
+
+describe("runDrafterTick comment-energy", () => {
+  const commentLead = (over: Record<string, unknown> = {}) =>
+    lead({
+      tier: "T1",
+      payload: {
+        text: "post text",
+        url: "https://www.linkedin.com/feed/update/urn:li:activity:7000000000000000001/",
+        authorName: "Jane",
+        authorPublicId: "jane-builder",
+        comments: 12,
+      },
+      ...over,
+    });
+
+  it("fetches comments, injects the COMMENT SECTION into the prompt, and records apify spend", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const fetchPostComments = vi.fn().mockResolvedValue([
+      { id: "c1", url: "", text: "commenting is the real distribution channel", authorName: "Dev", authorHeadline: "Founder", reactions: 9, repliesCount: 1, createdAt: "" },
+      { id: "c2", url: "", text: "love the consistency angle", authorName: "Mia", authorHeadline: null, reactions: 2, repliesCount: 0, createdAt: "" },
+    ]);
+    const record = vi.fn().mockResolvedValue(undefined);
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [commentLead()] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      fetchPostComments: url => withMeteredApifyCall({
+        client: { drainRunReceipts: () => [{ runId: "comment-run", actor: "linkedin-post-comments",
+          actualUsd: 0.01, credentialId: "comment-token", status: "SUCCEEDED", terminal: true,
+          resultCount: 2, resultCountComplete: true, fetchedResultCount: 2 }] },
+        recorder: { record }, log, orgId: "o", instanceId: "i", agentRole: "linkedin_intern",
+        worker: "drafter", actor: "linkedin-post-comments", startedAt: new Date(),
+      }, () => fetchPostComments(url)),
+    });
+
+    expect(fetchPostComments).toHaveBeenCalledWith(
+      "https://www.linkedin.com/feed/update/urn:li:activity:7000000000000000001/",
+    );
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    expect(prompt).toContain("THE COMMENT SECTION");
+    expect(prompt).toContain("commenting is the real distribution channel");
+    expect(prompt).toContain("12 comments"); // saturation signal from the known count
+
+    // Apify spend recorded as engine='apify' for the comment fetch.
+    const apifyRows = record.mock.calls.map((c) => c[0]).filter((r) => r.engine === "apify");
+    expect(apifyRows).toHaveLength(1);
+    expect(apifyRows[0]!.model).toBe("apify/linkedin-post-comments");
+    expect(apifyRows[0]!.cents).toBe(1); // Reported receipt cost, independent of normalized count.
+  });
+
+  it("uses browser-observed commentCount for existing comment context", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const fetchPostComments = vi.fn().mockResolvedValue([
+      { id: "c1", url: "", text: "A useful comment", authorName: "Dev", authorHeadline: null, reactions: 1, repliesCount: 0, createdAt: "" },
+    ]);
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [commentLead({ payload: { text: "post text", url: leadPayload.url, source: "extension_observed", reactionCount: 4, commentCount: 12 } })] as never,
+      runner: runner as never, kb: kb as never, postOutbound, markStatus, fetchPostComments,
+    });
+    expect(fetchPostComments).toHaveBeenCalledWith(leadPayload.url);
+    expect((runner.draft.mock.calls[0]![0] as { prompt: string }).prompt).toContain("12 comments");
+  });
+
+  it("skips the fetch (no spend) when the post has fewer comments than the min", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const fetchPostComments = vi.fn();
+    const record = vi.fn();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [commentLead({ payload: { text: "post text", url: "https://x/y", comments: 1 } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      fetchPostComments,
+    });
+    expect(fetchPostComments).not.toHaveBeenCalled();
+    expect(record.mock.calls.filter((c) => c[0].engine === "apify")).toHaveLength(0);
+  });
+
+  it("fails open: an Apify error still drafts (no comment context, no spend)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const fetchPostComments = vi.fn().mockRejectedValue(new Error("apify 402"));
+    const record = vi.fn();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [commentLead()] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      fetchPostComments,
+    });
+    expect(n).toBe(1); // draft still shipped
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    expect(prompt).not.toContain("THE COMMENT SECTION");
+    expect(record.mock.calls.filter((c) => c[0].engine === "apify")).toHaveLength(0);
