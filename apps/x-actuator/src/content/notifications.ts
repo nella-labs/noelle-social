@@ -198,3 +198,118 @@ export function selectRepliesToMe(
  *
  * This is the "was it ever a candidate" question, and it has to be answerable
  * on its own because the notifications page is mostly things that are not
+ * replies to us: likes, follows, our own tweets. Describing a sweep's outcome
+ * in terms of every harvested cell would attribute a zero to the recency window
+ * when the real reason is that nobody replied to us at all.
+ */
+export function isReplyToMe(
+  item: Pick<HarvestedNotification, "handle" | "replying_to">,
+  selfHandle: string,
+): boolean {
+  const me = stripAt(selfHandle);
+  if (!me) return false;
+  if (stripAt(item.handle) === me) return false; // never answer ourselves
+  return item.replying_to.includes(me);
+}
+
+/**
+ * The operator's own @handle, read from the logged-in chrome.
+ *
+ * LIVE-TUNE: the sidebar account switcher renders "Display Name @handle" and is
+ * the one element on every page guaranteed to name the logged-in account. The
+ * "Profile" nav link (/{handle}) is the fallback for the narrow layout, where
+ * the switcher collapses to an avatar with no text.
+ */
+export function readSelfHandle(root: ParentNode): string | null {
+  // The account switcher renders "Display Name @handle" and is present on every
+  // logged-in page. Checked first because it is unambiguous.
+  const switcher = root.querySelector("[data-testid='SideNav_AccountSwitcher_Button']");
+  if (switcher) {
+    for (const span of Array.from(switcher.querySelectorAll("span"))) {
+      const t = (span.textContent ?? "").trim();
+      if (t.startsWith("@") && t.length > 1) return stripAt(t);
+    }
+  }
+  // The profile nav link, whose href IS the handle. Two testids because X ships
+  // a different one on the narrow layout, where the switcher collapses to a
+  // bare avatar with no text.
+  for (const sel of ["[data-testid='AppTabBar_Profile_Link']", "a[aria-label='Profile'][href^='/']"]) {
+    const href = root.querySelector(sel)?.getAttribute("href") ?? "";
+    const m = /^\/([A-Za-z0-9_]{1,15})$/.exec(href);
+    if (m) return m[1]!.toLowerCase();
+  }
+  // Deliberately NO frequency-based guess as a last resort: a WRONG self handle
+  // would silently harvest the wrong conversations (every reply aimed at
+  // someone else), which is far worse than harvesting none. When both reads
+  // fail the caller falls back to the operator-configured handle and, failing
+  // that, says so loudly instead of guessing.
+  return null;
+}
+
+/**
+ * The ancestor chain above a focused tweet on its permalink page, oldest first.
+ *
+ * X renders a thread page as the ancestors, then the focused tweet, then its
+ * replies. Everything before the focused cell in DOM order is the conversation
+ * that led to it — which is exactly the context the drafter needs to answer a
+ * reply instead of cold-replying to a fragment. Returns [] when the focused
+ * tweet isn't on the page (a deleted/protected target).
+ */
+export function harvestThread(root: ParentNode, focusTweetId: string): ThreadTweet[] {
+  const cells = findFeedTweets(root);
+  const chain: ThreadTweet[] = [];
+  for (const cell of cells) {
+    if (isPromoted(cell)) continue; // an ad between cells is not part of the thread
+    const id = tweetId(cell);
+    // WHERE THE FOCAL TWEET IS. LIVE-TUNE, and the subtle part: X renders the
+    // focal tweet's timestamp WITHOUT a self-permalink anchor — you are already
+    // on its page — so `tweetId` cannot resolve it (see the header comment in
+    // tests/fixtures/status-page.html, captured from the real site). Matching on
+    // `id === focusTweetId` therefore NEVER fires on a real thread page, and this
+    // function returned [] for every real conversation.
+    //
+    // So the marker is the ABSENCE of an id, with the explicit id match kept for
+    // layouts that do render a self-link. Stopping at an id-less ancestor (a
+    // partially-hydrated cell) is the safe failure: a shorter chain, or an empty
+    // one the sweep then drops and retries — never a mis-attributed thread.
+    if (id === null || id === focusTweetId) return chain;
+    const handle = tweetAuthorHandle(cell);
+    const text = tweetText(cell);
+    if (!handle || !text) continue;
+    chain.push({ tweet_id: id, handle, text });
+  }
+  return []; // focal tweet never appeared → the chain we built isn't trustworthy
+}
+
+/**
+ * Collapse an ancestor chain into the two turns the drafter actually quotes:
+ * the thread's root, and the last thing WE said (what they are answering).
+ * Both are optional — a reply to our root post has no separate "our reply".
+ */
+export function conversationFrom(
+  chain: readonly ThreadTweet[],
+  selfHandle: string,
+): { root_post_id?: string; root_post_text?: string; our_reply_id?: string; our_reply_text?: string } {
+  const me = stripAt(selfHandle);
+  const out: {
+    root_post_id?: string;
+    root_post_text?: string;
+    our_reply_id?: string;
+    our_reply_text?: string;
+  } = {};
+  const root = chain[0];
+  if (root) {
+    out.root_post_id = root.tweet_id;
+    out.root_post_text = root.text;
+  }
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const t = chain[i]!;
+    if (stripAt(t.handle) !== me) continue;
+    // The root already carries our text when we are the root author.
+    if (root && t.tweet_id === root.tweet_id) break;
+    out.our_reply_id = t.tweet_id;
+    out.our_reply_text = t.text;
+    break;
+  }
+  return out;
+}
