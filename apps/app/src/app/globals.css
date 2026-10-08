@@ -798,3 +798,203 @@ code, pre { font-family: "JetBrains Mono", ui-monospace, monospace; }
      row on phone (issues search toolbar, spend Plan-B actions). */
   .plan-b-actions { margin-left: 0 !important; }
 
+  /* Billing hero aside: once the 1.2fr/1fr grid stacks (.stack-phone), shed the
+     left border + indent so the month-to-date panel sits cleanly below the plan
+     summary instead of carrying a stray vertical rule. */
+  .billing-hero-aside { border-left: 0 !important; padding-left: 0 !important; }
+
+  /* System migration-ledger list: 2-up CSS columns → single column on phone. */
+  .schema-cols { columns: 1 !important; }
+
+  /* Key/value rows (vault file meta, system stats): let a long mono value — an
+     absolute file path, a URL — wrap under its key instead of overflowing the
+     card and forcing horizontal scroll. */
+  .kv { flex-wrap: wrap; }
+  .kv .v { min-width: 0; overflow-wrap: anywhere; word-break: break-word; text-align: left; }
+
+  /* Placeholder/empty-state cards (hire pages, private-alpha stubs) shed some
+     padding so their centered stat rows aren't crushed at ~375px. */
+  .placeholder-card { padding: 24px 18px; }
+}
+
+/* ── Mobile top bar + slide-out nav drawer ────────────────────────────────
+   Rendered on every page by <MobileNav> but invisible above the phone
+   breakpoint: the bar is display:none and the drawer sits off-canvas
+   (transform + visibility) until React adds .open. The phone media query at
+   the end performs the actual icon-rail → hamburger swap. */
+.mobile-topbar { display: none; }
+.mobile-topbar-burger {
+  display: inline-flex; flex-direction: column; justify-content: center; gap: 4px;
+  width: 42px; height: 42px; flex-shrink: 0;
+  border: 0; border-radius: 9px; background: transparent; cursor: pointer;
+}
+.mobile-topbar-burger:hover { background: var(--paper-2); }
+.mobile-topbar-burger span {
+  display: block; width: 18px; height: 1.5px; margin: 0 auto;
+  background: var(--ink); border-radius: 2px;
+}
+.mobile-topbar-brand {
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.mobile-topbar-right { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+
+.nav-drawer-root {
+  position: fixed; inset: 0; z-index: 1000;
+  visibility: hidden; pointer-events: none;
+}
+.nav-drawer-root.open { visibility: visible; pointer-events: auto; }
+.nav-drawer-backdrop {
+  position: absolute; inset: 0;
+  /* Fixed dark scrim — theme-agnostic so it darkens in light AND dark mode
+     (var(--ink) would invert to a light scrim in dark theme). */
+  background: rgba(0, 0, 0, 0.45);
+  opacity: 0; transition: opacity .22s ease;
+}
+.nav-drawer-root.open .nav-drawer-backdrop { opacity: 1; }
+.nav-drawer-panel {
+  position: absolute; top: 0; bottom: 0; left: 0;
+  width: min(86vw, 300px);
+  background: var(--bg);
+  border-right: 1px solid var(--rule);
+  box-shadow: 0 0 60px -8px rgba(0, 0, 0, 0.45);
+  display: flex; flex-direction: column;
+  padding-top: env(safe-area-inset-top, 0px);
+  transform: translateX(-100%);
+  transition: transform .24s cubic-bezier(.4, 0, .2, 1);
+  will-change: transform;
+}
+.nav-drawer-root.open .nav-drawer-panel { transform: translateX(0); }
+.nav-drawer-close {
+  position: absolute; z-index: 2;
+  top: calc(10px + env(safe-area-inset-top, 0px)); right: 10px;
+  width: 34px; height: 34px;
+  border: 0; border-radius: 8px; background: transparent;
+  color: var(--ink-muted); font-size: 16px; cursor: pointer;
+}
+.nav-drawer-close:hover { background: var(--paper-2); color: var(--ink); }
+/* The drawer composes the same navigation in a vertical layout. */
+.nav-drawer-panel .sidebar { display: flex; flex-direction: column; align-items: stretch; gap: 28px; width: 100%; height: 100%; overflow-y: auto; border: 0; padding: 28px 20px; }
+.nav-drawer-panel .workspace-nav { flex-direction: column; align-items: stretch; margin: 0; }
+.nav-drawer-panel .nav-workspace { display: flex; max-width: none; }
+.nav-drawer-panel .nav-spacer { margin-top: auto; }
+.nav-drawer-panel .nav-account-menu { position: static; margin-top: 12px; box-shadow: none; }
+
+@media (max-width: 768px) {
+  /* Swap the 64px icon rail for the hamburger drawer. */
+  .app { display: flex; }
+  .sidebar { display: none; }   /* desktop rail; the drawer copy is re-enabled above */
+  .topbar { display: none; }    /* breadcrumb bar; the mobile top bar replaces it */
+  .mobile-topbar {
+    display: flex; align-items: center; gap: 10px;
+    min-height: 56px;
+    padding: env(safe-area-inset-top, 0px) 12px 0;
+    border-bottom: 1px solid var(--rule);
+    background: var(--paper);
+    position: relative; z-index: 5; flex-shrink: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ── Posts lane (Lyra) ──────────────────────────────────────────────────── */
+.lane-tabs {
+  display: flex; gap: 6px; margin: 14px 0 18px;
+  border-bottom: 1px solid var(--rule-soft, var(--rule)); padding-bottom: 0;
+}
+.lane-tab {
+  padding: 8px 14px; font-size: 13px; color: var(--ink-muted);
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  text-decoration: none; white-space: nowrap;
+}
+.lane-tab:hover { color: var(--ink); }
+.lane-tab--active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 500; }
+
+.ideas-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+.ideas-msg { font-size: 12px; color: var(--ink-muted); }
+
+.ideas-empty { padding: 40px 28px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 8px; }
+.ideas-empty .serif { font-size: 20px; margin: 0; }
+.ideas-empty p { color: var(--ink-muted); max-width: 52ch; margin: 0; line-height: 1.5; }
+
+.ideas-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+.idea-card { padding: 18px; display: grid; gap: 10px; }
+.idea-card__head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.idea-status {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 2px 8px; border-radius: 999px; background: var(--paper-2); color: var(--ink-muted);
+}
+.idea-status--approved, .idea-status--drafting { background: color-mix(in oklch, var(--info, #5b8) 20%, transparent); color: var(--ink); }
+.idea-status--ready, .idea-status--drafted { background: color-mix(in oklch, var(--ok, #6a4) 22%, transparent); color: var(--ink); }
+.idea-day, .idea-pillar, .idea-angle { font-size: 11px; color: var(--ink-muted); }
+.idea-day { color: var(--accent); }
+.idea-hook { font-size: 19px; line-height: 1.3; margin: 0; }
+.idea-thesis { margin: 0; color: var(--ink-muted); line-height: 1.5; }
+.idea-refs { margin-top: 2px; }
+.idea-refs__list { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 12px; }
+.idea-ref { font-size: 12px; }
+.idea-ref__link { color: var(--accent); text-decoration: none; }
+.idea-ref__link:hover { text-decoration: underline; }
+.idea-card__actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+
+/* Posts board sub-tabs + drafts + week calendar */
+/* Cross-platform switcher (All · LinkedIn · X · Reddit). Was unstyled, so the
+   links ran together as "AllLinkedInXReddit"; render a proper pill row. */
+.platform-switcher { display: flex; gap: 6px; margin: 0 0 12px; flex-wrap: wrap; }
+.platform-pill {
+  padding: 5px 14px; border-radius: 999px; font-size: 12.5px; text-decoration: none;
+  color: var(--ink-muted); background: var(--paper-2); box-shadow: 0 0 0 0.5px var(--rule);
+  transition: background .12s, color .12s; white-space: nowrap;
+}
+.platform-pill:hover { color: var(--ink); }
+.platform-pill--active { background: var(--accent); color: #fff; box-shadow: none; font-weight: 500; }
+
+.board-tabs { display: flex; gap: 4px; margin: 0 0 18px; flex-wrap: wrap; }
+.board-tab {
+  padding: 6px 12px; font-size: 12.5px; color: var(--ink-muted); text-decoration: none;
+  border-radius: 8px; display: inline-flex; align-items: center; gap: 6px;
+}
+.board-tab:hover { background: color-mix(in oklch, var(--ink) 5%, transparent); color: var(--ink); }
+.board-tab--active { background: var(--paper-2); color: var(--ink); font-weight: 500; }
+.board-tab__count {
+  font-size: 10.5px; background: var(--accent-soft); color: var(--accent-deep); border-radius: 999px;
+  padding: 0 6px; min-width: 16px; text-align: center;
+}
+.idea-quality--fail { color: var(--warn, #b80); }
+
+.post-draft-body {
+  width: 100%; resize: vertical; line-height: 1.55; font-family: var(--body);
+  font-size: 14.5px; padding: 12px; border-radius: 10px; min-height: 120px;
+}
+
+.week-grid {
+  display: grid; grid-template-columns: repeat(7, minmax(150px, 1fr));
+  gap: 10px; overflow-x: auto;
+}
+.week-col { padding: 10px; display: grid; gap: 8px; align-content: start; min-height: 120px; }
+.week-col__head { display: flex; justify-content: space-between; align-items: baseline; }
+.week-dow { font-size: 12px; font-weight: 600; }
+.week-date { font-size: 10.5px; color: var(--ink-muted); }
+.week-card { display: grid; gap: 6px; padding: 8px; border-radius: 8px; background: var(--paper); border: 1px solid var(--rule-soft, var(--rule)); }
+.week-card__hook { margin: 0; font-size: 13px; line-height: 1.35; }
+.week-card__actions { display: flex; gap: 6px; }
+.btn-xs { height: 24px; padding: 0 8px; font-size: 11px; border-radius: 7px; }
+@media (max-width: 768px) {
+  .week-grid { grid-template-columns: repeat(7, 78vw); }
+}
+
+/* Post detail / drafter chat */
+.post-detail-grid { display: grid; grid-template-columns: 1fr 360px; gap: 20px; align-items: start; }
+.post-detail-side { position: sticky; top: 16px; }
+.regen-banner { padding: 10px 14px; margin-bottom: 14px; color: var(--accent); font-size: 12.5px; }
+.drafter-chat { padding: 16px; display: grid; gap: 12px; }
+.chat-thread { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; max-height: 360px; overflow-y: auto; }
+.chat-empty { font-size: 13px; line-height: 1.5; }
+.chat-turn { display: grid; gap: 3px; }
+.chat-role { font-size: 10px; text-transform: uppercase; color: var(--ink-muted); letter-spacing: 0.05em; }
+.chat-turn--operator .chat-body { background: var(--paper-2); }
+.chat-body { margin: 0; padding: 8px 10px; border-radius: 8px; font-size: 13.5px; line-height: 1.5; background: var(--paper); }
