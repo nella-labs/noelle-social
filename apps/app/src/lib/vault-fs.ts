@@ -198,3 +198,107 @@ export async function readVaultSource(
 ): Promise<VaultSourceRead> {
   const root = await resolveVaultRoot(boundRoot);
   if (!root || !isSafeVaultPath(rel) || !Number.isSafeInteger(options.maxBytes) || options.maxBytes < 1 || options.maxBytes > VAULT_PREVIEW_MAX_BYTES) return { kind: "unavailable" };
+  try {
+    const handle = await openVaultFile(root, rel);
+    let stream: ReturnType<FileHandle["createReadStream"]> | undefined;
+    try {
+      const before = await handle.stat({ bigint: true });
+      const complete = before.size <= BigInt(options.maxBytes);
+      if (!complete && !options.prefix) return { kind: "too_large" };
+      const extent = Number(complete ? before.size : BigInt(options.maxBytes));
+      let bytes: Uint8Array = new Uint8Array();
+      if (extent) {
+        stream = handle.createReadStream({ autoClose: false, start: 0, end: extent - 1, highWaterMark: 65_536, ...(options.signal ? { signal: options.signal } : {}) });
+        bytes = await readBoundedHttpBytes(new Response(Readable.toWeb(stream) as ReadableStream<Uint8Array>), { maxBytes: options.maxBytes, ...(options.signal ? { signal: options.signal } : {}) });
+      }
+      const identity = fileIdentity(before);
+      if (bytes.byteLength !== extent || !sameVaultFileIdentity(identity, fileIdentity(await handle.stat({ bigint: true })))) return { kind: "changed" };
+      let text: string;
+      try { text = decodeVaultText(bytes, { complete }); }
+      catch { return { kind: "invalid_encoding" }; }
+      return { kind: "file", text, complete, identity, contentSha256: createHash("sha256").update(bytes).digest("hex"), bytesRead: bytes.byteLength };
+    } finally { stream?.destroy(); await handle.close(); }
+  } catch (error) {
+    return { kind: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unavailable" };
+  }
+}
+
+/** A complete regular-file preview, or null when missing, unsafe or above the preview limit. */
+export async function readVaultFile(boundRoot: string | null, rel: string): Promise<string | null> {
+  const result = await readVaultSource(boundRoot, rel, { maxBytes: VAULT_PREVIEW_MAX_BYTES });
+  return result.kind === "file" ? result.text : null;
+}
+
+export interface VaultWriteGuard {
+  basis: VaultFileBasis;
+  assertActive(): Promise<void>;
+  rootStillBound(): Promise<boolean>;
+  signal?: AbortSignal;
+  /** Called immediately before the rename is submitted, when its outcome can become uncertain. */
+  onRenameAdmitted?(): void;
+}
+
+/** Replace complete captured text while the caller retains its cooperative writer lease. */
+export async function writeVaultFile(
+  boundRoot: string | null,
+  rel: string,
+  content: string,
+  guard: VaultWriteGuard,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const root = await resolveVaultRoot(boundRoot);
+  if (!root) return { ok: false, error: "no_vault" };
+  if (!isSafeVaultPath(rel)) return { ok: false, error: "unsafe_path" };
+  if (content.length === 0) return { ok: false, error: "empty" };
+  if (content.length > VAULT_EDIT_MAX_CHARACTERS) return { ok: false, error: "too_large" };
+  if (!guard?.basis || guard.basis.path !== rel) return { ok: false, error: "refresh_required" };
+  try { assertVaultText(content); }
+  catch (error) {
+    if (error instanceof VaultSourceEncodingError) return { ok: false, error: "invalid_encoding" };
+    if (error instanceof RangeError) return { ok: false, error: "too_large" };
+    throw error;
+  }
+  const bytes = Buffer.from(content, "utf8");
+  const desiredHash = createHash("sha256").update(bytes).digest("hex");
+  let temp: string | undefined;
+  try {
+    const rootCurrent = async () => await guard.rootStillBound() && await vaultRootIdentity(root) === guard.basis.rootIdentity;
+    if (!await rootCurrent()) return { ok: false, error: "refresh_required" };
+    await guard.assertActive();
+    const current = async () => readVaultSource(root, rel, { maxBytes: VAULT_COMPLETE_MAX_BYTES, ...(guard.signal ? { signal: guard.signal } : {}) });
+    const matchesBasis = (source: VaultSourceRead) => guard.basis.exists
+      ? source.kind === "file" && source.complete && source.contentSha256 === guard.basis.contentSha256 && Boolean(guard.basis.fileIdentity && sameVaultFileIdentity(source.identity, guard.basis.fileIdentity))
+      : source.kind === "missing";
+    const source = await current();
+    if (source.kind === "file" && source.complete && source.contentSha256 === desiredHash) {
+      if (!await rootCurrent()) return { ok: false, error: "refresh_required" };
+      await guard.assertActive();
+      return { ok: true };
+    }
+    if (!matchesBasis(source)) return { ok: false, error: "conflict" };
+    const parents = await vaultParents(root, rel, true);
+    let mode = 0o666;
+    if (guard.basis.exists) {
+      const permission = await openVaultFile(root, rel, true);
+      try { mode = (await permission.stat()).mode & 0o777; }
+      finally { await permission.close(); }
+    }
+    temp = join(dirname(join(root, rel)), `.noelle-vault-${randomUUID()}.tmp`);
+    const handle = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+    try {
+      if (guard.basis.exists) await handle.chmod(mode);
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally { await handle.close(); }
+    if (!await rootCurrent()) return { ok: false, error: "refresh_required" };
+    if (!await parentsUnchanged(parents) || !matchesBasis(await current())) return { ok: false, error: "conflict" };
+    await guard.assertActive();
+    guard.onRenameAdmitted?.();
+    await rename(temp, join(root, rel));
+    temp = undefined;
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "write_failed" };
+  } finally {
+    if (temp) await unlink(temp).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
+  }
+}
