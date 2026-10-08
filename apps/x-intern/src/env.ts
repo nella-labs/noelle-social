@@ -198,3 +198,203 @@ const EnvSchema = z.object({
   /** How many tokens to probe at once. Cheap GETs, so a small fan-out is fine. */
   X_APIFY_HEALTH_SWEEP_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(3),
   CLASSIFIER_POLL_MS: z.coerce.number().int().positive().default(30_000),
+  DRAFTER_POLL_MS: z.coerce.number().int().positive().default(30_000),
+  SEND_POLL_MS: z.coerce.number().int().positive().default(60_000),
+  // content-publish worker (Vega-only X API auto-posting of scheduled slots).
+  CONTENT_PUBLISH_POLL_MS: z.coerce.number().int().positive().default(60_000),
+  // Minimum spacing between two auto-published posts (ms). The tick publishes at
+  // most ONE slot and won't publish again until this window elapses, so a backlog
+  // of overdue slots drains one-per-window instead of bursting in a single tick.
+  // Velocity is X's #1 lock trigger (docs/x-account-safety.md). 0 disables the
+  // gate (still one publish per tick). Default 5 min.
+  CONTENT_PUBLISH_MIN_SPACING_MS: z.coerce.number().int().min(0).default(5 * 60_000),
+  // Content media (self-host): where the api-vm wrote uploaded image bytes. The
+  // publish worker reads them from here to upload+attach to an auto-post. Set to
+  // the SAME dir the api-vm + app use (docs/content-workspace.md § Media storage).
+  // On the `gcs` backend the worker fetches content_media.url instead, so the
+  // dir is unused. Default `local` matches the api-vm default.
+  NOELLE_MEDIA_BACKEND: z.enum(["local", "gcs"]).default("local"),
+  NOELLE_MEDIA_DIR: z.string().optional(),
+  // ── X self-track (the LEARN loop) ──────────────────────────────────────────
+  // Measure the operator's OWN published posts and feed engagement back into
+  // ideation. Bolted onto the content-publish worker as an interval sweep
+  // (mirrors Nova's self-track). Vega-only in practice (draft-only agents never
+  // publish, so they have no own posts to measure).
+  NOELLE_X_SELF_TRACK: boolFlag.default("1"),
+  // Sweep cadence and how far back to keep re-measuring a published post.
+  NOELLE_X_SELF_TRACK_MS: z.coerce.number().int().positive().default(6 * 60 * 60_000),
+  NOELLE_X_SELF_TRACK_WINDOW_DAYS: z.coerce.number().int().positive().default(30),
+  // Max own posts pulled from Apify + max slots re-measured per instance per sweep.
+  NOELLE_X_SELF_TRACK_MAX: z.coerce.number().int().positive().default(50),
+  // ── X own-account snapshot (what the drafter is allowed to say about itself) ─
+  // Refresh the operator's own handle + follower/following/post counts onto the
+  // shared memory bus (bucket `own_account`), so the drafter states a real number
+  // instead of inventing one. Distinct from self-track above: that one only ever
+  // saw a follower count riding along on a recently published post, so it went
+  // dark with nothing published in 30 days (and died outright once the Apify pool
+  // was exhausted). This asks the X API who the token belongs to — one read per
+  // sweep, no write budget, no dependence on having posted.
+  NOELLE_X_OWN_ACCOUNT: boolFlag.default("1"),
+  // Sweep cadence. A follower count moves slowly and the free X API tier meters
+  // reads tightly, so 12h (≈60 calls/month) keeps it fresh at negligible cost.
+  NOELLE_X_OWN_ACCOUNT_MS: z.coerce.number().int().positive().default(12 * 60 * 60_000),
+  // ── X API metrics (real per-post engagement for the Performance tab) ────────
+  // The official-API twin of self-track: re-measures the operator's OWN published
+  // posts via GET /2/tweets (public_metrics → real IMPRESSIONS, which Apify can't
+  // see) and appends to the same own_post_metrics table. Runs as a throttled
+  // sweep inside content-publish (which already builds the write-token client).
+  NOELLE_X_METRICS: boolFlag.default("1"),
+  // Sweep cadence. A read costs no write budget, but engagement moves slowly, so
+  // ~3h keeps the Performance tab fresh without hammering the API.
+  NOELLE_X_METRICS_MS: z.coerce.number().int().positive().default(3 * 60 * 60_000),
+  // Official X API OAuth2 app credentials (used for token refresh on the write path).
+  X_API_CLIENT_ID: z.string().optional(),
+  X_API_CLIENT_SECRET: z.string().optional(),
+  // Anti-flag daily ceiling: max replies auto-sent per instance in a rolling
+  // 24h, on top of auto_send_max_per_hour. Caps queued batches no matter how
+  // many the operator selected.
+  AUTOSEND_MAX_PER_DAY: z.coerce.number().int().positive().default(50),
+  // Anti-flag velocity guard: max auto-sends per rolling 30 min (velocity, not
+  // daily total, is X's #1 lock trigger). The send worker also claims at most
+  // 2 rows per tick so a backlog can't burst.
+  AUTOSEND_MAX_PER_30MIN: z.coerce.number().int().positive().default(6),
+  // Block external links on the unattended auto-send path. Default ON (fail-closed:
+  // blocking is the safe state; set "0"/"false" only to DISABLE the guard). When on,
+  // an auto-sent reply carrying an external (non-x.com/twitter.com/t.co) link is
+  // never posted unattended — the drafter withholds the schedule and the send
+  // worker reverts any already-stamped link row to the human-review inbox. Autonomous
+  // links in replies are a documented top-tier spam signal (docs/x-account-safety.md).
+  NOELLE_AUTOSEND_BLOCK_EXTERNAL_LINKS: boolFlag.default("1"),
+  // Persist the X send worker's 429 cooldown + escalating streak to
+  // noelle.agent_instances so a merge-driven pm2 restart can't resume posting into
+  // an actively rate-limited account. Default OFF → in-memory-only, exactly as
+  // today (no new query, no updated_at churn). On → the read FAILS CLOSED on boot
+  // (unreadable cooldown ⇒ assume in-cooldown, skip sends this tick), with a
+  // 120-min ceiling so a stale row self-heals. See lib/send-backoff.ts + 0082.
+  X_PERSIST_SEND_COOLDOWN: boolFlag,
+  // Reply-freshness ceiling, in hours of TARGET-TWEET age (payload.posted_at).
+  // Applied at draft claim (0088 RPCs), at auto-send claim + retry, and as the
+  // expiry sweep on pending approvals: a reply to a tweet older than this is
+  // never drafted or posted — on X it reads as necro-engagement and earns
+  // nothing from the ranker. 0 disables every age gate (legacy behavior).
+  // Ceiling on TARGET-TWEET age for a reply (hours). Default 25: on X a reply to
+  // a tweet much older than a day is dead — outside the live-conversation window
+  // the ranker rewards; the extra hour past 24 keeps a lead that arrived late in
+  // yesterday's cycle from aging out one tick before the actuator reaches it.
+  // Enforced at draft claim (0088 RPC), the drafter's expiry sweeps, and the
+  // browser-actuator feed (apps/api-vm actionable-x reads the SAME env). 0
+  // disables every age gate. The api-vm side defaults to 25 too, so set this
+  // once in ~/.noelle/.env to change both.
+  // .int() is REQUIRED: the value is bound into `make_interval(hours => $n)` in
+  // raw postgres.js queries, and a fractional hours arg throws
+  // `function make_interval(hours => numeric) does not exist` — which would
+  // fail-closed every freshness sweep/claim for the whole tick. Reject a
+  // non-integer at boot instead.
+  X_REPLY_MAX_AGE_HOURS: XReplyMaxAgeHoursSchema,
+  // Overnight quiet window (UTC hours, [start,end), wraps) — the send worker
+  // won't fire NEW auto-sends inside it (24/7 flat cadence is a bot signature).
+  // Default 4–12 UTC ≈ overnight for UTC-5; matches the api-vm schedule's quiet.
+  AUTOSEND_QUIET_START_UTC: z.coerce.number().int().min(0).max(23).default(4),
+  AUTOSEND_QUIET_END_UTC: z.coerce.number().int().min(0).max(24).default(12),
+  // When on, the drafter's stamped auto_send_target_at never lands in the quiet
+  // window (pushed to its end, matching what send.ts already enforces). Default
+  // false → computeAutoSendTargetAt is called WITHOUT quiet params (byte-identical
+  // to today). See lib/auto-send.ts + docs/x-account-safety.md §8.
+  AUTOSEND_STAMP_HONORS_QUIET: boolFlag,
+  // Cross-tick inter-send floor (anti-velocity-burst; default OFF -> no behavior
+  // change until enabled). ON => at most ONE reply per tick + a JITTERED gap
+  // (persisted in memory, like the 429 cooldown) since the last successful post,
+  // so a post-downtime backlog drains one-at-a-time. Velocity is X's #1 lock
+  // trigger (docs/x-account-safety.md §2/§4). Strictly slows sends => fail-safe.
+  NOELLE_AUTOSEND_INTERSEND_FLOOR: boolFlag,
+  AUTOSEND_INTERSEND_MIN_MS: z.coerce.number().int().min(0).default(60_000),
+  AUTOSEND_INTERSEND_MAX_MS: z.coerce.number().int().min(0).default(120_000),
+  PROFILER_POLL_MS: z.coerce.number().int().positive().default(15 * 60_000),
+  IDLE_POLL_MS: z.coerce.number().int().positive().default(30_000),
+
+  // ---- X Account Feeder (manual, cost-gated style-learning run) -------------
+  // The feeder pulls recent tweets (originals + authored replies) from a curated
+  // list of admired source accounts via Apify, then fans out Gemini extractors to
+  // distil each account's writing STYLE into an "ultra profile" + a style corpus
+  // the drafter samples per-lead. Runs ONLY when an operator has flipped the
+  // manual run flag (account_feeder_run_requested_at) — never on a schedule
+  // (Apify cost). Ported from Lyra's Account Feeder.
+  //
+  // How often the feeder polls for a pending manual run. Cheap index-only read.
+  X_FEEDER_POLL_MS: z.coerce.number().int().positive().default(30_000),
+  // Original posts kept per source account per run. Billed per result by Apify,
+  // so keep it bounded.
+  X_FEEDER_POST_LIMIT: z.coerce.number().int().positive().default(40),
+  // Authored replies kept per source account per run — their real outbound reply
+  // voice. Same per-result billing.
+  X_FEEDER_COMMENT_LIMIT: z.coerce.number().int().positive().default(40),
+  // Max parallel Gemini style-extractors (one per source account) the feeder runs
+  // at once via batchMap. Bounds Gemini concurrency per manual run.
+  X_FEEDER_CONCURRENCY: z.coerce.number().int().positive().default(4),
+
+  // ── X ideation worker (operator-triggered "Generate ideas" on the X lane). ──
+  // How often to drain the ideation_requests queue, and how many per tick.
+  IDEATION_POLL_MS: z.coerce.number().int().positive().default(30_000),
+  IDEATION_BATCH: z.coerce.number().int().positive().default(2),
+  // Single-mode idea count when the request omits one (batch is always 7).
+  IDEATION_DEFAULT_COUNT: z.coerce.number().int().min(1).max(10).default(3),
+  // Net-new viral lane: max posts to keep per keyword search (0 disables the
+  // Apify keyword source; the watchlist + voice sources still produce ideas).
+  X_IDEATION_KEYWORD_LIMIT: z.coerce.number().int().min(0).default(10),
+  // Virality floor for the net-new search (min_faves). The ideation lane only
+  // borrows structure from posts that actually performed.
+  X_IDEATION_MIN_FAVES: z.coerce.number().int().min(0).default(30),
+  // Recency window (hours) for the net-new search. Default 7 days.
+  X_IDEATION_WINDOW_HOURS: z.coerce.number().int().positive().default(168),
+  // Watchlist author engagement ("topic radar") source tuning.
+  X_ANALYST_WINDOW_DAYS: z.coerce.number().int().positive().default(30),
+  X_ANALYST_TOP_AUTHORS: z.coerce.number().int().positive().default(8),
+  X_ANALYST_SAMPLE_POSTS: z.coerce.number().int().positive().default(3),
+  X_ANALYST_MIN_POSTS: z.coerce.number().int().positive().default(1),
+  // How many voice anchors to retrieve from the vault per ideation run.
+  NOELLE_IDEATION_VOICE_TOPK: z.coerce.number().int().positive().default(8),
+  // Operator content pillars (CSV) — the breadth scaffold for ideation.
+  NOELLE_POSTS_PILLARS: z.string().default(""),
+  // Learn loop → ideation: how many of the operator's OWN top posts to surface
+  // as the "what's working for you" bias block (0 disables the own-performance
+  // source; the pillar/angle rollup still surfaces if any posts are measured).
+  X_IDEATION_OWN_PERF_POSTS: z.coerce.number().int().min(0).default(5),
+  // How long a watchlist-person profile stays fresh before the profiler regenerates it.
+  PROFILE_REFRESH_DAYS: z.coerce.number().int().positive().default(3),
+  // How many people to (re)profile per profiler tick (one fetch + LLM call each).
+  PROFILER_BATCH: z.coerce.number().int().positive().default(3),
+  // Profile anyone we've SENT strictly more than this many replies to, even when
+  // they aren't (or are no longer) on the watchlist — a backstop for the gaps in
+  // auto-promote. 0 = profile anyone we've replied to at all.
+  PROFILER_MIN_REPLIES: z.coerce.number().int().min(0).default(5),
+  // Only replies sent within this window count toward PROFILER_MIN_REPLIES, so
+  // a person we stopped talking to eventually leaves the queue instead of being
+  // re-profiled forever.
+  PROFILER_REPLY_WINDOW_DAYS: z.coerce.number().int().positive().default(90),
+
+  // X graphql token bucket (req per WINDOW_MS).
+  X_RATE_TOKENS: z.coerce.number().int().positive().default(100),
+  X_RATE_WINDOW_MS: z.coerce.number().int().positive().default(15 * 60_000),
+
+  // Drafter retrieval-score gate. Leads whose strongest anchor falls below this
+  // threshold are skipped without invoking the LLM. Default 6 — calibrated on the
+  // NORMALIZED BM25 scale (score ÷ matched-query-term count) against the live
+  // mars voice base scoped to [noelle-voice, content/voice-anchors, 02-brand]:
+  // 60 real posts scored a top anchor of 8.5–516 (short on-theme posts ≥ ~10.8),
+  // while off-topic controls scored 4.8 (recipe) / 8.1 (finance). 6 sits in the
+  // gap — it drops clear off-topic noise with a wide margin below real content,
+  // and is a no-op on an UNSCOPED corpus (whole-vault scores run ~80–800), so the
+  // managed GCS path does not regress. Raise it for stricter topical gating.
+  DRAFTER_RELEVANCE_THRESHOLD: z.coerce.number().min(0).default(6),
+
+  // Classifier quality gate. A non-priority (keyword-lane) lead must score at
+  // least this (the classifier's 0-100 quality score) to be drafted. Leads the
+  // classifier scored below it — or could not score at all (label=other carries
+  // a null score) — are dropped to 'skipped' instead of reaching the inbox.
+  // Watchlist (priority) leads always bypass (they're forced score=1). X had NO
+  // quality gate before this, so q<50 / unscored junk was being drafted. Default
+  // 50. Set 0 to disable. Mirrors LinkedIn's LINKEDIN_Q_THRESHOLD (75).
+  X_Q_THRESHOLD: z.coerce.number().int().min(0).max(100).default(50),
+  // Engagement-tiered model escalation (ported from Lyra). A lead whose post has
+  // real traction is drafted by the smarter, costlier model:
+  //   useOpus = likes > X_OPUS_LIKES || (replies > X_OPUS_REPLIES && !comment_bait)
