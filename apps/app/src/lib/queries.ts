@@ -1798,3 +1798,203 @@ export async function listRecentActivityForInstance(
       union all
       select
         a.decided_at                              as when_,
+        case a.status
+          when 'sent'    then 'sent'
+          when 'skipped' then 'skipped'
+          else a.status
+        end                                       as verb,
+        'reply ' || left(a.draft_id::text, 8)
+          || coalesce(' · ' || a.skip_reason, '') as what,
+        null::int                                 as cents,
+        null::text                                as model,
+        -- For 'sent' rows: the pieces the JS sentReplyUrl() helper turns into
+        -- a live X permalink to Vega's reply (the post with the reply in it).
+        d.payload->>'sent_url'                    as sent_url,
+        d.sent_external_id                        as sent_external_id,
+        l.payload->>'author_handle'               as author_handle
+      from noelle.approvals a
+      left join noelle.drafts d on d.id = a.draft_id
+      left join noelle.leads  l on l.id = d.lead_id
+      where a.agent_instance_id = ${inst.id}
+        and a.status in ('sent', 'skipped')
+        and a.decided_at is not null
+      union all
+      select
+        coalesce(w.finished_at, w.started_at)     as when_,
+        case
+          when w.error is not null then 'errored'
+          when w.worker = 'discovery'  then 'swept'
+          when w.worker = 'classifier' then 'screened'
+          when w.worker = 'drafter'    then 'cycled'
+          when w.worker = 'send'       then 'posted'
+          else w.worker
+        end                                       as verb,
+        case
+          when w.error is not null
+            then w.worker || ' · ' || left(w.error, 80)
+          else w.worker || ' · '
+               || coalesce(w.rows_processed, 0) || ' row'
+               || case when coalesce(w.rows_processed, 0) = 1 then '' else 's' end
+        end                                       as what,
+        null::int                                 as cents,
+        null::text                                as model,
+        null::text                                as sent_url,
+        null::text                                as sent_external_id,
+        null::text                                as author_handle
+      from noelle.worker_runs w
+      where ${includeWorkerRuns}
+    ) t
+    where t.when_ is not null
+    order by t.when_ desc
+    limit ${limit}
+  `;
+
+  return rows.map((r) => ({
+    when: r.when_,
+    verb: r.verb,
+    // Worker error rows carry the raw backend-prefixed message (e.g.
+    // "drafter · vertex 503: …") — scrub the backend token before it can
+    // reach any feed. Other `what` values contain no backend tokens.
+    what: scrubBackendTokens(r.what),
+    cents: r.cents,
+    // Clean, engine-free model name (e.g. "Sonnet 4.6"); null for any model
+    // we don't surface — the raw engine/id never reaches the UI.
+    model: cleanModelLabel(r.model),
+    // Live X permalink for sent replies (null for every other row).
+    url: sentReplyUrl({
+      sentUrl: r.sent_url,
+      sentExternalId: r.sent_external_id,
+      authorHandle: r.author_handle,
+    }),
+  }));
+}
+
+export interface AutoSendQueueRow {
+  approvalId: string;
+  draftId: string;
+  leadId: string;
+  targetAt: string;
+  createdAt: string;
+  authorHandle: string | null;
+  bodyPreview: string | null;
+  charCount: number | null;
+}
+
+/**
+ * Auto-send queue for a single agent instance — pending approvals whose
+ * drafter stamped `auto_send_target_at`. Ordered by target time so the
+ * agent panel can render "next up in 4m 12s · …".
+ *
+ * Tenancy: piggybacks on `getAgentInstance` (assertOrgMember inside).
+ * Reads off the partial index `approvals_auto_send_due_idx`.
+ */
+export async function listAutoSendQueueForInstance(
+  instanceId: string,
+  limit = 20,
+): Promise<AutoSendQueueRow[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+  const rows = await readSql<
+    Array<{
+      approval_id: string;
+      draft_id: string;
+      lead_id: string;
+      target_at: string;
+      created_at: string;
+      lead_payload: unknown;
+      draft_payload: unknown;
+    }>
+  >`
+    select
+      a.id                        as approval_id,
+      a.draft_id                  as draft_id,
+      a.lead_id                   as lead_id,
+      a.auto_send_target_at       as target_at,
+      a.created_at                as created_at,
+      l.payload                   as lead_payload,
+      d.payload                   as draft_payload
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    where a.agent_instance_id = ${inst.id}
+      and a.status = 'pending'
+      and a.auto_send_target_at is not null
+    order by a.auto_send_target_at asc
+    limit ${limit}
+  `;
+  return rows.map((r) => {
+    const lead = leadPayload({ payload: r.lead_payload } as NoelleLead);
+    const draft = draftPayload({ payload: r.draft_payload } as NoelleDraft);
+    const body = bodyForSelectedAngle(draft);
+    return {
+      approvalId: r.approval_id,
+      draftId: r.draft_id,
+      leadId: r.lead_id,
+      targetAt: r.target_at,
+      createdAt: r.created_at,
+      authorHandle: lead.author_handle ?? null,
+      bodyPreview: body ? truncate(body, 200) : null,
+      charCount: draft.char_count ?? (body ? body.length : null),
+    };
+  });
+}
+
+/**
+ * Default anti-flag ceilings the dashboard LABELS. The real limits live in the
+ * x-intern worker env (AUTOSEND_MAX_PER_30MIN / AUTOSEND_MAX_PER_DAY) — those
+ * env vars are undefined in apps/app, and the worker remains the sole enforcer.
+ * These constants only render a "default ceiling" for the operator; a worker
+ * override changing the true limit is cosmetic drift here, never a gate on a
+ * real send. Keep in sync with apps/x-intern/src/env.ts if the defaults move.
+ */
+export const AUTOSEND_MAX_PER_30MIN_DEFAULT = 6;
+export const AUTOSEND_MAX_PER_DAY_DEFAULT = 50;
+
+export interface AutoSendUsage {
+  /** Auto-sends this instance completed in the last rolling 30 minutes. */
+  per30Min: number;
+  /** Auto-sends this instance completed in the last rolling 24 hours. */
+  perDay: number;
+  /** Labelled default ceiling (worker env is the real enforcer). */
+  per30MinCap: number;
+  /** Labelled default ceiling (worker env is the real enforcer). */
+  perDayCap: number;
+}
+
+/**
+ * How many auto-sends this instance has actually completed recently, for the
+ * autopilot panel's "within human-plausible velocity" readout. Counts only
+ * `status='sent' AND decided_by='auto-send'` rows (the exact predicate the
+ * worker's own rate brake uses), off the partial index
+ * `approvals_decided_inst_idx`.
+ *
+ * FAIL-CLOSED: returns null when the instance can't be resolved / the caller
+ * isn't a member (getAgentInstance runs assertOrgMember). The page also wraps
+ * this in `.catch(() => null)`, and the panel HIDES the caps row on null — it
+ * never renders "0 of N", which would fabricate headroom and mislead the
+ * operator into thinking it's safe to walk away.
+ */
+export async function getAutoSendUsage(
+  instanceId: string,
+): Promise<AutoSendUsage | null> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return null;
+  const rows = await readSql<Array<{ per30min: string | number; perday: string | number }>>`
+    select
+      count(*) filter (where decided_at >= now() - interval '30 minutes') as per30min,
+      count(*)                                                            as perday
+    from noelle.approvals
+    where agent_instance_id = ${inst.id}
+      and status = 'sent'
+      and decided_by = 'auto-send'
+      and decided_at >= now() - interval '24 hours'
+  `;
+  const r = rows[0];
+  return {
+    per30Min: r ? Number(r.per30min) : 0,
+    perDay: r ? Number(r.perday) : 0,
+    per30MinCap: AUTOSEND_MAX_PER_30MIN_DEFAULT,
+    perDayCap: AUTOSEND_MAX_PER_DAY_DEFAULT,
+  };
+}
+
