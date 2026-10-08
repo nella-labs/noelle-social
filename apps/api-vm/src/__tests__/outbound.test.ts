@@ -998,3 +998,203 @@ describe("POST /api/outbound", () => {
     __setDbClientForTests(db);
 
     const res = await postOutbound(
+      createApp(),
+      relationshipPayload({
+        owner: { orgId: ORG_ID, agentInstanceId: linkedinInstance },
+        leadId: "li-relationship-lead-1",
+        platform: "linkedin",
+        authorHandle: "kaia-tham",
+        authorId: "li-member-123",
+        originalPostId: "urn:li:activity:123",
+        originalPostUrl: "https://www.linkedin.com/feed/update/urn:li:activity:123/",
+      }),
+    );
+    expect(res.status).toBe(200);
+
+    const fakeState = (db as unknown as { __state: Record<string, TableState> }).__state;
+    expect(fakeState.leads!.rows[0]!).toMatchObject({
+      external_id: "li-relationship-lead-1",
+      org_id: ORG_ID,
+      agent_instance_id: linkedinInstance,
+      platform: "linkedin",
+      author_handle: "kaia-tham",
+      author_id: "li-member-123",
+      status: "drafted",
+    });
+    expect(fakeState.drafts!.rows[0]!.payload).toMatchObject({
+      kind: "dm",
+      human_review_required: true,
+    });
+    expect(fakeState.approvals!.rows).toHaveLength(1);
+    expect(fakeState.approvals!.rows[0]!).toMatchObject({
+      agent_instance_id: linkedinInstance,
+      status: "pending",
+    });
+    expect(fakeState.approvals!.rows[0]!.auto_send_target_at).toBeUndefined();
+  });
+
+  it("merges into the existing lead payload — never clobbers discovery/classifier fields", async () => {
+    // The lead already exists (discovery wrote text + the tweet's real posted_at
+    // + author_followers; the classifier appended its meta). The drafter's
+    // outbound upsert must MERGE, not replace — else it erases the real post
+    // date (making an ancient tweet look fresh) and the source text.
+    const REAL_POSTED_AT = "2026-02-24T14:00:41.000Z";
+    const db = makeFakeDb({
+      agent_instances: {
+        rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }],
+        error: null,
+      },
+      leads: {
+        rows: [
+          {
+            id: "00000000-0000-4000-8000-0000000000aa",
+            external_id: LEAD_EXTERNAL_ID,
+            org_id: ORG_ID,
+            platform: "x",
+            payload: {
+              text: "the real source tweet text from discovery",
+              posted_at: REAL_POSTED_AT,
+              author_followers: 999,
+              classifier: { label: "pain", recency: { age_days: 1.2 } },
+            },
+          },
+        ],
+        error: null,
+      },
+      drafts: { rows: [], error: null },
+      approvals: { rows: [], error: null },
+    });
+    __setDbClientForTests(db);
+
+    // Drafter posts the lead's REAL posted_at (post-fix) and omits `text`.
+    const payload = { ...basePayload(), postedAt: REAL_POSTED_AT };
+    const app = createApp();
+    const body = JSON.stringify(payload);
+    const ts = Math.floor(Date.now() / 1000);
+    const { signature } = signHmacBody(HMAC_SECRET, ts, body);
+    const res = await app.request("/api/outbound", {
+      method: "POST",
+      body,
+      headers: {
+        "content-type": "application/json",
+        "x-noelle-timestamp": String(ts),
+        "x-noelle-signature": signature,
+      },
+    });
+    expect(res.status).toBe(200);
+
+    const fakeState = (db as unknown as { __state: Record<string, TableState> }).__state;
+    const leadRows = fakeState.leads!.rows;
+    expect(leadRows).toHaveLength(1);
+    const merged = leadRows[0]!.payload as Record<string, unknown>;
+    // Discovery + classifier fields survive…
+    expect(merged.text).toBe("the real source tweet text from discovery");
+    expect(merged.posted_at).toBe(REAL_POSTED_AT);
+    expect(merged.classifier).toEqual({ label: "pain", recency: { age_days: 1.2 } });
+    // …and the drafter's draft-context fields are added.
+    expect(merged.tier).toBe("T1");
+    expect(merged.post_kind).toBe("opinion");
+  });
+
+  it("is idempotent: re-POSTing the same payload returns the same approvals", async () => {
+    const db = makeFakeDb({
+      agent_instances: {
+        rows: [
+          { id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" },
+        ],
+        error: null,
+      },
+      leads: { rows: [], error: null },
+      drafts: { rows: [], error: null },
+      approvals: { rows: [], error: null },
+    });
+    __setDbClientForTests(db);
+
+    const app = createApp();
+    const body = JSON.stringify(basePayload());
+    const ts = Math.floor(Date.now() / 1000);
+    const { signature } = signHmacBody(HMAC_SECRET, ts, body);
+    const headers = {
+      "content-type": "application/json",
+      "x-noelle-timestamp": String(ts),
+      "x-noelle-signature": signature,
+    };
+
+    const first = await app.request("/api/outbound", {
+      method: "POST",
+      body,
+      headers,
+    });
+    const second = await app.request("/api/outbound", {
+      method: "POST",
+      body,
+      headers,
+    });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+
+    // Same row counts after the second call.
+    const fakeState = (db as unknown as { __state: Record<string, TableState> })
+      .__state;
+    expect(fakeState.leads!.rows).toHaveLength(1);
+    expect(fakeState.drafts!.rows).toHaveLength(3);
+    expect(fakeState.approvals!.rows).toHaveLength(3);
+  });
+
+  it("returns 500 when the lead upsert fails", async () => {
+    const db = makeFakeDb({
+      agent_instances: {
+        rows: [
+          { id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" },
+        ],
+        error: null,
+      },
+      leads: { rows: [], error: "constraint violation" },
+      drafts: { rows: [], error: null },
+      approvals: { rows: [], error: null },
+    });
+    __setDbClientForTests(db);
+
+    const app = createApp();
+    const body = JSON.stringify(basePayload());
+    const ts = Math.floor(Date.now() / 1000);
+    const { signature } = signHmacBody(HMAC_SECRET, ts, body);
+
+    const res = await app.request("/api/outbound", {
+      method: "POST",
+      body,
+      headers: {
+        "content-type": "application/json",
+        "x-noelle-timestamp": String(ts),
+        "x-noelle-signature": signature,
+      },
+    });
+
+    expect(res.status).toBe(500);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toBe("lead_upsert_failed");
+  });
+
+  it("returns 500 when no active instance exists for the platform", async () => {
+    const db = makeFakeDb({
+      agent_instances: { rows: [], error: null },
+      leads: { rows: [], error: null },
+      drafts: { rows: [], error: null },
+      approvals: { rows: [], error: null },
+    });
+    __setDbClientForTests(db);
+
+    const app = createApp();
+    const body = JSON.stringify(basePayload());
+    const ts = Math.floor(Date.now() / 1000);
+    const { signature } = signHmacBody(HMAC_SECRET, ts, body);
+
+    const res = await app.request("/api/outbound", {
+      method: "POST",
+      body,
+      headers: {
+        "content-type": "application/json",
+        "x-noelle-timestamp": String(ts),
+        "x-noelle-signature": signature,
+      },
