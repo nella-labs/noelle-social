@@ -1,0 +1,23 @@
+[Unit]
+Description=Noelle Reddit intern — discovery worker (instance %i)
+Documentation=file:///opt/noelle/docs/reddit-intern.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=noelle-api
+Group=noelle-api
+WorkingDirectory=/opt/noelle/repo/apps/reddit-intern
+ExecStart=/opt/noelle/repo/apps/reddit-intern/run.sh discovery
+EnvironmentFile=/etc/noelle/db.env
+EnvironmentFile=/etc/noelle/worker.env
+Environment=WORKER_ID=%i
+Restart=on-failure
+RestartSec=15s
+MemoryMax=512M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
