@@ -2198,3 +2198,94 @@ export async function runDmRequestTick(
       });
       const draftArgs = {
         bucket: "drafter-codex",
+        routing: xInternRouting(instance),
+        orgId: instance.org_id,
+        instanceId: instance.id,
+        worker: "drafter" as const,
+        agentRole: "x_intern" as const,
+        // ownAccount = the operator's real follower numbers (so a cold DM can't
+        // invent them); the last arg suppresses the pitch on every rung below
+        // Invite, because the base DM section mandates it and a user-prompt rung
+        // directive cannot reliably beat a system-prompt mandate.
+        system: buildDrafterSystem(
+          instance.objective,
+          "",
+          brand,
+          null,
+          null,
+          undefined,
+          null,
+          ownAccount,
+          !rung.proposesCall,
+        ),
+        prompt,
+      };
+      const res = await runner.draft(draftArgs);
+      const parsed = DrafterOutput.safeParse(safeJsonParse(res.text));
+      if (!parsed.success || !("drafts" in parsed.data) || !parsed.data.dm) {
+        log.warn({ leadId: lead.id }, "dm-request: no DM in drafter output; skipping");
+        continue;
+      }
+      const dmCheck = await refineDmVoice({
+        body: stripEmDashes(stripDisallowedEmoji(parsed.data.dm.body)),
+        regenerate: async (feedback) => {
+          const r = await runner.draft({ ...draftArgs, prompt: `${prompt}\n\n${feedback}\nKeep the strict JSON output shape.` });
+          const p = DrafterOutput.safeParse(safeJsonParse(r.text));
+          return p.success && "drafts" in p.data && p.data.dm
+            ? stripEmDashes(stripDisallowedEmoji(p.data.dm.body)) : null;
+        },
+      });
+      const dmBody = dmCheck.body;
+      if (!dmBody) {
+        log.warn({ leadId: lead.id, reasons: dmCheck.reasons }, "dm-request: voice check rejected DM");
+        continue;
+      }
+      const body: OutboundIn = {
+        leadId: lead.external_id,
+        batchNumber: null,
+        platform: "x",
+        authorHandle: lead.author_handle,
+        authorId: lead.author_id ?? "0",
+        authorFollowers:
+          typeof payload.followers === "number" ? payload.followers : null,
+        allowsDms: null,
+        originalPostId: lead.external_id,
+        originalPostText: postText,
+        originalPostUrl:
+          payload.url ??
+          `https://x.com/${lead.author_handle}/status/${lead.external_id}`,
+        postedAt,
+        matchedTrigger: null,
+        // ONLY the DM — the reply for this lead was already handled.
+        drafts: [
+          {
+            id: randomUUID(),
+            kind: "dm" as const,
+            angle: null,
+            body: dmBody,
+            charCount: [...dmBody].length,
+            dmVoiceCheck: { pass: true, attempts: dmCheck.attempts, reasons: dmCheck.reasons },
+          },
+        ],
+        tier: lead.tier ?? null,
+        postKind: lead.classifier_label,
+        anchors: anchors
+          .slice(0, 5)
+          .map((a) => ({ snippet: a.snippet, score: a.score })),
+        autoSend: null,
+      };
+      await postOutbound(body);
+      drafted++;
+      log.info(
+        { leadId: lead.id, handle: lead.author_handle },
+        "dm-request: queued on-demand DM",
+      );
+    } catch (err) {
+      log.error(
+        { leadId: lead.id, err: (err as Error).message },
+        "dm-request: generation failed",
+      );
+    }
+  }
+  return drafted;
+}

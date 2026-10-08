@@ -198,3 +198,112 @@ async function main() {
     log.info({ everyMs: env.NOELLE_X_OWN_ACCOUNT_MS }, "x own-account tracking enabled");
   }
 
+  await runWorkerLoop({
+    log,
+    kind: "ideation",
+    pollMs: env.IDEATION_POLL_MS,
+    idlePollMs: env.IDLE_POLL_MS,
+    listActive: () => listWatchlistOrActiveXInternInstances(sql),
+    onTick: async (inst) => {
+      // Cheap queue read first: most ticks find no pending operator requests.
+      const requests = await claimIdeationRequests(sql, {
+        agentInstanceId: inst.id,
+        batch: env.IDEATION_BATCH,
+      });
+      if (requests.length === 0) return;
+
+      const gather = async (req: IdeationRequest): Promise<IdeationGather> => {
+        const topAuthors = await getXWatchlistAuthorEngagement(sql, {
+          agentInstanceId: inst.id,
+          windowDays: env.X_ANALYST_WINDOW_DAYS,
+          limitAuthors: env.X_ANALYST_TOP_AUTHORS,
+          samplePosts: env.X_ANALYST_SAMPLE_POSTS,
+          minPosts: env.X_ANALYST_MIN_POSTS,
+        });
+
+        let repliedPosts: IdeationGather["repliedPosts"] = [];
+        try {
+          repliedPosts = await getRepliedPostSources(sql, {
+            orgId: inst.org_id,
+            platform: "x",
+          });
+        } catch (err) {
+          log.warn({ err: (err as Error).message }, "x ideation replied-post source read failed");
+        }
+
+        let voiceAnchors: string[] = [];
+        if (sharedKb) {
+          const q = req.topics.length
+            ? req.topics.join(" ")
+            : inst.objective ?? "the operator's voice and the topics they post about";
+          try {
+            const hits = await sharedKb.search(q, env.NOELLE_IDEATION_VOICE_TOPK, {
+              filterDirs: parseIncludeDirs(env.NOELLE_VOICE_DIRS),
+            });
+            voiceAnchors = hits.map((h) => h.snippet).filter(Boolean);
+          } catch (err) {
+            log.warn({ err: (err as Error).message }, "x ideation voice search failed");
+          }
+        }
+
+        // The LEARN signal: the operator's own measured posts, rolled up by
+        // pillar/angle. Fail-open — a read error just drops the bias block.
+        let ownPerformance = null;
+        if (env.X_IDEATION_OWN_PERF_POSTS > 0) {
+          try {
+            ownPerformance = await getOwnPostPerformance(sql, {
+              instanceId: inst.id,
+              windowDays: env.NOELLE_X_SELF_TRACK_WINDOW_DAYS,
+              topPosts: env.X_IDEATION_OWN_PERF_POSTS,
+            });
+          } catch (err) {
+            log.warn({ err: (err as Error).message }, "x ideation own-performance read failed");
+          }
+        }
+
+        return { repliedPosts, topAuthors, keywordPosts: [], voiceAnchors, pillars, ownPerformance };
+      };
+
+      for (const req of requests) {
+        const bus = busForInstance(inst);
+        const run = await recordRun({ sql, kind: "ideation", bus });
+        try {
+          // X v1 has no polish path (the polish/voice-spec stack is LinkedIn-only
+          // so far). Finish a polish request cleanly rather than hang it.
+          if (req.mode === "polish") {
+            log.info({ req: req.id }, "x ideation: polish not supported yet; no-op");
+            await finishIdeationRequest(sql, { id: req.id, status: "done" });
+            await run.finish({ status: "ok", rowsProcessed: 0 });
+            continue;
+          }
+          const n = await runIdeationTick({
+            log,
+            instance: inst,
+            request: req,
+            gather,
+            runner,
+            sink: (ideas) => ideasClient.postIdeas({ platform: "x", ideationRequestId: req.id, ideas }),
+            idFactory: () => randomUUID(),
+            defaultCount: env.IDEATION_DEFAULT_COUNT,
+          });
+          await finishIdeationRequest(sql, { id: req.id, status: "done" });
+          await run.finish({ status: "ok", rowsProcessed: n });
+        } catch (err) {
+          await finishIdeationRequest(sql, {
+            id: req.id,
+            status: "error",
+            errorMessage: (err as Error).message,
+          });
+          await run.finish({ status: "error", errorMessage: (err as Error).message });
+          log.error({ instance: inst.id, req: req.id, err: (err as Error).message }, "x ideation request failed");
+        }
+      }
+    },
+    shouldStop,
+  });
+}
+
+main().catch((err) => {
+  console.error("x ideation fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
