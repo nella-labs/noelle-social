@@ -198,3 +198,61 @@ export async function extractVideo(opts: ExtractVideoOpts): Promise<ExtractedVid
       /* leave downloaded=false */
     }
   }
+  if (!downloaded) {
+    opts.log?.warn({ url: opts.videoUrl }, "video download failed; teardown will use caption only");
+    return EMPTY;
+  }
+
+  const result: ExtractedVideo = { ...EMPTY, localVideoPath: videoPath };
+
+  // 2) duration
+  try {
+    const { stdout } = await exec(ffprobe, buildDurationArgs(videoPath));
+    result.durationS = parseDuration(stdout);
+  } catch {
+    /* optional */
+  }
+
+  // 3) audio → transcript (local faster-whisper)
+  try {
+    const wav = join(opts.workDir, "audio.wav");
+    await exec(ffmpeg, buildAudioArgs(videoPath, wav));
+    const { stdout } = await exec(whisper, [
+      wav,
+      "--model",
+      opts.whisperModel ?? "base",
+      "--output_format",
+      "json",
+      "--output_dir",
+      opts.workDir,
+    ]);
+    let raw = stdout;
+    try {
+      raw = await readFile(join(opts.workDir, "audio.json"), "utf8");
+    } catch {
+      /* some builds print JSON to stdout instead of a file */
+    }
+    const t = parseWhisperJson(raw);
+    result.transcript = t.transcript;
+    result.segments = t.segments;
+  } catch (e) {
+    opts.log?.warn({ err: (e as Error).message }, "transcription failed (continuing without transcript)");
+  }
+
+  // 4) keyframes (scene cuts, with an interval fallback)
+  try {
+    const pattern = join(opts.workDir, "frame-%03d.jpg");
+    const { stderr } = await exec(ffmpeg, buildKeyframeArgs(videoPath, pattern));
+    result.cutTimestamps = parseSceneCuts(stderr);
+    let frames = await listFrames(opts.workDir);
+    if (frames.length === 0) {
+      await exec(ffmpeg, buildIntervalFrameArgs(videoPath, pattern)).catch(() => undefined);
+      frames = await listFrames(opts.workDir);
+    }
+    result.keyframePaths = selectKeyframes(frames, maxFrames);
+  } catch (e) {
+    opts.log?.warn({ err: (e as Error).message }, "keyframe extraction failed (continuing without frames)");
+  }
+
+  return result;
+}
