@@ -198,3 +198,166 @@ hoverDwellMs(rng): number             // logNormal ~220ms
 Content script returns per-candidate-post `{wordCount, isTruncated (has …more), hasMedia, author, isWatchlist}`. Behavior:
 
 - **"…more" expansion:** if `decideStop()` true AND post `isTruncated` AND `wordCount(visible) > ~60`, with **p=0.7** click the `…more` expander (via the §2 selector), then **re-measure** word count and **re-run reading dwell on the now-fuller text**. Sometimes (p=0.3) read the truncated preview and move on without expanding (humans do this too). Expanding-then-reading is itself a strong human decoy action.
+- **Longer dwell on media/long posts:** dwell model (b) already scales with wordCount; add `hasMedia → +normal(1500, 600)ms` (looking at the image/video) and a higher P(stop).
+- **Comment/DM target reading:** before commenting (`doComment`), the current `sleep(800–2200)` is replaced by `readingDwellMs` computed from the *target post's* word count (you opened its permalink — read it like a human would before replying). Same for DM: dwell on the profile.
+
+### (e) Action Scheduler Upgrades — augments `planTimeline`
+
+Keep the burst architecture (it's good) but fix the *gap distribution* and add decoys/autocorrelation.
+
+- **Inter-action gaps:** today bursts place actions at `rng.float(0, burstSpan·0.6)` (uniform). Replace within-burst spacing with **log-normal gaps + AR(1) autocorrelation**:
+  `gap[n] = ρ·gap[n-1] + (1-ρ)·base[n] + ε`, ρ = **normal(0.4, 0.1)** clamped [0.2,0.6], `base[n] = logNormal` with **per-session median** drawn at session start (the "personal tempo," see (f)), typical median **150–280 s** between *write* actions, `ε = normal(0, 0.1·base)`. This raises inter-action CV from current ~moderate to the human **0.8–2.0** band and adds momentum so fast runs stay fast.
+- **Burst structure:** keep ~1 burst / 45–90 min (`windowHours / float(0.75,1.5)`), but make burst *intensity* vary: each burst draws an action-count from a Gamma so some bursts are heavy, some light (humans batch then stop). Never the same daily total — vary ±20% day-to-day (e.g., 18, then 24, not 20 every day).
+- **Decoy / non-goal actions** (new `PlannedAction` kinds, `kind:"decoy"`): interleave **2–4 per active hour**:
+  - `decoy:hover` — hover a name/`…more`/reaction button, dwell 150–400ms, move away (no click).
+  - `decoy:expand` — click `…more`, read, no reaction.
+  - `decoy:profile-peek` — open a feed author's profile, dwell `gamma`, close, no action.
+  - `decoy:scroll-explore` — scroll through 1–4 posts at reading pace before the *next real* action (never teleport to the target post).
+  Decoys are scheduled by the planner (so they're seeded/testable) and executed in the tick loop.
+- **Off-hours hard taper:** strengthen `densityWeight` from 0.25 → **0.05** in 23:00–06:00 local, and add a hard rule in the loop: **no `write` actions (like/comment/dm) between 23:00–06:00 operator-local**; decoys/ambient only. Off-hours writes are "a near-certain automation flag."
+
+```ts
+// scheduler.ts additions — pure:
+planTimeline(...)  // now emits {kind: "like"|"comment"|"dm"|"decoy", subtype?, atMs}
+//  - within-burst gaps via logNormal + AR(1)
+//  - per-burst Gamma intensity
+//  - decoys interleaved at 2–4/active-hour
+//  - hard write-curfew 23:00–06:00
+```
+
+### (f) Session / Fatigue Model — new module `src/lib/session.ts` (pure)
+
+Draw a **session persona** at `startRun` from a seed and hold it (this is the "session-level entropy" that prevents a repeated session signature):
+
+- **Personal tempo:** base inter-action median `logNormal` ∈ [150s, 280s]; reading speed `normal(238,60)`; tremor amplitude; ρ; click-offset bias side. All fixed for the session.
+- **Warm-up (first ~3–5 min):** scale inter-action gaps ×**1.4→1.0** ramp, and suppress writes for the first `normal(120, 40)`s (arrive, scroll, read before doing anything). Warm-up effects saturate fast (MacKenzie <3% across blocks) — keep it light.
+- **Engagement decay within session:** multiply *base action rate* by a decay so late-session is slower: `rate(t) = rate0 · max(0.4, exp(-t/T))`, T ≈ **35 min** (softer than the aggressive ×0.2-at-5-min single-page model, which is per-*page* not per-*session*). Conservative default: gentle decay, since over-aggressive decay itself becomes a signature.
+- **Micro-breaks:** every `gamma(k=2, θ=12min)` of activity, insert a break of `logNormal` median **90 s** (clamp [20s, 6min]) — pure idle, cursor idle-drift only.
+- **Leave-and-return:** with p≈**0.15 per ~30 min**, do an `ambient:navigate` (already exists) to notifications/mynetwork OR **blur the tab** (focus another tab via no-op) for `logNormal` median 40s, then return. Models the >57% tab-switch rate. Vary whether a session is "read-heavy" (few writes, lots of scroll/dwell) or "action-heavy."
+- **Circadian volume scaling:** scale the *target* action counts by time-of-day (peak 10:00–14:00 = ×1.0, evening ×0.8, early morning ×0.4, curfew ×0). 12–31% performance variation also nudges tempo (slightly slower outside midday).
+
+### (g) Distraction / Idle Model
+
+When no action is due (`idx < 0`), the loop already calls `runAmbient`. Upgrade ambient:
+- **Scroll-read** (current default) → use the **new scroll engine + reading dwell**, not the old `wheel(...,600–1800,...)` + `sleep(1500–6000)`.
+- **"Looking away" pause:** with p≈0.2, instead of scrolling, just idle (cursor idle-drift + tremor, no events) for `gamma(k=2, θ=4s)` ≈ 5–12s — models distraction. Power-law tail: rarely (p≈0.03) a long pause `logNormal` median 90s.
+- **Non-productive hover during ambient:** occasionally hover a visible name/`…more` and drift away.
+
+---
+
+## 4. Detection-Evasion Checklist (prioritized — what moves the needle most)
+
+**Already won (preserve, don't regress):** real headed Chrome extension on residential session ⇒ no `navigator.webdriver`, no `Runtime.enable` leak, no headless WebGL/JA4/HTTP-2 mismatch, isTrusted via CDP. **Never port to Playwright/headless.**
+
+**Tier 1 — behavioral velocity (highest impact, all pure/testable):**
+1. Sigma-lognormal velocity envelope + **overshoot+corrective sub-movement** on every click *(BeCAPTCHA's #1 feature)*.
+2. **Micro-tremor 8–12 Hz on every coordinate**, including hover/idle (a still pixel = instant tell).
+3. Variable point density + **non-uniform inter-event sleeps** (replace `sleep(6–22)` uniform).
+4. **Pre-click hover dwell** (~220ms log-normal) + click point ≠ center (2D-Gaussian).
+
+**Tier 2 — scroll & reading (fixes the user-reported "robotic"):**
+5. Momentum/inertia scroll (τ=325ms decay), flick-vs-slow mixture, jittered wheel deltas, re-reads → scroll-spacing CV > 0.5.
+6. Reading dwell proportional to word count (Brysbaert 238wpm) + stop-vs-scroll-past decision.
+7. `…more` expansion on long truncated posts, then re-read.
+
+**Tier 3 — timing & pacing:**
+8. Replace all uniform `rng.float` action-gaps with **log-normal + AR(1) ρ≈0.4**; inter-action CV → 0.8–2.0.
+9. Vary daily volumes ±20%; per-burst Gamma intensity; never identical schedule.
+10. **Hard write-curfew 23:00–06:00**, circadian volume scaling.
+
+**Tier 4 — behavioral completeness:**
+11. Decoy actions 2–4/active-hour (hover-no-click, expand-no-react, profile-peek, non-task scroll before target).
+12. Session persona + warm-up + decay + micro-breaks + leave-return; per-session entropy on every parameter.
+
+**Tier 5 — hardening / can't-fully-fix (acknowledge limits):**
+13. `getCoalescedEvents()` empty is **unpatchable from MV3**; mitigate by keeping volumes low so we're not pulled for inspection. (OS-level injection is out of scope.)
+14. Keep acceptance/reply rates high (server-side spam signal #1) — this is a *content/targeting* lever (Lyra-side), but the actuator must not blast low-quality comments/DMs.
+
+---
+
+## 5. Safe-Pacing Recommendation (concrete)
+
+Grounded in rate-safety research, biased conservative (this is the write path; HeyReach-style account-level bans are real). Caveat: the specific numeric thresholds in research ("40 profiles/20min", "200/day") are **community estimates, not official** (REFUTED as precise) — so treat all numbers as soft ceilings and keep well under.
+
+**Hard rule (overrides everything):** velocity > totals. No burst > **5–10 write-actions/hour**; never uniform intervals (enforced by log-normal+AR(1) gaps median 150–280s).
+
+**Established account, steady-state daily targets (set as `RunParams`/`caps` ceilings):**
+
+| Signal | Conservative target/day | Hard ceiling/day | Per-hour cap | Notes |
+|---|---|---|---|---|
+| Likes | 30–50 | 80 | ≤10 | lowest-risk action |
+| Comments | 15–25 | 40 | ≤5–8 | velocity is the risk, not total |
+| DMs (1st-degree) | 12–20 | 30 | ≤4 | keep reply-rate >30–40% |
+| Decoys (hover/peek/expand) | 20–40 | — | — | non-write, free |
+| Active window | **07:00–21:00 operator-local** | never 23:00–06:00 | — | curfew enforced in loop |
+| Inter-write spacing | logNormal median 150–280s | never < 45s | — | + AR(1) momentum |
+
+**Warm-up ramp for a new/cold account (4 weeks), as a `warmupWeek` multiplier on targets:**
+
+| Week | Likes | Comments | DMs | Connection reqs (if added) |
+|---|---|---|---|---|
+| 1 | 5–10 | 5 | 0 | 5 (known contacts) |
+| 2 | 15–20 | 10–15 | 5–10 | 10 |
+| 3 | 30–40 | 20–30 | 15 | 15 |
+| 4+ | 50–80 (cap) | 30–40 | 20–30 | 20–25 |
+
+**Day-to-day:** vary totals ±20% (18 one day, 24 the next — never exactly N daily). Distribute across 2–4 bursts in the active window. On any challenge/CAPTCHA (`detectChallenge` already wired) → **halt run, back off ≥14 days**, then resume at warm-up Week-2 levels.
+
+---
+
+## 6. Implementation Plan (mapped to files, ordered by impact)
+
+Legend: **[pure]** = unit-testable with seeded RNG (no browser). **[browser]** = manual smoke only (CDP/DOM).
+
+### Step 0 — Fix likes (unblock the whole pipeline) — *small, high-impact*
+- **`src/content/locators.ts`** [pure-ish, fixture-testable]: in `locateLikeTarget`, search **all in-viewport** posts (not `posts[0]`), filter sponsored/already-liked, return the chosen post's `topY` + bbox so the loop can scroll it to center first.
+- **`src/background/index.ts`** `tick()` like-branch [browser]: before locate, scroll the candidate to viewport center and **poll** `locateLike` up to ~1.5s for the social-action bar to hydrate (retry loop). Surface the existing `no-likeable-post(posts=N,withBtn=M)` diagnostic in `s.lastEvent`.
+- Add fixtures: a multi-post feed + an already-liked post to `tests/fixtures/`. **Tests:** `tests/dom/locators.test.ts` — picks first likeable, skips sponsored/liked.
+
+### Step 1 — Add distributions to `Rng` — *foundation* [pure]
+- **`src/lib/rng.ts`**: add `normal`, `logNormal`, `gamma`, `pickWeighted`. **Tests** `tests/rng.test.ts`: seeded determinism + distribution sanity (mean/var within tolerance over N draws).
+
+### Step 2 — New mouse model in `motion.ts` + upgrade `cdp.moveAndClick` — *highest behavioral impact*
+- **`src/lib/motion.ts`** [pure]: add `mousePlan(from,to,targetSize,rng)` (sigma-lognormal envelope, variable density, overshoot+correct), `clickPoint(rect,rng)`, `tremor(base,t,rng)`, `hoverDwellMs(rng)`. Keep old `mousePath` temporarily for callers, then delete.
+- **`src/background/cdp.ts`** `moveAndClick` [browser]: consume `mousePlan` — dispatch `mouseMoved` per point using the plan's **non-uniform `sleepsMs`**, apply `tremor` to every coord, do the **hover dwell**, then **overshoot → correct → press/hold/release** at `clickPoint` (pass the element rect from the locator, not just center). Ensure full chain: moves → `mousePressed` → hold `gamma`-ms → `mouseReleased`.
+- **Signature change:** locators must return the element **rect** (x,y,w,h), not just center, so `clickPoint`/Fitts `W` work. Update `LocateResult` + `elementCenter` callers in `locators.ts`.
+- **Tests** `tests/motion.test.ts` [pure]: invariants from §3(c) (velocity peak position, overshoot present, CV of sleeps, off-chord curvature, endpoint == clickPoint).
+
+### Step 3 — New scroll engine in `motion.ts` + upgrade `cdp.wheel`/`ambient` — *fixes "robotic"*
+- **`src/lib/motion.ts`** [pure]: add `planScrollGestures(rng, totalPx, contentHints)` (flick/slow/nudge/back mixture, momentum decay, jittered deltas). Delete `planScrollSteps`.
+- **`src/background/cdp.ts`** `wheel` [browser]: consume gestures; emit `mouseWheel` with per-gesture decelerating deltas and **non-uniform** inter-event sleeps from the plan; tremor on the x,y.
+- **`src/background/ambient.ts`** [browser]: replace the `wheel(...,600–1800)`+uniform-sleep with scroll-gestures + reading dwell; add the "looking away" idle branch and non-productive hover.
+- **Tests** `tests/motion.test.ts` / `tests/ambient.test.ts` [pure]: deltas decay within a flick, no two equal consecutive deltas, spacing CV > 0.4, total ≈ target.
+
+### Step 4 — Reading-dwell + content hints — *fixes proportional reading & adds `…more`*
+- **`src/content/selectors.ts`** [pure, fixture-testable]: add `findSeeMore(post)`, `postText(post)`/`wordCount(post)`, `hasMedia(post)`, `isTruncated(post)`. Add fixtures (long post w/ `…more`, media post). **Tests** `tests/dom/selectors.test.ts`.
+- **`src/lib/dwell.ts`** (new) [pure]: `readingDwellMs(rng, wordCount, hints, sessionWpm)`, `decideStop(rng, wordCount, hints)`. **Tests** `tests/dwell.test.ts`: monotonic in wordCount, right-skew shape, floor/cap respected.
+- **`src/content/locators.ts`** [pure]: `locateLike` returns `wordCount/hasMedia/isTruncated/author`; add `locateSeeMore`.
+- **`src/background/index.ts`** [browser]: in like-branch, run `decideStop`/`readingDwellMs` before clicking; expand `…more` (p=0.7) then re-read; in `doComment`/`doDm` replace fixed `sleep(800–2200)`/`(1000–2500)` with `readingDwellMs` from the target post/profile.
+
+### Step 5 — Scheduler upgrade in `scheduler.ts` — *server-side pacing/CV* [pure]
+- **`src/lib/scheduler.ts`**: within-burst gaps via `logNormal`+AR(1); per-burst Gamma intensity; emit `decoy` actions (2–4/active-hr) as new `PlannedAction` subtypes; strengthen off-hours `densityWeight`→0.05 and add `kind:"like"|"comment"|"dm"` **write-curfew 23:00–06:00**; vary daily total ±20%.
+- **`src/lib/types.ts`**: extend `ActionKind`/`PlannedAction` with `"decoy"` + `subtype`.
+- **Tests** `tests/scheduler.test.ts`: inter-action CV in [0.8,2.0]; zero writes in curfew window; decoys present; AR(1) autocorrelation lag-1 ρ in band; first-action-soon responsiveness preserved.
+
+### Step 6 — Session/fatigue module — *session entropy* [pure + browser]
+- **`src/lib/session.ts`** (new) [pure]: `makeSessionPersona(seed)` (tempo, wpm, tremor, ρ, curfew, read-heavy-vs-action-heavy), `warmupScale(tMs)`, `engagementDecay(tMs)`, `microBreakDue(activityMs, rng)`. **Tests** `tests/session.test.ts`.
+- **`src/background/index.ts`** [browser]: build persona at `startRun`, store in `RunState`; apply warm-up suppression + decay + micro-breaks + leave-return in `tickOnce`. Thread `sessionWpm`/persona into dwell + mouse + scroll calls.
+
+### Step 7 — Decoy execution in the loop [browser]
+- **`src/background/index.ts`**: handle `kind:"decoy"` subtypes (hover-no-click, expand-no-react, profile-peek, scroll-explore-before-target). Reuse `mousePlan` for hover (move + hover dwell, **no press**).
+
+**Build/verify:** run `pnpm build` in the worktree first (shared `@noelle/*` packages must be built or tests can't resolve dist — per the worktree-build lesson). All pure modules: `vitest run`. Browser-only steps (2,3,4-loop,6,7): manual smoke on a real LinkedIn tab with the panel log (DevTools can't be open during a run — it blocks `chrome.debugger`), watching `s.lastEvent` and the activity events. Verify likes succeed end-to-end (Step 0) **before** layering behavior on top.
+
+**Sequencing rationale:** Step 0 unblocks (likes are functionally broken). Steps 1–3 kill the loudest behavioral tells (velocity + scroll = the user's actual complaint and BeCAPTCHA's top features). Step 4 adds the reading/`…more` realism. Steps 5–7 harden pacing and add decoys/session arc. Each step is independently shippable and the pure planners carry the test coverage; only CDP dispatch and live-DOM selectors need manual smoke.
+
+---
+
+### Conflicts / unverifiable parameters → conservative defaults taken
+- **CDP `isTrusted:true`** — fragile/unconfirmed → don't rely on it; invest in behavior + low volume.
+- **`getCoalescedEvents` as a deployed signal** — spec-real, deployment unverified → assume worst case, but unpatchable in MV3 → mitigate via low volume.
+- **LinkedIn numeric rate thresholds** — community estimates (REFUTED as official) → use them only as soft ceilings, stay well under.
+- **Per-page ×0.2-at-5min decay** — too aggressive for a *session* model → softened to exp decay T≈35min, floor 0.4.
+- **Fragile selectors** (`…more`, `.update-components-text/-actor__name`, `.msg-form` scope, reaction flyout) — marked ⚠ LIVE-CHECK; prefer ARIA sub-selectors; **skip the reaction flyout entirely** (plain Like only).
+
+**Relevant files:** `apps/linkedin-actuator/src/lib/{rng,motion,scheduler,types}.ts`, `.../src/lib/{dwell,session}.ts` (new), `.../src/background/{cdp,index,ambient}.ts`, `.../src/content/{selectors,locators}.ts`, `.../tests/{motion,scheduler,rng,ambient,dwell,session}.test.ts`, `.../tests/dom/{selectors,locators}.test.ts`, `.../tests/fixtures/*.html`.

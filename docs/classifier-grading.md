@@ -198,3 +198,40 @@ Everything else is `skipped` and never shown.
 
 ## Relationship scout (VIP flag + suggested DM)
 
+Independently of the on-brand grade, the classifier also runs a **relationship
+scout** in the *same* LLM call (no extra call, no extra latency). It judges
+whether the post's **author** is a high-leverage person to build a relationship
+with — an ICP match, a founder/CEO/builder of a notable or venture-backed company
+(e.g. a YC founder), an investor, or a respected operator/creator — and, when so,
+pre-drafts a short, genuine intro DM (a real question or a low-pressure coffee-chat
+ask; **no pitch, no link**).
+
+- **Where:** the `relationship` block in the classifier output
+  (`buildClassifierSystem(..., vipScout)` appends the scout instructions). Shared
+  shape: `@noelle/contracts` `VipSignalSchema`
+  (`{ vip, reason, tags[], add_to_watchlist, dm_soon, suggested_dm }`).
+- **Stored:** `noelle.leads.vip_signal` (jsonb), written by `markLeadClassified`.
+  `NULL` = the scout never ran (predates the feature / disabled) or fail-open.
+- **Why precomputed:** `api-vm` has no LLM path, so the suggested DM can't be
+  generated on button-click — it rides along on the classifier verdict.
+- **Surfaced:** a loud gold banner above the draft picker on the approvals detail
+  page (both Vega's `DraftReviewPanel` and Lyra's `LinkedInApprovalDetailView`)
+  and inline in the speed lane (`SpeedrunRow`): the reason + tags, a one-click
+  **Add to watchlist** (seeds the scout reason as the engagement objective), and
+  the **suggested intro DM** with **Copy** + **Park in DMs**. It's meant to catch
+  the eye *before* the reflex Send / Mark sent.
+- **Park in DMs:** the suggested DM is otherwise copy-and-it's-gone. "Park in DMs"
+  (`parkVipIntroDm`, `apps/app/.../approvals/vip-dm-actions.ts`) persists it as a
+  real `kind='dm'` draft + pending approval for the lead, so it shows in the inbox
+  under the **DMs On** toggle (filter `payload->>'kind'='dm'`) — parked for when
+  you want to send it a bit later, not right now. The body is read server-side
+  from `vip_signal.suggested_dm` (never the client), and the write is idempotent:
+  the draft carries `payload.source='vip_intro_dm'` so re-clicking never parks a
+  second copy.
+- **Toggle:** on by default; set `NOELLE_VIP_SCOUT=false` (or `0`) on the
+  classifier worker to disable. Additive + fail-open — leaving it on is safe; a
+  scout-off run or an omitted field simply yields `vip_signal = NULL` (no banner).
+
+The same scout runs in the LinkedIn intern (Lyra). It's especially apt there —
+the suggested DM and watchlist add feed Lyra's existing draft-only intro-DM and
+connection-tracking flows.
