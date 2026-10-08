@@ -798,3 +798,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
     //
     // A NULL score means the classifier could not score the lead, NOT that the
     // lead is junk. The old condition dropped null alongside sub-threshold, on
+    // the belief that `label=other` junk lands in the null bucket — it does not:
+    // over the last 90 days 399 `other` leads carry a score and 193 do not, and
+    // velocity_score is non-nullable in the classifier's schema, so a scored
+    // classification always produces a number. Null on a lead that reached the
+    // drafter therefore means the scoring call FAILED (the `too_old` and
+    // `non_english` paths short-circuit earlier and never get here).
+    //
+    // So the old gate was fail-CLOSED: a classifier outage silently dropped every
+    // keyword lead, which is the opposite of the documented fail-open contract
+    // Lyra and Orion implement. An unscored lead now passes to the drafter, where
+    // the relevance gate and the post-draft verifier still apply.
+    if (
+      qualityThreshold > 0 &&
+      !replyRequest &&
+      !lead.priority &&
+      lead.classifier_score != null &&
+      lead.classifier_score < qualityThreshold
+    ) {
+      log.info(
+        { leadId: lead.id, classifierScore: lead.classifier_score, qualityThreshold },
+        "drafter skipped lead below classifier quality threshold",
+      );
+      await markStatus({
+        leadId: lead.id,
+        status: "skipped",
+        meta: {
+          skip_reason: `below-quality-threshold (score=${lead.classifier_score ?? "null"} < ${qualityThreshold})`,
+          classifier_score: lead.classifier_score,
+          quality_threshold: qualityThreshold,
+        },
+      });
+      continue;
+    }
+
+    try {
+      const retrievedAnchors = await kb.search(postText, 8, voiceOpts).catch((err) => {
+        log.warn({ err: (err as Error).message }, "knowledge base search failed; drafting with no anchors");
+        return [];
+      });
+      // Generated brand summaries and unrendered templates are not examples of
+      // how the operator speaks. Keep them out of both writer and verifier
+      // prompts; recent sent replies remain the primary voice evidence.
+      const anchors = retrievedAnchors.filter(usableVoiceAnchor);
+
+      // Retrieval-score gate. Replaces the old "model decides skip/no-fit"
+      // behaviour in SYSTEM_X. If the strongest anchor is below the
+      // configured threshold, the lead is too far from the knowledge base to
+      // produce an authentic reply — skip without spending an LLM call.
+      const topAnchorScore = retrievedAnchors.length === 0
+        ? 0
+        : Math.max(...retrievedAnchors.map((a) => a.score));
+      // Watchlist (priority) leads bypass the relevance gate entirely — every
+      // post from a watchlisted person must get a drafted reply. Anchors are
+      // still fetched above for voice grounding; we just never skip-on-score.
+      if (!replyRequest && !lead.priority && topAnchorScore < relevanceThreshold) {
+        log.info(
+          { leadId: lead.id, topAnchorScore, relevanceThreshold },
+          "drafter skipped lead below relevance threshold",
+        );
+        await markStatus({
+          leadId: lead.id,
+          status: "skipped",
+          meta: {
+            skip_reason: `below-relevance-threshold (score=${topAnchorScore.toFixed(3)} < ${relevanceThreshold})`,
+            top_anchor_score: topAnchorScore,
+            relevance_threshold: relevanceThreshold,
+          },
+        });
+        continue;
+      }
+
+      // Second, KNOWLEDGE retrieval pass: scoped to product/positioning vault
+      // dirs, so the drafter can ground factual claims about the offer instead
+      // of inventing them from model priors. Skipped entirely when no knowledge
+      // dirs are configured (managed prod today). Fail-open to no knowledge.
+      const knowledge =
+        knowledgeDirs && knowledgeDirs.length && knowledgeTopK > 0
+          ? await kb
+              .search(postText, knowledgeTopK, { filterDirs: knowledgeDirs })
+              .catch((err) => {
+                log.warn(
+                  { err: (err as Error).message },
+                  "knowledge retrieval failed; drafting without product knowledge",
+                );
+                return [];
+              })
+          : [];
+
+      // Optional visual context falls back to empty on ordinary failure.
+      // Denied model admission propagates to the existing budget hold policy.
+      const imageCaption = await captionImages({
+        imageUrls: payload.images ?? [],
+        postText,
+        ...(captionFn ? { captionFn } : {}),
+      });
+
+      // Detect the post's ENERGY once (label-first: a persisted energy label from the
+      // classifier, then classifier_label, then text heuristics). Drives the
+      // energy-aware register, the prompt energy-hint, and — collapsed to
+      // celebration/neutral — the Account Feeder style block. Gated on
+      // NOELLE_DRAFTER_ENERGY; off → null and behavior is byte-identical to today.
+      const postEnergy = args.energy?.enabled
+        ? detectPostEnergy(postText, {
+            classifierLabel: lead.classifier_label,
+            energyLabel: (payload as { energy?: string | null }).energy ?? null,
+          })
+        : null;
+      // The Account Feeder + verifier want the binary celebration/neutral register.
+      // Derive it from the richer energy when energy is on; else keep old detection.
+      const postRegister = postEnergy
+        ? energyToRegister(postEnergy)
+        : detectPostRegister(postText, lead.classifier_label);
+
+      // Voice variety, one of two mutually exclusive mechanisms per lead:
+      //
+      //  SHAPE (default) — rotate this reply's FORM through X_FORM_VARIANTS so
+      //    the feed stops reading as one mold. This is what lets Vega answer with
+      //    a single word ('brutal') on one lead and a 200-char three-beat take on
+      //    the next. Unlike Lyra's #498 the shape is a STANDALONE block, so it
+      //    fires on every lead instead of only pinned-voice ones.
+      //  REGISTER (strong energies only) — on a joke/celebration/vent/hot take,
+      //    mirroring the TONE beats varying the form, so the energy-aware register
+      //    wins for that lead and no shape is assigned.
+      //
+      // Never both: each claims authority over reply length, and two contradicting
+      // length rules in one prompt is how #498's review said drafts get squeezed.
+      const toneFirst = postEnergy != null && TONE_FIRST_ENERGIES.has(postEnergy);
+      // Splitting the tone-first lane. It used to mean "register, and no shape
+      // at all", so every joke/celebration/vent/hot-take lead was drafted in the
+      // default length band and the four energies that are the LOUDEST part of
+      // the feed were also its most uniform. Now half of them are given a shape
+      // drawn only from the shapes that can carry that energy, and the other
+      // half keep the register — which still expresses things a shape cannot
+      // (HYPE's CAPS, DEADPAN's dryness). The energy HINT is injected either
+      // way, so tone mirroring never depends on which side of the split a lead
+      // lands on. Register and shape stay mutually exclusive: two length rules
+      // in one prompt is how drafts get squeezed.
+      const toneFirstShape =
+        toneFirst && variety?.enabled
+          ? (variety.rng ?? Math.random)() < TONE_FIRST_SHAPE_SHARE
+          : false;
+      // LIGHT lane: the classifier judged this not substantial-grade but still
+      // worth a short warm reaction (a ship, a launch, a personal win) — or it is
+      // a watchlist lead whose skip verdict was clamped. Vega used to have no
+      // such lane: a lead was either fully drafted or dropped. It reuses the
+      // shape machinery rather than a second prompt, minus the shapes that
+      // cannot carry a congrats (a bare QUESTION_ONLY is off-register on a win).
+      const isLight = lead.classifier_label === "light";
+      // NO stance exclusion on Vega, and the reason is the USER prompt, not the
+      // system one. SYSTEM_X's output block does ask for three angles, but
+      // renderPrompt's closing line asks for "Exactly ONE reply draft (the
+      // single best angle)" on BOTH of its branches, and that line is last —
+      // so every X prompt is single-draft whichever system prompt it carries.
+      // A stance shape governs that one reply, which is exactly what it is for.
+      //
+      // A previous version of this excluded STANCE_SHAPE_IDS for brand-less
+      // orgs on the premise that managed prod has no brand_config. That premise
+      // was backwards: Vega's live row carries a 4.5 KB config with a populated
+      // qa, so the exclusion never fired in prod, and where it DID fire it
+      // removed RIFF and FLAT_DISAGREE — 15% of the rotation, including the only
+      // joke shape — from a prompt that was never multi-angle.
+      const formVariant =
+        variety?.enabled && (!toneFirst || toneFirstShape)
+          ? (variety.formVariantRotation ?? xFormVariantRotation).next(variety.rng, [
+              ...(isLight ? LIGHT_EXCLUDED_VARIANT_IDS : []),
+              // Only on the shaped half of the tone-first split. An ordinary
+              // analytical lead keeps the full rotation.
+              ...(toneFirstShape ? shapesExcludedForEnergy(postEnergy, X_FORM_VARIANTS) : []),
+            ])
+          : undefined;
+      const shapeBlock = formVariant ? renderAssignedShapeBlock(formVariant) : undefined;
+      // OPENING MOVE: varies how the reply STARTS (the register varies tone, the
+      // shape varies length — this varies structure). Only for shapes that leave
+      // the opener free: the short shapes have no opening distinct from the whole
+      // reply, and HOOK_THEN_LINE/OBSERVE_ASK/DETAIL_ZOOM already prescribe their
+      // own opener, so a second directive would fight the first. On a lead with
+      // no shape at all (the tone-first register lane) there is nothing to
+      // conflict with, so the move applies there too.
+      const openingMoveBlock =
+        variety?.enabled && (!formVariant || SHAPES_WITH_FREE_OPENER.includes(formVariant.id))
+          ? renderOpeningMoveBlock(
+              pickOpeningMove(
+                variety.rng,
+                // TWO_FLAT and RUN_ON explicitly forbid a question, so the
+                // QUESTION move would order one the shape bans. pickOpeningMove
+                // renormalizes over whatever pool it is handed.
+                formVariant && SHAPES_BANNING_QUESTIONS.includes(formVariant.id)
+                  ? X_OPENING_MOVES.filter((m) => m.id !== "QUESTION")
+                  : X_OPENING_MOVES,
+              ),
+              "reply",
+            )
+          : undefined;
+      // Gen-z SPOKEN REGISTER: on a minority of leads, offer ONE current
+      // marker the reply may use once, or drop. Independent of the shape and
+      // register lanes because it governs WORD CHOICE, not length or tone, so
+      // it can sit alongside either without contradicting it. The rate is the
+      // whole design — "don't overdo it, it looks more ai that way" — so this
+      // is gated separately from NOELLE_DRAFTER_VARIETY's on/off and defaults
+      // to 22%. A rate of 0 emits no block and leaves the prompt unchanged.
