@@ -198,3 +198,170 @@ describe("post generation progress", () => {
       ],
       false,
     ).content[0]!.text;
+    expect(out).toContain("Post generation needs_review");
+    expect(out).toContain("request_drafts_found:** 4");
+    expect(out).toContain("third x");
+    expect(out).toContain("second x");
+    expect(out).toContain("first x");
+  });
+
+  it("renders failed verifier output as needs_review for a completed request", () => {
+    const out = renderGenerationResult(
+      request({ requestStatus: "needs_review", requestedPlatforms: ["linkedin"], expectedPlatforms: ["linkedin"] }),
+      [
+        draft("linkedin", {
+          quality_score: "0.41",
+          quality_passed: false,
+          verifier_meta: { pass: false, reasons: ["too generic"] },
+        }),
+      ],
+      false,
+    ).content[0]!.text;
+    expect(out).toContain("Post generation needs_review");
+    expect(out).toContain("reviewer_result:** failed, score 0.41");
+    expect(out).toContain("too generic");
+  });
+
+  it("renders real worker draft bodies and verifier metadata when present", () => {
+    const out = renderGenerationResult(
+      request({ requestStatus: "drafted", requestedPlatforms: ["linkedin"], expectedPlatforms: ["linkedin"] }),
+      [
+        draft("linkedin", {
+          quality_score: "0.91",
+          quality_passed: true,
+          verifier_meta: { pass: true },
+        }),
+      ],
+      false,
+    ).content[0]!.text;
+    expect(out).toContain("Post generation drafted");
+    expect(out).toContain("reviewer_result:** passed, score 0.91");
+    expect(out).toContain("Fresh linkedin body");
+    expect(out).toContain('"pass": true');
+  });
+});
+
+describe("post generation evidence", () => {
+  it.each(["drafted", "needs_review"])(
+    "does not claim a finished review from an empty %s journal",
+    (requestStatus) => {
+      const output = renderGenerationResult(request({ requestStatus }), [], false).content[0]!.text;
+      expect(output).toContain("Post generation drafts_missing");
+      expect(output).toContain(`journal_status:** ${requestStatus}`);
+      expect(output).not.toContain("passed the existing reviewer/verifier");
+      expect(output).not.toContain("failed at least one platform");
+    },
+  );
+
+  it("keeps a missing platform visible after the journal claims completion", () => {
+    const output = renderGenerationResult(
+      request({ requestStatus: "drafted" }),
+      [draft("linkedin", { quality_passed: true, verifier_meta: { pass: true } })],
+      false,
+    ).content[0]!.text;
+    expect(output).toContain("Post generation drafts_missing");
+    expect(output).toContain("waiting_for:** x");
+    expect(output).not.toContain("passed the existing reviewer/verifier");
+  });
+
+  it("does not treat missing verdicts as a passed review", () => {
+    const output = renderGenerationResult(
+      request({ requestStatus: "drafted" }),
+      [draft("linkedin"), draft("x")],
+      false,
+    ).content[0]!.text;
+    expect(output).toContain("Post generation review_pending");
+    expect(output).not.toContain("passed the existing reviewer/verifier");
+  });
+
+  it.each([
+    ["missing metadata pass", true, {}, "review_pending"],
+    ["nonboolean metadata pass", true, { pass: "true" }, "review_pending"],
+    ["array metadata", true, [], "review_pending"],
+    ["string metadata", true, "passed", "review_pending"],
+    ["missing quality verdict", null, { pass: true }, "review_pending"],
+    ["failed metadata", true, { pass: false }, "needs_review"],
+    ["failed quality verdict", false, { pass: true }, "needs_review"],
+    ["failed quality with incomplete metadata", false, {}, "needs_review"],
+  ])("does not claim a passing review with %s", (_label, qualityPassed, meta, status) => {
+    const output = renderGenerationResult(
+      request({ requestStatus: "drafted", expectedPlatforms: ["x"] }),
+      [draft("x", { quality_passed: qualityPassed as boolean | null, verifier_meta: meta })],
+      false,
+    ).content[0]!.text;
+    expect(output).toContain(`Post generation ${status}`);
+    expect(output).not.toContain("passed the existing reviewer/verifier");
+    expect(output).not.toContain("reviewer_result:** passed");
+    if (status === "needs_review") expect(output).toContain("failed review result");
+  });
+
+  it("shows a real failed verdict even if the journal says drafted", () => {
+    const output = renderGenerationResult(
+      request({ requestStatus: "drafted" }),
+      [
+        draft("linkedin", { quality_passed: true, verifier_meta: { pass: true } }),
+        draft("x", { quality_passed: false, verifier_meta: { pass: false } }),
+      ],
+      false,
+    ).content[0]!.text;
+    expect(output).toContain("Post generation needs_review");
+    expect(output).not.toContain("passed the existing reviewer/verifier");
+  });
+
+  it("keeps optional review distinct from a measured passing verdict", () => {
+    const output = renderGenerationResult(
+      request({ requestStatus: "drafted", reviewRequired: false }),
+      [draft("linkedin"), draft("x")],
+      false,
+    ).content[0]!.text;
+    expect(output).toContain("Post generation drafted");
+    expect(output).toContain("Automatic review was not required");
+    expect(output).not.toContain("passed the existing reviewer/verifier");
+  });
+
+  it("keeps polling an empty terminal journal until actual drafts arrive", async () => {
+    vi.useFakeTimers();
+    let draftReads = 0;
+    const sql = vi.fn(async (strings: TemplateStringsArray) => {
+      const query = strings.join("$");
+      if (query.includes("from noelle.post_ideas")) return [idea];
+      if (query.includes("from noelle.post_generation_requests"))
+        return [
+          {
+            id: request().requestId,
+            org_id: idea.org_id,
+            idea_id: idea.id,
+            agent_instance_id: idea.agent_instance_id,
+            platforms: ["linkedin", "x"],
+            review_required: true,
+            source: "mcp",
+            status: "drafted",
+            created_at: idea.created_at,
+          },
+        ];
+      if (query.includes("from noelle.post_drafts"))
+        return ++draftReads === 1
+          ? []
+          : [
+              draft("linkedin", { quality_passed: true, verifier_meta: { pass: true } }),
+              draft("x", { quality_passed: true, verifier_meta: { pass: true } }),
+            ];
+      throw new Error("Unexpected fixture query");
+    });
+    try {
+      const pending = getPostWithFullDrafts(
+        { sql } as unknown as NoelleContext,
+        { orgId: idea.org_id, slug: "one", name: "One" },
+        idea.id,
+        { requestId: request().requestId, waitSeconds: 1 },
+      );
+      await vi.runAllTimersAsync();
+      const output = (await pending).content[0]!.text;
+      expect(draftReads).toBe(2);
+      expect(output).toContain("Fresh linkedin body");
+      expect(output).toContain("Post generation drafted");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
