@@ -798,3 +798,203 @@ describe("runDrafterTick — vision caption (grounded-drafting)", () => {
   });
 
   it("fails open when the vision call throws (drafting proceeds, no image line)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const captionFn = vi.fn().mockRejectedValue(new Error("vision 500"));
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { title: "post", text: "", images: ["https://i.redd.it/a.jpg"] } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      captionFn,
+    });
+    expect(n).toBe(1);
+    expect((runner.draft.mock.calls[0]![0] as { prompt: string }).prompt).not.toContain("THE POST'S IMAGE SHOWS:");
+  });
+});
+
+describe("runDrafterTick — verifier (grounded-drafting)", () => {
+  const verdict = (pass: boolean) =>
+    JSON.stringify(
+      pass
+        ? { voice: 0.9, grounding: 0.9, relevance: 0.9, reasons: [], fix: null }
+        : { voice: 0.3, grounding: 0.4, relevance: 0.5, reasons: ["too generic"], fix: "name a concrete detail" },
+    );
+
+  it("disabled by default → no judge calls, verifierMeta null", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    expect(postOutbound.mock.calls[0]![0].verifierMeta).toBeNull();
+  });
+
+  it("passes on the first try → no regenerate, verdict attached", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    expect(judge).toHaveBeenCalledTimes(4); // set feedback plus each of the three retained angles
+    const meta = postOutbound.mock.calls[0]![0].verifierMeta;
+    expect(meta.pass).toBe(true);
+    expect(meta).toMatchObject({ judgeOk: true, judgeProvider: "legacy" });
+    expect(meta.attempts).toBe(0);
+    for (const draft of postOutbound.mock.calls[0]![0].drafts) {
+      expect(draft.verifierMeta).toMatchObject({ pass: true, judgeOk: true, attempts: 0 });
+    }
+  });
+
+  it("regenerates with the critique on a failing verdict, keeps the improved draft", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValueOnce(verdict(false)).mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(2);
+    expect((runner.draft.mock.calls[1]![0] as { prompt: string }).prompt).toContain("REVIEW FEEDBACK");
+    expect(postOutbound.mock.calls[0]![0].verifierMeta.attempts).toBe(1);
+  });
+
+  it("gives up after `retries`, queues the best attempt with a failing verdict", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValue(verdict(false));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(3);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    expect(postOutbound.mock.calls[0]![0].verifierMeta.pass).toBe(false);
+  });
+
+  it("verifies the LIGHT path too (one supportive comment)", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(postOutbound.mock.calls[0]![0].verifierMeta.pass).toBe(true);
+  });
+
+  it("passes prior and recent reply history into the verifier judge", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      getPriorReplies: vi.fn().mockResolvedValue(["already told jane about sccache"]),
+      getRecentPhrasings: vi.fn().mockResolvedValue(["event happened, therefore everyone gets the same lesson"]),
+      recentPhrasingsTopK: 10,
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+
+    const prompt = judge.mock.calls[0]![1] as string;
+    expect(prompt).toContain("PRIOR REPLIES TO THIS PERSON");
+    expect(prompt).toContain("already told jane about sccache");
+    expect(prompt).toContain("RECENT REPLIES ACROSS THE FEED");
+    expect(prompt).toContain("event happened, therefore everyone gets the same lesson");
+  });
+
+  it("keeps a regenerated Reddit draft when only novelty and diversity improve", async () => {
+    const improved = { drafts: [{ angle: "empathetic", body: "different shape with a concrete tradeoff", char_count: 38 }] };
+    const runner = {
+      draft: vi
+        .fn()
+        .mockResolvedValueOnce({ text: JSON.stringify({ drafts: [{ angle: "empathetic", body: "same lesson sequence again", char_count: 26 }] }), engine: "bedrock", model: "m" })
+        .mockResolvedValueOnce({ text: JSON.stringify(improved), engine: "bedrock", model: "m" }),
+    };
+    const judge = vi
+      .fn()
+      .mockResolvedValueOnce(
+        JSON.stringify({ voice: 0.9, grounding: 0.9, relevance: 0.9, novelty: 0.1, reasons: ["repeats prior"], fix: "take a new angle" }),
+      )
+      .mockResolvedValueOnce(
+        JSON.stringify({ voice: 0.9, grounding: 0.9, relevance: 0.8, novelty: 0.9, reasons: [], fix: null }),
+      );
+    const { postOutbound, kb, markStatus } = deps({ runner });
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      getPriorReplies: vi.fn().mockResolvedValue(["same lesson sequence before"]),
+      verify: { enabled: true, retries: 1, makeCalls: () => [judge] },
+    });
+
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.drafts[0].body).toContain("different shape");
+    expect(body.verifierMeta.pass).toBe(true);
+    expect(body.verifierMeta.scores.novelty).toBe(0.9);
+  });
+
+  it.each([
+    [
+      "substantial",
+      { tier: "T3", classifier_label: "substantial" },
+      { drafts: [{ angle: "empathetic", body: "same high scoring repeated point", char_count: 32 }] },
+      { drafts: [{ angle: "empathetic", body: "lower scoring but valid new angle", char_count: 33 }] },
+    ],
+    [
+      "light",
+      { classifier_label: "light", tier: null },
+      { drafts: [{ angle: "empathetic", body: "same quick launch note again", char_count: 28 }] },
+      { drafts: [{ angle: "empathetic", body: "fresh support ownership angle", char_count: 29 }] },
+    ],
+  ])("queues a passing %s retry even when its score total is lower", async (_path, leadOverrides, initial, passingRetry) => {
+    const runner = {
+      draft: vi
+        .fn()
+        .mockResolvedValueOnce({ text: JSON.stringify(initial), engine: "bedrock", model: "m" })
+        .mockResolvedValueOnce({ text: JSON.stringify(passingRetry), engine: "bedrock", model: "m" }),
+    };
+    const judge = vi
