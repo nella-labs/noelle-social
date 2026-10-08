@@ -398,3 +398,111 @@ export interface IntroDmPerson {
   // ---- joined from the person's generated profile (summary IS NOT NULL) ----
   summary: string;
   topics: string[];
+  tone: string | null;
+  engagementNotes: string | null;
+}
+
+/**
+ * Atomically CLAIM + STAMP up to `cap` watchlist people for a one-time intro DM.
+ *
+ * Eligibility: `intro_dm_drafted_at IS NULL` (never introduced) AND the person
+ * has a GENERATED profile (join noelle.linkedin_watchlist_profiles where
+ * summary IS NOT NULL) — the intro DM is personalized off the profile, so an
+ * unprofiled person waits for the profiler. Oldest-added first (stable).
+ *
+ * The claim is atomic: the inner select takes FOR UPDATE SKIP LOCKED on the
+ * eligible rows (so two concurrent drafters never grab the same person), and the
+ * outer UPDATE stamps `intro_dm_drafted_at = now()` on exactly those rows as it
+ * claims them. A stamped person never re-enters the eligible set, so each person
+ * gets exactly one intro DM, ever. If the drafter then crashes before posting the
+ * outbound, that one person's DM is lost (the flag is already stamped) — an
+ * acceptable trade, matching the claim-removes-flag pattern of claimDmRequestLeads
+ * and the per-person watchlist-drafting claim. A daily `cap` paces the rollout.
+ *
+ * Mirrors leads-db.claimDmRequestLeads (FOR UPDATE SKIP LOCKED inner select,
+ * stamp in the outer UPDATE, return the claimed rows).
+ */
+export async function claimIntroDmPeople(
+  sql: Sql,
+  args: { agentInstanceId: string; cap: number },
+): Promise<IntroDmPerson[]> {
+  if (args.cap <= 0) return [];
+  const rows = await sql<
+    {
+      id: string;
+      fsd_profile_id: string;
+      public_id: string | null;
+      name: string | null;
+      headline: string | null;
+      objective: string | null;
+      summary: string;
+      topics: unknown;
+      tone: string | null;
+      engagement_notes: string | null;
+    }[]
+  >`
+    update noelle.linkedin_watchlist_people p
+    set intro_dm_drafted_at = now()
+    from noelle.linkedin_watchlist_profiles pr
+    where p.id in (
+      select c.id
+      from noelle.linkedin_watchlist_people c
+      join noelle.linkedin_watchlist_profiles cpr
+        on cpr.agent_instance_id = c.agent_instance_id
+       and cpr.fsd_profile_id = c.fsd_profile_id
+      where c.agent_instance_id = ${args.agentInstanceId}
+        and c.intro_dm_drafted_at is null
+        and cpr.summary is not null
+      order by c.added_at asc
+      limit ${args.cap}
+      for update skip locked
+    )
+      and pr.agent_instance_id = p.agent_instance_id
+      and pr.fsd_profile_id = p.fsd_profile_id
+    returning p.id, p.fsd_profile_id, p.public_id, p.name, p.headline, p.objective,
+              pr.summary, pr.topics, pr.tone, pr.engagement_notes
+  `;
+  return rows.map((r) => ({
+    id: r.id,
+    fsdProfileId: r.fsd_profile_id,
+    publicId: r.public_id,
+    name: r.name,
+    headline: r.headline,
+    objective: r.objective,
+    summary: r.summary,
+    topics: Array.isArray(r.topics) ? (r.topics as string[]) : [],
+    tone: r.tone,
+    engagementNotes: r.engagement_notes,
+  }));
+}
+
+export interface WatchlistObjectiveEntry {
+  publicId: string | null;
+  objective: string;
+}
+
+/**
+ * Per-person objectives for the instance's watchlist, keyed by public_id
+ * (lowercased) so the drafter can steer how it engages a specific person. Only
+ * people with both an objective and a public_id are included.
+ */
+export async function getWatchlistObjectives(
+  sql: Sql,
+  instanceId: string,
+): Promise<Map<string, WatchlistObjectiveEntry>> {
+  const rows = await sql<{ public_id: string | null; objective: string | null }[]>`
+    select public_id, objective
+    from noelle.linkedin_watchlist_people
+    where agent_instance_id = ${instanceId} and objective is not null
+  `;
+  const map = new Map<string, WatchlistObjectiveEntry>();
+  for (const r of rows) {
+    if (r.objective && r.public_id) {
+      map.set(r.public_id.trim().toLowerCase(), {
+        publicId: r.public_id,
+        objective: r.objective,
+      });
+    }
+  }
+  return map;
+}
