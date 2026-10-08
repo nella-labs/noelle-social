@@ -398,3 +398,203 @@ async function startDrain(opts?: { manual?: boolean }) {
       upvoteGapJitter: rng.float(1, 1.8),
     };
     await saveState(state);
+    // The arm is now accounted for: RunState carries armedSend → endRun disarms.
+    // Inside the serial lock so it can't interleave with checkAutonomy's
+    // classify-then-disarm of the same marker (see startRun).
+    if (armedSend) await withSendSwitch(() => clearPendingArm(epoch));
+  } catch (e) {
+    // Same failed-start leak as startRun: never leave a landed arm standing when
+    // the drain aborted before its RunState was persisted (see startRun's catch).
+    await rollbackArmAfterFailedStart(cfg, epoch, armedSend);
+    throw e;
+  }
+
+  if (tabId != null) await cdp.attach(tabId).catch(() => {}); // banner appears
+  await chrome.alarms.create(ALARM, { periodInMinutes: 0.5 });
+  for (const ms of [3500, 8000, 15000, 22000]) setTimeout(() => void tick(), ms);
+}
+
+// The operator explicitly clicking Run/Drain in the extension IS the consent to
+// post, so auto-enable the master reply switch (reply_send_enabled) for this
+// instance — approved replies then flow to the queue without the operator ever
+// having to flip a dashboard toggle. Deliberately called ONLY when startRun/
+// startDrain carry the manual flag (the message-handler path), NOT from the
+// unattended auto-start path (checkAutonomy passes no flag), so the global
+// panic-stop kill switch (which sets reply_send_enabled=false on every intern)
+// stays authoritative for lights-out runs. Best-effort: a failure — e.g. an
+// older api-vm without this endpoint — is logged, not fatal, so Run still
+// proceeds against whatever the flag already is. Returns whether this run
+// actually ARMED the switch — the POST landed AND the server reports the flag
+// was OFF before it (prior=false, the OFF→ON transition was ours). Only such an
+// arm may be disarmed by endRun / the failed-start rollback: a failed POST means
+// the flag is whatever the operator set, and a landed no-op enable against an
+// ALREADY-ON flag (prior=true — the operator's standing dashboard consent for
+// the documented lights-out workflow) is not ours to flip OFF either. A missing
+// prior (older api-vm) is treated as prior=true — fail-safe, never disarm what
+// might be standing consent (see armedByManualEnable).
+async function enableSendForManualRun(): Promise<boolean> {
+  const cfg = await getConfig();
+  if (!cfg) return false;
+  try {
+    const { prior } = await new ActuatorApi(cfg).enableSend(cfg.instanceId, true);
+    return armedByManualEnable(prior);
+  } catch (e) {
+    console.warn("[actuator] could not auto-enable sending:", e instanceof Error ? e.message : e);
+    return false;
+  }
+}
+
+// Roll a LANDED arm back OFF after a manual start failed before persisting its
+// RunState (see the try/catch in startRun/startDrain). Serialized through
+// withSendSwitch and epoch-guarded exactly like endRun's disarm: if a newer
+// Run/Drain already superseded this failed start (bumped the epoch and armed for
+// ITS run), the switch — and the pending-arm marker — belong to that run now, so
+// this must leave both alone. On a successful disarm the pending-arm marker is
+// cleared (the arm is accounted for); on a failed disarm the marker STAYS, which
+// keeps checkAutonomy fail-closed (no lights-out start, disarm retried there)
+// until the switch is confirmed OFF.
+async function rollbackArmAfterFailedStart(
+  cfg: ActuatorConfig,
+  epoch: number,
+  armedSend: boolean,
+): Promise<void> {
+  if (!armedSend) return;
+  await withSendSwitch(async () => {
+    if ((await currentEpoch()) !== epoch) return; // superseded — the newer run owns the switch
+    try {
+      await new ActuatorApi(cfg).enableSend(cfg.instanceId, false);
+      await clearPendingArm(epoch);
+      console.warn("[actuator] start failed after arming send — rolled reply_send_enabled back OFF");
+    } catch (e) {
+      console.warn(
+        "[actuator] start failed after arming send AND the rollback disarm failed — autonomy stays blocked until the switch is confirmed OFF:",
+        e instanceof Error ? e.message : e,
+      );
+    }
+  });
+}
+
+async function endRun(status: RunState["status"]) {
+  // Abort the live run's in-flight work FIRST. Every pending dwell/motion sleep
+  // resolves immediately, so a tick caught mid-action unwinds in ~a frame instead
+  // of finishing a tens-of-seconds reading dwell — this is what makes STOP feel
+  // instant. The epoch bump below still guarantees it can't save its plan back.
+  runAbort.abort();
+  // Stamp the challenge day on a challenge halt BEFORE loading run state, so the
+  // stamp survives even when loadState() returns null (the auto-start safety gate
+  // + backoff read this key next tick, and across service-worker restarts).
+  if (status === "halted-challenge") {
+    await chrome.storage.local.set({ [CHALLENGE_DAY_KEY]: localDayKey(new Date()) });
+  }
+  // Bump the epoch FIRST so any tick still in flight (mid-scroll, mid-post) loaded
+  // a now-stale epoch and can neither post nor write "running" back over this stop.
+  // Then stamp the terminal state with the fresh epoch so it is authoritative.
+  const term = await bumpEpoch();
+  const s = await loadState();
+  if (s) {
+    s.status = status;
+    s.epoch = term;
+    await saveState(s);
+    // Detach EVERY tab this run attached (a re-pin after the pinned tab closed
+    // attaches more than one, and the re-pin may not be persisted yet), so no
+    // debugger session — or its banner — lingers after the run halts.
+    await cdp.detachAll();
+    // shortfall logging (no silent truncation)
+    const cfg = await getConfig();
+    if (cfg) {
+      const api = new ActuatorApi(cfg);
+      // Disarm the master reply switch ONLY when this run armed it (a manual
+      // Run/Drain whose enable POST landed — RunState.armedSend), so sending a
+      // manual run turned ON is fail-closed at rest, while the operator's
+      // standing dashboard toggle survives: autonomous runs never arm, and
+      // GET /api/actionable-reddit gates on reply_send_enabled ONLY (no
+      // auto_send_enabled lights-out fallback like LinkedIn), so an
+      // unconditional disable here would silently starve every later
+      // autonomous run.
+      //
+      // AND only if this run is still current. A manual Run/Drain that
+      // superseded us has already bumped the epoch past `term` and re-enabled
+      // sending for ITS run; disabling here would race that enable back OFF and
+      // empty the new run's queue (the "0/0 despite pending drafts" bug). When
+      // superseded, leave the switch alone — the newer run owns it. Serialized
+      // with the run-start enable (withSendSwitch) so the check-then-disable
+      // can't interleave with an enable.
+      await withSendSwitch(async () => {
+        if (shouldDisableSendOnRunEnd({ armedSend: s.armedSend, termEpoch: term, curEpoch: await currentEpoch() })) {
+          await api.enableSend(cfg.instanceId, false).catch(() => {});
+        }
+      });
+      const events: RedditActivityEvent[] = [];
+      const at = new Date(Date.now()).toISOString();
+      const miss = shortfall(s.targets.comments, s.done.comments);
+      if (miss > 0) events.push({ type: "skip", reason: `shortfall-replies-${miss}`, at });
+      if (events.length) await api.logActivity(s.sessionId, events).catch(() => {});
+    }
+  }
+  await chrome.alarms.clear(ALARM);
+}
+
+// Drain auto-continue. A drain plans a FIXED number of reply slots (the queue
+// size at start), so it used to STOP after that first batch even when the inbox
+// still held approvals — the ones capped at start, that arrived mid-run, or that
+// were re-queued after a transient failure ("the actuator stopped before
+// finishing the approvals inbox"). When every planned slot is done, re-fetch the
+// queue and, if pending replies remain, APPEND a fresh batch of reply slots and
+// extend the window — so one operator Drain clears the WHOLE inbox without a
+// manual re-trigger. Returns true iff it extended (caller keeps the run running).
+// Bounded by MAX_DRAIN_ROUNDS. Naturally self-limiting: an empty queue (nothing
+// left, or sending disabled server-side) returns false → the drain ends; replies
+// that keep failing hit the per-draft retry cap → doneDraftIds → filtered out of
+// the next fetch → remaining reaches 0. REPLY-ONLY, like startDrain: the planner
+// is fed likesPerGap*=0 and the plan is filtered to comment slots, so an
+// extension round can never introduce a vote slot.
+async function maybeExtendDrain(
+  s: RunState, cfg: ActuatorConfig, api: ActuatorApi, now: number, rng: ReturnType<typeof makeRng>,
+): Promise<boolean> {
+  if (s.mode !== "drain") return false;
+  const q = await api.fetchQueue().catch(() => null);
+  if (!q) return false;
+  const done = new Set(s.doneDraftIds);
+  s.commentPool = mergePool(s.commentPool, q.comments.map(toPoolItem), done) as RedditPoolItem[];
+  s.lastPollMs = now; // this fetch counts as a poll; don't double-fetch next tick
+  const remaining = s.commentPool.length;
+  if (!shouldExtendDrain(s.mode, s.drainRounds ?? 0, remaining)) return false;
+
+  // Plan a fresh drain batch for the remaining replies, starting shortly from
+  // now, and splice it onto the timeline. The existing reply-slot executor shifts
+  // these off s.commentPool exactly as it did the first batch. Re-plan with the
+  // SAME persisted temperament (old states without drainStyle fall back to today's
+  // defaults via `?? {}`), so every round keeps one coherent session character.
+  const planned = planDrainTimeline({
+    approvedComments: remaining,
+    startMs: now,
+    rng,
+    shortBandProb: cfg.drainShortBandProb,
+    likesPerGapMin: 0,
+    likesPerGapMax: 0,
+    ...(s.drainStyle ?? {}),
+  }).filter((a) => a.kind === "comment");
+  const newLast = planned.reduce((m, a) => Math.max(m, a.atMs), now);
+  for (const a of planned) s.actions.push({ kind: a.kind, atMs: a.atMs, executed: false });
+  s.windowHours = (newLast - s.startMs) / 3600_000 + 0.15; // extend so the new tail fits
+  s.targets.comments += remaining;
+  s.drainRounds = (s.drainRounds ?? 0) + 1;
+  s.lastEvent = `draining more — ${remaining} left in inbox (round ${s.drainRounds})`;
+  return true;
+}
+
+async function maybeReplenish(s: RunState, api: ActuatorApi, now: number, rng: ReturnType<typeof makeRng>) {
+  if (now - s.lastPollMs < POLL_MS * rng.float(0.8, 1.6)) return;
+  s.lastPollMs = now;
+  const q = await api.fetchQueue().catch(() => null);
+  if (!q) return;
+  const done = new Set(s.doneDraftIds);
+  // mergePool is the shared engine's PoolItem[] merge; it preserves the item
+  // objects (keyed on draftId), so the RedditPoolItem target fields ride through —
+  // the cast just re-narrows the widened return. Reddit never DMs, so no dm merge.
+  s.commentPool = mergePool(s.commentPool, q.comments.map(toPoolItem), done) as RedditPoolItem[];
+}
+
+// Ambient read-actions (expand "…more" / open a post's comments to read) are
+// paced by a rolling cooldown so they cluster like real reading instead of
+// firing on every ~4s idle tick. Base gap × a 1–2 jitter ⇒ roughly one every
