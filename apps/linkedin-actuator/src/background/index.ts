@@ -1198,3 +1198,203 @@ async function tickOnce() {
             if (urn) evt.activity_urn = urn;
           }
           events.push(evt);
+          if (!marked) events.push({ type: "skip", reason: "marksent-unconfirmed", at });
+          // Each reply also reacts to the post — a human likes what they engage
+          // with, and it gives visible engagement even while standalone feed-likes
+          // are flaky. Best-effort + not counted against the like target. But a
+          // human doesn't like EVERY post they reply to, and a 100%-consistent
+          // reply→like pairing is a tell — so skip the reaction on a small,
+          // drifting fraction of replies (~2%, re-rolled in [1%,5%] every 123;
+          // see ../lib/like-skip). State persists via saveIfCurrent at tick end.
+          if (action.kind === "comment") {
+            const { skip: skipLike, next: nextSkip } = rollLikeSkip(s.likeSkip, () => rng.next());
+            s.likeSkip = nextSkip;
+            if (!skipLike) {
+              const rx = await likeCurrentPost(tabId, cfg, rng);
+              if (rx) events.push({ type: "like", reaction: rx, at });
+            }
+          }
+          // Drain mode: return to the feed after replying so the gap's scheduled
+          // likes + ambient browsing happen on the feed (not the post page).
+          if (s.mode === "drain" && action.kind === "comment") {
+            await navigateTab(tabId, "https://www.linkedin.com/feed/", rng).catch(() => {});
+            await waitTabComplete(tabId);
+          }
+        } else {
+          // Transient failure. Two changes from the old `pool.unshift` (retry at the
+          // FRONT, forever): (1) name the failing stage in the skip reason + attach
+          // the post's activity URN, so linkedin_activity says WHY and on WHICH post
+          // — the current bare `comment-failed` is undiagnosable; (2) cap per-draft
+          // retries and re-queue at the BACK, so one post the composer/submit can't
+          // handle (or a live action-block) can no longer be retried every slot and
+          // starve every other pending draft (the "wall of comment-failed" symptom).
+          const { tries, giveUp } = retryDecision(item.tries ?? 0);
+          item.tries = tries;
+          const stage = res.detail ? `:${res.detail}` : "";
+          const skip: LinkedInActivityEvent = {
+            type: "skip",
+            reason: giveUp
+              ? `${action.kind}-failed:gave-up-after-${tries}${stage}`
+              : `${action.kind}-failed${stage}`,
+            at,
+          };
+          if (action.kind === "comment") {
+            const urn = activityUrnFrom(item.url);
+            if (urn) skip.activity_urn = urn;
+          }
+          if (action.kind === "comment" && res.claimed) {
+            // After a submit click or chord, confirmation can be lost. Keep the
+            // server claim reserved and never automatically try this post again.
+            s.doneDraftIds.push(item.draftId);
+            action.executed = true;
+            skip.reason = `comment-failed:claim-reserved${stage}`;
+          } else if (giveUp) {
+            // Drop the draft for this session (mark done locally, do NOT markSent —
+            // nothing posted) so it stops monopolizing comment slots. The queue's
+            // persistent dedup is unaffected; a later session re-serves it fresh.
+            s.doneDraftIds.push(item.draftId);
+            action.executed = true;
+          } else {
+            pool.push(item); // BACK of the queue — let healthy drafts go first
+            const d = deferLater(action, now, s.startMs + s.windowHours * 3600_000, rng);
+            action.atMs = d.atMs;
+          }
+          events.push(skip);
+        }
+      }
+    }
+  } catch (e) {
+    // A STOP that unwound an in-flight action surfaces as AbortError — log it as
+    // a clean "stopped" skip, not a scary error string.
+    const reason = isAbortError(e) ? "stopped" : `err:${(e instanceof Error ? e.message : String(e)).slice(0, 80)}`;
+    events.push({ type: "skip", reason, at });
+    // Mirror real errors (not clean stops) to the Chrome Bridge sink so the
+    // doctor can see selector drift / attach failures without DevTools open.
+    if (!isAbortError(e)) sinkLog("error", "tick action failed", { reason });
+  }
+
+  // Surface the outcome to the panel (DevTools can't be open during a run).
+  const last = events[events.length - 1];
+  if (last) {
+    s.lastEvent =
+      last.type === "like"
+        ? (last.reaction && last.reaction !== "LIKE"
+            ? `reacted ${reactionLabel(last.reaction as ReactionType)} to ${last.author_name ?? "a post"} (${s.done.likes}/${s.targets.likes})`
+            : `liked ${last.author_name ?? "a post"} (${s.done.likes}/${s.targets.likes})`)
+      : last.type === "comment" ? `commented (${s.done.comments}/${s.targets.comments})`
+      : last.type === "dm" ? `sent DM (${s.done.dms}/${s.targets.dms})`
+      : `skip: ${last.reason ?? "?"}`;
+  }
+
+  // Drain auto-continue: before ending a finished drain, try to append another
+  // batch for any approvals still in the inbox, so one Drain clears it all.
+  if (s.mode === "drain" && s.actions.every((a) => a.executed)) {
+    const extended = await maybeExtendDrain(s, api, now, rng); // appends non-executed slots when work remains
+    // Persistent drain: an empty inbox does NOT end the run. Keep it alive and
+    // watching (roll the window, arm the next watch-poll) so a reply approved
+    // later goes out with no re-click. Only STOP, a challenge halt, or the batch
+    // ceiling (drainShouldKeepWaiting=false) end a drain now.
+    if (!extended && drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0)) {
+      s.windowHours = (now - s.startMs) / 3600_000 + DRAIN_WATCH_WINDOW_H;
+      s.lastDrainWatchMs = now;
+      s.lastEvent = "inbox clear — watching for new approvals (no re-click needed)";
+    }
+  }
+
+  // A caught-up persistent drain stays "running" (watching); every other finished
+  // run goes idle and is ended below.
+  if (s.actions.every((a) => a.executed) && !drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0)) {
+    s.status = "idle";
+  }
+  // Persist only if we're still the live run. A STOP or a superseding Run that
+  // landed mid-tick bumped the epoch, so saveIfCurrent drops this write instead
+  // of resurrecting a run that was already stopped/replaced.
+  const saved = await saveIfCurrent(s);
+  await api.logActivity(s.sessionId, events).catch(() => {});
+  if (saved && s.status === "idle") await endRun("idle");
+}
+
+// markSent, retried with backoff. Returns whether the send was confirmed to the
+// server. The caller has ALREADY recorded the draft locally as done, so a false
+// return never causes a re-post — it only means the DB approval may still read
+// 'pending' until a later tick reconciles.
+async function markSentWithRetry(api: ActuatorApi, approvalId: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await api.markSent(approvalId);
+      return true;
+    } catch {
+      if (stopped()) return false;
+      if (attempt < 3) await sleep(800 * (attempt + 1)); // backoff (abort-aware)
+    }
+  }
+  return false;
+}
+
+// Best-effort reaction on the post currently open (doComment just navigated to
+// it) — a human likes/reacts to what they engage with. Uses the same weighted
+// variety as feed likes. Not counted against the like target. Returns the
+// reaction landed, or null if it was skipped (already-liked / no button / STOP).
+async function likeCurrentPost(tabId: number, cfg: ActuatorConfig, rng: ReturnType<typeof makeRng>): Promise<ReactionType | null> {
+  if (stopped()) return null;
+  const loc = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect }>(tabId, { cmd: "locatePostLike" }).catch(() => null);
+  if (!loc?.ok || loc.x == null) return null;
+  await sleep(rng.float(500, 2200)); // widened dwell (anti-fingerprint, #429)
+  if (stopped()) return null;
+  return reactWithVariety(tabId, rectFrom(loc), cfg, rng);
+}
+
+// Outcome of a comment/DM attempt. "unavailable" means the target post/profile
+// no longer exists (a deleted permalink) — a PERMANENT failure the caller must
+// drop, not retry. "failed" is transient (slow load, missing selector, submit
+// that never landed) → retry. On "failed", `detail` names the exact stage that
+// broke ("box-not-found" / "submit-not-found" / "not-cleared" / …) so the DB skip
+// row (linkedin_activity.reason = `comment-failed:<detail>`) says WHY without a
+// live DevTools session — mirroring the like path's `no-likeable-post(...)`
+// diagnostics. This is the difference between "comments broke, unknown why" and a
+// row that points straight at the failing component.
+type ActionKindResult = "ok" | "unavailable" | "failed" | "claim-unavailable" | "claim-denied";
+type ActionResult = { kind: ActionKindResult; detail?: string; claimed?: boolean };
+type CommentClaim = "claimed" | "already-claimed" | "unavailable";
+
+// Open the post, locate + type + submit via trusted CDP input.
+/**
+ * Empty whichever composer still holds text, and confirm it where LinkedIn
+ * gives us a read.
+ *
+ * LinkedIn registers a `beforeunload` handler while a comment, reply or message
+ * box holds un-sent text. The actuator's next `chrome.tabs.update` — the return
+ * to the feed, or the hop to the next post — then navigates away from that dirty
+ * box and Chromium raises "Leave site? Changes you made may not be saved." The
+ * dialog blocks the renderer, freezes the content script's tick loop, and wedges
+ * the run until a human clicks it. It cannot be answered over CDP either:
+ * handling `beforeunload` via Page.handleJavaScriptDialog is broken upstream
+ * (puppeteer/puppeteer#9871), so removing the TRIGGER is the only fix.
+ *
+ * Tries each composer LinkedIn can leave dirty, and BOTH are verified by a read:
+ * `readCommentBox` for the comment/reply boxes, `readMessageCompose` for the
+ * message compose. Never throws: it runs on paths that already decided the
+ * draft's fate.
+ *
+ * Each pass confirms emptiness itself afterwards rather than trusting
+ * runClearComposer's return. That helper reports success when the box cannot be
+ * FOCUSED, on the reasonable assumption that an unfocusable box is an absent
+ * one — but a composer can also be present, dirty and unfocusable: a minimised
+ * messaging bubble measures 0x0, and the locators correctly refuse a zero rect
+ * rather than clicking the viewport corner. Trusting the helper there would
+ * report "cleared" for a box still holding text and swallow the warning, which
+ * is the one outcome that leaves the dialog armed with nobody told.
+ */
+async function clearComposer(
+  tabId: number,
+  rng: ReturnType<typeof makeRng>,
+  /**
+   * The DM body this run typed, when the caller is the DM path. Absent for every
+   * other caller, and that default is the important part.
+   *
+   * The comment/reply box is ours: nothing but this actuator types in it, and
+   * its text does not survive a `chrome.tabs.update` anyway, so clearing it on
+   * any navigation only ever discards our own un-sent reply a beat before the
+   * navigation would have.
+   *
+   * `.msg-form` is neither. It is the messaging overlay that rides along on
