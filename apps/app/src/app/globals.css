@@ -998,3 +998,203 @@ code, pre { font-family: "JetBrains Mono", ui-monospace, monospace; }
 .chat-role { font-size: 10px; text-transform: uppercase; color: var(--ink-muted); letter-spacing: 0.05em; }
 .chat-turn--operator .chat-body { background: var(--paper-2); }
 .chat-body { margin: 0; padding: 8px 10px; border-radius: 8px; font-size: 13.5px; line-height: 1.5; background: var(--paper); }
+.chat-pinned { font-size: 10px; color: var(--accent); }
+.chat-input { width: 100%; resize: vertical; font-family: var(--body); font-size: 13.5px; padding: 10px; border-radius: 10px; }
+.chat-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.chat-pin { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-muted); }
+@media (max-width: 900px) {
+  .post-detail-grid { grid-template-columns: 1fr; }
+  .post-detail-side { position: static; }
+}
+
+/* Cross-platform post SET — side-by-side platform columns (X | LinkedIn), each
+   cycling its own versions. The core of the Content workspace detail view. */
+.post-set { display: grid; gap: 16px; }
+.post-set-generate { padding: 18px; display: grid; gap: 10px; justify-items: start; }
+.post-set-addplatform { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-top: 2px; }
+
+.post-set-grid { display: grid; gap: 16px; align-items: start; }
+/* data-cols = number of platform columns (X · LinkedIn · Reddit). A lone column
+   is capped + centered so it doesn't stretch the full width and look lost. */
+.post-set-grid[data-cols="1"] { grid-template-columns: minmax(0, 560px); justify-content: center; }
+.post-set-grid[data-cols="2"] { grid-template-columns: 1fr 1fr; }
+.post-set-grid[data-cols="3"] { grid-template-columns: 1fr 1fr 1fr; }
+
+.platform-column {
+  padding: 14px; display: grid; gap: 10px; align-content: start;
+  border-top: 2px solid var(--col-accent, var(--rule));
+}
+.platform-column__bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.platform-column__name { font-weight: 600; font-size: 13px; }
+.platform-column__ver { font-size: 10.5px; color: var(--ink-muted); }
+.platform-column__nav { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.platform-column__dots { display: flex; justify-content: center; gap: 5px; }
+.platform-column__dot {
+  width: 7px; height: 7px; border-radius: 50%; border: none;
+  background: var(--rule); cursor: pointer; padding: 0; transition: all .15s;
+}
+.platform-column__dot.is-active { background: var(--col-accent, var(--accent)); width: 18px; border-radius: 4px; }
+.platform-column__empty { padding: 18px; display: grid; gap: 10px; justify-items: center; text-align: center; font-size: 13px; }
+/* Inline "Refine" composer + the "writing a new version…" indicator. */
+.platform-column__refine { display: grid; gap: 6px; padding: 8px; border-radius: 10px; background: var(--paper-2); box-shadow: 0 0 0 0.5px var(--rule); }
+.platform-column__refine textarea { width: 100%; box-sizing: border-box; font-size: 13px; line-height: 1.5; resize: vertical; }
+.platform-column__refine-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.platform-column__generating { font-size: 11px; color: var(--accent); }
+
+.draft-editor { display: grid; gap: 8px; }
+.draft-editor__meta { display: flex; align-items: center; gap: 10px; font-size: 11px; flex-wrap: wrap; }
+.draft-editor__count { color: var(--ink-muted); }
+.draft-editor__count.is-over { color: var(--warn, #b80); font-weight: 600; }
+.draft-editor__url { width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 8px; font-size: 12.5px; }
+.draft-editor__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* Platform badge on the Drafts board cards (X / LinkedIn / Reddit variants). */
+.idea-platform {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 2px 7px; border-radius: 6px; background: var(--paper-2); color: var(--ink-muted);
+}
+.idea-platform[data-platform="x"] { color: #1d9bf0; }
+.idea-platform[data-platform="linkedin"] { color: #0a66c2; }
+.idea-platform[data-platform="reddit"] { color: #ff4500; }
+
+@media (max-width: 900px) {
+  .post-set-grid[data-cols="2"], .post-set-grid[data-cols="3"] { grid-template-columns: 1fr; }
+}
+
+/* Rich column anatomy (content-pipeline parity): title + labelled field rows. */
+.draft-editor__head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11px; }
+.draft-editor__vname { font-weight: 700; font-size: 12px; }
+.draft-editor__title { margin: 4px 0 2px; font-size: 15px; line-height: 1.3; }
+.draft-editor__title-plat { color: var(--ink-muted); font-style: italic; }
+.draft-editor__foot { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 4px; }
+.draft-editor__saving { color: var(--ink-muted); }
+
+.field { display: grid; gap: 4px; margin-top: 6px; }
+.field__label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-muted); }
+.field__labelrow { display: flex; align-items: center; justify-content: space-between; }
+.field__input {
+  width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 8px;
+  font-size: 13px; font-family: var(--body); line-height: 1.5; resize: vertical;
+}
+.field__toggle {
+  background: none; border: none; padding: 0; cursor: pointer; text-align: left;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-muted);
+}
+
+/* STATUS lifecycle (Draft / Written / Scheduled / Posted) + Unpost. */
+.stage-row { display: flex; flex-wrap: wrap; gap: 4px; }
+.stage-pill {
+  padding: 3px 9px; border-radius: 7px; border: none; cursor: pointer; font-size: 11.5px;
+  background: var(--paper-2); color: var(--ink-muted); transition: all .12s;
+}
+.stage-pill:hover { color: var(--ink); }
+.stage-pill.is-active { background: color-mix(in oklch, #22c55e 22%, var(--paper)); color: #15803d; font-weight: 600; }
+.stage-unpost { margin-top: 4px; background: none; border: none; padding: 0; cursor: pointer; font-size: 11px; color: var(--ink-muted); text-decoration: underline; }
+
+/* CATEGORY tags (Building / Studying / Workout / Gtm). */
+.cat-row { display: flex; flex-wrap: wrap; gap: 4px; }
+.cat-pill {
+  padding: 3px 9px; border-radius: 7px; border: none; cursor: pointer; font-size: 11.5px;
+  background: var(--paper-2); color: var(--ink-muted); transition: all .12s;
+}
+.cat-pill:hover { color: var(--ink); }
+.cat-pill.is-active { background: color-mix(in oklch, var(--accent) 20%, var(--paper)); color: var(--accent-deep, var(--accent)); font-weight: 600; }
+
+.post-stage-badge { padding: 1px 7px; border-radius: 6px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; background: var(--paper-2); color: var(--ink-muted); }
+.post-stage-badge--posted { background: color-mix(in oklch, #22c55e 22%, var(--paper)); color: #15803d; }
+.post-stage-badge--scheduled { background: color-mix(in oklch, #06b6d4 20%, var(--paper)); color: #0e7490; }
+.post-stage-badge--written { background: color-mix(in oklch, #8b5cf6 20%, var(--paper)); color: #6d28d9; }
+
+/* Per-post media — an image (any platform) or the video (LinkedIn), bound to a
+   single draft variant via content_media.draft_id. Thumbnails with a remove ✕. */
+.draft-media { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+.draft-media__item {
+  position: relative; width: 96px; height: 96px; border-radius: 10px; overflow: hidden;
+  background: #0b0b0d; box-shadow: 0 0 0 0.5px var(--rule);
+}
+.draft-media__preview { width: 100%; height: 100%; object-fit: cover; display: block; }
+.draft-media__missing { display: flex; width: 100%; height: 100%; align-items: center; justify-content: center; color: var(--ink-muted); font-size: 10px; }
+.draft-media__del {
+  position: absolute; top: 4px; right: 4px; width: 20px; height: 20px; border: none;
+  border-radius: 50%; background: rgba(0,0,0,.55); color: #fff; cursor: pointer;
+  font-size: 11px; line-height: 1; display: flex; align-items: center; justify-content: center;
+}
+.draft-media__del:hover:not(:disabled) { background: rgba(0,0,0,.8); }
+.draft-media__hint { font-size: 11px; color: var(--ink-muted); font-style: italic; margin: 2px 0 0; }
+.draft-media__add { white-space: nowrap; }
+
+/* Posts board — filter/sort/search toolbar over the generated post cards. */
+.drafts-panel { display: grid; gap: 14px; }
+.drafts-toolbar { margin-bottom: 2px; }
+
+/* Media library — day-grouped grid with Clips/B-rolls + search/sort (content-pipeline). */
+.media-panel { display: grid; gap: 14px; }
+.media-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.media-stat { font-size: 12px; color: var(--ink-muted); }
+.media-tabs { display: inline-flex; background: var(--paper-2); border-radius: 9px; padding: 2px; }
+.media-tab { padding: 5px 14px; border: none; background: none; border-radius: 7px; cursor: pointer; font-size: 12.5px; color: var(--ink-muted); }
+.media-tab.is-active { background: var(--paper); color: var(--ink); box-shadow: 0 0 0 0.5px var(--rule); }
+.media-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.media-search { flex: 1 1 220px; padding: 9px 12px; border-radius: 9px; font-size: 13px; }
+.media-select { padding: 9px 10px; border-radius: 9px; font-size: 12.5px; }
+.media-group { display: grid; gap: 10px; }
+.media-group__head { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 1px solid var(--rule); padding-bottom: 6px; }
+.media-group__day { font-size: 13px; font-weight: 600; }
+.media-group__count { font-size: 11px; color: var(--ink-muted); }
+.media-grid { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+.media-card { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+.media-thumb-wrap { aspect-ratio: 9 / 16; background: #0b0b0d; overflow: hidden; }
+.media-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+.media-thumb-play { position: relative; width: 100%; height: 100%; border: none; padding: 0; cursor: pointer; background: #0b0b0d; display: block; }
+.media-thumb-play__icon {
+  position: absolute; inset: 0; margin: auto; width: 44px; height: 44px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,.45); border-radius: 50%; color: #fff; font-size: 15px;
+}
+.media-card__foot { padding: 8px 10px; display: grid; gap: 4px; }
+.media-name { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.media-card__meta { display: flex; justify-content: space-between; gap: 8px; }
+.media-meta { font-size: 10.5px; color: var(--ink-muted); }
+.media-card__actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 2px; }
+.media-del { justify-self: start; }
+
+/* Segmented control (a row of mutually exclusive tabs, e.g. the Spend range picker). */
+.seg { display: inline-flex; background: var(--paper-2); border-radius: 999px; padding: 4px; gap: 2px; }
+.seg__btn { padding: 7px 14px; border: none; background: none; border-radius: 999px; cursor: pointer; font-size: 12px; color: var(--ink-muted); white-space: nowrap; }
+.seg__btn:hover:not(:disabled):not(.is-active) { color: var(--ink); }
+.seg__btn.is-active { background: var(--ink); color: var(--paper); }
+.seg__btn:disabled { opacity: .4; cursor: not-allowed; }
+
+/* Overview KPI cards (were unstyled → "4Ideas" smush). */
+.overview-panel { display: grid; gap: 18px; }
+.kpi { display: flex; flex-direction: column; gap: 3px; padding: 14px 16px; border-radius: 12px; background: var(--paper-2); box-shadow: 0 0 0 0.5px var(--rule); }
+.kpi-value { font-size: 24px; font-weight: 600; line-height: 1; }
+.kpi-label { font-size: 11px; color: var(--ink-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.overview-platforms { display: flex; gap: 10px; flex-wrap: wrap; }
+.overview-plat { display: grid; gap: 2px; padding: 8px 12px; }
+
+/* iPhone pass for the Content surfaces. The post-set grid already stacks at
+   ≤900px; this tightens the columns bar, media density, and the segmented
+   controls so nothing overflows on a ~375px screen. */
+@media (max-width: 768px) {
+  .platform-column__bar { gap: 6px; }
+  .media-grid { grid-template-columns: repeat(auto-fill, minmax(144px, 1fr)); gap: 10px; }
+  .media-head { gap: 8px; }
+  .seg { flex: 1 1 auto; justify-content: center; }
+  .draft-editor__head { gap: 6px; }
+}
+
+/* Lyra lanes card + Intelligence box (agent page) */
+.lanes-card { display: grid; gap: 12px; }
+.intel-box { padding: 10px; border-radius: 10px; background: var(--paper-2); display: grid; gap: 4px; }
+.intel-row { font-size: 12.5px; display: flex; gap: 8px; }
+.intel-sub { font-size: 10.5px; color: var(--ink-muted); }
+.lane-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.lane-row { display: flex; align-items: center; gap: 10px; }
+.lane-switch {
+  width: 34px; height: 20px; border-radius: 999px; background: var(--rule);
+  border: none; padding: 0; position: relative; cursor: pointer; flex: 0 0 auto;
+  transition: background 0.15s;
+}
+.lane-switch--on { background: var(--accent); }
+.lane-switch__dot {
