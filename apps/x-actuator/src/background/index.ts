@@ -798,3 +798,203 @@ async function tickOnce() {
 
   // challenge guard
   const ch = await send<{ observed?: { challenge?: boolean } }>(tabId, { cmd: "detectChallenge" }).catch(() => null);
+  if (ch?.observed?.challenge) {
+    await endRun("halted-challenge");
+    await api.logActivity(s.sessionId, [{ type: "skip", reason: "challenge", at: new Date(now).toISOString() }]).catch(() => {});
+    return;
+  }
+
+  if (!stopped() && now - (s.lastPriorityPollMs ?? 0) >= PRIORITY_POLL_MS && await browserDiscoveryEnabled()) {
+    s.lastPriorityPollMs = now;
+    const ready = await api.fetchPriorityReady().catch(() => null);
+    if (ready && myEpoch === (await currentEpoch()) && !stopped()) {
+      integratePriorityReady(s, ready, now, rng);
+    }
+  }
+
+  const idx = dueActionIndex(s.actions, now);
+  if (idx < 0) {
+    // Re-read beside the idle-like decision: a panel edit or minute boundary
+    // during replenishment must not allow a write from stale settings.
+    const writeQuiet = await currentWriteQuiet(Date.now(), s.curfewEnabled === true);
+    // Persistent drain: when every slot is done, keep re-checking the server queue
+    // (paced, ~DRAIN_WATCH_POLL_MS) so approvals made after the inbox emptied get
+    // fresh slots and go out with no re-click. maybeExtendDrain appends slots +
+    // bumps drainRounds only when supply exists; an empty check is a no-op.
+    if (
+      drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0) &&
+      s.actions.every((a) => a.executed) &&
+      now - (s.lastDrainWatchMs ?? 0) >= DRAIN_WATCH_POLL_MS
+    ) {
+      s.lastDrainWatchMs = now;
+      await maybeExtendDrain(s, cfg, api, now, rng);
+    }
+
+    // Nothing due. While it waits, the actor should stay lively — and the
+    // operator wants it actively LIKING + clicking "Show more", not just
+    // scrolling. So slip a like into the wait (paced, curfew-safe, and bounded by
+    // the like budget so it never exceeds the daily cap), otherwise ambient-browse
+    // (whose read-actions now lean toward expanding "Show more").
+    const idleLike = shouldIdleLike({
+      doneLikes: s.done.likes,
+      targetLikes: s.targets.likes,
+      // Pass the per-run flag. Without it this defaulted to the GLOBAL switch
+      // (WRITE_CURFEW_ENABLED = false), so the idle-like slot was never
+      // curfew-gated on any run — which is why likes kept firing at 2am on a
+      // Full-auto run whose curfew was explicitly on.
+      inCurfew: writeQuiet.held,
+      sinceLastIdleLikeMs: now - (s.lastIdleLikeMs ?? 0),
+      minGapMs: IDLE_LIKE_MIN_GAP_MS * rng.float(1, 1.8),
+      inQuietGap: s.mode === "drain" && inQuietDrainGap(s.actions, now),
+      // A drain takes ONLY the like slots its plan scheduled (#497).
+      inDrain: s.mode === "drain",
+    });
+    // The notifications sweep rides the idle branch: a run flagged
+    // `notifications` spends one of its waits, every ~10-20 min, reading the
+    // mentions tab instead of ambient-browsing. Checking your mentions IS
+    // ambient behavior, so this costs no extra behavioral surface — and the
+    // leads it files come back as approvals that THIS run then posts.
+    //
+    // ORDER MATTERS (chooseIdleActivity owns it): the sweep is decided BEFORE the
+    // supply gate, because the sweep is what CREATES this run's supply. Gating it
+    // on "we already have something to send" deadlocks the feature in its normal
+    // starting state — Auto notifications clicked with an empty approval queue.
+    const activity = chooseIdleActivity({
+      sweepDue: notificationSweepDue({
+        enabled: s.notifications === true,
+        sinceLastSweepMs: now - (s.lastNotifSweepMs ?? 0),
+        minGapMs: SWEEP_MIN_GAP_MS * rng.float(1, 2),
+      }),
+      // SUPPLY GATE: with nothing to send (both pools empty) a live run goes QUIET —
+      // no idle-likes, no ambient browsing. Without this, a run whose pipeline had
+      // run dry still burned engagement every tick: 2026-07-20 Lyra logged 346 likes
+      // against 3 comments in a day, 359/43 the day before. The watch-poll above
+      // still runs, so the moment an approval lands the run picks it up and the
+      // normal in-gap liking resumes.
+      pipelineDry: pipelineIsDry(s.commentPool.length, s.dmPool.length),
+      idleLike,
+    });
+    let browseResult: Awaited<ReturnType<typeof ambientBrowse>> | null = null;
+    if (activity === "quiet") {
+      const result = !stopped() && await browserDiscoveryEnabled()
+        ? await ambientBrowse(s, cfg, tabId, rng, now) : "waiting";
+      s.lastEvent = result === "browsed" ? "reading for new X posts — no likes while the pipeline is empty"
+        : result === "buffered" ? "submitting saved X posts — no browser scroll"
+        : result === "full" ? "5 replies buffered — waiting for a send slot"
+        : result === "unavailable" ? "discovery capacity unavailable — waiting"
+        : "nothing to send — idle (no likes while the pipeline is empty)";
+      await saveIfCurrent(s);
+      return;
+    }
+    if (activity === "sweep") {
+      s.lastNotifSweepMs = now; // pace off the attempt, so a broken sweep can't spin
+      const out = await runNotificationSweep(tabId, {
+        cdp, rng, sleep, send, api, instanceId: cfg.instanceId, wpm: s.persona.wpm,
+        navigate: async (id, url) => {
+          // Epoch-guard every navigation: a STOP or a superseding run must never
+          // find its tab yanked to /notifications by a sweep that outlived it.
+          // Checked twice: navigateTab clears the composer first, which can take
+          // a couple of seconds, so the guard is re-run right before the actual
+          // navigation (a STOP landing inside that window used to slip through).
+          if (myEpoch !== (await currentEpoch())) return;
+          await navigateTab(id, url, rng, async () => myEpoch === (await currentEpoch())).catch(() => {});
+          await waitTabComplete(id);
+        },
+        stopped,
+        configuredHandle: cfg.selfHandle,
+      }).catch((e): SweepOutcome => ({
+        fresh: 0, accepted: 0, skipped: 0,
+        detail: isAbortError(e) ? "stopped" : `sweep-failed: ${e instanceof Error ? e.message : String(e)}`,
+      }));
+      // Be specific about WHY a sweep found nothing. "nothing new" with 0 cells
+      // read means the page never rendered (or the selectors drifted) and is a
+      // completely different problem from "read 25 cells, none of them were
+      // replies to you" — the old single message hid that distinction and made
+      // a broken sweep look like a quiet one.
+      // TELEMETRY. Every sweep outcome is written to the activity table, so a
+      // sweep that finds nothing is diagnosable from SQL instead of requiring
+      // the operator to be watching the panel at the right moment. This is the
+      // gap that made the first two rounds of this bug guesswork.
+      await api
+        .logActivity(s.sessionId, [
+          {
+            type: "skip",
+            reason: `sweep:${out.detail ?? (out.fresh > 0 ? `ingested-${out.accepted}` : `read-${out.harvested ?? 0}-none-new`)}`.slice(0, 200),
+            at: new Date(now).toISOString(),
+          } as XActivityEvent,
+        ])
+        .catch(() => {});
+      s.lastEvent = out.detail
+        ? `notifications: ${out.detail}`
+        : out.fresh === 0
+          ? out.harvested
+            ? `notifications: read ${out.harvested} cells, none are new replies to you`
+            : "notifications: page rendered NO notification cells — selectors may have drifted"
+          : `notifications: ${out.accepted} queued for drafting (${out.skipped} already known)`;
+    } else if (activity === "like") {
+      s.lastIdleLikeMs = now; // pace off the attempt, not just a hit (the scan is costly)
+      const events: XActivityEvent[] = [];
+      const at = new Date(now).toISOString();
+      try {
+        await likeAFeedPost(tabId, s, cfg, rng, events, at);
+      } catch (e) {
+        if (!isAbortError(e)) throw e; // STOP mid-like → fall through to the STOP-race guard below
+      }
+      await api.logActivity(s.sessionId, events).catch(() => {});
+    } else {
+      browseResult = await ambientBrowse(s, cfg, tabId, rng, now);
+      if (browseResult === "full") s.lastEvent = "5 replies buffered — waiting for a send slot";
+      else if (browseResult === "buffered") s.lastEvent = "submitting saved X posts — no browser scroll";
+      else if (browseResult === "unavailable") s.lastEvent = "discovery capacity unavailable — waiting";
+      else if (browseResult === "waiting") s.lastEvent = "waiting for next paced discovery read";
+    }
+    // STOP race: a stop/halt may have landed during the (now longer) idle
+    // like/ambient read — don't resurrect the run by writing "running" back over it.
+    const cur = await loadState();
+    if (cur && cur.status !== "running") return;
+    const nextAt = Math.min(...s.actions.filter((a) => !a.executed).map((a) => a.atMs));
+    const inSec = Number.isFinite(nextAt) ? Math.max(0, Math.round((nextAt - now) / 1000)) : 0;
+    // A sweep already wrote its own outcome line — don't clobber it with the
+    // generic idle text, or the panel would never show what the sweep found.
+    if (activity === "like" || browseResult === "browsed") {
+      s.lastEvent = activity === "like" ? `liked while waiting — next action in ~${inSec}s` : `browsing — next action in ~${inSec}s`;
+    }
+    await saveIfCurrent(s);
+    return;
+  }
+
+  const action = s.actions[idx]!;
+  const events: XActivityEvent[] = [];
+  const at = new Date(now).toISOString();
+  const windowEndMs = s.startMs + s.windowHours * 3600_000;
+  // "dm" stays in the predicate as a forward-compat guard even though X plans
+  // none today (api.ts hardcodes dms: []). There is no dm executor branch, so a
+  // dm slot that slipped past this gate would never advance atMs and would be
+  // re-selected by dueActionIndex every tick — wedging the run.
+  const isWrite =
+    action.kind === "like" || action.kind === "comment" || action.kind === "dm";
+  // Re-read at the write floor. A running reply is not interrupted by a panel
+  // edit, but the next slot observes it before touching the page.
+  const writeQuiet = await currentWriteQuiet(Date.now(), s.curfewEnabled === true);
+
+  // Runtime write floor: Discover + Reply reads its saved local-time window;
+  // legacy Auto uses ../lib/curfew.ts; manual Run/Drain have no quiet window.
+  //
+  // Scoped to EVERY WRITE, likes included. It used to hold posts only, so a
+  // curfewed run sat liking at 2am while the panel said "overnight pause" — the
+  // exact asleep-but-active signature the curfew exists to remove. Ambient
+  // BROWSING still continues; it leaves no public trace.
+  if (isWrite && writeQuiet.held) {
+    const d = deferLater(action, now, windowEndMs, rng);
+    action.atMs = d.atMs;
+    events.push({ type: "skip", reason: "curfew", at });
+    s.lastEvent = writeQuiet.discoveryActive
+      ? `quiet window ${writeQuiet.schedule.start}–${writeQuiet.schedule.end} — browsing, no replies or likes`
+      : "overnight pause — no replies or likes 1:00–9:00";
+    // A held send slot must not pin discovery on this permalink all night.
+    // ambientBrowse enforces the existing discovery read cadence and buffer cap.
+    if (writeQuiet.discoveryActive) await ambientBrowse(s, cfg, tabId, rng, now);
+    await saveIfCurrent(s);
+    await api.logActivity(s.sessionId, events).catch(() => {});
+    return;
+  }
