@@ -1198,3 +1198,203 @@ async function tickOnce() {
             if (dk && !(s.actionedUrls ?? []).includes(dk)) (s.actionedUrls ??= []).push(dk);
             const evt: XActivityEvent = { type: "skip", reason: `reply-failed${stage}:ambiguous-dropped`, at };
             const tid = tweetIdFrom(item.url);
+            if (tid) evt.tweet_id = tid;
+            events.push(evt);
+          } else if (decision.plan === "give-up") {
+            // Drop the draft for this session (done locally, NOT markSent —
+            // nothing posted) so it stops monopolizing reply slots. A later
+            // session re-serves it fresh; server dedup is unaffected.
+            item.tries = decision.tries;
+            s.doneDraftIds.push(item.draftId);
+            action.executed = true;
+            events.push({ type: "skip", reason: `reply-failed:gave-up-after-${decision.tries}${stage}`, at });
+          } else {
+            item.tries = decision.tries;
+            s.commentPool.push(item); // BACK of the queue — healthy drafts go first
+            const d = deferLater(action, now, s.startMs + s.windowHours * 3600_000, rng);
+            action.atMs = d.atMs;
+            // Name the failing stage (box-not-found / stopped) so the
+            // x_activity row says WHY, not just "failed".
+            events.push({ type: "skip", reason: res.detail ? `reply-failed:${res.detail}` : "reply-failed", at });
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // A STOP that unwound an in-flight action surfaces as AbortError — log it as
+    // a clean "stopped" skip, not a scary error string.
+    const reason = isAbortError(e) ? "stopped" : `err:${(e instanceof Error ? e.message : String(e)).slice(0, 80)}`;
+    events.push({ type: "skip", reason, at });
+    // Mirror real errors (not clean stops) to the Chrome Bridge sink so the doctor
+    // can see selector drift / attach failures without DevTools open (observability only).
+    if (!isAbortError(e)) sinkLog("error", "tick action failed", { reason });
+  }
+
+  // Surface the outcome to the panel (DevTools can't be open during a run).
+  const last = events[events.length - 1];
+  if (last) {
+    s.lastEvent =
+      last.type === "like"
+        ? (last.engagement && last.engagement !== "like"
+            ? `${engagementLabel(last.engagement as EngagementKind).toLowerCase()}ed @${last.author_handle ?? "a tweet"} (${s.done.likes}/${s.targets.likes})`
+            : `liked @${last.author_handle ?? "a tweet"} (${s.done.likes}/${s.targets.likes})`)
+      : last.type === "reply" ? `replied (${s.done.comments}/${s.targets.comments})`
+      : `skip: ${last.reason ?? "?"}`;
+  }
+
+  // Drain auto-continue: before ending a finished drain, try to append another
+  // batch for any approvals still in the inbox, so one Drain clears it all.
+  if (s.mode === "drain" && s.actions.every((a) => a.executed)) {
+    const extended = await maybeExtendDrain(s, cfg, api, now, rng); // appends non-executed slots when work remains
+    // Persistent drain: an empty inbox does NOT end the run. Keep it alive and
+    // watching (roll the window, arm the next watch-poll) so a reply approved
+    // later goes out with no re-click. Only STOP, a challenge halt, or the batch
+    // ceiling (drainShouldKeepWaiting=false) end a drain now.
+    if (!extended && drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0)) {
+      s.windowHours = (now - s.startMs) / 3600_000 + DRAIN_WATCH_WINDOW_H;
+      s.lastDrainWatchMs = now;
+      s.lastEvent = "inbox clear — watching for new approvals (no re-click needed)";
+    }
+  }
+
+  // A caught-up persistent drain stays "running" (watching); every other finished
+  // run goes idle and is ended below.
+  if (s.actions.every((a) => a.executed) && !drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0)) {
+    s.status = "idle";
+  }
+  // Persist only if we're still the live run. A STOP or a superseding Run that
+  // landed mid-tick bumped the epoch, so saveIfCurrent drops this write instead
+  // of resurrecting a run that was already stopped/replaced.
+  const saved = await saveIfCurrent(s);
+  await api.logActivity(s.sessionId, events).catch(() => {});
+  if (saved && s.status === "idle") await endRun("idle");
+}
+
+// Outcome of a reply attempt. A plain ReplyResult flows through the verified
+// submit pipeline (ok / failed-with-stage-detail + the dispatched ambiguity
+// flag). `{ unavailable }` means the target tweet no longer exists / can't be
+// replied to — either the post is GONE (deleted, protected, suspended account,
+// dead permalink) or replies are restricted ("Who can reply?"); its `detail`
+// names the cause (post-unavailable | reply-restricted) — a PERMANENT failure
+// the caller must drop, not retry. `{ superseded }` means the pre-send
+// approval-state check found the approval decided or owned elsewhere (human
+// skip/sent, or the x-intern API-autosend claim) — drop locally with NO
+// durable write. On a plain failure, `detail` names the exact stage that broke
+// ("box-not-found" / "submit-not-found" / "not-cleared" / …) so the DB skip
+// row (x_activity.reason = `reply-failed:<detail>`) says WHY without a live
+// DevTools session — mirroring the like path's `no-likeable-tweet(...)`
+// diagnostics. Signature reading: a wall of not-cleared = a live reply
+// action-block, submit-not-found = submit selector drift, box-not-found =
+// composer/post-type drift.
+type CommentOutcome = ReplyResult | { unavailable: true; detail?: string } | { superseded: string };
+
+// markSent, retried with backoff. Returns whether the send was confirmed to the
+// server. The caller has ALREADY recorded the draft locally as done, so a false
+// return never causes a re-post — it only means the DB approval may still read
+// 'pending' until a later tick reconciles. Epoch-aware: once the run that posted
+// is stopped/superseded, stop retrying (the reconcile skip event still logs).
+async function markSentWithRetry(api: ActuatorApi, approvalId: string, epoch: number): Promise<boolean> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await api.markSent(approvalId);
+      return true;
+    } catch {
+      if (epoch !== (await currentEpoch())) return false; // run stopped/superseded — stop retrying
+      if (attempt < 3) await sleep(800 * (attempt + 1)); // linear backoff
+    }
+  }
+  return false;
+}
+
+// Best-effort like on the tweet just replied to (doComment navigated to its
+// status page). Opt-in via cfg.replyAlsoLikes — see the call site. Passes the
+// reply target's id so the content script picks the right <article> on a thread
+// page. Not counted against the like target. Returns whether a like landed.
+// Never throws (best-effort means best-effort): a CDP throw here would abort
+// the tick mid-bookkeeping (e.g. skip the drain-mode return-to-home nav) for a
+// decoy action.
+async function likeCurrentTweet(tabId: number, item: PoolItem, rng: ReturnType<typeof makeRng>): Promise<boolean> {
+  if (stopped()) return false; // STOP after the reply → skip the decoy like
+  try {
+    const loc = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect }>(
+      tabId, { cmd: "locatePostLike", tweetId: tweetIdFrom(item.url) },
+    ).catch(() => null);
+    if (!loc?.ok || loc.x == null) return false;
+    await sleep(rng.float(500, 1500)); // a beat between posting and liking
+    await actorClick(tabId, rectFrom(loc), rng);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Open the post, locate + type, then submit VERIFIED via trusted CDP input.
+// Never throws: every failure comes back as a ReplyResult so it flows through
+// replyFailureDecision at the call site. A throw that escaped to tickOnce's
+// generic catch would lose the pool item without recording it (already
+// shift()ed, never in doneDraftIds) → maybeReplenish re-serves it with NO tries
+// bookkeeping and, worse, with no dispatched verdict. Everything before
+// submitReply is pre-dispatch (nav / locate / focus-click / typing), so a throw
+// here is safely a bounded retry; submitReply itself never throws (see
+// runSubmitReply) and owns the post-dispatch ambiguity.
+async function doComment(tabId: number, item: PoolItem, rng: ReturnType<typeof makeRng>, wpm: number, epoch: number, api: ActuatorApi): Promise<CommentOutcome> {
+  // Has anything been typed into the composer yet? Every exit after this flips
+  // true — except a landed post, which clears the box itself — has to empty it
+  // again, or the next navigation raises a "Leave site?" dialog nobody can answer.
+  let typed = false;
+  try {
+    await navigateTab(tabId, item.url, rng);
+    await waitTabComplete(tabId);
+    // Read the target post like a human before replying — dwell proxied from a
+    // ~60-word read at this session's pace (we don't have the post's wc here).
+    await sleep(readingDwellMs(rng, Math.max(0, Math.round(rng.normal(60, 40))), {}, wpm));
+    // tab.status=complete and the reading dwell do not guarantee X's SPA has
+    // mounted the reply editor. Poll that condition briefly on this SAME pinned
+    // permalink, rechecking permanent dead/restricted states on each attempt.
+    const targetId = tweetIdFrom(item.url);
+    const composer = await waitForReplyComposer({
+      now: Date.now,
+      sleep,
+      stale: async () => stopped() || epoch !== (await currentEpoch()),
+      onTarget: async () => {
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        const url = tab?.pendingUrl ?? tab?.url;
+        return isXPageUrl(url) && targetId !== null && tweetIdFrom(url) === targetId;
+      },
+      postUnavailable: async () => {
+        const state = await send<{ observed?: { unavailable?: boolean } }>(tabId, { cmd: "detectPostUnavailable" }).catch(() => null);
+        return state?.observed?.unavailable === true;
+      },
+      replyRestricted: async () => {
+        const state = await send<{ observed?: { restricted?: boolean } }>(tabId, { cmd: "detectReplyRestricted" }).catch(() => null);
+        return state?.observed?.restricted === true;
+      },
+      locateBox: () => send<{ ok: boolean; x?: number; y?: number; rect?: Rect; skipReason?: string }>(tabId, { cmd: "locateCommentBox" }),
+    }, targetId);
+    if (composer.kind === "stopped") return { ok: false, detail: "stopped", dispatched: false };
+    if (composer.kind === "unavailable") return { unavailable: true, detail: composer.detail };
+    if (composer.kind === "missing") return { ok: false, detail: composer.detail, dispatched: false };
+    const box = composer.box;
+    if (stopped() || epoch !== (await currentEpoch())) return { ok: false, detail: "stopped", dispatched: false };
+    await actorClick(tabId, rectFrom(box), rng); // focus the box
+    typed = true; // from here on, any non-landing exit must empty the box again
+    await cdp.typeText(tabId, item.body, rng, sleep);
+    await sleep(rng.float(400, 2000));
+  } catch (e) {
+    console.warn("[actuator] reply setup failed pre-dispatch", e);
+    if (typed) await clearComposer(tabId, rng);
+    return { ok: false, detail: "nav-or-type-error", dispatched: false };
+  }
+  // STOP before we dispatch the submit gesture. This is a PRE-dispatch bail
+  // (nothing has been submitted yet), so unwinding here is safe — the tick catch
+  // maps it to a clean "stopped" skip and saveIfCurrent (stale epoch post-STOP)
+  // drops the shift, leaving the draft in the persisted pool. Once submitReply is
+  // called, the dispatched-ambiguity lives in runSubmitReply (submit.ts) instead.
+  try {
+    throwIfAborted(runAbort.signal);
+  } catch (e) {
+    // A STOP unwinding here leaves the just-typed reply sitting in the box, and
+    // the operator's very next navigation would hit "Leave site?". Clear before
+    // re-throwing so a stopped run leaves the tab as it found it.
+    await clearComposer(tabId, rng);
+    throw e;
