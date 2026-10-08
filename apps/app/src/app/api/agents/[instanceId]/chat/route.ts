@@ -198,3 +198,203 @@ async function buildSystemPrompt(
   });
   return profile.systemPrompt({ displayName, context });
 }
+
+async function resolveInstance(
+  instanceId: string,
+): Promise<
+  | { kind: "ok"; instance: NoelleAgentInstance }
+  | { kind: "forbidden" }
+  | { kind: "not_found" }
+> {
+  try {
+    const instance = await getAgentInstance(instanceId);
+    if (!instance) return { kind: "not_found" };
+    return { kind: "ok", instance };
+  } catch (err) {
+    if (err instanceof OrgMembershipError) return { kind: "forbidden" };
+    throw err;
+  }
+}
+
+export async function GET(
+  req: Request,
+  ctx: { params: Promise<{ instanceId: string }> },
+): Promise<NextResponse> {
+  const { instanceId } = await ctx.params;
+  const draftId = new URL(req.url).searchParams.get("draftId");
+  const resolved = await resolveInstance(instanceId);
+  if (resolved.kind === "forbidden") {
+    return NextResponse.json(
+      { error: "forbidden", message: "Not a member of this org." },
+      { status: 403 },
+    );
+  }
+  if (resolved.kind === "not_found") {
+    return NextResponse.json(
+      { error: "not_found", message: "Agent instance not found." },
+      { status: 404 },
+    );
+  }
+  const { instance } = resolved;
+  const displayName = displayNameFor(instance);
+  const profile = tryGetChatProfile(instance.role);
+
+  // Resume the operator's most recent thread for this instance. Fail-open: a
+  // history read error must not block the greeting (the chat still works, it
+  // just starts fresh).
+  const conversation = await loadLatestChatConversation(instanceId).catch(
+    (err) => {
+      console.warn("[chat] history load failed:", err);
+      return { conversationId: null, messages: [] as never[] };
+    },
+  );
+
+  let greeting = profile
+    ? profile.greeting({ displayName })
+    : {
+        body: `Hi — I'm ${displayName}. Ask me anything about my work.`,
+        suggestions: ["What are you working on?", "What do you need from me?"],
+      };
+
+  // Refine mode: the chat was opened from a specific draft. Make the first paint
+  // name the video and offer refine-shaped chips, so it's obvious Nova knows
+  // what we're working on. Fail-open: any load issue keeps the generic greeting.
+  if (draftId && instance.role === "video_intern") {
+    const ctxSnap = await loadChatContextForInstance(instance, { draftId }).catch(
+      () => ({} as Awaited<ReturnType<typeof loadChatContextForInstance>>),
+    );
+    if (ctxSnap.currentDraft) {
+      greeting = videoRefineGreeting(displayName, ctxSnap.currentDraft.hook);
+    }
+  }
+
+  return NextResponse.json({
+    greeting,
+    conversationId: conversation.conversationId,
+    messages: conversation.messages,
+    model: chatModelLabel(instance.model_overrides),
+  });
+}
+
+export async function POST(
+  req: Request,
+  ctx: { params: Promise<{ instanceId: string }> },
+): Promise<NextResponse> {
+  const { instanceId } = await ctx.params;
+
+  let body: z.infer<typeof BodySchema>;
+  try {
+    const raw = await req.json();
+    const parsed = BodySchema.safeParse(raw);
+    if (!parsed.success) {
+      return NextResponse.json(
+        { error: "invalid_body", message: parsed.error.message },
+        { status: 400 },
+      );
+    }
+    body = parsed.data;
+  } catch {
+    return NextResponse.json(
+      { error: "invalid_json", message: "Request body must be valid JSON." },
+      { status: 400 },
+    );
+  }
+
+  const resolved = await resolveInstance(instanceId);
+  if (resolved.kind === "forbidden") {
+    return NextResponse.json(
+      { error: "forbidden", message: "Not a member of this org." },
+      { status: 403 },
+    );
+  }
+  if (resolved.kind === "not_found") {
+    return NextResponse.json(
+      { error: "not_found", message: "Agent instance not found." },
+      { status: 404 },
+    );
+  }
+  const { instance } = resolved;
+
+  const vaultSnapshot: VaultSnapshot = { digest: null, bases: {}, refreshReasons: {}, byteAllowance: 0 };
+  const system = await buildSystemPrompt(instance, body.draftId);
+
+  let backend: EngineBackend;
+  let chatModel: string;
+  let viaClaudeCli = false;
+  try {
+    const picked = await loadChatBackend(instance.model_overrides);
+    backend = picked.backend;
+    chatModel = picked.model;
+    viaClaudeCli = picked.viaClaudeCli;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Bedrock init failed";
+    const stage = err instanceof BedrockInitError ? err.stage : "unknown";
+    // Stringify the error structure: Vercel runtime logs swallow nested
+    // Error objects passed as the second console.error arg, so without
+    // JSON.stringify the cause never makes it to the dashboard.
+    console.error(
+      `[chat] bedrock init failed stage=${stage} ${JSON.stringify(
+        serializeError(err),
+      )}`,
+    );
+    return NextResponse.json(
+      { error: "model_unavailable", stage, message: msg },
+      { status: 503 },
+    );
+  }
+
+  // Thread this turn onto the active conversation, or start a fresh one. We
+  // need the id before the model call so we can both load prior turns and
+  // persist under it afterward.
+  const conversationId = body.conversationId ?? crypto.randomUUID();
+
+  // Prior turns of this conversation become the model's history. Fail-open: if
+  // the read errors we still answer, just without memory of earlier turns.
+  const history = body.conversationId
+    ? await loadChatTurnsForModel(instanceId, body.conversationId).catch(
+        (err) => {
+          console.warn("[chat] history-for-model load failed:", err);
+          return [] as Awaited<ReturnType<typeof loadChatTurnsForModel>>;
+        },
+      )
+    : [];
+
+  try {
+    let res;
+    try {
+      res = await backend.call({ system, prompt: body.message, model: chatModel, history });
+    } catch (callErr) {
+      if (!viaClaudeCli) throw callErr;
+      // `claude -p` failed (binary missing / not logged in) — fall back to
+      // Bedrock so the chat still answers instead of breaking.
+      console.warn("[chat] claude-cli call failed, falling back to bedrock:", callErr);
+      const bedrock = await loadBedrockBackend();
+      chatModel = resolveChatModel(instance.model_overrides);
+      res = await bedrock.call({ system, prompt: body.message, model: chatModel, history });
+    }
+    // The model may append a fenced `noelle-proposal` block when the founder
+    // asked to change targeting/mission. Pull it out + validate it; the block
+    // is stripped from the text either way so the founder never sees raw JSON.
+    // The proposal only becomes a DB write when the client hits Apply (which
+    // replays it through the applyTargetingChange server action).
+    // Two propose-then-confirm channels share the reply: a targeting/mission
+    // proposal and (Head of Growth) a vault edit. Extract both — each strips its
+    // own fenced block, so the displayed text has neither.
+    const p = extractProposal(res.text);
+    const v = extractVaultEdit(p.text);
+    // Nova's video refiner may also append a script-edit block. Extract it last
+    // so its fenced block is stripped from the displayed text too.
+    const sc = extractScriptEdit(v.text);
+    const storedVaultEdit = v.vaultEdit ? bindVaultEdit(v.vaultEdit, vaultSnapshot, instance.role) : null;
+
+    // Persist the completed turn (user message + cleaned agent reply). The
+    // displayed/stored text has the fenced blocks stripped; the proposal +
+    // vault edit ride along as jsonb so the transcript re-renders their cards
+    // on resume. The script edit is live-only (no column) — it's actioned in
+    // the studio this session, not replayed on reload. Fail-open: a write error
+    // must not lose the answer the user already has — log and still return.
+    const messageId = await appendChatTurn({
+      instanceId,
+      conversationId,
+      userBody: body.message,
+      agentBody: sc.text,
