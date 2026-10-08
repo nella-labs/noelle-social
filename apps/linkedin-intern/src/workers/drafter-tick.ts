@@ -2598,3 +2598,203 @@ function leadEngagement(payload: {
 /**
  * useOpus = likes > likesThreshold || (comments > commentsThreshold && !commentBait).
  * The comments trigger is suppressed for engagement-bait posts. Missing or
+ * non-finite engagement counts are treated as zero.
+ */
+export function decideOpus(args: {
+  likes: number | null | undefined;
+  comments: number | null | undefined;
+  commentBait: boolean;
+  likesThreshold: number;
+  commentsThreshold: number;
+}): { useOpus: boolean; likes: number; comments: number; commentBait: boolean } {
+  const likes = Number.isFinite(args.likes) ? (args.likes as number) : 0;
+  const comments = Number.isFinite(args.comments) ? (args.comments as number) : 0;
+  const useOpus =
+    likes > args.likesThreshold ||
+    (comments > args.commentsThreshold && !args.commentBait);
+  return { useOpus, likes, comments, commentBait: args.commentBait };
+}
+
+/**
+ * Fetch + digest the existing comments on a post for the drafter prompt. Gated:
+ * no fetcher, no URL, or a known comment count below `minCount` → returns "" (no
+ * spend). Fail-open on an Apify error. The caller meters each paid attempt,
+ * including failed reads and empty results.
+ */
+async function fetchCommentDigest(args: {
+  lead: LeadRow;
+  payload: { url?: string; comments?: number | null };
+  fetchPostComments?: (postUrl: string) => Promise<LinkedInComment[]>;
+  maxComments: number;
+  minCount: number;
+  log: Logger;
+}): Promise<string> {
+  const { lead, payload, fetchPostComments, maxComments, minCount, log } = args;
+  const totalCount = Number.isFinite(payload.comments) ? (payload.comments as number) : 0;
+  const url = payload.url;
+  if (!fetchPostComments || !url || totalCount < minCount) return "";
+
+  let comments: LinkedInComment[];
+  try {
+    comments = await fetchPostComments(url);
+  } catch (err) {
+    log.warn(
+      { leadId: lead.id, err: (err as Error).message },
+      "comment fetch failed; drafting without comment context",
+    );
+    return "";
+  }
+  if (comments.length === 0) return "";
+
+  return renderCommentDigest(
+    comments.map((c) => ({
+      text: c.text,
+      authorName: c.authorName,
+      authorHeadline: c.authorHeadline,
+      reactions: c.reactions,
+    })),
+    Math.max(totalCount, comments.length),
+    maxComments < 12 ? maxComments : 12,
+  );
+}
+
+function buildPersonDirective(
+  payload: { authorName?: string | null; authorHeadline?: string | null },
+  profile: WatchlistProfileRow | undefined,
+  objective: WatchlistObjectiveEntry | undefined,
+): string | null {
+  const lines: string[] = [];
+  if (payload.authorName) lines.push(`Name: ${payload.authorName}`);
+  if (payload.authorHeadline) lines.push(`Headline: ${payload.authorHeadline}`);
+  if (profile?.summary) lines.push(`Who they are: ${profile.summary}`);
+  if (profile?.topics?.length) lines.push(`Topics they post about: ${profile.topics.join(", ")}`);
+  if (profile?.tone) lines.push(`How they write: ${profile.tone}`);
+  if (profile?.engagementNotes) lines.push(`How to engage them so it lands: ${profile.engagementNotes}`);
+  if (objective?.objective) lines.push(`Operator's goal for this person: ${objective.objective}`);
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
+/**
+ * The "Product knowledge" block injected into the drafter prompt from the second
+ * (scoped) knowledge retrieval pass. Empty array → no block (byte-identical to
+ * today). Mirrors the X intern's renderPrompt knowledge wording.
+ */
+function knowledgeBlock(knowledgeAnchors: string[]): string[] {
+  if (!knowledgeAnchors.length) return [];
+  return [
+    "",
+    "Product knowledge from the operator's vault (the ONLY facts you may assert about the product/offer — do not invent capabilities, pricing, or claims beyond these; if none fit, write a peer comment with no pitch):",
+    knowledgeAnchors.map((a, i) => `[${i + 1}] ${a}`).join("\n"),
+  ];
+}
+
+/** The vision-caption line, or [] when there's no caption. */
+function imageBlock(imageCaption: string): string[] {
+  return imageCaption
+    ? [
+        "",
+        `THE POST'S IMAGE SHOWS: ${imageCaption}`,
+        "The image is part of what they posted — if it's central to the point (a chart, screenshot, photo, slide, result), your reply SHOULD engage with the specific thing it shows, not just the text. Reference what's actually in it (the number, the detail, the moment). If the image is incidental, don't force it. Never a generic \"love the visual / great graphic\".",
+      ]
+    : [];
+}
+
+/**
+ * The "you already said this to this person" block, or [] when there's no
+ * history. Lists the reply bodies Lyra already sent/queued to THIS connection so
+ * the model says something new instead of repeating its own take. Each is
+ * truncated to keep the prompt bounded.
+ */
+function priorRepliesBlock(priorReplies: string[] | undefined): string[] {
+  if (!priorReplies || priorReplies.length === 0) return [];
+  const lines = priorReplies
+    .slice(0, 5)
+    .map((b, i) => `[${i + 1}] ${b.length > 240 ? `${b.slice(0, 237)}…` : b}`);
+  return [
+    "",
+    "COMMENTS YOU ALREADY SENT/QUEUED TO THIS PERSON (do NOT repeat these takes, openers, or phrasings — they've already heard them; bring a genuinely different angle or stay quiet on what you already covered):",
+    ...lines,
+  ];
+}
+
+/**
+ * The global "phrasings you've reached for lately, across the whole feed" block,
+ * or [] when there's no history. These are Lyra's most recent replies to ANY
+ * author — the point is to vary openers and stock phrasings feed-wide, so the
+ * comments stop reading like the same template. Truncated to keep the prompt
+ * bounded.
+ */
+function recentPhrasingsBlock(recentPhrasings: string[] | undefined): string[] {
+  if (!recentPhrasings || recentPhrasings.length === 0) return [];
+  const lines = recentPhrasings
+    .slice(0, 20)
+    .map((b, i) => `[${i + 1}] ${b.length > 160 ? `${b.slice(0, 157)}…` : b}`);
+  return [
+    "",
+    "YOUR LAST REPLIES ACROSS THE FEED (these should be nothing alike — make THIS one clearly different: vary the opener, the length, the rhythm, the closer, and the words you reach for, so your comments never read like one template):",
+    ...lines,
+  ];
+}
+
+function renderSubstantialPrompt(args: {
+  postText: string;
+  authorName: string | null;
+  publicId: string | null;
+  anchors: string[];
+  knowledgeAnchors: string[];
+  imageCaption: string;
+  commentDigest: string;
+  allowedAngles: Array<"empathetic" | "technical" | "contrarian">;
+  wantDm: boolean;
+  singleReply?: boolean;
+  /**
+   * The "ASSIGNED REGISTER FOR THIS REPLY" block (lib/register.ts), or undefined
+   * when voice variety is off. Injected between the post and the voice anchors so
+   * the model reads it as a directive on the comment register. The DM is excluded
+   * by the block's own wording.
+   */
+  registerBlock?: string;
+  /**
+   * The standalone "THIS REPLY'S ASSIGNED SHAPE" block, rendered in the register
+   * slot (they are mutually exclusive — both claim reply length).
+   */
+  shapeBlock?: string;
+  /**
+   * True when a shape was assigned at all, inline in the STYLE block or as
+   * `shapeBlock`. Only this flag can neutralise the closing length line below.
+   */
+  shapeAssigned?: boolean;
+  /** The "OPENING MOVE FOR THIS REPLY" block (lib/opening-move.ts), or undefined when variety is off. */
+  openingMoveBlock?: string;
+  /** The gen-z "SPOKEN REGISTER" marker block, or undefined when no marker was offered. */
+  genzBlock?: string;
+  /** Reply bodies already sent/queued to this person (do-not-repeat memory). */
+  priorReplies?: string[];
+  /** Recent reply bodies across the whole feed (global avoid-list). */
+  recentPhrasings?: string[];
+  /**
+   * The CONVERSATION block for a notification lead — the post this exchange
+   * started from, and the last thing WE said. Without it the drafter has no
+   * idea it is mid-conversation and writes an opening remark into a two-person
+   * exchange.
+   */
+  /** Operator guidance attached to an explicit MCP reply request. */
+  operatorInstructions?: string;
+  conversationBlock?: string | undefined;
+}): string {
+  const who = args.authorName ?? (args.publicId ? `@${args.publicId}` : "a watchlist person");
+  const angleList = args.allowedAngles.join(", ");
+  const draftsShape = args.singleReply
+    ? '{"angle":"empathetic","body":"…","char_count":N}'
+    : args.allowedAngles
+        .map((a) => `{"angle":"${a}","body":"…","char_count":N}`)
+        .join(",");
+  const dmShape = args.wantDm ? ',"dm":{"body":"…","char_count":N}' : "";
+  return [
+    // First, so the model reads "this is a thread you are already in" BEFORE it
+    // reads the post — otherwise it frames the whole thing as a cold comment.
+    ...(args.conversationBlock ? [args.conversationBlock, ""] : []),
+    `LinkedIn post by ${who}:`,
+    args.postText,
+    ...imageBlock(args.imageCaption),
+    ...(args.commentDigest ? ["", args.commentDigest] : []),
