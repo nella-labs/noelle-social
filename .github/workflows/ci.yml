@@ -51,7 +51,7 @@ jobs:
       # Keyed by sha, restored from the most recent branch/os run — so a second push
       # to the same branch skips re-doing unchanged work. To upgrade to a shared
       # remote cache later, set TURBO_TOKEN (secret) + TURBO_TEAM (var) and drop this.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .turbo
           key: turbo-${{ runner.os }}-${{ github.sha }}
