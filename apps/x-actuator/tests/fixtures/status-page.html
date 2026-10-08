@@ -1,0 +1,23 @@
+<!-- A status (permalink) page after replying: the FOCAL tweet renders its
+     <time> WITHOUT a self-permalink anchor (you are already on its page), while
+     other tweets in the thread (ancestors / replies) keep their permalinks. -->
+<div aria-label="Timeline: Conversation">
+  <article data-testid="tweet">
+    <div data-testid="User-Name"><span>Bob Builder</span> <span>@bob</span></div>
+    <div data-testid="tweetText" lang="en">the tweet we just replied to, focal on this page</div>
+    <time datetime="2026-07-01T10:00:00.000Z">10:00 AM · Jul 1, 2026</time>
+    <div role="group">
+      <button data-testid="reply" aria-label="Reply"></button>
+      <button data-testid="like" aria-label="Like"></button>
+    </div>
+  </article>
+  <article data-testid="tweet">
+    <div data-testid="User-Name"><span>Carol</span> <span>@carol</span></div>
+    <a href="/carol/status/1802000000000000002"><time datetime="2026-07-01T10:05:00.000Z">10:05 AM</time></a>
+    <div data-testid="tweetText" lang="en">a reply below the focal tweet</div>
+    <div role="group">
+      <button data-testid="reply" aria-label="Reply"></button>
+      <button data-testid="like" aria-label="Like"></button>
+    </div>
+  </article>
+</div>
