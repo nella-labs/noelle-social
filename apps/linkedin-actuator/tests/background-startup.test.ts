@@ -198,3 +198,134 @@ describe("linkedin registered lifecycle entry", () => {
     const observed = { status: h.snapshot().status, epoch: h.snapshot().epoch,
       currentEpoch: h.sessionValues["actuator.epoch"], desired: h.values["actuator.remoteState"],
       alarmCleared: h.chrome.alarms.clear.mock.calls.length };
+    expect(observed).toEqual({ status: "stopped", epoch: 9, currentEpoch: 9, desired: "stopped", alarmCleared: 1 });
+  });
+  it("STOP while the first queue is pending remains stopped without a saved run", async () => {
+    const entered = deferred<void>(); const release = deferred<typeof queue>();
+    seams.fetchQueue.mockImplementation(async () => { entered.resolve(); return release.promise; });
+    const h = await boot(false, false, { status: "none" });
+    const start = h.command("startDrain"); await entered.promise;
+    expect(await h.command("stopRun")).toEqual({ ok: true }); await settle();
+    expect(h.sessionValues["actuator.runstate"]).toBeUndefined();
+    expect(h.values["actuator.remoteState"]).toBe("stopped");
+    expect(seams.enableSend.mock.calls.map(call => call[1])).toEqual([true, false]);
+    release.resolve(queue); expect(await start).toEqual({ ok: false, error: "start superseded" });
+    expect(seams.attach).not.toHaveBeenCalled();
+  });
+  it("a superseded pending attachment does not detach or overwrite a newer run", async () => {
+    const entered = deferred<void>(); const release = deferred<void>();
+    seams.attach.mockImplementationOnce(async () => { entered.resolve(); return release.promise; });
+    const h = await boot(); const old = h.command("startRun"); await entered.promise;
+    expect(await h.command("startDrain")).toEqual({ ok: true }); await settle();
+    const current = h.snapshot(); expect(current.epoch).toBe(9);
+    const alarmCount = h.chrome.alarms.create.mock.calls.length;
+    release.resolve(); expect(await old).toEqual({ ok: false, error: "start superseded" });
+    expect(h.snapshot()).toEqual(current); expect(seams.detach).not.toHaveBeenCalled();
+    expect(h.chrome.alarms.create).toHaveBeenCalledTimes(alarmCount);
+    expect(await h.command("tick")).toEqual({ ok: true });
+    expect(h.chrome.tabs.sendMessage).toHaveBeenCalledWith(9, { cmd: "detectChallenge" });
+    expect(h.snapshot().status).toBe("halted-challenge");
+  });
+  it("Full automatic keeps its curfew and standing intent", async () => {
+    const h = await boot();
+    expect(await h.command("startFullAuto")).toEqual({ ok: true }); await settle();
+    expect(h.snapshot()).toMatchObject({ epoch: 8, status: "running", curfewEnabled: true, mode: "drain" });
+    expect(h.values["actuator.fullAuto"]).toEqual({ curfew: true });
+  });
+  it("the disabled notifications command neither claims an epoch nor enables sending", async () => {
+    const h = await boot();
+    expect(await h.command("startNotifications")).toMatchObject({ ok: false });
+    expect(h.sessionValues["actuator.epoch"]).toBe(7);
+    expect(seams.fetchQueue).not.toHaveBeenCalled(); expect(seams.enableSend).not.toHaveBeenCalled();
+  });
+  it("discovery keeps an existing drain and starts only when idle", async () => {
+    const h = await boot(false, false, { session: { "actuator.runstate": {
+      sessionId: "existing", epoch: 7, status: "running", mode: "drain",
+    } } });
+    expect(await h.command("startBrowserDiscovery")).toEqual({ ok: true }); await settle();
+    expect(h.snapshot()).toMatchObject({ sessionId: "existing", epoch: 7 });
+    expect(seams.fetchQueue).not.toHaveBeenCalled();
+    h.sessionValues["actuator.runstate"] = { ...h.snapshot(), status: "idle" };
+    expect(await h.command("startBrowserDiscovery")).toEqual({ ok: true }); await settle();
+    expect(h.snapshot()).toMatchObject({ epoch: 8, status: "running", mode: "drain", curfewEnabled: false });
+  });
+  it("discovery configuration preparation cannot remove a newer STOP", async () => {
+    const h = await boot(true); const start = h.command("startBrowserDiscovery"); await h.enteredConfig.promise;
+    expect(await h.command("stopRun")).toEqual({ ok: true });
+    h.configRelease.resolve(); expect(await start).toEqual({ ok: false, error: "start superseded" });
+    expect(h.values["actuator.remoteState"]).toBe("stopped");
+    expect(h.values["actuator.browserDiscoveryCanary"]).not.toBe(true); expect(seams.fetchQueue).not.toHaveBeenCalled();
+  });
+  it.each(["daily", "resume", "startup-resume", "auto-drain", "recovery"])("%s starts only if its captured generation still owns the health result", async path => {
+    const h = await automaticBoot(path);
+    const entered = deferred<void>(); const release = deferred<{ status: string }>();
+    seams.health.mockImplementation(async () => { entered.resolve(); return release.promise; });
+    if (path === "startup-resume") h.startup();
+    else h.alarm({ name: "autonomy-check" }); await entered.promise;
+    expect(await h.command("stopRun")).toEqual({ ok: true });
+    const stopped = h.snapshot(); seams.attach.mockClear(); h.chrome.alarms.create.mockClear();
+    release.resolve({ status: "ok" }); await settle();
+    expect(h.snapshot()).toEqual(stopped); expect(h.sessionValues["actuator.epoch"]).toBe(8);
+    expect(h.values["actuator.remoteState"]).toBe("stopped");
+    expect(seams.attach).not.toHaveBeenCalled(); expect(h.chrome.alarms.create).not.toHaveBeenCalled();
+    expect(seams.enableSend.mock.calls.map(call => call[1])).toEqual([false]);
+  });
+  it.each(["daily", "resume", "startup-resume", "auto-drain", "recovery"])("healthy %s still starts through its registered alarm", async path => {
+    const h = await automaticBoot(path);
+    if (path === "startup-resume") h.startup();
+    else h.alarm({ name: "autonomy-check" }); await settle();
+    expect(h.snapshot()).toMatchObject({ epoch: 8, status: "running", curfewEnabled: true });
+    expect(h.snapshot().sessionId).not.toBe("previous"); expect(seams.attach).toHaveBeenCalledTimes(1);
+    expect(seams.enableSend.mock.calls.map(call => call[1])).toEqual(path.endsWith("resume") ? [true] : []);
+  });
+  it("STOP waits for an in-flight consent enable and completes its no-state disable", async () => {
+    const entered = deferred<void>(); const release = deferred<void>();
+    seams.enableSend.mockImplementationOnce(async () => { entered.resolve(); await release.promise; });
+    const h = await boot(false, false, { status: "none" });
+    const start = h.command("startDrain"); await entered.promise;
+    let stopped = false;
+    const stop = h.command("stopRun").then(reply => { stopped = true; return reply; });
+    await settle(); expect(stopped).toBe(false); expect(h.sessionValues["actuator.epoch"]).toBe(9);
+    release.resolve(); expect(await start).toEqual({ ok: false, error: "start superseded" });
+    expect(await stop).toEqual({ ok: true });
+    expect(seams.enableSend.mock.calls.map(call => call[1])).toEqual([true, false]);
+    expect(seams.fetchQueue).not.toHaveBeenCalled();
+  });
+  it("older STOP cleanup cannot disable consent for a newer accepted run", async () => {
+    const h = await boot(); expect(await h.command("startRun")).toEqual({ ok: true });
+    const entered = deferred<void>(); const release = deferred<void>();
+    const get = h.chrome.storage.local.get; let first = true;
+    h.chrome.storage.local.get = vi.fn(async keys => {
+      if (keys === "actuator.config" && first) { first = false; entered.resolve(); await release.promise; }
+      return get(keys);
+    });
+    const stop = h.command("stopRun"); await entered.promise;
+    expect(await h.command("startDrain")).toEqual({ ok: true }); await settle();
+    const newer = h.snapshot(); expect(newer.epoch).toBe(10);
+    release.resolve(); expect(await stop).toEqual({ ok: true }); await settle();
+    expect(h.snapshot()).toEqual(newer); expect(h.values["actuator.remoteState"]).toBe("running");
+    expect(seams.enableSend.mock.calls.map(call => call[1])).toEqual([true, true]);
+    expect(h.chrome.alarms.clear).not.toHaveBeenCalled();
+  });
+  it.each(["intent write", "epoch read"])("failed best-effort %s leaves the shared queue usable for STOP", async failure => {
+    const h = await boot(); const set = h.chrome.storage.local.set; const get = h.chrome.storage.session.get;
+    let published = false; let failed = false;
+    h.chrome.storage.local.set = vi.fn(async patch => {
+      if (patch["actuator.remoteState"] === "running") {
+        if (failure === "intent write") throw new Error("intent storage failed");
+        published = true;
+      }
+      await set(patch);
+    });
+    h.chrome.storage.session.get = vi.fn(async keys => {
+      if (failure === "epoch read" && published && !failed && keys === "actuator.epoch") {
+        failed = true; throw new Error("publication epoch read failed");
+      }
+      return get(keys);
+    });
+    expect(await h.command("startDrain")).toEqual({ ok: true }); await settle();
+    expect(h.snapshot()).toMatchObject({ epoch: 8, status: "running" });
+    expect(await h.command("stopRun")).toEqual({ ok: true }); await settle();
+    expect(h.snapshot()).toMatchObject({ epoch: 9, status: "stopped" });
+  });
+});
