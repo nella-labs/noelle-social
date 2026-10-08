@@ -2798,3 +2798,203 @@ export async function getPersonStatsForOrg(orgId: string, handle: string): Promi
     from noelle.leads
     where org_id = ${orgId} and lower(author_handle) = ${h}
       and classifier_label is not null
+    group by classifier_label
+    order by count(*) desc
+    limit 5
+  `;
+  const [apprAgg] = await readSql<
+    Array<{ replies_sent: number; pending_replies: number; last_interaction: string | null }>
+  >`
+    select
+      count(*) filter (where a.status = 'sent')::int    as replies_sent,
+      count(*) filter (where a.status = 'pending')::int as pending_replies,
+      max(a.decided_at) filter (where a.status = 'sent') as last_interaction
+    from noelle.approvals a
+    join noelle.leads l on l.id = a.lead_id
+    where a.org_id = ${orgId} and lower(l.author_handle) = ${h}
+  `;
+  return {
+    postsSeen: leadAgg?.posts_seen ?? 0,
+    repliesSent: apprAgg?.replies_sent ?? 0,
+    pendingReplies: apprAgg?.pending_replies ?? 0,
+    lastInteractionAt: apprAgg?.last_interaction ?? null,
+    topTopics: topics.map((t) => t.classifier_label),
+  };
+}
+
+/** Org-wide interaction history for a handle, newest-first (any agent). */
+export async function listPersonInteractionsForOrg(
+  orgId: string,
+  handle: string,
+  limit = 30,
+): Promise<PersonInteraction[]> {
+  const h = normHandle(handle);
+  const rows = await readSql<PersonInteractionRaw[]>`
+    select
+      a.id             as approval_id,
+      a.lead_id        as lead_id,
+      a.status         as status,
+      a.decided_at     as decided_at,
+      a.created_at     as created_at,
+      d.sent_external_id as sent_external_id,
+      l.external_id    as lead_external_id,
+      l.author_handle  as lead_author_handle,
+      l.author_id      as lead_author_id,
+      l.payload        as lead_payload,
+      d.payload        as draft_payload
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = a.lead_id
+    where a.org_id = ${orgId} and lower(l.author_handle) = ${h}
+    order by coalesce(a.decided_at, a.created_at) desc
+    limit ${limit}
+  `;
+  // NOT grouped (unlike the per-instance history): the Contacts surface relies on
+  // each DM row standing alone so a parked/deferred DM keeps its own "fire it now"
+  // action. Collapsing per post would hide those.
+  return rows.map((r) => toPersonInteraction(r));
+}
+
+/**
+ * Spend (cents) charged to a single agent instance in the current calendar
+ * month, for the Budget panel. Reads `noelle.llm_calls` directly (not
+ * `org_spend_month`) because the rollup is org-level, not instance-level. Cheap
+ * query — indexed on `(org_id, started_at desc)`.
+ *
+ * EXCLUDES `engine='apify'` — Apify is metered separately (the Connections card
+ * shows per-token Apify spend, and the Spend page splits AI vs Apify), and the
+ * budget *enforcement* already excludes it (see packages/runtime/src/pgBudgetAdapters.ts), so the
+ * panel must match: the LinkedIn data fetch never counts against the LLM budget.
+ */
+export async function getInstanceSpendThisMonth(
+  instanceId: string,
+): Promise<number> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return 0;
+  const rows = await readSql<Array<{ cents: number }>>`
+    select coalesce(sum(cents), 0)::int as cents
+    from noelle.llm_calls
+    where org_id = ${inst.org_id}
+      and agent_role = ${inst.role}
+      and engine <> 'apify'
+      and started_at >= date_trunc('month', now())
+  `;
+  return rows[0]?.cents ?? 0;
+}
+
+/**
+ * Most-recent successful run for a worker, used by engagement status.
+ *
+ * Cloud SQL has `noelle.worker_runs` (not `sync_runs`). The `worker` column
+ * holds 'discovery' | 'classifier' | 'drafter' | 'send'. Success is
+ * inferred from `finished_at IS NOT NULL AND error IS NULL`.
+ *
+ * No `assertOrgMember`: `worker_runs` is a global ops table, not org-scoped.
+ */
+export async function getLastSyncRun(
+  kind: "discovery" | "classifier" | "drafter" | "send",
+): Promise<NoelleSyncRun | null> {
+  const rows = await readSql<NoelleSyncRun[]>`
+    select * from noelle.worker_runs
+    where worker = ${kind}
+      and finished_at is not null
+      and error is null
+    order by finished_at desc nulls last
+    limit 1
+  `;
+  return rows[0] ?? null;
+}
+
+/**
+ * Workers with an in-flight run right now. "In-flight" = `finished_at IS NULL`
+ * AND `started_at` within the last 15 minutes — the bound discards crashed
+ * runs whose heartbeat row was never closed.
+ *
+ * Returned set drives the pulsing dot on Vega's card so the founder can
+ * actually see when a worker is doing something live.
+ *
+ * No `assertOrgMember`: `worker_runs` is a global ops table.
+ */
+export async function listActiveWorkers(): Promise<Set<"discovery" | "classifier" | "drafter" | "send">> {
+  const rows = await readSql<Array<{ worker: "discovery" | "classifier" | "drafter" | "send" }>>`
+    select distinct worker
+    from noelle.worker_runs
+    where finished_at is null
+      and error is null
+      and started_at > now() - interval '15 minutes'
+  `;
+  return new Set(rows.map((r) => r.worker));
+}
+
+// ── Shared memory bus reads ──────────────────────────────────────────────────
+// Read side of the bus (noelle.bus_events + noelle.bus_state, migration 0032).
+// Org-scoped + membership-guarded like every other read here. Powers a future
+// in-product orchestration view and the live HTML generator.
+// See docs/shared-memory-bus.md.
+
+export interface DashboardBusEvent {
+  id: string;
+  agentInstanceId: string | null;
+  agentRole: string;
+  worker: string | null;
+  topic: string;
+  severity: string;
+  summary: string | null;
+  payload: Record<string, unknown>;
+  correlationId: string | null;
+  createdAt: string;
+}
+
+export interface DashboardBusStateEntry {
+  bucket: string;
+  key: string;
+  value: unknown;
+  version: number;
+  updatedByWorker: string | null;
+  updatedAt: string;
+}
+
+const toIso = (v: unknown): string =>
+  v instanceof Date ? v.toISOString() : String(v);
+
+/** Recent bus_events for an org, newest first. Optional topic/instance filter. */
+export async function listBusEvents(
+  orgId: string,
+  opts: { topic?: string; instanceId?: string; limit?: number } = {},
+): Promise<DashboardBusEvent[]> {
+  const userId = await getRequiredUserId();
+  await assertMember(orgId, userId);
+  const limit = BusEventsQuerySchema.shape.limit.parse(
+    Math.max(1, Math.min(Math.floor(opts.limit ?? 100), 500)),
+  );
+  const rows = await readSql<
+    Array<{
+      id: string;
+      agent_instance_id: string | null;
+      agent_role: string;
+      worker: string | null;
+      topic: string;
+      severity: string;
+      summary: string | null;
+      payload: Record<string, unknown> | null;
+      correlation_id: string | null;
+      created_at: unknown;
+    }>
+  >`
+    select id, agent_instance_id, agent_role, worker, topic,
+           severity, summary, payload, correlation_id, created_at
+    from noelle.bus_events
+    where org_id = ${orgId}
+      ${opts.topic ? sql`and topic = ${opts.topic}` : sql``}
+      ${opts.instanceId ? sql`and agent_instance_id = ${opts.instanceId}` : sql``}
+    order by created_at desc
+    limit ${limit}
+  `;
+  return rows.map((r) => ({
+    id: r.id,
+    agentInstanceId: r.agent_instance_id,
+    agentRole: r.agent_role,
+    worker: r.worker,
+    topic: r.topic,
+    severity: r.severity,
+    summary: r.summary,
