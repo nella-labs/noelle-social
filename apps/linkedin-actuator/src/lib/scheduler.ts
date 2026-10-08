@@ -398,3 +398,138 @@ export function planTimeline(opts: PlanOpts): { actions: PlannedAction[]; clamps
   // long pause is what real humans do: it keeps the gap distribution heavy-tailed
   // and barely dents volume. Applied at plan time so it flows into every
   // downstream pass (curfew shift, taper, hourly ceiling).
+  //
+  // The pause draws come from a SEPARATE rng seeded from plan-deterministic
+  // inputs (startMs/total/window), NOT the main stream, so the tempo/burst/volume
+  // RNG sequence stays byte-for-byte unchanged — this layer only ADDS the
+  // occasional pause, it never reshuffles the underlying plan. It still varies
+  // run-to-run in production (startMs is a ms timestamp) and stays deterministic
+  // for a fixed plan in tests.
+  const EXTRA_PAUSE_PROB = 0.2;
+  const PAUSE_WINDOW_FRAC = 0.06;
+  const EXTRA_PAUSE_MAX_MS = Math.min(360_000, windowMs * PAUSE_WINDOW_FRAC);
+  const pauseRng = makeRng(
+    (Math.trunc(startMs / 1000) ^ Math.imul(total, 0x9e3779b1) ^ Math.trunc(windowMs / 1000)) >>> 0,
+  );
+
+  const actions: PlannedAction[] = [];
+  // Actions that don't fit the window at a human pace are DROPPED, not squeezed
+  // in — piling them at endMs is the exact all-at-once tell we avoid. Tracked so
+  // the shortfall surfaces as a ClampNote instead of vanishing silently.
+  const dropped: Record<ActionKind, number> = { like: 0, comment: 0, dm: 0 };
+
+  // Walk through bursts in order, placing actions sequentially.
+  let kindIdx = 0;
+  let prevGap = medianGapMs; // seed for AR(1)
+  let cursor = startMs;      // current time pointer
+  let overflow = false;
+
+  for (let b = 0; b < burstCount && !overflow; b++) {
+    const count = burstSizes[b] ?? 0;
+    // Advance cursor to burst start (if ahead of current position).
+    const bs = burstStarts[b]!;
+    if (bs > cursor) cursor = bs;
+
+    for (let a = 0; a < count && kindIdx < total; a++, kindIdx++) {
+      const kind = kinds[kindIdx]!;
+
+      // AR(1) gap: gap[n] = rho*gap[n-1] + (1-rho)*base[n] + eps
+      const base = rng.logNormal(muLog, sigmaLog);
+      const eps = rng.normal(0, 0.13 * base);
+      const gap = Math.max(8_000, rho * prevGap + (1 - rho) * base + eps);
+      prevGap = gap;
+
+      // Occasional multi-minute "distraction" pause layered on top of the AR(1)
+      // tempo gap — applied only ~EXTRA_PAUSE_PROB of the time ("at random"),
+      // drawn from the independent pauseRng so the main stream is untouched (see
+      // above). Kept OUT of prevGap so it never compounds through the
+      // autocorrelation; it's a one-off interruption, not a tempo shift. When a
+      // pause lands on a tight window it pushes the tail past the end (dropped +
+      // surfaced as ClampNotes below) — the intended slower/safer trade, never a
+      // silent loss.
+      const extraJitterMs =
+        pauseRng.next() < EXTRA_PAUSE_PROB ? pauseRng.float(0, EXTRA_PAUSE_MAX_MS) : 0;
+
+      // Skip the gap before the very first action so responsiveness clamp works.
+      if (actions.length > 0) cursor += gap + extraJitterMs;
+
+      // Overflow: this action falls past the window end. The cursor only ever
+      // advances (gaps are positive, burst starts move forward), so once we're
+      // past the end every remaining action is too — drop them all.
+      if (cursor > endMs) { overflow = true; break; }
+
+      let atMs = Math.max(startMs, Math.round(cursor));
+
+      // ── 5. Overnight write-curfew hard shift ────────────────────────────
+      const shifted = shiftOutOfCurfew(atMs, startMs, endMs);
+      if (shifted === null) { dropped[kind]++; continue; } // whole window in curfew
+      atMs = shifted;
+
+      actions.push({ kind, atMs });
+      // Update cursor to actual scheduled time so next gap is correct.
+      cursor = atMs;
+    }
+  }
+
+  // Anything still unplaced (overflow tail) is a window-fit shortfall.
+  for (; kindIdx < total; kindIdx++) dropped[kinds[kindIdx]!]++;
+
+  // Surface each kind's shortfall as a ClampNote so callers can log it (the
+  // scheduler never silently truncates the requested volume).
+  for (const k of ["comment", "like", "dm"] as ActionKind[]) {
+    if (dropped[k] > 0) {
+      const requested = kinds.reduce((n, kk) => (kk === k ? n + 1 : n), 0);
+      clamps.push({ kind: k, requested, allowed: requested - dropped[k] });
+    }
+  }
+
+  // Taper-weight pass: with deepNightTaper on, probabilistically drop actions
+  // in the 01:00–06:00 band. (Curfew already hard-removes 23:00–06:00.)
+  const survived = deepNightTaper
+    ? actions.filter((a) => rng.next() <= densityWeight(a.atMs, true))
+    : actions;
+
+  survived.sort((a, b) => a.atMs - b.atMs);
+
+  // ── 6. First-action-soon responsiveness ──────────────────────────────────
+  // Make the FIRST action fire shortly after Run rather than potentially many
+  // minutes/hours in.
+  if (survived.length > 0 && survived[0]!.atMs > startMs + 8_000) {
+    survived[0] = {
+      kind: survived[0]!.kind,
+      atMs: startMs + Math.round(rng.float(2_000, 6_000)),
+    };
+    survived.sort((a, b) => a.atMs - b.atMs);
+  }
+
+  // ── 7. Hourly write ceiling ───────────────────────────────────────────────
+  // Cap comment+DM (write) actions to maxWritesPerHour in any rolling hour.
+  // Likes are lower-risk and stay paced by the gap model. Greedy placement in
+  // time order: a write may fire no earlier than the N-th previously-placed
+  // write + 1h, so no 60-min window ever holds more than N writes. A write that
+  // can only be placed past the window end is DROPPED (fail-safe under-actuation)
+  // rather than piled at the end. Writes nudged into the curfew band are caught
+  // by the runtime curfew floor in the tick loop.
+  if (maxWritesPerHour > 0) {
+    const writes = survived.filter((a) => a.kind !== "like").sort((a, b) => a.atMs - b.atMs);
+    const placed: number[] = [];
+    const dropped = new Set<PlannedAction>();
+    for (const w of writes) {
+      let at = w.atMs;
+      if (placed.length >= maxWritesPerHour) {
+        const earliest = placed[placed.length - maxWritesPerHour]! + HOUR + rng.float(30_000, 120_000);
+        if (at < earliest) at = Math.round(earliest);
+      }
+      if (at > endMs) { dropped.add(w); continue; }
+      w.atMs = at;
+      placed.push(at); // monotonic (writes sorted, at only moves forward) → stays sorted
+    }
+    if (dropped.size > 0) {
+      const kept = survived.filter((a) => !dropped.has(a));
+      survived.splice(0, survived.length, ...kept);
+    }
+    survived.sort((a, b) => a.atMs - b.atMs);
+  }
+
+  return { actions: survived, clamps };
+}
