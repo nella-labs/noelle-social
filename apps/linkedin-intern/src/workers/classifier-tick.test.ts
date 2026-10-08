@@ -198,3 +198,203 @@ describe("classifyOneLead (linkedin)", () => {
     expect(stored).toBeCloseTo(0.78, 10);
     expect(values).not.toContain(78); // never the raw 0-100 q
   });
+
+  it("classifies a light lead → status 'classified', label 'light', tier null", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(light);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("classified");
+    expect(values).toContain("light");
+    expect(values).toContain(0.6); // score = q/100, normalised to 0-1
+    expect(values).toContain(null); // tier null
+  });
+
+  it("classifies a skip lead → status 'skipped', label 'skip'", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(skip);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("skipped");
+    expect(values).toContain("skip");
+  });
+
+  it("clamps a SKIP to 'light' for a hand-picked WATCHLIST connection when above the off-topic floor", async () => {
+    const { sql, values } = makeSql();
+    // Watch lane leaves payload.source unset; the engine under-rated a genuine
+    // milestone (q=35) to skip. The person is the gate → rescue it to a light note.
+    const classify = vi.fn().mockResolvedValue(skipMilestone);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: true }, // watch-lane connection (no source)
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("classified");
+    expect(values).toContain("light");
+    expect(values).not.toContain("skipped");
+  });
+
+  it("does NOT clamp an off-topic/hiring skip even for a watchlist connection (below the off-topic floor)", async () => {
+    const { sql, values } = makeSql();
+    // A watched connection's hiring repost / off-lane post (q=8) — the operator does not
+    // want a reply. The clamp must NOT rescue it.
+    const classify = vi.fn().mockResolvedValue(skip);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: true }, // watch-lane connection (no source)
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("skipped");
+    expect(values).not.toContain("light");
+  });
+
+  it("does NOT clamp a profile_search skip — an algorithmic discovery is not the watchlist", async () => {
+    const { sql, values } = makeSql();
+    // The ISTE-board case: source='profile_search', priority=true, classifier
+    // said skip (off-topic). The author is not hand-picked → honor the skip.
+    const classify = vi.fn().mockResolvedValue(skipOffTopic);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: {
+        ...baseLead,
+        priority: true,
+        payload: { ...baseLead.payload, source: "profile_search" },
+      },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("skipped");
+    expect(values).not.toContain("light");
+  });
+
+  it("does NOT clamp a keyword-lane skip even when priority is set", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(skipOffTopic);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: {
+        ...baseLead,
+        priority: true,
+        payload: { ...baseLead.payload, source: "keyword" },
+      },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("skipped");
+    expect(values).not.toContain("light");
+  });
+
+  it("does NOT clamp a skip for a non-priority lead", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(skip);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: false },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("skipped");
+  });
+
+  it("leaves a PRIORITY substantial lead unchanged (clamp only touches skip)", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(substantial);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: true },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("substantial");
+    expect(values).toContain("T1");
+  });
+
+  it("persists comment_bait=true on the lead when the classifier flags engagement-bait", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(baitLight);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead },
+      log: { warn: vi.fn() },
+    });
+    // markLeadClassified writes comment_bait = true into the UPDATE.
+    expect(values).toContain(true);
+  });
+
+  it("persists comment_bait=false for a normal lead", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(substantial);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain(false);
+  });
+
+  const frenchText =
+    "Nous avons lancé notre nouvelle application et les retours sont très positifs";
+
+  it("skips a non-English (French) lead before any classify call → status 'skipped'", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn();
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, payload: { ...baseLead.payload, text: frenchText } },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).not.toHaveBeenCalled();
+    expect(values).toContain("skipped");
+    expect(values).toContain("skip"); // reply_kind/classifier_label = 'skip'
+    const meta = values.find(
+      (v) => v && typeof v === "object" && (v as { classifier?: { skip_reason?: string } }).classifier?.skip_reason,
+    ) as { classifier: { skip_reason: string } } | undefined;
+    expect(meta?.classifier.skip_reason).toBe("non-english");
+  });
+
+  it("skips a non-English lead even when priority is set (gate covers all leads)", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn();
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: true, payload: { ...baseLead.payload, text: frenchText } },
+      log: { warn: vi.fn() },
+    });
