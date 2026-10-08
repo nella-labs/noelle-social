@@ -1,0 +1,11 @@
+node_modules
+dist
+.next
+.turbo
+.vercel
+pnpm-lock.yaml
+coverage
+.DS_Store
+
+# Don't reformat SQL DDL — column ordering and quoting matter
+supabase/migrations/**/*.sql
