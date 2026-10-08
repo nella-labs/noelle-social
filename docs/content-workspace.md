@@ -198,3 +198,203 @@ truth. Two producers write the same rows:
 In-app generation (the Ideas toolbar + per-idea **Generate posts**) creates a
 LinkedIn-home idea that fans out to **X + LinkedIn**; it's available under All /
 LinkedIn / X. Reddit is view-only (Orion drafts replies, not original posts).
+
+## The bridge: `noelle content push`
+
+```
+# push a batch of ideas (object form: { platform, ideas: [...] })
+# each idea may carry targetPlatforms to fan out, e.g.
+#   { "id": "<uuid>", "platform": "linkedin",
+#     "targetPlatforms": ["linkedin","x"], "hook": "…" }
+cat ideas.json | noelle content push --kind ideas
+
+# bare ideas array + explicit platform
+cat ideas-array.json | noelle content push --kind ideas --platform x
+
+# push a single pre-written draft for one platform
+cat draft.json | noelle content push --kind draft --platform linkedin
+```
+
+- Reads JSON from `--file <path>` or stdin; validates it against the wire
+  contract before sending.
+- Signs with HMAC-SHA256 (`NOELLE_HMAC_SECRET`) exactly like the server workers
+  (`X-Noelle-Timestamp` + `X-Noelle-Signature`, 5-minute window).
+- Targets `NOELLE_API_URL` (default `http://127.0.0.1:18791`; Lima forwards the
+  guest api-vm port to the Mac, so localhost reaches the VM). Point it at
+  `https://api.trynoelle.com` to push to prod for your own org.
+
+Payload shapes (camelCase, per `posts.ts`):
+
+```jsonc
+// --kind ideas
+{ "platform": "linkedin",
+  "ideas": [{ "id": "uuid", "platform": "linkedin", "hook": "…",
+              "thesis": "…", "angle": "story", "pillar": "building",
+              "inspirationRefs": [], "sourceEngine": "voice-post", "model": "…" }] }
+
+// --kind draft
+{ "ideaId": "uuid", "platform": "linkedin", "body": "the post",
+  "charCount": 412, "sourceEngine": "voice-post", "model": "…",
+  "qualityPassed": true }
+```
+
+The client lives at `@noelle/runtime/content-push`
+(`signContentRequest` / `pushPostIdeas` / `pushPostDraft`) and is reused by both
+producers.
+
+## Voice grounding & the vault
+
+Both producers ground on the **per-org noelle vault** (not a Mac-local folder):
+self-host = `NOELLE_VAULT_DIR` on the Lima VM (markdown, BM25, live re-index),
+prod = the org's GCS prefix (`noelle.vaults`). Scope retrieval with
+`NOELLE_VOICE_DIRS` / `NOELLE_KNOWLEDGE_DIRS`.
+
+To seed an operator's voice from an existing Obsidian vault:
+
+```
+NOELLE_VAULT_DIR=~/.noelle/vault \
+  node scripts/ingest-vault-anchors.mjs \
+  --src /path/to/context/voice-anchors
+# idempotent — re-run after edits; never deletes destination files.
+```
+
+The edits ledger (`noelle.content_edits`) captures operator corrections; a later
+pass materializes recent edits back into the vault so future drafts learn from
+them (content-pipeline's `edits.md` loop, made multi-tenant).
+
+### Voice spec — the rules live in the vault too
+
+Voice *anchors* (sample posts) come from the vault; the voice *rules* (hard bans,
+structure, CTA style) used to be inlined in `post-drafter.ts`. They are now a
+single editable file the operator keeps in their vault — **`voice-spec.md`** —
+that BOTH the `voice-post` skill and the dashboard drafter read, so editing one
+file steers every generated post (X + LinkedIn).
+
+- Path: `NOELLE_VOICE_SPEC_PATH`, default `<NOELLE_VAULT_DIR>/voice-spec.md`.
+- When present, `buildPostDrafterSystem` / `buildXPostSystem` inject it as an
+  **authoritative** block above the inlined rules (loader: `lib/voice-spec.ts`,
+  cached 15 min so edits apply without a restart).
+- When absent, the system prompt is **byte-identical** to before (the inlined
+  rules alone) — safe to ship dark; turns on the moment the file lands.
+- Starter template: `docs/voice-spec.template.md` — copy it into the vault and
+  edit. (This is the "skill, inside the vault.")
+
+## Media storage
+
+Uploads flow browser → server action → `POST /api/content-media` (JWT) → the
+storage backend, selected by env:
+
+- **self-host (`NOELLE_MEDIA_BACKEND=local`, default):** bytes are written under
+  `NOELLE_MEDIA_DIR` and served same-origin by the Next app at `/media/<key>`
+  (the only Tailscale-published origin, so media loads on every device). Set the
+  same `NOELLE_MEDIA_DIR` for the api-vm and the app.
+- **prod (`NOELLE_MEDIA_BACKEND=gcs` + `NOELLE_MEDIA_BUCKET`):** bytes go to the
+  media bucket; the row's `url` is the (public/signed) GCS URL.
+
+Storage keys are `<orgId>/media/<uuid>.<ext>`. The abstraction lives at
+`@noelle/runtime/content-storage` (`createLocalContentStorage` /
+`createGcsContentStorage`).
+
+### Images on auto-posts (Vega only)
+
+Vega is the one intern that publishes, so it is the one that can attach an image
+to a live post. A scheduled slot binds to a `post_drafts` row (`draft_id`); an
+image is a `content_media` row linked to that draft (`draft_id`) or to the
+draft's idea (`idea_id`, cross-platform or `platform='x'`). At publish time the
+`content-publish` worker:
+
+1. resolves the slot's attached image(s) — up to 4, X's per-tweet cap;
+2. reads the bytes (local disk under `NOELLE_MEDIA_DIR` on self-host; the signed
+   `content_media.url` on the `gcs` backend);
+3. uploads each via the X write client's `uploadMedia` (v1.1 `media/upload`,
+   simple single-request — images only) to get a `media_id`; then
+4. posts with `media.media_ids` attached (`XWriteClient.postTweet({ mediaIds })`).
+
+The worker needs `NOELLE_MEDIA_DIR` (and `NOELLE_MEDIA_BACKEND`, default `local`)
+set to the SAME values the api-vm + app use. A missing/unreadable asset is
+skipped (the post still goes out); a retryable X error (rate-limit / lock)
+returns the slot to `ready` exactly like a failed post. Text-only posts are
+unchanged when no image is attached.
+
+**Setting the image.** Uploading a fresh image to a draft (composer →
+`POST /api/content-media` with `draftId`) already binds it. To point an
+*existing* library asset (or a generated image) at a scheduled post without
+re-uploading, `PATCH /api/content-media/:id` with `{ "draftId": "<uuid>" }`
+(binding derives the draft's idea; `null` unlinks). A Schedule/Media UI affordance
+for this and end-to-end image *generation* are follow-ups (see the PR notes).
+
+Video is not yet supported on the auto-post path — v1.1 chunked upload
+(INIT/APPEND/FINALIZE + STATUS polling) is a follow-up; `uploadMedia` handles
+images only today.
+
+## Hooking up a skill (voice-post)
+
+The global `voice-post` skill keeps generating (dry-run → approve). On approve,
+when `NOELLE_CONTENT_TARGET=on`, it pipes its output to `noelle content push`
+instead of (or in addition to) content-pipeline's `localhost:3010`:
+
+```
+echo "$IDEAS_JSON"  | noelle content push --kind ideas
+echo "$DRAFT_JSON"  | noelle content push --kind draft --platform linkedin
+```
+
+Default OFF so it never double-writes unintentionally. `daily-post-batch` and
+`yc-series-post` carry the same optional `NOELLE_CONTENT_TARGET` section
+(daily-batch maps each day onto `suggestedDay`). With all three repointed,
+content-pipeline is no longer the *only* content home — flip the flag to make
+noelle the destination, and retire content-pipeline as the dashboard once
+you've confirmed the cross-device loop (it stays intact as a read-only archive;
+no code in this repo depends on it).
+
+## Cross-device verification (run on the live box)
+
+These need the running self-host VM + your devices and can't be verified from a
+dev session:
+
+1. **Self-host:** apply migrations (`noelle migrate`), restart the api-vm/app,
+   then from the Mac: `echo '<ideas json>' | noelle content push --kind ideas`.
+   Confirm a `noelle.post_ideas` row, then open the Tailscale URL
+   (`https://<host>.<tailnet>.ts.net/app/<org>/content`) on your phone and see it.
+2. **Prod:** apply migrations to Cloud SQL (`psql -U postgres -f infra/cloudsql/schema/0055_…`,
+   `…0056_…`), deploy api-vm + Vercel, confirm the worker path lands ideas and
+   the dashboard shows them on the web.
+
+## Status
+
+- **Phase 1 (this PR):** cross-platform workspace + nav + redirects, platform
+  widened to reddit, edits ledger, the HMAC bridge (`noelle content push`), and
+  the vault ingest script.
+- **Phase 2 (done):** Media library + blob storage abstraction (local + GCS) +
+  the same-origin `/media` serve route.
+- **Phase 3 (done):** cross-platform Overview (KPIs + per-platform breakdown +
+  weekly tracker); `daily-post-batch` + `yc-series-post` repointed (optional,
+  default-OFF); content-pipeline wind-down stance documented.
+- **Cross-platform fan-out (migration 0059):** the idea is now the cross-platform
+  source concept; one Generate fans out into a side-by-side X + LinkedIn post set
+  with per-platform versions (the content-pipeline `GeneratorRun` model). This
+  corrects Phase 1's single-platform-per-idea modeling.
+- **Deferred follow-ups:** edits-ledger → vault exporter (materialize
+  `content_edits` back into the vault); platform-scoped voice dirs (X drafts use
+  the same vault voice as LinkedIn today); X/Reddit *ideation* workers (the X
+  drafter exists via fan-out, but only LinkedIn has an ideation worker); an
+  editable Vault page.
+
+## Writing checks for generated ideas
+
+LinkedIn and X idea generation and LinkedIn idea polish use the shared anti-AI
+reader rules. Each hook and thesis passes the existing deterministic format
+checker with strict voice enabled before storage. Hook and thesis are checked
+separately so repeating the core claim across the two fields is allowed.
+
+When text fails, the worker makes at most one rewrite call with the rejected
+candidates and specific reasons. The rewrite must retain the batch count and
+order, factual limits, and core point. Stable repair IDs bind each candidate to
+its original position. Only hook and thesis can change; source tags, angle,
+pillar, and already clean ideas are retained from the original response. The
+worker checks the result again and saves only a passing response. Failed or malformed repairs raise a
+request error and save nothing; failed polish leaves the existing idea intact.
+Text beyond the storage limits (600 characters for a hook, 1200 for a thesis)
+also requires repair, so storage cannot truncate a checked idea afterward.
+
+The shared gate lives in `packages/runtime/src/ideaQuality.ts`; prompt guidance
+lives in `packages/runtime/src/antiAiWriting.ts`. These checks catch known wording
