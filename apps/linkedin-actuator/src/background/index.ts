@@ -2598,3 +2598,171 @@ async function runPriorityLoop(): Promise<void> {
           result: "failed", stage: "priority", observed: 0, accepted: 0, duplicates: 0, invalid: 0,
           error: discoveryError(error),
         });
+      }
+      return null;
+    });
+    if (!(await browserDiscoveryEnabled())) { pendingPriority = null; continue; }
+    if (ready) since = advancePriorityCursor(since, requestStartedAt, Date.now());
+    if (!ready) {
+      await plainSleep(4000);
+      continue;
+    }
+    if (ready.comments.length === 0) {
+      await plainSleep(15_000); // send switch or server gate may be withholding
+      continue;
+    }
+    const current = await loadState().catch(() => null);
+    if (current?.status !== "running" || current.epoch !== epoch || stopped()) continue;
+    pendingPriority = pendingPriority?.epoch === epoch && pendingPriority.instanceId === cfg.instanceId
+      ? { epoch, instanceId: cfg.instanceId, comments: [...pendingPriority.comments, ...ready.comments] }
+      : { epoch, instanceId: cfg.instanceId, comments: ready.comments };
+    if (priorityTickDecision(ticking) === "defer") priorityRetryAfterTick = true;
+    else void tick();
+  }
+}
+
+// Publish a LOCAL panel action's intent to the server so the phone/dashboard and
+// the local panel never disagree, and mirror it locally so the gate honors it
+// immediately (before the loop reads it back). Full-automatic, Drain, and STOP are
+// master-switch actions (all persistent now); only the timed one-shot Run stays
+// orthogonal and never publishes.
+function requireStarted(epoch: number | null): number {
+  if (epoch === null) throw new Error("start superseded");
+  return epoch;
+}
+async function prepareDrain(run: PendingStart, intent: { curfew: boolean; notifications?: boolean }): Promise<void> {
+  const epoch = requireStarted(await run.epoch);
+  if (!(await runIfCurrent(epoch, async () => {
+    await chrome.storage.local.set({ [DRAIN_INTENT_KEY]: intent });
+    await chrome.storage.local.remove([DISCOVERY_CANARY_KEY, STOP_DAY_KEY, REMOTE_STATE_KEY]);
+  }))) throw new Error("start superseded");
+}
+async function publishLocalIntent(desired: "running" | "stopped", epoch: number): Promise<void> {
+  const cfg = await getConfig().catch(() => null);
+  if (!cfg) return;
+  if (!(await runIfCurrent(epoch, () => chrome.storage.local.set({ [REMOTE_STATE_KEY]: desired })).catch(() => false))) return;
+  const s = await loadState().catch(() => null);
+  const runState: "running" | "idle" = s?.status === "running" ? "running" : "idle";
+  if (epoch !== await currentEpoch().catch(() => null)) return;
+  await new ActuatorApi(cfg).ackIntent(runState, desired).catch(() => {});
+}
+
+chrome.runtime.onStartup.addListener(() => { void ensureAutonomyAlarm(); void ensureIntentLoop(); ensurePriorityLoop(); void checkDrainResume(); void checkAutonomy(); });
+chrome.runtime.onInstalled.addListener(() => { void ensureAutonomyAlarm(); void ensureIntentLoop(); ensurePriorityLoop(); void checkDrainResume(); });
+
+chrome.alarms.onAlarm.addListener((a) => {
+  // The 0.5-min ALARM survives a self-reload/SW-death (alarms persist), so it is
+  // the fastest place to resume a wiped standing drain — checkDrainResume no-ops when
+  // a run is already live, so this never double-starts one.
+  if (a.name === ALARM) { void ensureIntentLoop(); ensurePriorityLoop(); void tick(); void checkDrainResume(); void pulseBridge(false); }
+  else if (a.name === AUTONOMY_ALARM) { void ensureIntentLoop(); ensurePriorityLoop(); void checkAutonomy(); void checkDrainResume(); void checkSelfReload(); void pulseBridge(true); }
+});
+chrome.runtime.onMessage.addListener((msg: { cmd: string; params?: never; cap?: unknown }, _s, reply) => {
+  (async () => {
+    try {
+      if (msg.cmd === "startRun") {
+        const run = reserveStart();
+        requireStarted(await startRun(msg.params!, { manual: true }, run));
+        reply({ ok: true });
+      }
+      else if (msg.cmd === "startDrain" || msg.cmd === "startFullAuto") {
+        const run = reserveStart();
+        const curfew = msg.cmd === "startFullAuto";
+        await prepareDrain(run, { curfew });
+        const epoch = requireStarted(await startDrain({ manual: true, curfew }, run));
+        void publishLocalIntent("running", epoch);
+        reply({ ok: true });
+      }
+      else if (msg.cmd === "startBrowserDiscovery") {
+        const expectedEpoch = await currentEpoch();
+        if (!(await getConfig())) { reply({ ok: false, error: "actor is not configured" }); return; }
+        let epoch = expectedEpoch;
+        const guard = async (operation: () => Promise<void>) => {
+          if (!(await runIfCurrent(expectedEpoch, operation))) throw new Error("start superseded");
+        };
+        await activateBrowserDiscovery({
+          storage: {
+            get: keys => chrome.storage.local.get(keys),
+            set: items => guard(() => chrome.storage.local.set(items)),
+            remove: keys => guard(() => chrome.storage.local.remove(keys)),
+          },
+          keys: { drainIntent: DRAIN_INTENT_KEY, stopDay: STOP_DAY_KEY, remoteState: REMOTE_STATE_KEY },
+          loadStatus: async () => (await loadState())?.status === "running" ? "running" : "idle",
+          startDrain: async () => { epoch = requireStarted(await startDrain({ manual: true, curfew: false, expectedEpoch })); },
+        });
+        void publishLocalIntent("running", epoch);
+        reply({ ok: true });
+      }
+      // Auto notifications: an unattended drain WITH the notifications sweep on.
+      // It has to be a drain, not a sweep-only mode — a sweep-only run would
+      // harvest replies-to-us, hand them to Lyra, and then never post the
+      // drafts, because the thing that posts approvals is the drain it would
+      // have superseded. One click therefore runs the whole conversation loop.
+      else if (msg.cmd === "startNotifications") {
+        // Kill switch. Refuse even when invoked directly (an old content script
+        // still holding the button, a stale message, a console call) — the
+        // panel hiding the button is cosmetic, this is the actual gate.
+        if (!NOTIFICATIONS_ACTOR_ENABLED) {
+          reply({ ok: false, error: "notifications actor is disabled in code (lib/notifications-feature.ts)" });
+          return;
+        }
+        const run = reserveStart();
+        await prepareDrain(run, { curfew: true, notifications: true });
+        const epoch = requireStarted(await startDrain({ manual: true, curfew: true, notifications: true }, run));
+        void publishLocalIntent("running", epoch);
+        reply({ ok: true });
+      }
+      else if (msg.cmd === "stopRun") {
+        const terminal = reserveStop();
+        const epoch = await terminal;
+        await runIfCurrent(epoch, async () => {
+          await chrome.storage.local.remove([DRAIN_INTENT_KEY, DISCOVERY_CANARY_KEY]);
+          await chrome.storage.local.set({ [REMOTE_STATE_KEY]: "stopped" });
+        });
+        await endRun("stopped", terminal);
+        const cfg = await getConfig();
+        if (cfg?.autonomous) {
+          await runIfCurrent(epoch, () => chrome.storage.local.set({
+            [AUTO_START_DAY_KEY]: localDayKey(new Date()),
+            [STOP_DAY_KEY]: localDayKey(new Date()),
+          }));
+        }
+        void publishLocalIntent("stopped", epoch);
+        reply({ ok: true });
+      }
+      else if (msg.cmd === "getDiscoveryCapacity") {
+        const cfg = await getConfig();
+        if (!cfg) throw new Error("actor not configured");
+        reply({ ok: true, capacity: await new ActuatorApi(cfg).fetchDiscoveryCapacity() });
+      }
+      else if (msg.cmd === "getReplyCap" || msg.cmd === "setReplyCap") {
+        const cfg = await getConfig();
+        if (!cfg) throw new Error("actor not configured");
+        if (msg.cmd === "setReplyCap" && !(msg.cap === null ||
+          (typeof msg.cap === "number" && Number.isInteger(msg.cap) && msg.cap >= 0 && msg.cap <= 500))) {
+          throw new Error("invalid daily reply cap");
+        }
+        const api = new ActuatorApi(cfg);
+        reply({ ok: true, cap: msg.cmd === "getReplyCap"
+          ? await api.fetchReplyCap() : await api.setReplyCap(msg.cap as number | null) });
+      }
+      else if (msg.cmd === "getState") {
+        const store = await chrome.storage.local.get([DISCOVERY_STATUS_KEY, DISCOVERY_IDENTITY_STATUS_KEY]);
+        reply({
+          ok: true,
+          state: await loadState(),
+          browserDiscoveryActive: await browserDiscoveryEnabled(),
+          browserDiscoveryStatus: store[DISCOVERY_STATUS_KEY] ?? null,
+          browserDiscoveryIdentityStatus: store[DISCOVERY_IDENTITY_STATUS_KEY] ?? null,
+        });
+      }
+      else if (msg.cmd === "tick") { await tick(); reply({ ok: true }); } // content-script-driven loop (reliable, unlike SW timers)
+      else reply({ ok: false, error: "unknown command" });
+    } catch (e) {
+      // Surface the real reason to the panel — DevTools can't be open during a
+      // run (it blocks chrome.debugger), so the panel log is the only window in.
+      reply({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  })();
+  return true;
+});
