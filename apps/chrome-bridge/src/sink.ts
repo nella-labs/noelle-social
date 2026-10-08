@@ -198,3 +198,38 @@ export class Sink {
     try {
       const raw = readFileSync(path.join(this.logDir, HEARTBEATS_FILE), "utf8");
       const obj = JSON.parse(raw) as Record<string, unknown>;
+      for (const v of Object.values(obj)) {
+        const hb = HeartbeatSchema.safeParse(v);
+        if (hb.success) {
+          this.heartbeats.set(hb.data.source, hb.data);
+          this.sourcesSeen.add(hb.data.source);
+        }
+      }
+    } catch {
+      // no prior heartbeats (fresh boot) — fine.
+    }
+  }
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  if (!Number.isFinite(n)) return lo;
+  return Math.max(lo, Math.min(hi, Math.floor(n)));
+}
+
+function tsOf(at: string): number {
+  const t = Date.parse(at);
+  return Number.isFinite(t) ? t : 0;
+}
+
+function matches(e: LogEntry, q: LogQuery): boolean {
+  if (q.level && e.level !== q.level) return false;
+  if (q.sinceMs !== undefined) {
+    const t = Date.parse(e.at);
+    if (!Number.isFinite(t) || t < q.sinceMs) return false;
+  }
+  if (q.grep) {
+    const hay = `${e.msg} ${JSON.stringify(e.data ?? {})}`.toLowerCase();
+    if (!hay.includes(q.grep.toLowerCase())) return false;
+  }
+  return true;
+}
