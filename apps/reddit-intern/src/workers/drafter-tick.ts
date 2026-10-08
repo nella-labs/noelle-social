@@ -1598,3 +1598,62 @@ function renderLightPrompt(args: {
     '  {"drafts":[{"angle":"empathetic","body":"…","char_count":N}]}',
     // Shape-aware for the same reason as the substantial path above.
     args.shapeBlock
+      ? "Exactly ONE draft. Its length and sentence count are EXACTLY what THIS REPLY'S ASSIGNED SHAPE above asks for, which replaces the default 1-2 sentences. No DM."
+      : "Exactly ONE draft. 1-2 sentences. No DM.",
+  ].join("\n");
+}
+
+function safeJsonParse(s: string): unknown {
+  try { return normalizeSkipShape(JSON.parse(s)); } catch { /* fall through */ }
+  try {
+    const stripped = s.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
+    return normalizeSkipShape(JSON.parse(stripped));
+  } catch { /* fall through */ }
+  const firstBrace = s.indexOf("{");
+  const lastBrace = s.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    try { return normalizeSkipShape(JSON.parse(s.slice(firstBrace, lastBrace + 1))); }
+    catch { /* fall through */ }
+  }
+  const trimmed = s.trim();
+  const skipMatch = trimmed.match(/^SKIP:\s*(.+)/is);
+  if (skipMatch) return { skip: skipMatch[1]!.trim() };
+  if (looksLikeProseSkip(trimmed)) {
+    return { skip: trimmed.slice(0, 480) };
+  }
+  return null;
+}
+
+const PROSE_SKIP_MARKERS = [
+  "no overlap",
+  "no fit",
+  "not a fit",
+  "recommending skip",
+  "recommend skipping",
+  "skip this lead",
+];
+
+function looksLikeProseSkip(s: string): boolean {
+  const lower = s.toLowerCase();
+  return PROSE_SKIP_MARKERS.some((m) => lower.includes(m));
+}
+
+function normalizeSkipShape(parsed: unknown): unknown {
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    "drafts" in parsed &&
+    Array.isArray((parsed as { drafts: unknown }).drafts)
+  ) {
+    const drafts = (parsed as { drafts: Array<{ angle?: unknown; body?: unknown }> }).drafts;
+    const allSkip =
+      drafts.length > 0 &&
+      drafts.every((d) => typeof d?.angle === "string" && /^skip$/i.test(d.angle));
+    if (allSkip) {
+      const body = drafts[0]?.body;
+      const reason = typeof body === "string" ? body : "skipped by model";
+      return { skip: reason };
+    }
+  }
+  return parsed;
+}
