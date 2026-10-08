@@ -198,3 +198,203 @@ describe.skipIf(!url)("native permanent Reddit reply reservations", () => {
         blocker.then((result) => {
           throw result.ok ? new Error("Lock transaction ended before admission") : result.error;
         }),
+      ]);
+      pending = reify(Promise.resolve().then(operation));
+      await whileHeld(pending);
+    } catch (error) {
+      failure = { error };
+    } finally {
+      release();
+      await Promise.all([blocker, pending]);
+    }
+    if (failure) throw failure.error;
+    const lockResult = await blocker;
+    if (!lockResult.ok) throw lockResult.error;
+    const result = await pending;
+    if (!result) throw new Error("Operation was not admitted");
+    if (!result.ok) throw result.error;
+    return result.value;
+  }
+  async function locked(
+    reply: RedditReplyItem,
+    kind: "parent" | "draft" | "source",
+    operation: () => Promise<unknown>,
+    mutation: (tx: postgres.TransactionSql) => Promise<unknown>,
+  ) {
+    return withHeldRow(
+      reply,
+      kind,
+      operation,
+      async () => {
+        const until = Date.now() + 700;
+        let waits = 0;
+        while (Date.now() < until && !waits) {
+          const [row] = await other<{ n: number }[]>`select count(*)::int as n from pg_stat_activity
+          where datname=current_database() and wait_event_type='Lock'`;
+          waits = row!.n;
+          if (!waits) await sleep(10);
+        }
+        expect(waits).toBeGreaterThan(0);
+      },
+      mutation,
+    );
+  }
+  it("admits one exact captured Unicode reply and withholds its queued thread", async () => {
+    const reply = await seed();
+    expect((await claim(reply)).status).toBe(200);
+    const response = await actuator.request(`/api/actionable-reddit?instanceId=${instance}`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ replies: [] });
+    expect(await count()).toBe(1);
+  });
+  it("allows the coherent selected comment without changing its thread grain", async () => {
+    const reply = await seed("abc123", "Exact body", true);
+    expect((await claim(reply)).status).toBe(200);
+    expect((await claim(await seed("abc123", "Second angle", false, "t3_abc123"))).status).toBe(
+      409,
+    );
+    expect(await count()).toBe(1);
+  });
+  it("does not admit a second thread after a claimed approval's source is rewritten", async () => {
+    const reply = await seed();
+    expect((await claim(reply)).status).toBe(200);
+    const target = {
+      ...reply.target,
+      post_id: "other9",
+      url: "https://www.reddit.com/r/SaaS/comments/other9/title/",
+    };
+    await sql`update noelle.leads set external_id='other9',payload=payload||${sql.json({ url: target.url })} where id=${reply.lead_id}`;
+    expect((await claim({ ...reply, target })).status).toBe(409);
+    expect(await count()).toBe(1);
+  });
+  it("admits the same thread independently for a second current organization", async () => {
+    const first = await seed();
+    expect((await claim(first)).status).toBe(200);
+    const [parent] = await sql<
+      { id: string }[]
+    >`insert into noelle.agent_instances(org_id,role,status,reply_send_enabled)
+      values (${foreign},'reddit_intern','active',true) returning id`;
+    const second = await seed("abc123", "Second organization", false, "t3_abc123");
+    await sql`update noelle.leads set org_id=${foreign},agent_instance_id=${parent!.id} where id=${second.lead_id}`;
+    await sql`update noelle.drafts set org_id=${foreign} where id=${second.draft_id}`;
+    await sql`update noelle.approvals set org_id=${foreign},agent_instance_id=${parent!.id} where id=${second.approval_id}`;
+    auth.org = foreign;
+    instance = parent!.id;
+    expect((await claim(second)).status).toBe(200);
+    expect(await count()).toBe(2);
+  });
+  it.each(["draft", "source"] as const)(
+    "rechecks waited %s drift before claim admission",
+    async (kind) => {
+      const reply = await seed();
+      const result = await locked(
+        reply,
+        kind,
+        () => claim(reply),
+        async (tx) => {
+          if (kind === "draft")
+            await tx`update noelle.drafts set payload=payload||'{"body":"Changed"}' where id=${reply.draft_id}`;
+          else
+            await tx`update noelle.leads set payload=payload||'{"url":"https://redd.it/other9"}' where id=${reply.lead_id}`;
+        },
+      );
+      expect((result as Response).status).toBe(409);
+      expect(await count()).toBe(0);
+    },
+  );
+  it("allows one winner across independent SQL owners", async () => {
+    const reply = await seed();
+    const request = { instance_id: instance, reply };
+    const results = await Promise.all([
+      reserveRedditBrowserReply(sql, org, request, options),
+      reserveRedditBrowserReply(other, org, request, options),
+    ]);
+    expect(results.sort()).toEqual(["already-claimed", "claimed"]);
+    expect(await count()).toBe(1);
+  });
+  it.each([
+    "body",
+    "target",
+    "human-review",
+    "source",
+    "source-org",
+    "parent-org",
+    "parent-role",
+    "parent-status",
+    "consent",
+  ])("holds a changed %s before reservation", async (change) => {
+    const reply = await seed();
+    if (change === "body")
+      await sql`update noelle.drafts set payload=payload||'{"edited_body":"Changed"}' where id=${reply.draft_id}`;
+    else if (change === "target")
+      await sql`update noelle.leads set external_id='other9' where id=${reply.lead_id}`;
+    else if (change === "human-review")
+      await sql`update noelle.drafts set payload=payload||'{"human_review_required":true}' where id=${reply.draft_id}`;
+    else if (change === "source")
+      await sql`update noelle.leads set payload=payload||'{"url":"https://redd.it/other9"}' where id=${reply.lead_id}`;
+    else if (change === "source-org")
+      await sql`update noelle.leads set org_id=${foreign} where id=${reply.lead_id}`;
+    else if (change === "parent-org")
+      await sql`update noelle.agent_instances set org_id=${foreign} where id=${instance}`;
+    else if (change === "parent-role")
+      await sql`update noelle.agent_instances set role='x_intern' where id=${instance}`;
+    else if (change === "parent-status")
+      await sql`update noelle.agent_instances set status='paused' where id=${instance}`;
+    else
+      await sql`update noelle.agent_instances set reply_send_enabled=false,auto_send_enabled=false where id=${instance}`;
+    expect((await claim(reply)).status).toBe(409);
+    expect(await count()).toBe(0);
+  });
+  it("denies a foreign authenticated organization", async () => {
+    const reply = await seed();
+    auth.org = foreign;
+    expect((await claim(reply)).status).toBe(409);
+    expect(await count()).toBe(0);
+  });
+  it("preserves explicit link and recent challenge policies", async () => {
+    expect((await claim(await seed("abc123", "https://example.test"))).status).toBe(409);
+    vi.stubEnv("NOELLE_REDDIT_ACTUATOR_HALT_ON_CHALLENGE", "1");
+    const reply = await seed("other9");
+    await sql`insert into noelle.reddit_activity(organization_id,session_id,type,reason) values (${org},gen_random_uuid(),'skip','challenge')`;
+    expect((await claim(reply)).status).toBe(409);
+    expect(await count()).toBe(0);
+  });
+  it("counts admitted attempts without double-counting their successful activity", async () => {
+    const first = await seed();
+    expect((await claim(first)).status).toBe(200);
+    await sql`insert into noelle.reddit_activity(organization_id,session_id,type,approval_id,post_id)
+      values (${org},gen_random_uuid(),'reply',${first.approval_id},'abc123')`;
+    expect(await readRedditReplyUsage(sql, org)).toBe(1);
+    await sql`update noelle.reddit_reply_claims set claimed_at=now()-interval '1 day'`;
+    expect(await readRedditReplyUsage(sql, org)).toBe(1);
+    vi.stubEnv("NOELLE_REDDIT_ACTUATOR_DAILY_WRITE_CAP", "1");
+    expect((await claim(await seed("other9"))).status).toBe(409);
+  });
+  it.each(["0", "off"])("preserves the explicit daily cap %s", async (cap) => {
+    vi.stubEnv("NOELLE_REDDIT_ACTUATOR_DAILY_WRITE_CAP", cap);
+    expect((await claim(await seed())).status).toBe(cap === "0" ? 409 : 200);
+  });
+  it.each(["edit", "skip", "restore"])(
+    "blocks the canonical %s mutation after a claim",
+    async (action) => {
+      const reply = await seed();
+      expect((await claim(reply)).status).toBe(200);
+      if (action === "restore")
+        await sql`update noelle.approvals set status='skipped' where id=${reply.approval_id}`;
+      const operation =
+        action === "edit"
+          ? saveApprovalEdit(sql, scope(reply), "Changed")
+          : action === "skip"
+            ? skipApproval(sql, scope(reply))
+            : restoreSkippedApproval(sql, scope(reply));
+      await expect(operation).rejects.toMatchObject({ category: "send_already_claimed" });
+    },
+  );
+  it("preserves the browser skip endpoint's pending-only contract", async () => {
+    const reply = await seed();
+    await sql`update noelle.approvals set status='errored' where id=${reply.approval_id}`;
+    const response = await actuator.request(`/api/actuator/mark-skipped/${reply.approval_id}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason: "removed" }),
+    });
