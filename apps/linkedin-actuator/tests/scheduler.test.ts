@@ -198,3 +198,203 @@ describe("planDrainTimeline — session archetype opts", () => {
     const fullHeavy = [0.7, 0.05, 0.1, 0.05, 0.05, 0.05];
     let quietUnderCooldown = 0;
     let quietUnderFull = 0;
+    for (let seed = 1; seed <= 30; seed++) {
+      const a = planDrainTimeline({ approvedComments: 12, startMs: 0, rng: makeRng(seed), patternWeights: cooldownHeavy });
+      const b = planDrainTimeline({ approvedComments: 12, startMs: 0, rng: makeRng(seed), patternWeights: fullHeavy });
+      quietUnderCooldown += likesPerGap(a).filter((n) => n === 0).length;
+      quietUnderFull += likesPerGap(b).filter((n) => n === 0).length;
+      // Never exceeds the 0-3 per-gap like envelope regardless of the vector.
+      for (const n of likesPerGap(a).concat(likesPerGap(b))) expect(n).toBeLessThanOrEqual(3);
+    }
+    expect(quietUnderCooldown).toBeGreaterThan(quietUnderFull);
+  });
+
+  it("a widened gapMaxMs only slows the drain — floor stays 60s, gaps run slower than the default band", () => {
+    const gapsOf = (rngSeed: number, gapMaxMs?: number) => {
+      const t = planDrainTimeline({ approvedComments: 60, startMs: 0, rng: makeRng(rngSeed), ...(gapMaxMs ? { gapMaxMs } : {}) })
+        .filter((a) => a.kind === "comment").map((a) => a.atMs);
+      return t.slice(1).map((v, i) => v - t[i]!);
+    };
+    const wide = gapsOf(9, 255_000);
+    const def = gapsOf(9); // same rng stream, default 150s band
+    for (const g of wide) expect(g).toBeGreaterThanOrEqual(60_000); // floor never lowered
+    const mean = (xs: number[]) => xs.reduce((s, v) => s + v, 0) / xs.length;
+    // A wider band is same-or-slower everywhere and strictly slower on average.
+    expect(mean(wide)).toBeGreaterThan(mean(def));
+  });
+
+  it("longBreakMs inserts exactly one quiet long pause that shifts the rest later", () => {
+    const seedsWithBreak: number[] = [];
+    // The break decision derives from (startMs, approvedComments) via a separate
+    // rng (in production startMs is a fresh wall-clock ms), so vary startMs here.
+    for (let seed = 1; seed <= 20; seed++) {
+      const startMs = seed * 100_000;
+      const withBreak = planDrainTimeline({ approvedComments: 8, startMs, rng: makeRng(seed), longBreakMs: 600_000 });
+      const comments = withBreak.filter((a) => a.kind === "comment").map((a) => a.atMs).sort((x, y) => x - y);
+      const gaps = comments.slice(1).map((v, i) => v - comments[i]!);
+      // Non-break gaps use the default 150s band (tail ≤ 315s), so only the break
+      // gap can reach 600s — exactly one when a break fires.
+      const longGaps = gaps.filter((g) => g >= 600_000);
+      if (longGaps.length > 0) {
+        seedsWithBreak.push(seed);
+        expect(longGaps).toHaveLength(1); // exactly one break per batch
+        const idx = gaps.findIndex((g) => g >= 600_000);
+        const lo = comments[idx]!;
+        const hi = comments[idx + 1]!;
+        // The break gap is QUIET: no like slots inside it → idle-likes stay out.
+        const likesInBreak = withBreak.filter((a) => a.kind === "like" && a.atMs > lo && a.atMs < hi).length;
+        expect(likesInBreak).toBe(0);
+        expect(inQuietDrainGap(withBreak, lo + Math.floor((hi - lo) / 2))).toBe(true);
+      }
+    }
+    expect(seedsWithBreak.length).toBeGreaterThan(0); // breaks actually fire across sessions
+  });
+
+  it("an all-frontload vector puts every like in the first ~40%; all-backload in the last ~40%", () => {
+    // Forcing the pattern via the weight vector makes the placement UNAMBIGUOUS
+    // (an existence check can't tell a frontload gap from a light gap that lands
+    // early by chance). [full,cooldown,light,frontload,backload,cluster].
+    const front = planDrainTimeline({ approvedComments: 20, startMs: 0, rng: makeRng(3), patternWeights: [0, 0, 0, 1, 0, 0] });
+    const back = planDrainTimeline({ approvedComments: 20, startMs: 0, rng: makeRng(3), patternWeights: [0, 0, 0, 0, 1, 0] });
+    const fracs = (plan: ReturnType<typeof planDrainTimeline>) => {
+      const comments = plan.filter((a) => a.kind === "comment").map((a) => a.atMs).sort((x, y) => x - y);
+      const out: number[] = [];
+      for (const like of plan.filter((a) => a.kind === "like")) {
+        const lo = Math.max(...comments.filter((c) => c <= like.atMs));
+        const hi = Math.min(...comments.filter((c) => c > like.atMs));
+        if (Number.isFinite(hi)) out.push((like.atMs - lo) / (hi - lo));
+      }
+      return out;
+    };
+    const ff = fracs(front);
+    const bf = fracs(back);
+    expect(ff.length).toBeGreaterThan(10); // frontload actually places likes
+    expect(bf.length).toBeGreaterThan(10);
+    for (const f of ff) expect(f).toBeLessThanOrEqual(0.45); // every frontload like in the first ~40%
+    for (const f of bf) expect(f).toBeGreaterThanOrEqual(0.55); // every backload like in the last ~40%
+  });
+
+  it("explicit like knobs disable the pattern-weight draw (weights ignored, every gap full-fills)", () => {
+    // patternWeights alongside like knobs: patterns are OFF (patterned=false), so
+    // the weights are ignored. An all-cooldown vector WOULD zero every gap's likes
+    // if it applied — asserting every gap carries exactly the knob count proves it
+    // does not.
+    const plan = planDrainTimeline({
+      approvedComments: 20, startMs: 0, rng: makeRng(4),
+      patternWeights: [0, 1, 0, 0, 0, 0], // all-cooldown, i.e. zero likes — IF it applied
+      likesPerGapMin: 5, likesPerGapMax: 5,
+    });
+    for (const n of likesPerGap(plan)) expect(n).toBe(5); // knobs win; weights ignored
+  });
+
+  it("handles tiny queues and the long-break eligibility boundary (n<3 never breaks)", () => {
+    expect(planDrainTimeline({ approvedComments: 0, startMs: 0, rng: makeRng(1), longBreakMs: 600_000 })).toEqual([]);
+    const one = planDrainTimeline({ approvedComments: 1, startMs: 0, rng: makeRng(1), longBreakMs: 600_000 });
+    expect(one.filter((a) => a.kind === "comment")).toHaveLength(1);
+    // n=2 is below the break-eligibility floor (approvedComments >= 3): no 600s
+    // break can appear at any startMs (non-break gaps use the default band, ≤315s).
+    for (let seed = 1; seed <= 40; seed++) {
+      const two = planDrainTimeline({ approvedComments: 2, startMs: seed * 100_000, rng: makeRng(seed), longBreakMs: 600_000 });
+      const c = two.filter((a) => a.kind === "comment").map((a) => a.atMs).sort((x, y) => x - y);
+      expect(c[1]! - c[0]!).toBeLessThan(600_000);
+    }
+    // n=3 is the minimum eligible; a break (index ∈ {0,1}) can fire.
+    let sawBreakAt3 = false;
+    for (let seed = 1; seed <= 60 && !sawBreakAt3; seed++) {
+      const three = planDrainTimeline({ approvedComments: 3, startMs: seed * 100_000, rng: makeRng(seed), longBreakMs: 600_000 });
+      const c = three.filter((a) => a.kind === "comment").map((a) => a.atMs).sort((x, y) => x - y);
+      if (c.some((_, i) => i > 0 && c[i]! - c[i - 1]! >= 600_000)) sawBreakAt3 = true;
+    }
+    expect(sawBreakAt3).toBe(true);
+  });
+
+  it("is deterministic for a fixed seed + opts", () => {
+    const opts = { approvedComments: 8, startMs: 0, patternWeights: [0.3, 0.3, 0.1, 0.1, 0.1, 0.1], gapMaxMs: 200_000, longBreakMs: 500_000 };
+    const a = planDrainTimeline({ ...opts, rng: makeRng(7) });
+    const b = planDrainTimeline({ ...opts, rng: makeRng(7) });
+    expect(a).toEqual(b);
+  });
+
+  it("scales the cooldown pause with the session tempo — no archetype-independent 180s ceiling", () => {
+    // With cooldown the modal draw, a FIXED 180s cap made every temperament's
+    // quiet gap the same uniform[60s,180s] and sped slow archetypes up on mean
+    // (the #471 "floor+ceiling intact ≠ same velocity" trap). The cap is now
+    // gapMax × 1.2: byte-identical at the default 150s band, longer for slow
+    // sessions. Forced all-cooldown vector isolates the cooldown draw.
+    const allCooldown = [0, 1, 0, 0, 0, 0];
+    const gapsUnder = (gapMaxMs?: number) => {
+      const out: number[] = [];
+      for (let seed = 1; seed <= 40; seed++) {
+        const t = planDrainTimeline({
+          approvedComments: 8, startMs: 0, rng: makeRng(seed),
+          patternWeights: allCooldown, ...(gapMaxMs ? { gapMaxMs } : {}),
+        }).filter((a) => a.kind === "comment").map((a) => a.atMs);
+        for (let i = 1; i < t.length; i++) out.push(t[i]! - t[i - 1]!);
+      }
+      return out;
+    };
+    const slow = gapsUnder(255_000); // lurker's slowest tempo
+    const def = gapsUnder();         // default 150s band
+    const mean = (xs: number[]) => xs.reduce((s, v) => s + v, 0) / xs.length;
+    for (const g of def) {
+      expect(g).toBeGreaterThanOrEqual(60_000);
+      expect(g).toBeLessThanOrEqual(180_000); // default band: exactly the old cap
+    }
+    for (const g of slow) {
+      expect(g).toBeGreaterThanOrEqual(60_000);
+      expect(g).toBeLessThanOrEqual(306_000); // 255s × 1.2
+    }
+    expect(Math.max(...slow)).toBeGreaterThan(200_000); // a flat 180s cap would forbid this
+    expect(mean(slow)).toBeGreaterThan(mean(def)); // quiet-pause tempo tracks the archetype
+  });
+
+  it("keeps drain gaps mostly quiet — mean ≤ ~1 like/gap, median ≤ 1, max 3 (2026-07-23 re-tune)", () => {
+    // The production path: an archetype drawn per session, its jittered weight
+    // vector + tempo + break fed into the planner. Distribution asserted on
+    // mean AND median (a reshaped distribution can keep its floor/ceiling while
+    // its mean drifts — the #471 lesson), against the old baseline of ~3.4
+    // likes/gap under the 4-9 full fill.
+    const perGap: number[] = [];
+    for (let seed = 1; seed <= 200; seed++) {
+      const style = pickDrainArchetype(makeRng(seed + 1000));
+      const actions = planDrainTimeline({
+        approvedComments: 8, startMs: seed * 100_000, rng: makeRng(seed),
+        patternWeights: style.patternWeights, gapMaxMs: style.gapMaxMs, longBreakMs: style.longBreakMs,
+      });
+      perGap.push(...likesPerGap(actions));
+    }
+    const sorted = perGap.slice().sort((a, b) => a - b);
+    const mean = perGap.reduce((s, v) => s + v, 0) / perGap.length;
+    const median = sorted[Math.floor(sorted.length / 2)]!;
+    expect(mean).toBeGreaterThan(0.2);      // still SOME liking — the account isn't dead
+    expect(mean).toBeLessThanOrEqual(1.2);  // was ~3.4 before the re-tune
+    expect(median).toBeLessThanOrEqual(1);  // the typical wait shows 0-1 likes
+    expect(Math.max(...perGap)).toBeLessThanOrEqual(3); // never a like-burst before a reply
+  });
+});
+
+const caps = { likes: 120, comments: 80, dms: 10 };
+const start = 1_750_000_000_000; // fixed epoch ms
+
+function plan(over?: Partial<Parameters<typeof planTimeline>[0]>) {
+  return planTimeline({
+    params: { windowHours: 8, targetComments: 30, targetLikes: 60 },
+    approvedDms: 2,
+    caps,
+    startMs: start,
+    deepNightTaper: false,
+    rng: makeRng(123),
+    ...over,
+  });
+}
+
+// Helpers
+function computeCV(values: number[]): number {
+  if (values.length < 2) return 0;
+  const mean = values.reduce((s, v) => s + v, 0) / values.length;
+  if (mean === 0) return 0;
+  const variance = values.reduce((s, v) => s + (v - mean) ** 2, 0) / values.length;
+  return Math.sqrt(variance) / mean;
+}
+
+function lag1Autocorrelation(values: number[]): number {
