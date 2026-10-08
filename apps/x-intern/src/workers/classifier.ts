@@ -198,3 +198,203 @@ async function main() {
       const run = await recordRun({ sql, kind: "classifier", bus });
       try {
         // Recover leads stranded at 'classifying' by a crash/restart mid-claim —
+        // without this they are invisible to every future claim (see reapStaleClaims).
+        const reaped = await reapStaleClaims(sql, {
+          agentInstanceId: inst.id,
+          claimedStatus: "classifying",
+          requeueStatus: "new",
+        });
+        if (reaped.requeued || reaped.expired) {
+          log.warn({ org_id: inst.org_id, ...reaped }, "reaped stale classifying claims");
+        }
+        const observedReaped = await reapStaleClaims(sql, {
+          agentInstanceId: inst.id,
+          claimedStatus: "observed_classifying",
+          requeueStatus: "observed",
+        });
+        if (observedReaped.requeued) {
+          log.warn({ org_id: inst.org_id, ...observedReaped }, "requeued stranded X observations");
+        }
+        // Claim one observation at a time: a Jev outage never strands a batch
+        // in a mid-claim status, and the retry pause avoids a hot outage loop.
+        let observedProcessed = 0;
+        if (Date.now() >= (jevRetryAfter.get(inst.id) ?? 0)) {
+          const strictClassifier = createClassifier({
+            backend: meteredBackend,
+            objective: inst.objective ?? null,
+            vipScout: false,
+          });
+          for (let i = 0; i < 10; i++) {
+            const [lead] = await claimObservedLeadsForClassification(sql, {
+              orgId: inst.org_id, agentInstanceId: inst.id, batch: 1,
+            });
+            if (!lead) break;
+            const outcome = await classifyOneLead({
+              sql, classifier: strictClassifier, notifier, inst, lead, log, bus,
+              observedThreshold: env.X_Q_THRESHOLD,
+            });
+            if (outcome === "jev_unavailable") {
+              jevRetryAfter.set(inst.id, Date.now() + 60_000);
+              break;
+            }
+            observedProcessed++;
+          }
+        }
+        // Backpressure gate: classifier output ultimately feeds the drafter,
+        // which feeds the approval inbox. If approvals are at the (effective)
+        // cap, classifying more keyword leads just deepens the pile-up — so the
+        // keyword lane stops. The watchlist lane ignores this cap (watched
+        // accounts are always-on, with their own one-per-person bound).
+        let keywordBlocked = !keywordLaneOn;
+        if (keywordLaneOn) {
+          const cap = effectiveDraftsCap(inst);
+          if (cap != null) {
+            const pending = await countPendingApprovalsForInstance(sql, inst.id);
+            if (pending >= cap) {
+              keywordBlocked = true;
+              log.info({ org_id: inst.org_id, pending, cap }, "keyword lane paused: pending at cap");
+            }
+          }
+        }
+        if (keywordBlocked && !watchlistLaneOn) {
+          await run.finish({ status: "ok", rowsProcessed: observedProcessed });
+          return;
+        }
+
+        // Billing path. If the org brought its own Gemini key on the
+        // /connections page (`gemini-api-key`), classify through Google AI
+        // Studio with that key so usage bills *their* account. Otherwise use
+        // the Noelle-billed Vertex backend (trial credit). NOT_FOUND is the
+        // common case (Noelle-billed) and is expected, not an error — any
+        // other secret error propagates. Successful reads are TTL-cached by
+        // the secrets client, so the BYO lookup is one cached call per tick.
+        let backend: EngineBackend = meteredBackend;
+        let byo = false;
+        try {
+          const byoKey = await secrets.getForOrg(inst.org_id, "gemini-api-key");
+          backend = createGeminiKeyBackend({ apiKey: byoKey });
+          byo = true;
+        } catch (err) {
+          if (!(err instanceof SecretAccessError) || !/NOT_FOUND/.test(err.message)) throw err;
+        }
+
+        // Budget gate + spend recording apply ONLY to the Noelle-billed
+        // (Vertex) path. A BYO-key org pays Google directly, so its classifier
+        // usage is neither recorded as Noelle spend nor gated by the Noelle
+        // cap. On the Noelle path, skip the tick when the org/instance is at
+        // its cap on the `classifier` bucket; the next tick re-checks once
+        // spend frees up (a new month, or the owner raises the cap).
+        // Subscription and paid engines both retain the shared admission gate.
+        if (!byo) {
+          const blocked = await classifierBudgetBlock(budgetAdapters, {
+            orgId: inst.org_id,
+            instanceId: inst.id,
+            engine: recordEngine,
+          });
+          if (blocked) {
+            log.info(
+              {
+                org_id: inst.org_id,
+                layer: blocked.layer,
+                spent_cents: blocked.spentCents,
+                cap_cents: blocked.capCents,
+              },
+              "classifier paid lanes paused: budget cap reached",
+            );
+            await run.finish({ status: "ok", rowsProcessed: observedProcessed });
+            return;
+          }
+        }
+
+        // Resolve the model for the active backend:
+        //   - Bedrock (Noelle-billed, self-host): fixed Claude handle. The
+        //     dashboard's Gemini-only override doesn't apply here.
+        //   - Gemini (BYO key, or Vertex default): honour the per-worker
+        //     override; non-Gemini picks fall back to Gemini Flash + log
+        //     (the override targets an engine the Gemini backend can't reach).
+        let classifierModel: string | undefined;
+        if (!byo && billedEngine === "bedrock") {
+          classifierModel = bedrockModel ?? undefined;
+        } else {
+          const { model, fellBack } = resolveClassifierModel(inst.model_overrides);
+          classifierModel = model ?? undefined;
+          if (fellBack) {
+            log.info(
+              { org_id: inst.org_id },
+              "classifier override targets a non-Gemini engine; falling back to default Gemini Flash until that backend lands",
+            );
+          }
+        }
+        const classifier = createClassifier({
+          backend,
+          ...(classifierModel ? { model: classifierModel } : {}),
+          objective: inst.objective ?? null,
+          // Relationship scout flags high-leverage authors + pre-drafts an intro
+          // DM in the SAME classifier call. On unless NOELLE_VIP_SCOUT is
+          // explicitly disabled — additive + fail-open (no field → vip=null).
+          vipScout: VIP_SCOUT_ENABLED,
+        });
+
+        // When the keyword lane is live, claim any 'new' lead (covers priority
+        // too). When it's blocked (paused / disabled / inbox full) but the watchlist
+        // lane is on, claim only priority leads so watched accounts keep moving.
+        const claimed = await claimLeadsForClassification(sql, {
+          orgId: inst.org_id,
+          agentInstanceId: inst.id,
+          batch: CLASSIFICATION_BATCH_LIMIT,
+          priorityOnly: keywordBlocked,
+        });
+        // CLI_CONCURRENCY bounds local process fan-out; other backends run at
+        // most the ten claimed posts together. Rejected admission returns only
+        // unchanged claims to the queue immediately.
+        const usingCli = !byo && recordEngine === "claude-cli";
+        const concurrency = usingCli ? CLI_CONCURRENCY : Math.max(1, claimed.length);
+
+        // Prepare admission once before any batch or single-post model call.
+        // Uncovered eligible posts retain the existing per-post fallback.
+        const prepared = claimed.map((lead) => ({
+          lead,
+          eligibility: classificationEligibility(lead, inst),
+        }));
+        const eligible = prepared.filter(({ eligibility }) => !eligibility.drop);
+        const pre = new Map<string, ClassifyOutput>();
+        if (usingCli && CLASSIFIER_BATCH && eligible.length > 1) {
+          let batch: BatchClassifyResult;
+          try {
+            batch = await classifier.classifyMany(
+              eligible.map(({ lead }) => {
+                const p = (lead.payload ?? {}) as {
+                  text?: string;
+                  author_followers?: number | null;
+                };
+                return {
+                  postText: p.text ?? "",
+                  authorHandle: lead.author_handle,
+                  source: "x" as const,
+                  velocityAtDiscovery: 0,
+                  authorFollowers: p.author_followers ?? null,
+                };
+              }),
+            );
+          } catch (error) {
+            if (isBudgetAdmissionError(error)) {
+              await releaseClassificationClaims(sql, {
+                orgId: inst.org_id,
+                agentInstanceId: inst.id,
+                claims: claimed,
+              });
+            }
+            throw error;
+          }
+          batch.verdicts.forEach((verdict, index) => {
+            if (verdict) pre.set(eligible[index]!.lead.id, verdict);
+          });
+          log.info(
+            { claimed: claimed.length, eligible: eligible.length, covered: pre.size },
+            "classifier: batched call",
+          );
+        }
+
+        const outcomes = await batchMap(
+          prepared,
+          ({ lead, eligibility }) =>
