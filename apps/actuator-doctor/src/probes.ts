@@ -598,3 +598,106 @@ export function isInOperatingWindow(nowMs: number, startHour: number, endHour: n
 }
 
 export interface ArmAwareCtx {
+  inWindow: boolean; // are the actuators expected to be up right now (operating hours)?
+  inWarmup: boolean; // did the doctor just boot (post-deploy ext-reconnect window)?
+  /**
+   * Due browser work per lane (readBrowserDue) — drives the idle gate.
+   * null/undefined = gate disabled (NOELLE_DOCTOR_PAGE_WHEN_IDLE, or the due
+   * read failed): connectivity faults page whenever the lane is armed +
+   * in-window, due work or not.
+   */
+  pendingDue?: PendingDue | null;
+}
+
+// PURE. Turn faults on lanes that are not EXPECTED to be actuating right now into
+// observe-only ok=true, so they never page. A browser-actuation fault (heartbeat
+// / stuck_queue / send_failures / the bridge ext-disconnect) is expected — not a
+// problem — when the lane is disarmed (reply_send_enabled=false), OR outside the
+// operating window (Chrome is closed overnight), OR during the post-deploy warmup
+// (the extensions have not reconnected yet). The 24/7 infra faults (db_reachable,
+// api_freshness, worker pm2) are NOT touched here and page anytime.
+//
+// The IDLE gate (pendingDue): a pure CONNECTIVITY fault — an armed lane's
+// heartbeat, or the bridge's ext-disconnect — is also expected when nothing is
+// due to send: a closed Chrome on an idle lane is the operator's choice, not an
+// emergency. The moment an approval's auto_send_target_at passes with the
+// actuator still down, the fault comes back and climbs the ladder to a page
+// ("it cannot be activated when needed"). ACTIVITY faults (stuck_queue,
+// send_failures) are never idle-gated — they imply real send attempts. Neither
+// is chrome_reachable's OTHER reason, bridge-unreachable: a dead/hung bridge
+// process is 24/7 infra (and this is its only paging path — the seed has no
+// bridge pm2 signature), not a closed Chrome.
+export function applyArmAwareness(probes: ProbeResult[], arm: ArmState, ctx: ArmAwareCtx): ProbeResult[] {
+  // A Chrome disconnect only matters while some lane whose hands are a browser
+  // extension is armed. reddit-intern is now one of those (BROWSER_LANE_TARGETS).
+  const anyLaneArmed = BROWSER_LANE_TARGETS.some((t) => arm[t]?.armed);
+  const offHours = !ctx.inWindow;
+  const due = ctx.pendingDue ?? null;
+  const laneIdle = (t: DoctorTarget) => due !== null && (due[t] ?? 0) === 0;
+  // The bridge only matters while some ARMED lane has due browser work. Every
+  // lane counts here — all of LANE_TARGETS drain their actionable rows through
+  // the bridge's Chrome (BROWSER_LANE_TARGETS now covers the same set), so due
+  // work on any armed lane keeps the bridge urgent.
+  const bridgeIdle = due !== null && LANE_TARGETS.every((t) => !arm[t]?.armed || laneIdle(t));
+  return probes.map((p) => {
+    if (
+      isLaneTarget(p.target) &&
+      !p.ok &&
+      (p.check === "heartbeat" || p.check === "stuck_queue" || p.check === "send_failures") &&
+      (!arm[p.target]?.armed || offHours || ctx.inWarmup || (p.check === "heartbeat" && laneIdle(p.target)))
+    ) {
+      const reason = !arm[p.target]?.armed
+        ? "disarmed"
+        : offHours
+          ? "off-hours"
+          : ctx.inWarmup
+            ? "warmup"
+            : "idle";
+      return downgrade(p, reason, arm[p.target]?.armed ?? false);
+    }
+    if (
+      p.target === "bridge" &&
+      p.check === "chrome_reachable" &&
+      !p.ok &&
+      p.reason === "ext-disconnected" &&
+      (!anyLaneArmed || offHours || ctx.inWarmup || bridgeIdle)
+    ) {
+      const reason = !anyLaneArmed
+        ? "no-lane-armed"
+        : offHours
+          ? "off-hours"
+          : ctx.inWarmup
+            ? "warmup"
+            : "idle";
+      return downgrade(p, reason, anyLaneArmed);
+    }
+    return p;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Fan-out.
+// ---------------------------------------------------------------------------
+
+export interface ProbeContext {
+  env: Env;
+  sql: Sql;
+  now: number;
+  pm2Apps: Pm2App[];
+  startedAt: number; // doctor process boot ms — drives the heartbeat warmup grace
+}
+
+export async function runAllProbes(cx: ProbeContext): Promise<ProbeResult[]> {
+  const at = new Date(cx.now).toISOString();
+  const [api, hb, chrome, stuck, sendFail, build, db] = await Promise.all([
+    probeApiFreshness(cx.env, cx.sql, at, cx.now),
+    probeHeartbeat(cx.env, at, cx.now - cx.startedAt),
+    probeChromeReachable(cx.env, at),
+    probeStuckQueue(cx.env, cx.sql, at),
+    probeSendFailures(cx.env, cx.sql, at),
+    probeBuildStamp(cx.env, at),
+    probeDbReachable(cx.env, cx.sql, at),
+  ]);
+  const pm2 = probePm2(cx.env, cx.pm2Apps, at);
+  return [...pm2, ...api, ...hb, ...chrome, ...stuck, ...sendFail, ...build, ...db];
+}

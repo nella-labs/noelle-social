@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "updatedAt": "2026-07-17T00:00:00.000Z",
+  "signatures": [
+    {
+      "id": "ext-disconnected-while-armed",
+      "title": "Chrome extension disconnected while a lane is armed",
+      "description": "The bridge reports the actuator extension is not connected (or the bridge itself is unreachable) while at least one actuator lane is armed (reply_send_enabled=true). Nothing can post until it reconnects. Arm-gated: when NO lane is armed the chrome_reachable fault is downgraded upstream. ALSO idle-gated upstream: an ext-disconnected fault is downgraded while no due BROWSER work is waiting (stamped-due linkedin/reddit approvals; X's stamped rows are API-autosend-owned and never count), because a closed Chrome on an idle stack is deliberate. So this fires only when due browser work meets a disconnected extension. A bridge-unreachable fault (the bridge process itself down/hung) is 24/7 infra and skips the idle gate.",
+      "match": [{ "target": "bridge", "check": "chrome_reachable", "ok": false }],
+      "ladder": ["reload_extension", "reconnect_bridge", "page_human"],
+      "maxPerHour": 4,
+      "origin": "seed",
+      "confidence": 0.7
+    },
+    {
+      "id": "heartbeat-stale-armed",
+      "title": "Actuator heartbeat stale while armed",
+      "description": "An armed browser actuator (x-actuator / linkedin-actuator / reddit-actuator) sent heartbeats and then went silent past its stale window — its Chrome extension likely crashed, was disabled, or Chrome closed. LANE-SCOPED: the 'x-actuator' target is a lane placeholder the matcher substitutes per lane, reddit-intern included (the reddit lane now has a browser extension emitting a heartbeat via the bridge-sink). Ladder is reconnect_bridge (maybe the sink is wedged) then page_human: restart_worker is intentionally absent because the heartbeat comes from the BROWSER EXTENSION, not the pm2 worker, so restarting the worker cannot fix it. A never-seen heartbeat inside the warmup grace is not a fault (see NOELLE_DOCTOR_HEARTBEAT_GRACE_MS). Idle-gated upstream: fires only while the lane has due BROWSER work (linkedin: stamped-due approvals; X: never, its stamped rows belong to API autosend and its browser queue is operator-initiated, so stalled X autosend pages via queue-stuck/send-failures instead). NOELLE_DOCTOR_PAGE_WHEN_IDLE=1 disables the gate.",
+      "match": [{ "target": "x-actuator", "check": "heartbeat", "ok": false }],
+      "ladder": ["reconnect_bridge", "page_human"],
+      "maxPerHour": 4,
+      "origin": "seed",
+      "confidence": 0.6
+    },
+    {
+      "id": "worker-offline",
+      "title": "Actuator worker process offline",
+      "description": "A lane's pm2-supervised worker (drafter/classifier/discovery) is not online (errored, or missing while its peers run). LANE-SCOPED (x-actuator is the lane placeholder). Intentionally-stopped apps are excluded upstream, so this fires on a crash, not a pause.",
+      "match": [{ "target": "x-actuator", "check": "pm2", "ok": false }],
+      "ladder": ["restart_worker", "page_human"],
+      "maxPerHour": 4,
+      "origin": "seed",
+      "confidence": 0.75
+    },
+    {
+      "id": "queue-stuck-armed",
+      "title": "Approval queue stuck while armed and Chrome is reachable",
+      "description": "Approvals are pending well past their auto_send_target_at (the queue is not draining) on an armed lane while the extension IS connected — posting should be working but isn't. LANE-SCOPED (x-actuator placeholder). Reloading the extension usually unsticks a wedged content script. Note: the chrome_reachable ok:true clause is also satisfied by an idle-DOWNGRADED probe, which is only reachable for a stuck X queue (linkedin/reddit stuck work forces the idle gate open) — that is deliberate, it is how a stalled X API-autosend pages with Chrome closed.",
+      "match": [
+        { "target": "x-actuator", "check": "stuck_queue", "ok": false },
+        { "target": "bridge", "check": "chrome_reachable", "ok": true }
+      ],
+      "ladder": ["reload_extension", "page_human"],
+      "maxPerHour": 3,
+      "origin": "seed",
+      "confidence": 0.55
+    },
+    {
+      "id": "send-failures-spike",
+      "title": "Actuator skip / send-failure spike",
+      "description": "The lane's activity log shows a spike of 'skip' events in the trailing window (selector-not-found / challenge / cap) — the actuator is trying to post but failing. LANE-SCOPED (x-actuator placeholder). A reload often clears a stale-selector spike; the ladder ends at a human page.",
+      "match": [{ "target": "x-actuator", "check": "send_failures", "ok": false }],
+      "ladder": ["reload_extension", "page_human"],
+      "maxPerHour": 3,
+      "origin": "seed",
+      "confidence": 0.5
+    },
+    {
+      "id": "api-vm-down",
+      "title": "api-vm unreachable",
+      "description": "The api-vm health endpoint is not responding (or reports degraded). The dashboard, the actuator queue endpoints, and shape-validated outbound writes all depend on it. GLOBAL signature (fixed api-vm target).",
+      "match": [{ "target": "api-vm", "check": "api_freshness", "ok": false }],
+      "ladder": ["restart_worker", "page_human"],
+      "maxPerHour": 3,
+      "origin": "seed",
+      "confidence": 0.7
+    },
+    {
+      "id": "db-unreachable",
+      "title": "Postgres data plane unreachable",
+      "description": "A `select 1` against noelle Postgres failed. This is the break-the-silence signal: without it a DB outage makes readArmState fail-safe every lane to disarmed (masking real lane faults) while the stuck_queue/send_failures probes fail open, so the doctor would otherwise report healthy while the data plane is down. A DB outage can't be fixed by restarting a worker, so page a human immediately. GLOBAL (fixed api-vm target).",
+      "match": [{ "target": "api-vm", "check": "db_reachable", "ok": false }],
+      "ladder": ["page_human"],
+      "maxPerHour": 2,
+      "origin": "seed",
+      "confidence": 0.9
+    },
+    {
+      "id": "heartbeats-unauthorized",
+      "title": "Bridge heartbeats endpoint rejecting the doctor's token",
+      "description": "GET /heartbeats returned 401/403 — the bridge is UP but rejecting NOELLE_BRIDGE_TOKEN, so heartbeat-stale detection is silently disabled until the token is fixed. This must not masquerade as healthy. Not remediable automatically (a config fix), so page. GLOBAL (fixed bridge target).",
+      "match": [{ "target": "bridge", "check": "heartbeat", "ok": false, "reasonIncludes": "unauthorized" }],
+      "ladder": ["page_human"],
+      "maxPerHour": 2,
+      "origin": "seed",
+      "confidence": 0.9
+    }
+  ]
+}
