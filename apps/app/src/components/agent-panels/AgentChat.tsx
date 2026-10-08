@@ -1198,3 +1198,135 @@ function VaultEditCard({
             Cancel
           </button>
         </div>
+      ) : (
+        <div
+          style={{
+            marginTop: 8,
+            fontSize: 11.5,
+            fontFamily: "var(--mono)",
+            color: state === "applied" ? "var(--accent)" : "var(--ink-soft)",
+          }}
+        >
+          {state === "applied" ? "✓ Written to your vault" : "Dismissed"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Apply/Cancel card for a script edit Nova proposed. Validated server-side
+ * (ScriptEditProposalSchema). Apply loads the new lines into the studio editor
+ * (marked dirty) for the founder to review + Save — it does not write directly.
+ */
+function ScriptEditCard({
+  edit,
+  state,
+  canApply,
+  onApply,
+  onCancel,
+}: {
+  edit: ScriptEditProposal;
+  state: ProposalState;
+  canApply: boolean;
+  onApply?: () => void;
+  onCancel?: () => void;
+}) {
+  const beatCount = edit.beats?.length ?? 0;
+  return (
+    <div
+      style={{
+        marginTop: 8,
+        padding: "10px 12px",
+        borderRadius: 10,
+        background: "var(--paper-2)",
+        boxShadow: "0 0 0 0.5px var(--rule)",
+      }}
+    >
+      <div className="eyebrow" style={{ marginBottom: 6 }}>
+        {state === "applied"
+          ? "Script edit applied"
+          : state === "cancelled"
+            ? "Script edit dismissed"
+            : "Proposed script edit · you confirm"}
+      </div>
+      <div style={{ fontFamily: "var(--mono)", fontSize: 12, marginBottom: 6, opacity: state === "cancelled" ? 0.5 : 1 }}>
+        <div style={{ color: "var(--accent)" }}>✎ {edit.summary}</div>
+        <div style={{ color: "var(--ink-muted)", marginTop: 2 }}>
+          {edit.fullScript
+            ? "rewrites the full script"
+            : beatCount > 0
+              ? `updates ${beatCount} beat${beatCount === 1 ? "" : "s"}`
+              : "updates the script"}
+        </div>
+      </div>
+      {edit.beats && edit.beats.length > 0 ? (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 5,
+            marginBottom: 6,
+            opacity: state === "cancelled" ? 0.5 : 1,
+          }}
+        >
+          {edit.beats.slice(0, 6).map((b) => (
+            <div key={b.index} style={{ fontSize: 12, lineHeight: 1.45, color: "var(--ink-2)" }}>
+              <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--accent)", marginRight: 6 }}>
+                beat {b.index}
+              </span>
+              {b.line}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {state === "pending" ? (
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          <button
+            type="button"
+            className="btn btn-sm btn-accent"
+            disabled={!canApply}
+            onClick={onApply}
+            title={canApply ? undefined : "Open this draft in the studio to apply edits"}
+          >
+            Apply to draft
+          </button>
+          <button type="button" className="btn btn-sm btn-ghost" onClick={onCancel}>
+            Cancel
+          </button>
+        </div>
+      ) : (
+        <div
+          style={{
+            marginTop: 8,
+            fontSize: 11.5,
+            fontFamily: "var(--mono)",
+            color: state === "applied" ? "var(--accent)" : "var(--ink-soft)",
+          }}
+        >
+          {state === "applied" ? "✓ Loaded into the editor — review + Save" : "Dismissed"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Offline / first-paint fallback. Used while the server greeting is still
+ * loading. The authoritative greeting + suggestion chips live in the agent's
+ * chat profile in @noelle/agents/chat/<role>.ts — keep this only as a
+ * minimal stand-in so the panel never renders empty.
+ */
+function offlineGreeting(agentId: string, agentName: string): GreetingPayload {
+  const id = agentId === "x_intern" ? "x-intern" : agentId;
+  if (id === "x-intern") {
+    return {
+      body: `Hey — I'm ${agentName}, the X Growth Intern. Loading today's queue…`,
+      suggestions: [],
+    };
+  }
+  return {
+    body: `Hi — I'm ${agentName}. Ask me anything about my work.`,
+    suggestions: [],
+  };
+}
