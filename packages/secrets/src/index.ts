@@ -198,3 +198,14 @@ export function createSecretsClient(opts: {
             } catch {
               /* Best-effort prefetch. */
             }
+          }
+        }),
+      );
+    },
+    bust(secretId) {
+      const id = normaliseName(secretId);
+      cache.delete(id);
+      pending.delete(id);
+    },
+  };
+}
