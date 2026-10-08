@@ -198,3 +198,124 @@ export class Cdp {
       const hold = clampMs(rng.logNormal(Math.log(95), 0.42), 50, 260);
       await sleep(hold);
       tElapsed += hold;
+      const jr = tremor(target, tElapsed, rng);
+      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: jr.x, y: jr.y, button: "left", clickCount: 1, buttons: 0 });
+    }
+
+    this.lastPos = target;
+  }
+
+  /**
+   * Scroll `totalPx` driven by §3(a) momentum gestures (flick/slow-drag/
+   * micro-nudge/back-scroll mixture). Each gesture dispatches a decelerating
+   * `mouseWheel` delta series with non-uniform inter-delta sleeps + a post-dwell,
+   * with tremor on the wheel anchor x,y. Same `(tabId, at, totalPx, rng, sleep)`
+   * signature so existing callers keep working.
+   */
+  async wheel(
+    tabId: number,
+    at: Point,
+    totalPx: number,
+    rng: Rng,
+    sleep: Sleep,
+    contentHints?: { wordCount?: number; hasMedia?: boolean }[],
+  ): Promise<void> {
+    const gestures = planScrollGestures(rng, totalPx, contentHints);
+    let tElapsed = 0;
+    for (const g of gestures) {
+      for (let i = 0; i < g.deltas.length; i++) {
+        const j = tremor(at, tElapsed, rng);
+        await this.send(tabId, "Input.dispatchMouseEvent", {
+          type: "mouseWheel", x: j.x, y: j.y, deltaX: 0, deltaY: g.deltas[i]!,
+        });
+        const dt = g.interDeltaMs[i] ?? 0;
+        if (dt > 0) await sleep(dt);
+        tElapsed += dt;
+      }
+      if (g.postDwellMs != null && g.postDwellMs > 0) {
+        await sleep(g.postDwellMs);
+        tElapsed += g.postDwellMs;
+      }
+    }
+  }
+
+  /**
+   * Type `text` one character at a time with full US-keyboard metadata so each
+   * keydown/keyup carries a real key/code/keyCode (not keyCode=0 / code="" /
+   * key="Unidentified", which no hardware produces and both LinkedIn and X can
+   * read from keystroke telemetry). Shift is held across consecutive shifted
+   * characters like a real typist.
+   *
+   * The character itself is committed with `Input.insertText`, NOT via the
+   * keyDown's `text` field (ports #444). Reddit's new-Reddit comment composer is
+   * a framework-managed contenteditable (Lexical-style rich-text editor): it
+   * intercepts `beforeinput` and applies its own transaction. A keyDown-with-text
+   * produces a native edit the editor's model doesn't always sync from, so the
+   * character lands in the DOM but the model stays empty — which keeps the
+   * "Comment" submit DISABLED forever (the LinkedIn actuator's live symptom:
+   * text typed, box populated, submit never enables → submit-not-found).
+   * `Input.insertText` fires the `inputType:"insertText"` beforeinput/input the
+   * editor handles natively, so the model updates and the submit enables. We
+   * therefore send a text-less rawKeyDown (telemetry only, real key/code/keyCode,
+   * Shift-hold preserved), then insertText (the real, framework-observable edit),
+   * then keyUp.
+   */
+  async typeText(tabId: number, text: string, rng: Rng, sleep: Sleep): Promise<void> {
+    const delays = typingDelays(rng, text.length);
+    const shift = { down: false };
+    const releaseShift = async () => {
+      if (!shift.down) return;
+      await this.send(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, location: 1 });
+      shift.down = false;
+    };
+    let i = 0;
+    for (const ch of text) {
+      const def = keyStrokeFor(ch);
+      if (!def) {
+        await releaseShift();
+        await this.send(tabId, "Input.insertText", { text: ch });
+        await sleep(delays[i++] ?? 60);
+        continue;
+      }
+      if (def.shift && !shift.down) {
+        await this.send(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, modifiers: 8, location: 1 });
+        shift.down = true;
+      } else if (!def.shift && shift.down) {
+        await releaseShift();
+      }
+      const modifiers = shift.down ? 8 : 0;
+      // rawKeyDown (no `text`) → no native character insertion, just the
+      // keystroke telemetry with real US-keyboard metadata.
+      await this.send(tabId, "Input.dispatchKeyEvent", {
+        type: "rawKeyDown", key: def.key, code: def.code,
+        windowsVirtualKeyCode: def.keyCode, nativeVirtualKeyCode: def.keyCode,
+        unmodifiedText: def.unmodified, modifiers,
+      });
+      // The actual edit, via a path the framework editor observes and syncs from.
+      await this.send(tabId, "Input.insertText", { text: ch });
+      await this.send(tabId, "Input.dispatchKeyEvent", {
+        type: "keyUp", key: def.key, code: def.code,
+        windowsVirtualKeyCode: def.keyCode, nativeVirtualKeyCode: def.keyCode, modifiers,
+      });
+      await sleep(delays[i++] ?? 60);
+    }
+    await releaseShift();
+  }
+
+  /**
+   * Press Escape (rawKeyDown → keyUp with real key/code/keyCode). Used to dismiss
+   * an opened overflow "…" menu without clicking through it when a post-save can't
+   * be completed — the menu's backdrop swallows synthetic clicks, so Escape is the
+   * only safe close. Mirrors the X actuator's repost-menu dismiss.
+   */
+  async pressEscape(tabId: number): Promise<void> {
+    await this.send(tabId, "Input.dispatchKeyEvent", {
+      type: "rawKeyDown", key: "Escape", code: "Escape",
+      windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
+    });
+    await this.send(tabId, "Input.dispatchKeyEvent", {
+      type: "keyUp", key: "Escape", code: "Escape",
+      windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
+    });
+  }
+}
