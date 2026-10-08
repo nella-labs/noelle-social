@@ -998,3 +998,203 @@ function WorkerCard({
  * see, at the moment of picking, what they're committing to per million
  * tokens — the same numbers the spend recorder will bill them at.
  */
+function PriceLine({
+  handle,
+  fallback,
+}: {
+  handle: string;
+  fallback: string;
+}) {
+  const primary = catalogEntryFor(handle);
+  const sec = catalogEntryFor(fallback);
+  if (!primary && !sec) return null;
+  return (
+    <div
+      style={{
+        marginTop: 8,
+        fontSize: 11,
+        color: "var(--ink-muted)",
+        fontFamily: "var(--mono)",
+        display: "flex",
+        gap: 14,
+        flexWrap: "wrap",
+      }}
+    >
+      {primary ? (
+        <span>
+          primary · ${primary.inputCentsPerMTok / 100}/${primary.outputCentsPerMTok / 100} per Mtok
+        </span>
+      ) : null}
+      {sec ? (
+        <span>
+          fallback · ${sec.inputCentsPerMTok / 100}/${sec.outputCentsPerMTok / 100} per Mtok
+        </span>
+      ) : (
+        <span style={{ color: "var(--ink-soft)" }}>fallback · none (fail-on-error)</span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * BYO API keys placeholder — disabled provider grid. The full flow
+ * (encrypted at rest, per-provider test, billing skip) lands in the next
+ * release; this card is here so operators see what's coming.
+ */
+function ByoKeysGrid({ disabled }: { disabled: boolean }) {
+  const providers = [
+    { id: "anthropic", label: "Anthropic", hint: "Claude Sonnet 4.6, Opus 4.7, Haiku 4.5" },
+    { id: "openai", label: "OpenAI", hint: "OpenAI models — coming with full BYO" },
+    { id: "google", label: "Google AI", hint: "Gemini 2.5 Flash / Pro via your Google key" },
+    { id: "moonshot", label: "Moonshot", hint: "Kimi K2 — coming with full BYO" },
+    { id: "groq", label: "Groq", hint: "Open-weights on fast hardware — coming with full BYO" },
+    { id: "together", label: "Together", hint: "Llama / Mixtral hosted — coming with full BYO" },
+  ];
+  return (
+    <div
+      className="stack-phone"
+      style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+        gap: 10,
+        opacity: disabled ? 0.65 : 1,
+      }}
+    >
+      {providers.map((p) => (
+        <div
+          key={p.id}
+          style={{
+            padding: "12px 14px",
+            background: "var(--paper-2)",
+            borderRadius: 8,
+            boxShadow: "0 0 0 0.5px var(--rule)",
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div
+              style={{
+                fontSize: 12.5,
+                fontWeight: 500,
+                color: "var(--ink)",
+              }}
+            >
+              {p.label}
+            </div>
+            <div
+              style={{
+                fontSize: 11,
+                color: "var(--ink-muted)",
+                marginTop: 2,
+                lineHeight: 1.4,
+              }}
+            >
+              {p.hint}
+            </div>
+          </div>
+          <span
+            className="tag"
+            style={{
+              fontSize: 10,
+              fontFamily: "var(--mono)",
+              color: "var(--ink-soft)",
+            }}
+          >
+            next release
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Server-rendered radio-pill picker. Form posts a bare model id (or "none");
+ * the action resolves the engine from the catalog. The engine is never put in
+ * the radio value, so it doesn't appear in the page HTML / POST body.
+ */
+function ModelPills({
+  name,
+  defaultValue,
+  options,
+  disabled,
+}: {
+  name: string;
+  defaultValue: string;
+  options: ReadonlyArray<{ value: string; label: string; hint?: string }>;
+  disabled?: boolean;
+}) {
+  // The picker dedupes catalog entries by model, so a previously-saved
+  // override (e.g. a preview backend variant) may not be in `options`. Always
+  // include the saved value as a selectable option, or the radio group renders
+  // nothing selected and Save posts an empty field → "Invalid config payload".
+  // Label stays clean (cleanModelLabel never surfaces the engine).
+  const opts =
+    defaultValue && defaultValue !== "none" && !options.some((o) => o.value === defaultValue)
+      ? [
+          ...options,
+          {
+            value: defaultValue,
+            label: cleanModelLabel(defaultValue) ?? "Current model",
+            hint: "Your current saved choice.",
+          },
+        ]
+      : options;
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+        opacity: disabled ? 0.55 : 1,
+      }}
+    >
+      <div className="tweak-radio" style={{ flexWrap: "wrap" }}>
+        {opts.map((opt) => {
+          const active = opt.value === defaultValue;
+          return (
+            <label
+              key={opt.value}
+              className={active ? "active" : undefined}
+              style={{ display: "inline-block" }}
+            >
+              <input
+                type="radio"
+                name={name}
+                value={opt.value}
+                defaultChecked={active}
+                disabled={disabled}
+                style={{
+                  position: "absolute",
+                  opacity: 0,
+                  pointerEvents: "none",
+                }}
+              />
+              <span
+                style={{
+                  display: "inline-block",
+                  padding: "4px 10px",
+                  borderRadius: 6,
+                  fontSize: 11.5,
+                  color: active ? "var(--ink)" : "var(--ink-muted)",
+                  background: active ? "var(--paper)" : "transparent",
+                  boxShadow: active ? "0 0 0 0.5px var(--rule)" : "none",
+                  cursor: disabled ? "not-allowed" : "pointer",
+                }}
+              >
+                {opt.label}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+      {opts.find((o) => o.value === defaultValue)?.hint ? (
+        <div
+          style={{
+            fontSize: 11.5,
+            color: "var(--ink-muted)",
+            fontFamily: "var(--body)",
+          }}
+        >
