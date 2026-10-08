@@ -198,3 +198,203 @@ describe("runDrafterTick (linkedin quality pipeline)", () => {
       expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({
         status: "drafted", meta: expect.objectContaining({ engine: selected, model: `${selected}-model` }),
       }));
+    } finally { review.mockRestore(); }
+  });
+
+  it("does not request or judge a T1 companion DM when auto-DM is disabled", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const review = vi.spyOn(runtime, "verifyTiered").mockResolvedValue({
+      pass: true, judgeOk: true, judgeProvider: "legacy", reasons: [], fix: null,
+      scores: { voice: 1, grounding: 1, relevance: 1, format: 1, novelty: 1, diversity: 1 },
+    });
+    try {
+      await runDrafterTick({ log, instance: { id: "i", org_id: "o", dm_autodraft_enabled: false } as never,
+        claimedLeads: [lead({ tier: "T1" })] as never,
+        runner, kb: kb as never, postOutbound, markStatus,
+        verify: { enabled: true, retries: 0, makeCalls: () => [vi.fn()] },
+      });
+      expect(review.mock.calls.every(([drafts]) => drafts.every((draft) => draft.kind === "reply"))).toBe(true);
+      expect(postOutbound.mock.calls[0]![0].drafts.every((draft: { kind: string }) => draft.kind === "reply")).toBe(true);
+      expect(runner.draft.mock.calls[0]![0].prompt).toMatch(/do not include.*dm/i);
+    } finally { review.mockRestore(); }
+  });
+
+  it("reviews only the cleaned selected light reply and its normalized angle", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    runner.draft.mockResolvedValue({ text: JSON.stringify({ drafts: [
+      { angle: "supportive", body: "First reply 💀" },
+      { angle: "technical", body: "Unused companion" },
+    ] }), engine: "writer", model: "model" });
+    const review = vi.spyOn(runtime, "verifyTiered").mockResolvedValue({
+      pass: true, judgeOk: true, judgeProvider: "legacy", reasons: [], fix: null,
+      scores: { voice: 1, grounding: 1, relevance: 1, format: 1, novelty: 1, diversity: 1 },
+    });
+    try {
+      await runDrafterTick({ log, instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [lead({ classifier_label: "light", tier: null })] as never,
+        runner, kb: kb as never, postOutbound, markStatus,
+        verify: { enabled: true, retries: 0, makeCalls: () => [vi.fn()] },
+      });
+      const queued = postOutbound.mock.calls[0]![0].drafts[0];
+      expect(queued).toMatchObject({ body: "First reply", angle: "empathetic" });
+      expect(review.mock.calls[0]![0]).toEqual([{ kind: "reply", angle: queued.angle, body: queued.body }]);
+    } finally { review.mockRestore(); }
+  });
+
+  it("drops a committing light reply before it reaches outbound", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    runner.draft.mockResolvedValue({ text: JSON.stringify({ drafts: [
+      { angle: "empathetic", body: "I'll send you the demo tomorrow" },
+    ] }), engine: "writer", model: "model" });
+    expect(await runDrafterTick({ log, instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null })] as never,
+      runner, kb: kb as never, postOutbound, markStatus,
+    })).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ status: "skipped" }));
+  });
+
+  it("keeps good replies when the companion DM fails its own bounded voice check", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    runner.draft.mockResolvedValue({ text: JSON.stringify({ ...fullSubstantial, dm: { body: "Curious how you chose this tool?" } }), engine: "bedrock", model: "m" });
+    expect(await runDrafterTick({ log, instance: { id: "i", org_id: "o", dm_autodraft_enabled: true } as never, claimedLeads: [lead()] as never, runner: runner as never, kb: kb as never, postOutbound, markStatus })).toBe(1);
+    expect(runner.draft).toHaveBeenCalledTimes(2);
+    const rows = postOutbound.mock.calls[0]![0].drafts;
+    expect(rows.filter((row: { kind: string }) => row.kind === "reply")).toHaveLength(3);
+    expect(rows.filter((row: { kind: string }) => row.kind === "dm")).toHaveLength(0);
+  });
+
+  it("T1 substantial with auto-DM ON: 3 comment angles + 1 DM", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      // Auto-DM is opt-in (0036) — enable it to exercise the DM path.
+      instance: { id: "i", org_id: "o", dm_autodraft_enabled: true } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(1);
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.platform).toBe("linkedin");
+    const replies = body.drafts.filter((d: { kind: string }) => d.kind === "reply");
+    const dms = body.drafts.filter((d: { kind: string }) => d.kind === "dm");
+    expect(replies).toHaveLength(3);
+    expect(replies.map((r: { angle: string }) => r.angle)).toEqual(["empathetic", "technical", "contrarian"]);
+    expect(dms).toHaveLength(1);
+    expect(dms[0].dmVoiceCheck).toEqual({ pass: true, attempts: 0, reasons: [] });
+  });
+
+  it("T1 with auto-DM OFF (default): 3 comment angles, NO DM", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      // dm_autodraft_enabled absent → opt-in default off → replies only.
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+
+    const body = postOutbound.mock.calls[0]![0];
+    const replies = body.drafts.filter((d: { kind: string }) => d.kind === "reply");
+    const dms = body.drafts.filter((d: { kind: string }) => d.kind === "dm");
+    expect(replies).toHaveLength(3);
+    expect(dms).toHaveLength(0);
+  });
+
+  it("drafts an operator-requested reply with guidance and review tags while bypassing ordinary gates", async () => {
+    const orgId = "11111111-1111-4111-8111-111111111111";
+    const agentInstanceId = "33333333-3333-4333-8333-333333333333";
+    const { postOutbound, runner, kb, markStatus } = deps();
+    kb.search.mockResolvedValue([{ snippet: "anchor", score: 0.1, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] }]);
+    const pinNotification = vi.fn();
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: agentInstanceId, org_id: orgId } as never,
+      claimedLeads: [lead({ classifier_label: "light", classifier_score: 0, payload: { text: "thanks!", url: "https://www.linkedin.com/feed/update/urn:li:activity:123/", source: "notification", authorPublicId: "ada", reply_request: { request_key: "manual-li", instructions: "ask about the database constraint", force_human_review: true } } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      pinNotification,
+      relevanceThreshold: 99,
+      dailyLightCap: 0,
+    });
+
+    expect(n).toBe(1);
+    expect(pinNotification).not.toHaveBeenCalled();
+    expect(runner.draft.mock.calls[0]![0].prompt).toContain("ask about the database constraint");
+    const outbound = postOutbound.mock.calls[0]![0];
+    expect(outbound.owner).toEqual({ orgId, agentInstanceId });
+    expect(outbound.replyRequestKey).toBe("manual-li");
+    expect(outbound.humanReviewRequired).toBe(true);
+    expect(outbound.drafts.every((d: { kind: string }) => d.kind === "reply")).toBe(true);
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ status: "drafted", meta: expect.objectContaining({ reply_request_key: "manual-li" }) }));
+  });
+
+  it("watchlist (priority) lead with low engagement drafts on the default model (sonnet), NOT Opus", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", priority: true })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    // Priority/watchlist no longer forces Opus — only reaction-based tiering does.
+    expect(runner.draft.mock.calls[0]![0].routing.primary.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("low-engagement lead drafts on the default model (sonnet)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", priority: false })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    // DEFAULT_ROUTING.primary is sonnet — the everyday draft model. Opus is
+    // reserved for genuinely high-engagement leads via reaction tiering.
+    expect(runner.draft.mock.calls[0]![0].routing.primary.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("T2 substantial: 2 comment angles (empathetic, technical), NO DM", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_score: 85 })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(1);
+    const body = postOutbound.mock.calls[0]![0];
+    const replies = body.drafts.filter((d: { kind: string }) => d.kind === "reply");
+    const dms = body.drafts.filter((d: { kind: string }) => d.kind === "dm");
+    expect(replies.map((r: { angle: string }) => r.angle)).toEqual(["empathetic", "technical"]);
+    expect(dms).toHaveLength(0);
+  });
+
+  it("T3 substantial: 1 comment angle (empathetic), NO DM", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3", classifier_score: 77 })] as never,
+      runner: runner as never,
+      kb: kb as never,
