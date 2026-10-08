@@ -398,3 +398,133 @@ export async function SpendPanel({ orgId, orgSlug, rangeParam }: SpendPanelProps
                 </div>
                 <div style={{ textAlign: "right", fontFamily: "var(--mono)", fontSize: 13 }}>
                   {formatCents(b.cents)}
+                </div>
+                <div
+                  style={{
+                    textAlign: "right",
+                    fontFamily: "var(--mono)",
+                    fontSize: 12,
+                    color: "var(--ink-muted)",
+                  }}
+                >
+                  {Math.round(pctOfTotal)}% of total
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      </div>
+
+      {/* Apify provider usage — tracked, never capped */}
+      {hasApifyProviderFetch || apifyCents > 0 || apifyUnverifiedCents > 0 ? (
+        <div className="card" style={{ marginTop: 24 }}>
+          <div className="card-h">
+            <h3>Apify provider usage</h3>
+            <span className="tag tag-ok">not counted toward limit</span>
+          </div>
+          <div
+            style={{ color: "var(--ink-muted)", fontSize: 13, marginBottom: 10, maxWidth: "62ch" }}
+          >
+            Usage fetched from Apify for the selected calendar range. Expenses from retired tokens stay included.
+          </div>
+          <div
+            className="stack-phone"
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 110px",
+              gap: 16,
+              alignItems: "center",
+              padding: "14px 0",
+            }}
+          >
+            <div>
+              <div style={{ fontWeight: 500 }}>Fetched provider total</div>
+              <div style={{ marginTop: 4, color: "var(--ink-muted)", fontSize: 12 }}>
+                {formatFetchedAt(apifyProvider.fetchedAt)}
+              </div>
+            </div>
+            <div style={{ textAlign: "right", fontFamily: "var(--mono)", fontSize: 13 }}>
+              {apifyProviderAmount}
+            </div>
+          </div>
+          {apifyUnverifiedCents > 0 ? (
+            <div
+              className="stack-phone"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 110px",
+                gap: 16,
+                alignItems: "center",
+                padding: "14px 0",
+                borderTop: "1px dashed var(--rule-soft)",
+              }}
+            >
+              <div>
+                <div style={{ fontWeight: 500 }}>Run charges · unverified</div>
+                <div style={{ marginTop: 4, color: "var(--ink-muted)", fontSize: 12 }}>
+                  Recorded charges outside the saved provider readings&apos; coverage.
+                </div>
+              </div>
+              <div style={{ textAlign: "right", fontFamily: "var(--mono)", fontSize: 13 }}>
+                {formatCents(apifyUnverifiedCents)}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* X API — flat monthly subscription, tracked apart, never capped */}
+      {xapi.monthlyCostCents > 0 || xapi.postsThisMonth + xapi.repliesThisMonth > 0 ? (
+        <div className="card" style={{ marginTop: 24 }}>
+          <div className="card-h">
+            <h3>X API · {xapi.tier} tier</h3>
+            <span className="tag tag-ok">fixed subscription · not counted toward limit</span>
+          </div>
+          <div
+            style={{ color: "var(--ink-muted)", fontSize: 13, marginBottom: 12, maxWidth: "62ch" }}
+          >
+            Vega&apos;s posts + replies go through the official X API, which bills a flat monthly
+            tier (not per call). Shown here for visibility; it never trips a budget cap or pauses
+            the agent.
+          </div>
+          <div style={{ display: "flex", gap: 28, flexWrap: "wrap", alignItems: "baseline" }}>
+            <div>
+              <span className="serif" style={{ fontSize: 26, lineHeight: 1 }}>
+                {formatCents(xapi.monthlyCostCents)}
+              </span>
+              <span style={{ fontSize: 13, color: "var(--ink-muted)" }}> / month</span>
+            </div>
+            <div style={{ fontFamily: "var(--mono)", fontSize: 13, color: "var(--ink-2)" }}>
+              {xapi.postsThisMonth} post{xapi.postsThisMonth === 1 ? "" : "s"} ·{" "}
+              {xapi.repliesThisMonth} repl{xapi.repliesThisMonth === 1 ? "y" : "ies"}{" "}
+              <span style={{ color: "var(--ink-muted)" }}>written this month</span>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Plan B overflow */}
+      <div className="card" style={{ marginTop: 24, background: "var(--paper-2)" }}>
+        <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
+          <div className="serif" style={{ fontSize: 28, lineHeight: 1 }}>
+            Plan B overflow
+          </div>
+          <div className="plan-b-actions" style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+            <span className="tag tag-ok">
+              <span className="dot dot-ok" /> off
+            </span>
+            <button type="button" className="btn btn-sm" disabled>
+              Configure
+            </button>
+          </div>
+        </div>
+        <div style={{ color: "var(--ink-muted)", fontSize: 13, marginTop: 6, maxWidth: "62ch" }}>
+          When your BYOK subscription hits its rate limit, agents can fall back to Noelle&apos;s API
+          at metered rates. Off by default. Cap and per-agent overrides available.
+        </div>
+      </div>
+    </div>
+  );
+}
