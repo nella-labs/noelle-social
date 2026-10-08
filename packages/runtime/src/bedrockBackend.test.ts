@@ -198,3 +198,70 @@ describe("createBedrockBackend", () => {
   it("attaches a whole-system ephemeral breakpoint when cacheSystem is set", async () => {
     let received: { system?: unknown } | null = null;
     const client = makeMockClient((args) => {
+      received = args;
+      return { content: [{ type: "text", text: "ok" }], usage: { input_tokens: 5, output_tokens: 2 } };
+    });
+    const be = createBedrockBackend({ clientImpl: client! });
+    await be.call({ system: "SYS", prompt: "hi", model: "claude-sonnet-4-6", cacheSystem: true });
+    expect(Array.isArray(received!.system)).toBe(true);
+    const blocks = received!.system as Array<{ type: string; text: string; cache_control?: unknown }>;
+    expect(blocks[0]).toEqual({ type: "text", text: "SYS", cache_control: { type: "ephemeral" } });
+  });
+
+  it("splits the system at systemCachePrefixLen into cached prefix + uncached suffix", async () => {
+    let received: { system?: unknown } | null = null;
+    const client = makeMockClient((args) => {
+      received = args;
+      return { content: [{ type: "text", text: "ok" }], usage: { input_tokens: 5, output_tokens: 2 } };
+    });
+    const be = createBedrockBackend({ clientImpl: client! });
+    await be.call({ system: "ABCDEF", prompt: "hi", model: "claude-sonnet-4-6", systemCachePrefixLen: 3 });
+    expect(received!.system).toEqual([
+      { type: "text", text: "ABC", cache_control: { type: "ephemeral" } },
+      { type: "text", text: "DEF" },
+    ]);
+  });
+
+  it("folds cache-read/creation tokens into input_tokens (never under-counts spend)", async () => {
+    const client = makeMockClient(() => ({
+      content: [{ type: "text", text: "ok" }],
+      usage: { input_tokens: 100, cache_read_input_tokens: 900, cache_creation_input_tokens: 0, output_tokens: 7 },
+    }));
+    const be = createBedrockBackend({ clientImpl: client! });
+    const res = await be.call({ system: "SYS", prompt: "hi", model: "claude-sonnet-4-6", cacheSystem: true });
+    expect(res.usage).toEqual({ input_tokens: 1000, output_tokens: 7 });
+  });
+
+  it("FAILS OPEN: on a cache_control rejection it retries once with the plain string", async () => {
+    const seen: unknown[] = [];
+    let n = 0;
+    const client = makeMockClient((args) => {
+      seen.push(args.system);
+      n += 1;
+      if (n === 1) throw new Error("system.0.cache_control: unexpected field for this model");
+      return { content: [{ type: "text", text: "recovered" }], usage: { input_tokens: 5, output_tokens: 2 } };
+    });
+    const be = createBedrockBackend({ clientImpl: client! });
+    const res = await be.call({ system: "SYS", prompt: "hi", model: "claude-sonnet-4-6", cacheSystem: true });
+    expect(res.text).toBe("recovered");
+    expect(n).toBe(2);
+    // First attempt used the breakpoint array; the retry used the plain string.
+    expect(Array.isArray(seen[0])).toBe(true);
+    expect(seen[1]).toBe("SYS");
+  });
+
+  it("does NOT retry on a non-cache error (surfaces the mapped BedrockError)", async () => {
+    let n = 0;
+    const client = makeMockClient(() => {
+      n += 1;
+      const e = new Error("rate limit") as Error & { status: number };
+      e.status = 429;
+      throw e;
+    });
+    const be = createBedrockBackend({ clientImpl: client! });
+    await expect(
+      be.call({ system: "SYS", prompt: "hi", model: "claude-sonnet-4-6", cacheSystem: true }),
+    ).rejects.toBeInstanceOf(BedrockError);
+    expect(n).toBe(1);
+  });
+});
