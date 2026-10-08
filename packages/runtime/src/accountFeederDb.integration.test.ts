@@ -198,3 +198,44 @@ describe.skipIf(!url)("account corpus measurements (native PostgreSQL)", () => {
     voiceSummary: "Saved writing style", tone: "direct", structureNotes: "short paragraphs",
     hookPatterns: [], signaturePhrases: [], topTopics: [], avgLikeCount: null, avgCommentCount: null,
     postsAnalyzed: 1, samplePostIds: [], model: "test" });
+  it("preserves unknown and fractional measured profile averages", async () => {
+    await upsertAccountUltraProfile(sql, profile());
+    expect((await sql`select avg_like_count,avg_comment_count from noelle.account_ultra_profiles`)[0]).toEqual({ avg_like_count: null, avg_comment_count: null });
+    await upsertAccountUltraProfile(sql, { ...profile(), avgLikeCount: 0, avgCommentCount: 2.5 });
+    expect((await sql`select avg_like_count::text,avg_comment_count::text from noelle.account_ultra_profiles`)[0]).toEqual({ avg_like_count: "0", avg_comment_count: "2.5" });
+  });
+  it("does not admit foreign profile parents or replace a malformed saved profile owner", async () => {
+    const [other] = await sql`insert into noelle.organizations(slug,name) values ('foreign','Foreign') returning id`;
+    await upsertAccountUltraProfile(sql, { ...profile(), orgId: String(other!.id) });
+    expect((await sql`select count(*)::int as n from noelle.account_ultra_profiles`)[0]?.n).toBe(0);
+    await sql`insert into noelle.account_ultra_profiles(org_id,agent_instance_id,platform,account_handle,voice_summary)
+      values (${other!.id},${instanceId},'x','source','Foreign saved style')`;
+    await upsertAccountUltraProfile(sql, profile());
+    expect((await sql`select voice_summary from noelle.account_ultra_profiles`)[0]?.voice_summary).toBe("Foreign saved style");
+  });
+  it.each(["corpus", "profile", "embedding"])("checks the fresh parent after a concurrent org move for %s writes", async kind => {
+    let postId = "";
+    if (kind === "embedding") { await write(); postId = (await listUnembeddedStylePosts(sql, instanceId, 1))[0]!.id; }
+    const [other] = await sql`insert into noelle.organizations(slug,name) values ('foreign','Foreign') returning id`;
+    let ready!: () => void;
+    let release!: () => void;
+    const acquired = new Promise<void>(resolve => { ready = resolve; });
+    const unlocked = new Promise<void>(resolve => { release = resolve; });
+    const moving = sql.begin(async tx => { await tx`update noelle.agent_instances set org_id=${other!.id} where id=${instanceId}`; ready(); await unlocked; });
+    await acquired;
+    let finished = false;
+    const writing = (kind === "corpus" ? write() : kind === "profile" ? upsertAccountUltraProfile(sql, profile())
+      : updateStylePostEmbeddings(sql, [{ id: postId, body: "Saved source text", embedding: [1, ...Array(1023).fill(0) as number[]] }])).finally(() => { finished = true; });
+    const observer = postgres(url!, { max: 1 });
+    try {
+      await vi.waitFor(async () => {
+        if (finished) return;
+        const [waiting] = await observer`select count(*)::int as n from pg_stat_activity
+          where datname=current_database() and wait_event_type='Lock' and query like '%account_%'`;
+        expect(waiting?.n).toBeGreaterThan(0);
+      });
+    } finally { release(); await moving; await writing; await observer.end({ timeout: 0 }); }
+    if (kind === "embedding") expect((await sql`select embedding from noelle.account_style_posts where id=${postId}`)[0]?.embedding).toBeNull();
+    else expect((await sql`select (select count(*) from noelle.account_style_posts)+(select count(*) from noelle.account_ultra_profiles) as n`)[0]?.n).toBe("0");
+  });
+});

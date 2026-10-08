@@ -198,3 +198,162 @@ describe("humanizeTypos — each kind", () => {
       "the aardvark kept eating the whole batch of ants honestly",
       "success needs the queue to drain before the batch lands here",
       "committee meetings ran over again and nobody shipped a thing",
+      "the migration ran clean but the rollback still scares me honestly",
+    ];
+    for (const body of bodies) {
+      for (let seed = 1; seed <= 60; seed++) {
+        const out = humanizeTypos(body, { rate: 1, rng: makeLcg(seed) });
+        expect(out.body).not.toMatch(/([a-z])\1\1/);
+      }
+    }
+  });
+});
+
+describe("humanizeTypos — what it must never touch", () => {
+  it("does not duplicate not into a double negative", () => {
+    const body = "we do not charge customers before they approve the invoice";
+    const out = humanizeTypos(body, { rate: 1, rng: forceKind("DOUBLE_WORD", 0.3) });
+    expect(out.body.match(/\bnot\b/g)).toHaveLength(1);
+  });
+
+  it.each([
+    "no", "not", "never", "none", "nobody", "nothing", "neither", "nor", "without", "cannot",
+    "can't", "won't", "don't", "doesn't", "didn't", "isn't", "aren't", "wasn't", "weren't",
+    "shouldn't", "wouldn't", "couldn't", "mustn't", "hasn't", "haven't", "hadn't", "needn't", "ain't",
+  ])("preserves the negation token %s across kinds and seeds", (negation) => {
+    const body = `we ${negation} change the billing contract before customers approve the invoice`;
+    for (let seed = 1; seed <= 120; seed++) {
+      for (const { kind } of TYPO_VARIANTS) {
+        const next = makeLcg(seed);
+        const out = humanizeTypos(body, { rate: 1, rng: forceKind(kind, next(), next(), next()) });
+        expect(out.body.split(/\s+/).filter((token) => token === negation), `${kind} @${seed}`)
+          .toHaveLength(1);
+      }
+    }
+  });
+
+  it("never mutates a handle, a hashtag, a URL, a domain, or a number", () => {
+    const body = "shipped @noelle on getnella.dev with 12 users see https://x.com/foo #build";
+    const rng = makeLcg(3);
+    for (let i = 0; i < 2000; i++) {
+      const out = humanizeTypos(body, { rate: 1, rng });
+      expect(out.body).toContain("@noelle");
+      expect(out.body).toContain("getnella.dev");
+      expect(out.body).toContain("https://x.com/foo");
+      expect(out.body).toContain("#build");
+      expect(out.body).toContain("12");
+    }
+  });
+
+  it("never mutates a capitalised proper noun", () => {
+    const body = "we moved Nella onto Cloud Run and the cold start got worse honestly";
+    const rng = makeLcg(5);
+    for (let i = 0; i < 2000; i++) {
+      const out = humanizeTypos(body, { rate: 1, rng });
+      expect(out.body).toContain("Nella");
+      expect(out.body).toContain("Cloud");
+      expect(out.body).toContain("Run");
+    }
+  });
+
+  it("never mutates the first or the last token", () => {
+    const rng = makeLcg(13);
+    const first = SENTENCE.split(" ")[0]!;
+    const last = SENTENCE.split(" ").at(-1)!;
+    for (let i = 0; i < 2000; i++) {
+      const out = humanizeTypos(SENTENCE, { rate: 1, rng });
+      expect(out.body.split(" ")[0]).toBe(first);
+      expect(out.body.split(" ").at(-1)).toBe(last);
+    }
+  });
+
+  it("declines a reply too short to carry a believable slip", () => {
+    const out = humanizeTypos("eaten by wolves is wild", { rate: 1, rng: () => 0 });
+    expect(out.applied).toBeNull();
+    expect(humanizeTypos("brutal", { rate: 1, rng: () => 0 }).applied).toBeNull();
+  });
+
+  it("declines rather than exceeding maxLength", () => {
+    // A body one char under the cap: DOUBLE_WORD would blow past it.
+    const body = "the deploy went fine but the alerting never fired at all so nobody knew";
+    const out = humanizeTypos(body, {
+      rate: 1,
+      rng: forceKind("DOUBLE_WORD", 0),
+      maxLength: body.length,
+    });
+    expect(out.applied).not.toBe("DOUBLE_WORD");
+    expect(out.body.length).toBeLessThanOrEqual(body.length);
+  });
+
+  it("respects maxLength across many random draws", () => {
+    const body = "the deploy went fine but the alerting never fired at all so nobody knew";
+    const rng = makeLcg(17);
+    for (let i = 0; i < 2000; i++) {
+      const out = humanizeTypos(body, { rate: 1, rng, maxLength: 280 });
+      expect(out.body.length).toBeLessThanOrEqual(280);
+    }
+  });
+
+  it("ships a body clean when no token is safe to mutate", () => {
+    const body = "@a @b @c @d @e @f";
+    const out = humanizeTypos(body, { rate: 1, rng: () => 0 });
+    expect(out.body).toBe(body);
+    expect(out.applied).toBeNull();
+  });
+});
+
+describe("typoRateFromEnv", () => {
+  it("defaults to 18%", () => {
+    expect(typoRateFromEnv({})).toBe(DEFAULT_TYPO_RATE);
+    expect(DEFAULT_TYPO_RATE).toBe(0.18);
+  });
+
+  it("NOELLE_HUMAN_TYPOS=0 turns the pass off", () => {
+    expect(typoRateFromEnv({ NOELLE_HUMAN_TYPOS: "0" })).toBe(0);
+  });
+
+  it("honours a valid explicit rate", () => {
+    expect(typoRateFromEnv({ NOELLE_HUMAN_TYPO_RATE: "0.25" })).toBe(0.25);
+    expect(typoRateFromEnv({ NOELLE_HUMAN_TYPO_RATE: "0" })).toBe(0);
+  });
+
+  it("falls back to the default on a malformed rate", () => {
+    expect(typoRateFromEnv({ NOELLE_HUMAN_TYPO_RATE: "nope" })).toBe(DEFAULT_TYPO_RATE);
+    expect(typoRateFromEnv({ NOELLE_HUMAN_TYPO_RATE: "7" })).toBe(DEFAULT_TYPO_RATE);
+    expect(typoRateFromEnv({ NOELLE_HUMAN_TYPO_RATE: "-1" })).toBe(DEFAULT_TYPO_RATE);
+  });
+});
+
+describe("humanizeTypos — never INVENTS an offensive word", () => {
+  // KEY_NEIGHBOR is the first kind that SUBSTITUTES a letter, which makes
+  // real-word collisions reachable. Enumerated, not hypothesised: with o -> i on
+  // the same QWERTY row, "shot" -> "shit", and "duck"/"dock" -> "dick". Orion
+  // auto-sends, so there is no human between that and the subreddit.
+  const HAZARDS = [
+    "we took a decent shot at the whole retry problem honestly",
+    "the duck typing in that module keeps biting us on deploys",
+    "every dock worker script in the repo assumes the old path",
+  ];
+
+  it("never produces shit/dick from a clean body, swept over kinds and seeds", () => {
+    for (const body of HAZARDS) {
+      for (let seed = 1; seed <= 400; seed++) {
+        const out = humanizeTypos(body, { rate: 1, rng: makeLcg(seed) });
+        expect(out.body, `${body} @${seed}`).not.toMatch(/\b(shit|dick|cunt|fuck|retard)\b/);
+      }
+    }
+  });
+
+  it("does not FREEZE a body that already contains one — it censors invention, not speech", () => {
+    // The guard compares the word sets before and after, so a body that already
+    // says it is still mutable: only a word that was NOT there before and IS
+    // there after is refused. Asserting "the word survives" would be wrong,
+    // because a slip may legitimately land on that very word.
+    const body = "honestly the whole retry thing is shit and i said so twice";
+    let mutated = 0;
+    for (let seed = 1; seed <= 60; seed++) {
+      if (humanizeTypos(body, { rate: 1, rng: makeLcg(seed) }).applied) mutated++;
+    }
+    expect(mutated).toBeGreaterThan(0);
+  });
+});
