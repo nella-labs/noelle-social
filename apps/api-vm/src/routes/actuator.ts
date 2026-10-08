@@ -1198,3 +1198,203 @@ const actionableX: Handler<{ Variables: { actuator: ActuatorContext } }> = async
   const sql = noelleDb();
 
   // Verify the instance belongs to the configured actuator org (tenancy).
+  const owns = await sql<Array<{ id: string; reply_send_enabled: boolean; auto_send_enabled: boolean; actuator_daily_reply_cap: number | null }>>`
+    select id, reply_send_enabled, auto_send_enabled, actuator_daily_reply_cap from noelle.agent_instances
+    where id = ${instanceId} and org_id = ${orgId} limit 1
+  `;
+  if (owns.length === 0) return c.json({ error: "instance_not_in_org" }, 403);
+  // Consent gate, two flags, both OFF by default (serve an empty queue — still
+  // 200 so the extension keeps polling):
+  //   - reply_send_enabled (0081): per-run consent, set from the dashboard.
+  //   - auto_send_enabled: STANDING lights-out consent, set from the dashboard
+  //     and never touched by the extension — this is what lets the extension's
+  //     unattended auto-start/auto-drain paths (which deliberately never arm
+  //     reply_send_enabled) serve a queue.
+  // CAUTION — unlike LinkedIn (where the column is inert for Lyra),
+  // auto_send_enabled on X is ALSO the live consent for the x-intern API
+  // autosend pipeline (drafter-tick stamps auto_send_target_at under it;
+  // send-db claimAutoSendDue posts stamped rows via the official API). One flag
+  // therefore arms TWO unattended senders, so the pool is PARTITIONED by
+  // auto_send_target_at: stamped approvals belong to API autosend and are
+  // excluded below (SQL `auto_send_target_at is null` + the buildActionableX
+  // guard); only unstamped inbox rows are ever served here. The extension
+  // additionally re-verifies each approval via /api/actuator/approval-state/:id
+  // right before posting, closing the mid-session stamp/claim race.
+  // pauseAllSending clears BOTH, so the panic stop stays a real org-wide kill.
+  // Every withhold gate below (challenge breaker, daily write cap) applies to
+  // both consent paths unchanged.
+  if (owns[0]!.reply_send_enabled !== true && owns[0]!.auto_send_enabled !== true) {
+    return c.json(ActionableXResponseSchema.parse({ replies: [] }));
+  }
+
+  // Circuit-breaker: if the actuator recorded an X bot-challenge in the last
+  // hour, halt this org's send queue — replying into a live challenge is the
+  // fast path to a lock and nobody is watching. Fail-CLOSED: a query error
+  // halts. Auto-recovers once the hour elapses with no new challenge. Flag
+  // defaults OFF (opt-in); enable with '1'/'true'.
+  const haltOnChallenge =
+    process.env.NOELLE_X_ACTUATOR_HALT_ON_CHALLENGE === "1" ||
+    process.env.NOELLE_X_ACTUATOR_HALT_ON_CHALLENGE === "true";
+  if (haltOnChallenge) {
+    let recentChallenges: number | null = null;
+    try {
+      const chal = await sql<Array<{ n: number }>>`
+        select count(*)::int as n from noelle.x_activity
+        where org_id = ${orgId}
+          and reason = 'challenge'
+          and created_at >= now() - interval '1 hour'
+      `;
+      recentChallenges = chal[0]?.n ?? 0;
+    } catch (e) {
+      console.warn("[actuator] x challenge-halt check failed; failing closed",
+        (e as Error).message);
+      recentChallenges = null; // fail closed
+    }
+    if (shouldHaltForChallenge({ flagEnabled: true, recentChallengeCount: recentChallenges })) {
+      console.warn("[actuator] X send HALTED: recent bot-challenge",
+        { org_id: orgId, recentChallenges });
+      return c.json(ActionableXResponseSchema.parse({ replies: [] }));
+    }
+  }
+
+  // TODO(parity): the LinkedIn queue also has a server-side send-window floor
+  // and an unattended-autosend verifier gate. Mirror them here when the X
+  // actuator moves toward fully lights-out operation.
+
+  // Reply-freshness ceiling (X_REPLY_MAX_AGE_HOURS, default 25; 0 = off): never
+  // ACTUATE a reply to a tweet older than the ceiling. The drafter already
+  // refuses to draft stale tweets and expires stale pending approvals, but this
+  // is the definitive belt at the actuation chokepoint — it closes the window
+  // between a tweet aging out and the next drafter expiry tick. Same env name +
+  // default as x-intern so one ~/.noelle/.env value drives both. Fail-open on an
+  // undateable posted_at (matches the drafter's leadAge policy).
+  const maxAgeHours = resolveXReplyMaxAgeHours(process.env.X_REPLY_MAX_AGE_HOURS);
+
+  // Newest-POST-first: sort by the tweet's snowflake id (time-ordered), NOT by
+  // approval created_at (= newest DRAFT). The client consumes commentPool
+  // front-to-back, so front = freshest tweet — what "drain newest first" needs.
+  // The regex guard keeps a non-numeric/legacy external_id from breaking the
+  // numeric cast; those sort last, then by draft recency.
+  const rows = await sql<XJoinedRow[]>`
+    select
+      a.id            as approval_id,
+      d.id            as draft_id,
+      l.id            as lead_id,
+      d.payload       as draft_payload,
+      l.payload       as lead_payload,
+      l.external_id   as lead_external_id,
+      l.author_handle as author_handle,
+      l.external_id   as external_id,
+      a.auto_send_target_at as auto_send_target_at
+    from noelle.approvals a
+    join noelle.drafts d on d.id = a.draft_id
+    join noelle.leads  l on l.id = d.lead_id
+    where a.agent_instance_id = ${instanceId}
+      and a.org_id = ${orgId} and l.platform = 'x'
+      and ${replyApprovalContextSql(sql)}
+      and a.status = 'pending'
+      -- Partition: a stamped approval is owned by the x-intern API-autosend
+      -- pipeline (claimAutoSendDue will claim + post it). Never serve it to the
+      -- browser actuator — two senders on one approval = duplicate public reply.
+      -- Excluded here so stamped rows don't eat into the LIMIT; buildActionableX
+      -- re-checks (unit-tested belt).
+      and a.auto_send_target_at is null
+      and l.platform = 'x'
+      and ${unattendedReplyReviewSql(sql, sql`d.payload`)}
+      ${priorityOnly ? sql`and l.payload->>'source' = 'extension_observed'
+        and l.payload->'classifier'->>'judge' = 'jev'` : sql``}
+      -- Freshness: withhold a reply whose target tweet aged out (fail-open on
+      -- undateable posted_at). Belt for the drafter-side expiry sweep.
+      ${
+        maxAgeHours > 0
+          ? sql`and (
+              (l.payload->>'source' = 'extension_observed'
+                and l.payload->'classifier'->>'judge' = 'jev')
+              or
+              ${sourceTimestampSql(sql, sql`l.payload->>'posted_at'`)} is null
+              or ${sourceTimestampSql(sql, sql`l.payload->>'posted_at'`)} >= ${xReplyAgeCutoffSql(sql, sql`l.payload`, maxAgeHours)}
+            )`
+          : sql``
+      }
+    order by
+      (case when l.external_id ~ '^[0-9]+$' then l.external_id::numeric else null end) desc nulls last,
+      a.created_at desc
+    limit 500 -- TODO: paginate if a pending queue ever exceeds this
+  `;
+  // External-link guard (default ON): withhold any reply whose body carries a
+  // non-x.com/twitter.com/t.co link — a top-tier spam signal. Off via "0".
+  const blockExternalLinks = (process.env.NOELLE_X_ACTUATOR_BLOCK_EXTERNAL_LINKS ?? "1") !== "0";
+  const out = buildActionableX(
+    priorityOnly ? rows.filter(isPriorityReadyXRow) : rows,
+    (reason, r) => console.warn("[actuator] x item omitted:", reason, { approval_id: r.approval_id, draft_id: r.draft_id }),
+    { blockExternalLinks },
+  );
+
+  // Persistent dedup-by-link (always on): never serve a reply for a tweet
+  // already replied to — OR possibly replied to — any session, any lead, any
+  // prior markSent outcome. Keyed on the tweet id; see fetchXRepliedTweetIds
+  // for the two unioned sources ('sent' approvals + tweet_id-stamped
+  // x_activity rows, INCLUDING the ambiguous-dropped skip rows, so a dispatched
+  // submit that was never confirmed is not re-served and re-posted days later).
+  // Fail CLOSED: a re-reply on someone's tweet is the exact spam we're
+  // preventing, so on a query error serve nothing (still 200 so the extension
+  // keeps polling).
+  let deduped: ActionableXResponse = out;
+  try {
+    const repliedIds = await fetchXRepliedTweetIds(sql, orgId, out.replies.flatMap(reply => reply.target.tweet_id ? [reply.target.tweet_id] : []));
+    deduped = dedupeAlreadyRepliedX(out, repliedIds);
+    const dropped = out.replies.length - deduped.replies.length;
+    if (dropped > 0) {
+      console.warn("[actuator] x dedup-by-link: dropped already-replied tweets", { org_id: orgId, dropped });
+    }
+  } catch (err) {
+    console.error("[actuator] x dedup-by-link query failed; serving empty queue", err);
+    return c.json(ActionableXResponseSchema.parse({ replies: [] }));
+  }
+
+  // Per-author daily cap (opt-in; no-op unless NOELLE_X_ACTUATOR_PER_AUTHOR_DAILY_CAP
+  // is set). Runs BEFORE the global daily-write-cap trim so it strictly tightens
+  // the queue. Don't reply-bomb one account (docs/x-account-safety.md §3).
+  let served: ActionableXResponse = deduped;
+  const perAuthorRaw = process.env.NOELLE_X_ACTUATOR_PER_AUTHOR_DAILY_CAP;
+  if (perAuthorRaw != null && perAuthorRaw.trim() !== "") {
+    const parsed = Number(perAuthorRaw);
+    const cap = Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : 1; // fail-safe
+    try {
+      const writtenRows = await sql<Array<{ author_handle: string | null; n: number }>>`
+        select lower(l2.author_handle) as author_handle, count(distinct a2.id)::int as n
+        from noelle.x_activity act
+        join noelle.approvals a2 on a2.id = act.approval_id
+        join noelle.leads     l2 on l2.id = a2.lead_id
+        where act.org_id = ${orgId}
+          and act.type = 'reply'
+          and act.created_at >= date_trunc('day', now())
+        group by lower(l2.author_handle)
+      `;
+      const writtenCounts = new Map(writtenRows.filter((r) => r.author_handle).map((r) => [r.author_handle!, r.n]));
+      served = capActionableXPerAuthor(deduped, rows, { cap, writtenCounts });
+      const withheld = deduped.replies.length - served.replies.length;
+      if (withheld > 0) console.warn("[actuator] x per-author cap trim", { org_id: orgId, cap, withheld });
+    } catch (err) {
+      // Fail CLOSED: can't determine who was replied-to today → serve nothing (still 200 so the extension keeps polling).
+      console.error("[actuator] x per-author cap query failed; serving empty queue", err);
+      return c.json(ActionableXResponseSchema.parse({ replies: [] }));
+    }
+  }
+
+  // Server-side daily write-cap backstop. Client caps are advisory (a tampered
+  // or misconfigured extension can exceed them), so refuse to serve replies
+  // beyond the org's remaining daily write budget. Default 40 — X pacing is
+  // tighter than LinkedIn's (docs/x-actuator-plan.md: 20-40 replies/day), so
+  // unlike LinkedIn (unset ⇒ unlimited since PR #426) the X cap stays ON when
+  // the env is unset; lifting it requires the explicit sentinel
+  // NOELLE_X_ACTUATOR_DAILY_WRITE_CAP=off (or "unlimited"). When unlimited,
+  // skip the usage count entirely (nothing to compare against).
+  const policy = await readXBrowserReplyCap(sql, { orgId, instanceId });
+  if (!policy) return c.json(ActionableXResponseSchema.parse({ replies: [] }));
+  const dailyCap = policy.cap ?? Number.POSITIVE_INFINITY;
+  const used = dailyCap === Number.POSITIVE_INFINITY
+    ? 0
+    : await readXBrowserReplyUsage(sql, orgId);
+  const remaining = Math.max(0, dailyCap - used);
+  if (served.replies.length > remaining) {
