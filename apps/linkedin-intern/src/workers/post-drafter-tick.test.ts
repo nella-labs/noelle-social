@@ -198,3 +198,203 @@ describe("runPostDrafterTick", () => {
       draft: vi.fn().mockResolvedValue({ text: "not json", engine: "b", model: "m" }),
     };
     const sink = vi.fn();
+    const release = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 2,
+      sink,
+      release,
+    });
+
+    expect(n).toBe(0);
+    expect(sink).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledWith("idea-1");
+  });
+
+  it("runs the verifier and attaches a verdict when judges are provided", async () => {
+    const goodPost = JSON.stringify({ body: "I hire juniors. They compound fast." });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: goodPost, engine: "b", model: "m" }),
+    };
+    // A judge that passes everything.
+    const passJudge = vi.fn().mockResolvedValue(
+      JSON.stringify({
+        voice: 0.9,
+        grounding: 0.9,
+        relevance: 0.9,
+        reasons: ["on voice"],
+      }),
+    );
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d1" });
+
+    const n = await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [passJudge],
+      verifyRetries: 2,
+      sink,
+      release: vi.fn(),
+    });
+
+    expect(n).toBe(1);
+    expect(passJudge).toHaveBeenCalled();
+    const sunk = sink.mock.calls[0]![0];
+    expect(sunk.verifierMeta).not.toBeNull();
+    expect(sunk.verifierMeta.judgeOk).toBe(true);
+    expect(sunk.verifierMeta.judgeProvider).toBe("legacy");
+    expect(typeof sunk.qualityPassed).toBe("boolean");
+  });
+
+  it("fresh generate fans out into 3 X versions + 1 LinkedIn", async () => {
+    const runner = {
+      draft: vi
+        .fn()
+        .mockResolvedValue({ text: JSON.stringify({ body: "a post" }), engine: "b", model: "m" }),
+    };
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d" });
+    const clearPending = vi.fn().mockResolvedValue(undefined);
+    const release = vi.fn();
+
+    const n = await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [{ ...idea, targetPlatforms: ["linkedin", "x"], pendingPlatforms: null }],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 2,
+      sink,
+      release,
+      clearPending,
+    });
+
+    // "the three posts for X, and the linkedin post": X yields 3 versions, LI 1.
+    expect(n).toBe(4);
+    const platforms = sink.mock.calls.map((c) => c[0]!.platform).sort();
+    expect(platforms).toEqual(["linkedin", "x", "x", "x"]);
+    // Each platform got its OWN system prompt (X is ruthlessly short; LinkedIn is not).
+    const systems = runner.draft.mock.calls.map((c) => c[0]!.system as string);
+    expect(systems.some((s) => s.includes("X (Twitter) posts") && s.includes("HARD CAP 280"))).toBe(
+      true,
+    );
+    expect(
+      systems.some(
+        (s) => s.includes("You write LinkedIn posts") && !s.includes("X (Twitter) posts"),
+      ),
+    ).toBe(true);
+    expect(clearPending).toHaveBeenCalledWith("idea-1");
+    expect(release).not.toHaveBeenCalled();
+  });
+
+  it("pending_platforms scopes a regen to a subset (X only)", async () => {
+    const runner = {
+      draft: vi
+        .fn()
+        .mockResolvedValue({ text: JSON.stringify({ body: "x post" }), engine: "b", model: "m" }),
+    };
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d" });
+    const clearPending = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [{ ...idea, targetPlatforms: ["linkedin", "x"], pendingPlatforms: ["x"] }],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 2,
+      sink,
+      release: vi.fn(),
+      clearPending,
+    });
+
+    expect(n).toBe(1);
+    expect(sink.mock.calls[0]![0]!.platform).toBe("x");
+    expect(clearPending).toHaveBeenCalledWith("idea-1");
+  });
+
+  it("a single platform parse-fail keeps the other platform's draft (no release)", async () => {
+    // LinkedIn (first in target order) returns valid JSON; X returns junk → only
+    // the LinkedIn draft lands and the idea is NOT released (one platform won).
+    const runner = {
+      draft: vi
+        .fn()
+        .mockResolvedValueOnce({
+          text: JSON.stringify({ body: "li post" }),
+          engine: "b",
+          model: "m",
+        })
+        .mockResolvedValueOnce({ text: "not json", engine: "b", model: "m" }),
+    };
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d" });
+    const release = vi.fn();
+    const clearPending = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [{ ...idea, targetPlatforms: ["linkedin", "x"], pendingPlatforms: null }],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 2,
+      sink,
+      release,
+      clearPending,
+    });
+
+    expect(n).toBe(1);
+    expect(sink.mock.calls[0]![0]!.platform).toBe("linkedin");
+    expect(release).not.toHaveBeenCalled();
+    expect(clearPending).toHaveBeenCalledWith("idea-1");
+  });
+
+  it("verifies and regenerates MCP posts as original posts", async () => {
+    const runner = {
+      draft: vi
+        .fn()
+        .mockResolvedValueOnce({
+          text: JSON.stringify({ body: "first post" }),
+          engine: "b",
+          model: "m",
+        })
+        .mockResolvedValueOnce({
+          text: JSON.stringify({ body: "better post" }),
+          engine: "b",
+          model: "m",
+        }),
+    };
+    const judge = vi
+      .fn()
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          voice: 0.4,
+          grounding: 0.9,
+          relevance: 0.9,
+          reasons: ["too generic"],
+          fix: "make the original post more specific",
+        }),
+      )
+      .mockResolvedValueOnce(
+        JSON.stringify({ voice: 0.9, grounding: 0.9, relevance: 0.9, reasons: [], fix: null }),
+      );
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d1" });
+
+    await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [
+        {
+          ...idea,
+          generationRequestId: "11111111-1111-1111-1111-111111111111",
+          generationReviewRequired: true,
+        },
