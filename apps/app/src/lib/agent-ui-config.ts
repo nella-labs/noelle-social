@@ -198,3 +198,155 @@ const LINKEDIN_INTERN: AgentUiConfig = {
         title:
           "Only draft for posts newer than N hours (both lanes). Empty = no window.",
         min: 1,
+        max: 168,
+        nullable: true,
+      },
+      {
+        key: "postsPerSource",
+        label: "Posts per connection",
+        placeholder: "20",
+        title: "How many recent posts to sweep per watched connection each tick (5–100).",
+        min: 5,
+        max: 100,
+        nullable: false,
+      },
+      {
+        key: "minReactions",
+        label: "Min reactions",
+        placeholder: "none",
+        title:
+          "Reaction floor: filters the watch lane AND sets the search lane's high-engagement floor (a default applies when empty).",
+        min: 0,
+        max: 1_000_000,
+        nullable: true,
+      },
+      {
+        key: "minComments",
+        label: "Min comments",
+        placeholder: "none",
+        title: "Skip watched-connection posts below this comment count.",
+        min: 0,
+        max: 1_000_000,
+        nullable: true,
+      },
+    ],
+    tailorBooleans: [],
+    tailorLang: false,
+    tailorFootnote:
+      "Applies to the next run only. Lyra sweeps watched connections AND searches your keywords; the window + engagement floors decide which posts earn a draft. Edit the saved default under Configure agent → Discovery.",
+  },
+  watchlist: {
+    title: "Watchlist",
+    helper:
+      "Two lanes. People are connections Lyra always watches — every new post earns a drafted reply. Keywords are topics she searches LinkedIn-wide for high-engagement posts from outside your network. Pick an objective to steer how she engages.",
+    summary:
+      "Connections Lyra always replies to, plus the keywords she searches LinkedIn-wide for high-engagement posts. She drafts replies only (DMs off by default) and never posts.",
+    objectives: true,
+    add: { fieldLabel: "LinkedIn URL or handle", placeholder: "linkedin.com/in/patio11" },
+  },
+};
+
+const REDDIT_INTERN: AgentUiConfig = {
+  role: "reddit_intern",
+  supportsSendQueue: false,
+  pipeline: {
+    goalNoun: "threads with reply drafts ready",
+    drafterRole: "drafts the reply (never posts)",
+    pausedNote:
+      "Paused — Orion is asleep. Its only lane is the subreddit watchlist, so discovery, the classifier, and the drafter all stop until you start it again. (No profiler, no DMs — those are LinkedIn-only.)",
+    // Reddit discovery sweeps a subreddit watchlist over the Apify Reddit actor
+    // (posted-at + score/comment counts). A time window + engagement floors
+    // apply, mirroring LinkedIn's two-number model (no retweet/reply/lang
+    // operators — those are X search syntax).
+    tailorFields: [
+      {
+        key: "timeWindowHours",
+        label: "Posts from the last (hours)",
+        placeholder: "any time",
+        title:
+          "Only draft for threads newer than N hours. Empty = no window.",
+        min: 1,
+        max: 168,
+        nullable: true,
+      },
+      {
+        key: "postsPerSource",
+        label: "Posts per subreddit",
+        placeholder: "20",
+        title: "How many recent threads to sweep per watched subreddit each tick (5–100).",
+        min: 5,
+        max: 100,
+        nullable: false,
+      },
+      {
+        key: "minReactions",
+        label: "Min upvotes",
+        placeholder: "none",
+        title:
+          "Upvote floor: skip threads below this score. A default applies when empty.",
+        min: 0,
+        max: 1_000_000,
+        nullable: true,
+      },
+      {
+        key: "minComments",
+        label: "Min comments",
+        placeholder: "none",
+        title: "Skip threads below this comment count.",
+        min: 0,
+        max: 1_000_000,
+        nullable: true,
+      },
+    ],
+    tailorBooleans: [],
+    tailorLang: false,
+    tailorFootnote:
+      "Applies to the next run only. Orion sweeps your watched subreddits; the window + engagement floors decide which threads earn a draft. Edit the saved default under Configure agent → Discovery.",
+  },
+  watchlist: {
+    title: "Subreddits",
+    helper:
+      "The subreddits Orion watches. Every in-ICP thread in one earns a drafted reply. Give a subreddit an objective to steer how Orion engages, and a min score to skip low-signal threads.",
+    summary:
+      "The subreddits Orion sweeps for in-ICP threads. She drafts on-brand replies and auto-sends the approved ones via the Reddit actuator.",
+    objectives: true,
+    add: { fieldLabel: "subreddit", placeholder: "SaaS" },
+  },
+};
+
+const VIDEO_INTERN: AgentUiConfig = {
+  role: "video_intern",
+  supportsSendQueue: false,
+  pipeline: {
+    goalNoun: "top videos harvested + analysed",
+    drafterRole: "scripts the video (never posts)",
+    pausedNote:
+      "Paused — Nova is asleep. Harvest + analysis only run when you trigger them, so nothing happens until you start it again.",
+    tailorFields: [],
+    tailorBooleans: [],
+    tailorLang: false,
+    tailorFootnote:
+      "Nova tunes via its harvest filters (top-by-views, outperformers, niche-trending) on the watchlist, not a per-run form.",
+  },
+  watchlist: {
+    title: "Creators",
+    helper:
+      "The IG/TikTok creators Nova studies, plus niche keyword/hashtag lanes. Each harvest pulls their top-performing reels (by your filters) and breaks down what makes them work.",
+    summary:
+      "The creators + niches Nova learns from. It harvests their top videos, distils a Video Brand Guide, and helps you script your own. Never posts.",
+    objectives: false,
+    add: { fieldLabel: "creator handle", placeholder: "chrisdoesviral" },
+  },
+};
+
+export const AGENT_UI: Record<InternRole, AgentUiConfig> = {
+  x_intern: X_INTERN,
+  linkedin_intern: LINKEDIN_INTERN,
+  reddit_intern: REDDIT_INTERN,
+  video_intern: VIDEO_INTERN,
+};
+
+/** Resolve the UI config for an instance role; null for non-intern roles. */
+export function agentUiFor(role: string | null | undefined): AgentUiConfig | null {
+  return isInternRole(role) ? AGENT_UI[role] : null;
+}
