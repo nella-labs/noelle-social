@@ -1198,3 +1198,203 @@ describe("runDrafterTick", () => {
     const markStatus = vi.fn().mockResolvedValue(undefined);
 
     const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L2", external_id: "x2", payload: { text: "" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith({ leadId: "L2", status: "skipped", meta: { skip_reason: "empty post text" } });
+  });
+
+  it("marks lead as errored when drafter output schema fails", async () => {
+    const postOutbound = vi.fn();
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: "not valid json", engine: "codex", model: "gpt-5" }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L3", external_id: "x3", payload: { text: "some text" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith({ leadId: "L3", status: "errored", meta: { error: "schema" } });
+  });
+
+  it("keeps browser schema retries on Codex and recovers a malformed first draft", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "b", approval_id: "b" });
+    const draft = vi
+      .fn()
+      .mockResolvedValueOnce({ text: '{"drafts": [', engine: "codex", model: "gpt-5" })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e", char_count: 1 },
+            { angle: "technical", body: "t", char_count: 1 },
+            { angle: "contrarian", body: "c", char_count: 1 },
+          ],
+        }),
+        engine: "codex",
+        model: "gpt-5",
+      });
+    const runner = { draft };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L5", external_id: "x5", payload: { text: "some post text", source: "extension_observed" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(draft).toHaveBeenCalledTimes(2);
+    expect(draft.mock.calls.map((call) => call[0].codexSubscriptionOnly)).toEqual([true, true]);
+    expect(n).toBe(1);
+    expect(postOutbound).toHaveBeenCalled();
+    expect(markStatus).not.toHaveBeenCalledWith(expect.objectContaining({ status: "errored" }));
+  });
+
+  it("drafts successfully with markdown-fenced JSON", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "b", approval_id: "b" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: "```json\n" + JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e", char_count: 1 },
+            { angle: "technical", body: "t", char_count: 1 },
+            { angle: "contrarian", body: "c", char_count: 1 },
+          ],
+        }) + "\n```",
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L4", external_id: "x4", payload: { text: "some post text" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.drafts).toHaveLength(3);
+  });
+
+  it("treats {drafts:[{angle:'skip',body:'...'}]} as a skip, not a schema error", async () => {
+    const postOutbound = vi.fn();
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [{ angle: "skip", body: "SKIP: no nella connection — post is unrelated.", char_count: 1 }],
+        }),
+        engine: "bedrock",
+        model: "claude-sonnet-4-6",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "Lskip", external_id: "xskip", payload: { text: "irrelevant post" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ status: "skipped" }));
+  });
+
+  it("does NOT let a model skip silently drop a watchlist (priority) lead — marks errored, not skipped", async () => {
+    const postOutbound = vi.fn();
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({ skip: "not a nella fit" }),
+        engine: "bedrock",
+        model: "claude-sonnet-4-6",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 0.1, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "Lpri-skip", external_id: "xpriskip", payload: { text: "watchlist person post" }, author_handle: "u", author_id: null, status: "drafting", tier: "T1", classifier_label: "watchlist", classifier_score: 1, priority: true },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    // surfaced as errored (visible), NOT silently skipped
