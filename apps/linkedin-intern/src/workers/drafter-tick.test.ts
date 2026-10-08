@@ -2998,3 +2998,203 @@ describe("runDrafterTick — STYLE injection (F6)", () => {
   it("does NOT inject when style is ON but the pool is EMPTY (still byte-identical)", async () => {
     const base = deps();
     await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_label: "substantial" })] as never,
+      runner: base.runner as never,
+      kb: base.kb as never,
+      postOutbound: base.postOutbound,
+      markStatus: base.markStatus,
+    });
+    const baselineSystem = base.runner.draft.mock.calls[0]![0].system as string;
+
+    const empty = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_label: "substantial" })] as never,
+      runner: empty.runner as never,
+      kb: empty.kb as never,
+      postOutbound: empty.postOutbound,
+      markStatus: empty.markStatus,
+      style: styleConfig({ loadPool: vi.fn().mockResolvedValue([]) }) as never,
+    });
+    const emptySystem = empty.runner.draft.mock.calls[0]![0].system as string;
+    expect(emptySystem).not.toContain(STYLE_MARKER);
+    expect(emptySystem).toBe(baselineSystem);
+  });
+
+  it("fails open: a loadPool error still drafts with no STYLE block", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      style: styleConfig({ loadPool: vi.fn().mockRejectedValue(new Error("db down")) }) as never,
+    });
+    expect(n).toBe(1);
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    expect(system).not.toContain(STYLE_MARKER);
+  });
+});
+
+// ── F6b: Tiered multi-lead reply batching ─────────────────────────────────
+// The batch path groups N light, non-Opus leads into ONE model call per tick,
+// each with its own post text + per-lead STYLE block. The model returns a JSON
+// array [{id, reply}]; on ANY parse failure it falls back to per-lead single
+// calls so no lead is dropped or cross-wired. High-value (Opus-eligible,
+// verifier-on) leads always stay single-call. NOELLE_DRAFTER_BATCH OFF ⇒
+// byte-identical to today.
+
+// Batch response helpers
+function batchOk(leads: Array<{ id: string }>): string {
+  return JSON.stringify(leads.map((l) => ({ id: l.id, reply: `reply for ${l.id}` })));
+}
+
+describe("runDrafterTick — F6b tiered reply batching (NOELLE_DRAFTER_BATCH)", () => {
+  // Helper: two light leads
+  const lightLead = (id: string, externalId: string, over: Record<string, unknown> = {}) =>
+    lead({ id, external_id: externalId, classifier_label: "light", tier: null, ...over });
+
+  it.each([false, true])("stops later single LIGHT gathering after a writer budget rejection (batch=%s)", async (batchEnabled) => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockRejectedValue(new BudgetExceededError({
+      layer: "org", spent_cents: 100, cap_cents: 100, estimated_cents: 1,
+    })) };
+    const fetchPostComments = vi.fn().mockResolvedValue([{ text: "A concrete comment", authorName: "Jane" }]);
+    await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: ["L1", "L2", "L3"].map((id) => lightLead(id, id, {
+        payload: { ...leadPayload, comments: 10, reactions: batchEnabled ? 240 : 0 },
+      })) as never,
+      runner, kb: kb as never, postOutbound, markStatus, fetchPostComments,
+      commentFetchMinCount: 1, batch: { enabled: batchEnabled }, opusLikesThreshold: 200,
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    expect(fetchPostComments).toHaveBeenCalledTimes(1);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).not.toHaveBeenCalledWith(expect.objectContaining({ status: "errored" }));
+  });
+
+  it.each(["post", "status", "bus"])("continues a parsed batch without replay after a member %s failure", async (stage) => {
+    const { postOutbound, kb, markStatus } = deps();
+    const bus = { emit: vi.fn().mockResolvedValue(undefined) };
+    const runner = { draft: vi.fn().mockResolvedValue({
+      text: batchOk([{ id: "L1" }, { id: "L2" }, { id: "L3" }]), engine: "writer", model: "model",
+    }) };
+    if (stage === "post") postOutbound.mockRejectedValueOnce(new Error("transport unavailable"));
+    if (stage === "status") markStatus.mockRejectedValueOnce(new Error("status unavailable"));
+    if (stage === "bus") bus.emit.mockRejectedValueOnce(new Error("bus unavailable"));
+    const count = await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2"), lightLead("L3", "3")] as never,
+      runner, kb: kb as never, postOutbound, markStatus, bus: bus as never,
+      batch: { enabled: true },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    expect(postOutbound.mock.calls.map(([outbound]) => outbound.leadId)).toEqual(["1", "2", "3"]);
+    expect(count).toBe(stage === "post" ? 2 : 3);
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ leadId: "L3", status: "drafted" }));
+  });
+
+  it("does not replay an earlier acknowledged member after a later post fails", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    postOutbound.mockResolvedValueOnce({ id: "a", approval_id: "a" }).mockRejectedValueOnce(new Error("transport unavailable"));
+    const runner = { draft: vi.fn().mockResolvedValue({
+      text: batchOk([{ id: "L1" }, { id: "L2" }]), engine: "writer", model: "model",
+    }) };
+    expect(await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner, kb: kb as never, postOutbound, markStatus, batch: { enabled: true },
+    })).toBe(1);
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    expect(postOutbound.mock.calls.map(([outbound]) => outbound.leadId)).toEqual(["1", "2"]);
+  });
+
+  it("drops a committing batch LIGHT reply while retaining the other member", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify([
+      { id: "L1", reply: "I'll send you the demo tomorrow" },
+      { id: "L2", reply: "The preview makes this launch concrete" },
+    ]), engine: "writer", model: "model" }) };
+    expect(await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner, kb: kb as never, postOutbound, markStatus, batch: { enabled: true },
+    })).toBe(1);
+    expect(postOutbound.mock.calls.map(([outbound]) => outbound.leadId)).toEqual(["2"]);
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ leadId: "L1", status: "skipped" }));
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+  });
+
+  it("BATCH OFF (default): byte-identical to today — one draft call per light lead, no batch", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }),
+    };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lightLead("L1", "1"),
+        lightLead("L2", "2"),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      // batch explicitly off
+      batch: { enabled: false },
+    });
+    expect(n).toBe(2);
+    // Two individual calls, NOT one batch call
+    expect(runner.draft).toHaveBeenCalledTimes(2);
+    // Each call's prompt is the per-lead LIGHT prompt (not a batch array)
+    const prompts = runner.draft.mock.calls.map((c: unknown[]) => (c[0] as { prompt: string }).prompt);
+    for (const p of prompts) {
+      expect(p).not.toContain('"id":'); // no batch JSON
+    }
+  });
+
+  it("BATCH OFF (omitted): identical — no batch arg → one call per lead", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }),
+    };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      // no batch arg at all
+    });
+    expect(n).toBe(2);
+    expect(runner.draft).toHaveBeenCalledTimes(2);
+  });
+
+  it("BATCH ON: the gen-z marker block reaches the BATCHED light prompt", async () => {
+    // The batched path is the DEFAULT for light leads, and it renders through
+    // its own BatchedLightLeadInput shape rather than renderLightPrompt. When
+    // that shape had no genzBlock field the property was dropped silently —
+    // TypeScript's excess-property check does not fire through a .map() into a
+    // contextually-typed array — so the whole lane was dead on Lyra's main
+    // light path while every other marker test (single-lead) stayed green.
+    //
+    // Worse than dead: pickGenzBlock still rolled the gate and still advanced
+    // the process-wide rotation, so batched leads burned markers nobody saw and
+    // skewed the distribution for the leads that did render one.
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: batchOk([{ id: "L1" }, { id: "L2" }]),
+        engine: "bedrock",
+        model: "m",
+      }),
