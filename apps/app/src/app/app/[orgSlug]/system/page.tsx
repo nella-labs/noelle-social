@@ -198,3 +198,110 @@ export default async function SystemPage({ params }: PageProps) {
                 }}
               >
                 AI runs on your own provider keys — nothing is self-hosted here.
+              </div>
+            </div>
+          </div>
+
+          {/* Agent workers */}
+          <div className="card" style={{ marginBottom: 24 }}>
+            <div className="card-h">
+              <h3>Agent workers</h3>
+              <span className="tag">
+                {status.workerRuns.some((w) => w.enabled) ? "enabled" : "off (v1)"}
+              </span>
+            </div>
+            {status.workerRuns.map((w, i) => {
+              const state: ServiceState = !w.enabled
+                ? "disabled"
+                : w.stale
+                  ? "degraded"
+                  : "ok";
+              return (
+                <div
+                  key={w.kind}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    padding: "12px 0",
+                    borderTop: i === 0 ? 0 : "1px dashed var(--rule-soft)",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <StatusDot state={state} />
+                  <span style={{ fontWeight: 500, minWidth: 0 }}>{w.kind}</span>
+                  <span
+                    style={{
+                      marginLeft: "auto",
+                      fontFamily: "var(--mono)",
+                      fontSize: 12,
+                      color: "var(--ink-muted)",
+                    }}
+                  >
+                    {!w.enabled
+                      ? "disabled"
+                      : `last ok ${fmtAgo(w.lastSuccessAt)}${w.stale ? " · stale" : ""}`}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Schema */}
+          <div className="card">
+            <div className="card-h">
+              <h3>Database schema</h3>
+              <span className="tag">{status.schema.applied.length} applied</span>
+            </div>
+            {status.schema.applied.length === 0 ? (
+              <div style={{ color: "var(--ink-muted)", fontSize: 13 }}>
+                No migration ledger found. (On a managed deployment this is
+                expected; on self-host run <code style={{ fontFamily: "var(--mono)" }}>noelle
+                migrate</code>.)
+              </div>
+            ) : (
+              <div
+                className="schema-cols"
+                style={{
+                  fontFamily: "var(--mono)",
+                  fontSize: 12,
+                  color: "var(--ink-muted)",
+                  columns: 2,
+                }}
+              >
+                {status.schema.applied.map((f) => (
+                  <div key={f}>{f}</div>
+                ))}
+              </div>
+            )}
+            {status.schema.pending.length > 0 ? (
+              <div style={{ marginTop: 10, color: "var(--warn)", fontSize: 12 }}>
+                {status.schema.pending.length} pending: run{" "}
+                <code style={{ fontFamily: "var(--mono)" }}>noelle migrate</code>.
+              </div>
+            ) : null}
+          </div>
+        </>
+      ) : null}
+    </>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div
+        style={{
+          fontFamily: "var(--mono)",
+          fontSize: 11,
+          textTransform: "uppercase",
+          letterSpacing: "0.04em",
+          color: "var(--ink-muted)",
+        }}
+      >
+        {label}
+      </div>
+      <div style={{ marginTop: 2, fontWeight: 500 }}>{value}</div>
+    </div>
+  );
+}
