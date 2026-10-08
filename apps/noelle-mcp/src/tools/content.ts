@@ -198,3 +198,203 @@ const tools: Tool[] = [
     description:
       "Set (or clear) an idea's suggested publish day. Pass `day` as YYYY-MM-DD, or omit it to clear the suggestion. This does not create a publication slot.",
     inputSchema: {
+      type: "object",
+      properties: {
+        org: ORG_PROP,
+        ideaId: { type: "string", description: "The post idea uuid." },
+        day: { type: "string", description: "Publish day YYYY-MM-DD. Omit to clear." },
+      },
+      required: ["ideaId"],
+    },
+  },
+  {
+    name: "noelle_mark_post_ready",
+    description:
+      "Mark a draft ready to publish (status=ready, stamps marked_ready_at). Optional `editedBody` saves the operator's edited final body.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        org: ORG_PROP,
+        draftId: { type: "string", description: "The post draft uuid." },
+        editedBody: {
+          type: "string",
+          description: "Optional edited final body to save as final_body.",
+        },
+      },
+      required: ["draftId"],
+    },
+  },
+  {
+    name: "noelle_dismiss_post",
+    description:
+      "Dismiss a post idea or draft (status=dismissed). Set `target` to 'idea' or 'draft' to say which table `id` refers to.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        org: ORG_PROP,
+        id: { type: "string", description: "The idea or draft uuid to dismiss." },
+        target: {
+          type: "string",
+          enum: ["idea", "draft"],
+          description: "Which table `id` refers to.",
+        },
+      },
+      required: ["id", "target"],
+    },
+  },
+];
+
+async function listPostIdeas(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const status = optStr(args, "status");
+  const platform = optStr(args, "platform");
+  const limit = limitOf(args);
+
+  const rows = await ctx.sql<
+    Array<{
+      id: string;
+      platform: string;
+      target_platforms: string[] | null;
+      pending_platforms: string[] | null;
+      hook: string;
+      thesis: string | null;
+      angle: string | null;
+      pillar: string | null;
+      suggested_day: string | null;
+      batch_id: string | null;
+      status: string;
+      created_at: string;
+    }>
+  >`
+    select id, platform, coalesce(target_platforms, array[platform]) as target_platforms, pending_platforms,
+      hook, thesis, angle, pillar, suggested_day::text as suggested_day, batch_id, status, created_at::text as created_at
+    from noelle.post_ideas
+    where org_id = ${org.orgId}
+      and (
+        (${status ?? null}::text is not null and status = ${status ?? null})
+        or (${status ?? null}::text is null and status = any(${DEFAULT_IDEA_STATUSES}::text[]))
+      )
+      and (${platform ?? null}::text is null or platform = ${platform ?? null}
+           or ${platform ?? null} = any(coalesce(target_platforms, array[platform])))
+    order by created_at desc
+    limit ${limit}`;
+
+  const table = mdTable(
+    ["id", "status", "platform", "hook"],
+    rows.map((r) => [r.id, r.status, r.platform, truncate(r.hook, 80)]),
+  );
+  return text(`**${org.name}** — ${rows.length} post idea(s)\n\n${table}`);
+}
+
+async function listPostDrafts(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const status = optStr(args, "status");
+  const platform = optStr(args, "platform");
+  const limit = limitOf(args);
+
+  const rows = await ctx.sql<
+    Array<{
+      id: string;
+      platform: string;
+      status: string;
+      stage: string;
+      char_count: number | null;
+      quality_score: string | null;
+      quality_passed: boolean | null;
+      body: string | null;
+      hook: string;
+    }>
+  >`
+    select distinct on (d.idea_id, d.platform) d.id, d.platform, d.status, d.stage, d.char_count,
+      d.quality_score, d.quality_passed, coalesce(d.final_body, d.body) as body, i.hook
+    from noelle.post_drafts d join noelle.post_ideas i on i.id = d.idea_id
+    where d.org_id = ${org.orgId}
+      and (${status ?? null}::text is null or d.status = ${status ?? null})
+      and (${platform ?? null}::text is null or d.platform = ${platform ?? null})
+    order by d.idea_id, d.platform, d.created_at desc
+    limit ${limit}`;
+
+  const table = mdTable(
+    ["id", "platform", "status/stage", "score", "hook", "snippet"],
+    rows.map((r) => [
+      r.id,
+      r.platform,
+      `${r.status}/${r.stage}`,
+      r.quality_score ?? "—",
+      truncate(r.hook, 40),
+      truncate(r.body, 80),
+    ]),
+  );
+  return text(`**${org.name}** — ${rows.length} draft(s)\n\n${table}`);
+}
+
+async function getPost(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const ideaId = reqStr(args, "ideaId");
+  return getPostWithFullDrafts(ctx, org, ideaId, args);
+}
+
+async function addPostIdea(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("add a post idea");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const agent = await resolveAgentInstance(ctx, org.orgId, args);
+  const hook = reqStr(args, "hook");
+  const thesis = optStr(args, "thesis");
+  const angle = optStr(args, "angle");
+  const pillar = optStr(args, "pillar");
+  const suggestedDay = optStr(args, "suggestedDay");
+  const platform = optStr(args, "platform") ?? "linkedin";
+  const targetPlatforms = optStrArray(args, "targetPlatforms") ?? [platform];
+
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    insert into noelle.post_ideas
+      (org_id, agent_instance_id, platform, target_platforms, hook, thesis, angle, pillar,
+       suggested_day, inspiration_refs, status, source_engine, model)
+    values (${org.orgId}, ${agent.id}, ${platform}, ${targetPlatforms}, ${hook}, ${thesis ?? null},
+       ${angle ?? null}, ${pillar ?? null}, ${suggestedDay ?? null}, '[]'::jsonb, 'proposed', 'manual', 'operator')
+    returning id`;
+
+  const id = rows[0]?.id;
+  return text(
+    `Added post idea for **${agent.display_name ?? agent.role}** (${platform}). id=${id}`,
+  );
+}
+
+async function triggerIdeation(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("trigger ideation");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const agent = await resolveAgentInstance(ctx, org.orgId, args);
+  const mode = optStr(args, "mode") ?? "single";
+  const count = optNum(args, "count");
+  const topics = optStrArray(args, "topics") ?? [];
+  const platform = optStr(args, "platform") ?? "linkedin";
+  const targetPlatforms = [platform];
+
+  const rows = await ctx.sql<Array<{ id: string; batch_id: string | null }>>`
+    insert into noelle.ideation_requests
+      (org_id, agent_instance_id, mode, count, topics, week_start, batch_id, target_platforms, status, require_review)
+    values (${org.orgId}, ${agent.id}, ${mode}, ${count ?? null}, ${ctx.sql.json(topics)}, null,
+       gen_random_uuid(), ${targetPlatforms}, 'pending', true)
+    returning id, batch_id`;
+
+  const row = rows[0];
+  if (!row) throw new NoelleError("Failed to queue ideation request.");
+  return text(
+    `Queued a **${mode}** ideation request for **${agent.display_name ?? agent.role}** (target: ${platform}). ` +
+      `The ideation worker will claim it on its next tick; this is not a completed idea result.\n\n` +
+      `- request id: ${row.id}\n- batch id: ${row.batch_id}\n` +
+      `- requested count: ${count ?? (mode === "batch" ? "worker weekly default" : "worker default")}\n` +
+      `- topics guidance: ${topics.length > 0 ? topics.join(", ") : "none"}\n\n` +
+      `Source: saved replied posts. Poll noelle_get_ideation_request with requestId=${row.id}. ` +
+      `Noelle generates the ideas; do not insert chat-written replacements.`,
+  );
+}
