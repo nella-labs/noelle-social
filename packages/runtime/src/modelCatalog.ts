@@ -198,3 +198,51 @@ export function lookupCatalogEntry(
   model: string,
 ): CatalogEntry | undefined {
   return MODEL_CATALOG.find((m) => m.engine === engine && m.model === model);
+}
+
+/**
+ * The single catalog entry shown for a model id in the picker: prefer a wired
+ * ("ready") engine over a preview fallback. Users pick a model, never a
+ * backend, so the engine stays an internal detail. Both the dashboard picker
+ * and the config save action resolve through this, so they always agree on
+ * which engine a chosen model id maps to.
+ */
+export function catalogWinnerForModel(model: string): CatalogEntry | undefined {
+  let winner: CatalogEntry | undefined;
+  for (const m of MODEL_CATALOG) {
+    if (m.model !== model) continue;
+    if (!winner || (winner.status === "preview" && m.status === "ready")) {
+      winner = m;
+    }
+  }
+  return winner;
+}
+
+/** Resolve a bare model id to a full `{engine, model}` handle (winner engine). */
+export function handleForModel(model: string): EngineHandle | null {
+  const w = catalogWinnerForModel(model);
+  // CatalogEntry.model is a broad `string`, but every catalog row is a valid
+  // EngineHandle model literal (same narrowing effectiveHandle relies on).
+  return w ? ({ engine: w.engine, model: w.model } as EngineHandle) : null;
+}
+
+/**
+ * The handle the runtime should actually call when a user picks a
+ * "preview" model. We keep the user's choice in `model_overrides` so the
+ * dashboard reflects intent, but execution falls back to a known-wired
+ * engine until the preview backend lands. Vertex Gemini is now ready
+ * (vertexBackend.ts), so only the remaining preview entries — Vertex
+ * Claude and most of the Anthropic-direct family — get rewritten.
+ */
+export function effectiveHandle(handle: EngineHandle): EngineHandle {
+  const entry = lookupCatalogEntry(handle.engine, handle.model);
+  if (!entry || entry.status === "ready") return handle;
+  // Preview → swap to the closest "ready" model by family/tags.
+  if (entry.tags.includes("premium")) {
+    return { engine: "bedrock", model: "claude-opus-4-6" };
+  }
+  if (entry.tags.includes("classify")) {
+    return { engine: "bedrock", model: "claude-haiku-4-5" };
+  }
+  return { engine: "bedrock", model: "claude-sonnet-4-6" };
+}
