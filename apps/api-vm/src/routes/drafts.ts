@@ -398,3 +398,203 @@ drafts.post("/api/drafts/:id/send", async (c) => {
       const detail = err.message
         ? `X rejected the post (auth): ${err.message}. Check the X API keys under Connections (or, on the cookie fallback, re-grab ct0 + auth_token).`
         : "X credentials are no longer valid. Reconnect the X account under Connections.";
+      return c.json({ error: "x_auth_failed", detail }, 503);
+    }
+    if (err instanceof XRateLimitError) {
+      return c.json({ error: "x_rate_limited", detail: err.message }, 503);
+    }
+    if (err instanceof XError) {
+      return c.json({ error: "x_post_failed", detail: err.message }, 502);
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json({ error: "x_post_failed", detail: msg }, 502);
+  }
+
+  // --- Persist the success atomically ---
+  const now = new Date().toISOString();
+  let siblingSkipCount = 0;
+  try {
+    await sql.begin(async (tx) => {
+      // 1. Persist the body the user actually sent into drafts.payload,
+      //    along with the X tweet id and the public URL. The durable target
+      //    reservation already prevents another send while this write commits.
+      await tx`
+        update noelle.drafts
+        set sent_external_id = ${tweet.id},
+            posted_at = now(),
+            payload = coalesce(payload, '{}'::jsonb)
+                      || ${tx.json({
+                        ...(payload.edited ? { edited_body: payload.body } : {}),
+                        sent_url: tweet.url,
+                      })}
+        where id = ${row!.draft_id}
+      `;
+
+      // 2. Flip THIS approval to 'sent'.
+      await tx`
+        update noelle.approvals
+        set status = 'sent',
+            decided_at = ${now},
+            decided_by = ${auth.userId}
+        where id = ${row!.id}
+      `;
+
+      // 3. Skip every OTHER pending REPLY approval for the same lead —
+      //    reviewer chose one angle; the rest must not clutter the inbox.
+      //    The DM approval is spared: it's a separate, manual-send artifact
+      //    that the founder still needs to dispatch independently.
+      const siblings = await tx<Array<{ id: string }>>`
+        update noelle.approvals a
+        set status = 'skipped',
+            decided_at = ${now},
+            decided_by = ${auth.userId},
+            skip_reason = 'sibling-angle-sent'
+        from noelle.drafts d
+        where d.id = a.draft_id
+          and a.lead_id = ${row!.lead_id}
+          and a.id <> ${row!.id}
+          and a.status = 'pending'
+          and coalesce(d.payload->>'kind', 'reply') <> 'dm'
+        returning a.id
+      `;
+      siblingSkipCount = siblings.length;
+
+      // 4. Auto-park the lead's DM when the instance opts in (0026): move the
+      //    still-pending DM to 'deferred' so it lands on the person's Contacts
+      //    page (with Copy + "Mark DM sent") instead of the review inbox. No-op
+      //    when auto_defer_dms is false — the operator parks it manually.
+      await tx`
+        update noelle.approvals a
+        set status = 'deferred', decided_at = ${now}, decided_by = ${auth.userId}
+        from noelle.drafts d, noelle.agent_instances ai
+        where d.id = a.draft_id
+          and ai.id = a.agent_instance_id
+          and a.lead_id = ${row!.lead_id}
+          and a.status = 'pending'
+          and coalesce(d.payload->>'kind', 'reply') = 'dm'
+          and ai.auto_defer_dms = true
+      `;
+    });
+  } catch (err) {
+    // The post landed on X but our DB write threw. The user's reply IS
+    // live but our row still says 'pending'. Surface the tweet info so the
+    // dashboard can show "we posted this but couldn't record it — please
+    // mark as sent" and the operator can reconcile.
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json(
+      {
+        error: "db_write_failed_after_post",
+        detail: msg,
+        sent_external_id: tweet.id,
+        sent_url: tweet.url,
+      },
+      500,
+    );
+  }
+
+  // Best-effort: like the tweet we just replied to. A like failure must not
+  // fail the posted reply; report only whether the like landed.
+  let liked = false;
+  if (row.lead_external_id && likeClient) {
+    try {
+      liked = await likeClient.likeTweet(row.lead_external_id);
+    } catch {
+      liked = false;
+    }
+  }
+
+  return c.json({
+    approval_id: row.id,
+    draft_id: row.draft_id,
+    status: "sent" as const,
+    sent_at: now,
+    sent_external_id: tweet.id,
+    sent_url: tweet.url,
+    sibling_skipped: siblingSkipCount,
+    liked,
+  });
+});
+
+type DraftRouteContext = Context<{ Variables: { auth: AuthContext } }>;
+
+function mutationFailure(c: DraftRouteContext, error: unknown) {
+  if (error instanceof ApprovalMutationError) return c.json({ error: error.category }, 409);
+  console.error("[drafts] state mutation failed", error instanceof Error ? error.name : "unknown");
+  return c.json({ error: "internal" }, 500);
+}
+
+async function mutateApproval(
+  c: DraftRouteContext,
+  write: (
+    sql: ReturnType<typeof noelleDb>,
+    scope: { orgId: string; approvalId: string; operatorId: string },
+  ) => Promise<Response>,
+) {
+  const sql = noelleDb();
+  const approvalId = c.req.param("id")!;
+  try {
+    const [row] = await sql<
+      { org_id: string }[]
+    >`select org_id from noelle.approvals where id=${approvalId} limit 1`;
+    if (!row) return c.json({ error: "not_found" }, 404);
+    if (!(await isOrgMember(c.get("auth").userId, row.org_id)))
+      return c.json({ error: "not_org_member" }, 403);
+    return await write(sql, { orgId: row.org_id, approvalId, operatorId: c.get("auth").userId });
+  } catch (error) {
+    return mutationFailure(c, error);
+  }
+}
+
+// A DM is its own action; reply decisions apply only to coherent sibling angles.
+drafts.post("/api/drafts/:id/skip", async (c) => {
+  let body: DraftSkipIn;
+  try {
+    body = DraftSkipInSchema.parse(await c.req.json().catch(() => ({})));
+  } catch (error) {
+    return c.json(
+      { error: "invalid_body", detail: error instanceof Error ? error.message : String(error) },
+      400,
+    );
+  }
+  return mutateApproval(c, async (sql, scope) => {
+    const result = await skipApproval(sql, scope, body.reason ?? null);
+    return c.json({ approval_id: result.approvalId, status: "skipped" as const });
+  });
+});
+
+// Bulk counts only native coherent leads whose reply approvals actually changed.
+drafts.post("/api/drafts/bulk-skip", async (c) => {
+  let body: BulkSkipIn;
+  try {
+    body = BulkSkipInSchema.parse(await c.req.json().catch(() => ({})));
+  } catch (error) {
+    return c.json(
+      { error: "invalid_body", detail: error instanceof Error ? error.message : String(error) },
+      400,
+    );
+  }
+  if (!(await isOrgMember(c.get("auth").userId, body.org_id)))
+    return c.json({ error: "not_org_member" }, 403);
+  try {
+    const result = await bulkSkipApprovals(noelleDb(), {
+      orgId: body.org_id,
+      approvalIds: body.approval_ids,
+      operatorId: c.get("auth").userId,
+      ...(body.reason !== undefined ? { reason: body.reason } : {}),
+    });
+    return c.json({ skipped_count: result.leads });
+  } catch (error) {
+    return mutationFailure(c, error);
+  }
+});
+
+drafts.post("/api/drafts/:id/unskip", (c) =>
+  mutateApproval(c, async (sql, scope) => {
+    const result = await restoreSkippedApproval(sql, scope);
+    return c.json({ approval_id: result.approvalId, status: "pending" as const });
+  }),
+);
+
+// Wait for reply is an explicit DM-only transition, with current state rechecked.
+drafts.post("/api/drafts/:id/park", (c) =>
+  mutateApproval(c, async (sql, scope) => {
