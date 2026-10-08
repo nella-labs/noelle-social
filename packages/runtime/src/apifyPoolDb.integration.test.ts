@@ -198,3 +198,5 @@ describe.skipIf(!url)("shared Apify cooldown (native PostgreSQL)", () => {
     const [untouched] = await sql`select invalid_at,updated_at from noelle.connections where id=${otherKind}`;
     expect(untouched?.invalid_at).not.toBeNull();
     expect(untouched?.updated_at).toEqual(old);
+  });
+});
