@@ -398,3 +398,137 @@ describe("findReplySubmit — composer-anchored fallback (testid renamed)", () =
   it("never returns the left-nav 'Post' compose button (precedes the box)", () => {
     const root = mount(
       "<header><button data-testid='SideNav_NewTweet_Button' type='button'>Post</button></header>" +
+        "<main><div data-testid='tweetTextarea_0' contenteditable='true' role='textbox'>typed</div></main>",
+    );
+    expect(findReplySubmit(root)).toBeNull();
+  });
+
+  it("never returns a wordy button inside a tweet article (per-tweet affordance)", () => {
+    const root = mount(
+      "<div><div data-testid='tweetTextarea_0' contenteditable='true' role='textbox'>typed</div>" +
+        "<article data-testid='tweet'><button type='button'>Reply</button></article></div>",
+    );
+    expect(findReplySubmit(root)).toBeNull();
+  });
+
+  it("returns null when there is no composer at all", () => {
+    expect(findReplySubmit(mount("<div>nothing</div>"))).toBeNull();
+  });
+});
+
+describe("replyBoxText (post-submit verification signal)", () => {
+  it("reads '' from an empty composer (the DraftJS placeholder is outside the box)", () => {
+    const root = mount(fx("reply-composer.html"));
+    expect(replyBoxText(root)).toBe("");
+  });
+
+  it("returns the trimmed typed text", () => {
+    const root = mount(fx("reply-composer.html"));
+    findReplyBox(root)!.textContent = "  my reply  ";
+    expect(replyBoxText(root)).toBe("my reply");
+  });
+
+  it("strips zero-width space / BOM the editor can leave behind", () => {
+    const root = mount(fx("reply-composer.html"));
+    findReplyBox(root)!.textContent = "\u200B\uFEFF";
+    expect(replyBoxText(root)).toBe("");
+  });
+
+  it("returns null when there is no composer at all", () => {
+    expect(replyBoxText(mount("<div>no composer</div>"))).toBeNull();
+  });
+});
+
+describe("diagnoseReplySubmit (splits the submit-not-found causes)", () => {
+  const noZero = () => false; // every element has a real box
+  const allZero = () => true; // every element measures zero (no layout)
+
+  it("enabled composer submit → wf=1,en=1,vis=1 (should have been found)", () => {
+    const root = mount(fx("reply-composer.html"));
+    enableSubmit(root);
+    const d = diagnoseReplySubmit(root, noZero);
+    expect(d).toMatchObject({ box: true, wf: 1, en: 1, vis: 1 });
+    expect(d.top).toBe("Reply_ok");
+  });
+
+  it("disabled submit → wf=1,en=0 and top names it disabled (the enable-lag race)", () => {
+    const d = diagnoseReplySubmit(mount(fx("reply-composer.html")), noZero);
+    expect(d).toMatchObject({ wf: 1, en: 0, vis: 0 });
+    expect(d.top).toBe("Reply_dis");
+  });
+
+  it("enabled but zero-rect → en=1,vis=0 and top flags the layout skip", () => {
+    const root = mount(fx("reply-composer.html"));
+    enableSubmit(root);
+    const d = diagnoseReplySubmit(root, allZero);
+    expect(d).toMatchObject({ wf: 1, en: 1, vis: 0 });
+    expect(d.top).toBe("Reply_zr");
+  });
+
+  it("submit removed → wf=0 while the region dump still shows the page's buttons", () => {
+    const root = mount(fx("reply-composer.html"));
+    root.querySelector("button[data-testid='tweetButtonInline']")!.remove();
+    const d = diagnoseReplySubmit(root, noZero);
+    expect(d.wf).toBe(0);
+    expect(d.region.length).toBeGreaterThan(0);
+  });
+
+  it("dom descriptor captures the editor + submit state (sanitizer-safe)", () => {
+    const root = mount(fx("reply-composer.html"));
+    enableSubmit(root);
+    const d = diagnoseReplySubmit(root, noZero);
+    // The box is the DraftJS contenteditable inside tweetTextarea_0 → pm=1.
+    expect(d.dom).toMatch(/\bbx_div\b/);
+    expect(d.dom).toMatch(/\bpm_1\b/);
+    expect(d.dom).toMatch(/\blen_0\b/);
+    // Two contenteditables on the page (reply composer + DM drawer input).
+    expect(d.dom).toMatch(/\bnce_2\b/);
+    expect(d.dom).toMatch(/\bdis_false\b/);
+    // Only sanitizer-safe characters so it survives into the reason verbatim.
+    expect(d.dom).toMatch(/^[A-Za-z0-9 _-]+$/);
+  });
+
+  it("no box at all → box=false,wf=0", () => {
+    const d = diagnoseReplySubmit(mount("<div>nothing here</div>"), noZero);
+    expect(d.box).toBe(false);
+    expect(d.wf).toBe(0);
+  });
+});
+
+describe("findFeedTweets container fallback (wrapper-drift resistance)", () => {
+  it("recovers every tweet from its like buttons when the article selector misses", () => {
+    document.body.innerHTML = fx("feed-drifted.html");
+    // Zero article[data-testid='tweet'] — the direct selector finds nothing…
+    expect(document.querySelectorAll("article[data-testid='tweet']").length).toBe(0);
+    // …but the fallback climbs from the 2 like buttons to 2 tweet containers.
+    const tweets = findFeedTweets(document.body);
+    expect(tweets).toHaveLength(2);
+    // Each climbed container is tweet-sized: it wraps exactly one like button.
+    for (const t of tweets) expect(findLikeButtons(t)).toHaveLength(1);
+  });
+
+  it("keeps downstream extractors working on the climbed containers", () => {
+    document.body.innerHTML = fx("feed-drifted.html");
+    const tweets = findFeedTweets(document.body);
+    const real = tweets.find((t) => !isPromoted(t))!;
+    expect(real).toBeDefined();
+    expect(tweetId(real)).toBe("1801000000000000001");
+    expect(tweetAuthorHandle(real)).toBe("alice");
+    expect(findLikeButton(real)).not.toBeNull();
+  });
+
+  it("STILL detects the ad on the climbed container (the failure the promoted bias prevents)", () => {
+    document.body.innerHTML = fx("feed-drifted.html");
+    const tweets = findFeedTweets(document.body);
+    const promoted = tweets.filter((t) => isPromoted(t));
+    expect(promoted).toHaveLength(1);
+    expect(tweetId(promoted[0]!)).toBe("1801000000000000009");
+  });
+
+  it("does NOT fire the fallback when the article selector matches", () => {
+    document.body.innerHTML = fx("status-page.html"); // real article[data-testid='tweet'] markup
+    const tweets = findFeedTweets(document.body);
+    expect(tweets).toHaveLength(2);
+    for (const t of tweets) expect(t.tagName).toBe("ARTICLE");
+  });
+});
