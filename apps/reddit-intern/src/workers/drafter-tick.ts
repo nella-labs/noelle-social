@@ -1398,3 +1398,203 @@ function renderLeadContext(args: {
     const ctx = (args.postTitle && args.postTitle.trim()) || args.postText;
     if (fence) {
       lines.push(
+        `You are replying to a COMMENT in a Reddit thread (${where}), not to the original post. The original post by ${who} is shown for context inside <post_context> tags. ${FENCE_GUARD}`,
+        "<post_context>",
+        neutralizeFenceTokens(ctx),
+        "</post_context>",
+        `The block below between <comment_by_author> tags is the comment you are replying to, by ${cWho} (${args.commentTarget.score} upvotes) — reply to THIS. ${FENCE_GUARD}`,
+        `<comment_by_author handle="${cWho}">`,
+        neutralizeFenceTokens(args.commentTarget.body),
+        "</comment_by_author>",
+      );
+    } else {
+      lines.push(
+        `You are replying to a COMMENT in a Reddit thread (${where}), not to the original post.`,
+        `Original post by ${who} (context): ${ctx}`,
+        `The comment you are replying to, by ${cWho} (${args.commentTarget.score} upvotes):`,
+        args.commentTarget.body,
+      );
+    }
+  } else if (fence) {
+    // Reply to the post; fence the untrusted post text (fence tokens neutralized).
+    lines.push(
+      `The block below between <post_by_author> tags is a Reddit post by ${who} in ${where}, the post you are replying to. ${FENCE_GUARD}`,
+      `<post_by_author handle="${who}">`,
+      neutralizeFenceTokens(args.postText),
+      "</post_by_author>",
+    );
+  } else {
+    // Legacy (unfenced) lead — byte-identical to the pre-fence prompt.
+    lines.push(`Reddit post by ${who} in ${where}:`, args.postText);
+  }
+
+  lines.push(...imageBlock(args.imageCaption, fence));
+  lines.push(
+    ...commentDigestBlock(args.topComments, {
+      ...(fence !== undefined ? { fenceUntrusted: fence } : {}),
+      ...(args.commentTarget ? { excludeId: args.commentTarget.id } : {}),
+    }),
+  );
+  return lines;
+}
+
+/** The "you already replied to this person" block, or [] when there's no history. */
+function priorRepliesBlock(priorReplies: string[] | undefined): string[] {
+  if (!priorReplies || priorReplies.length === 0) return [];
+  const lines = priorReplies
+    .slice(0, 5)
+    .map((b, i) => `[${i + 1}] ${b.length > 240 ? `${b.slice(0, 237)}…` : b}`);
+  return [
+    "",
+    "COMMENTS YOU ALREADY SENT/QUEUED TO THIS PERSON (do NOT repeat these takes, openers, or phrasings — bring a genuinely different angle or stay quiet on what you already covered):",
+    ...lines,
+  ];
+}
+
+/** The global "phrasings you've reached for lately, across the whole feed" block. */
+function recentPhrasingsBlock(recentPhrasings: string[] | undefined): string[] {
+  if (!recentPhrasings || recentPhrasings.length === 0) return [];
+  const lines = recentPhrasings
+    .slice(0, 12)
+    .map((b, i) => `[${i + 1}] ${b.length > 160 ? `${b.slice(0, 157)}…` : b}`);
+  return [
+    "",
+    "YOUR RECENT REPLIES ACROSS THE FEED (do NOT reuse these openers, sentence shapes, or characteristic phrasings — vary how you open and the words you reach for so your comments don't read like one template):",
+    ...lines,
+  ];
+}
+
+function renderSubstantialPrompt(args: {
+  postText: string;
+  postTitle: string | null;
+  authorName: string | null;
+  subreddit: string | null;
+  anchors: string[];
+  knowledgeAnchors: string[];
+  imageCaption: string;
+  topComments?: RedditPayload["topComments"];
+  commentTarget?: RedditTopComment | null;
+  fenceUntrusted?: boolean;
+  allowedAngles: Array<"empathetic" | "technical" | "contrarian">;
+  registerBlock?: string;
+  /**
+   * The standalone "THIS REPLY'S ASSIGNED SHAPE" block, rendered in the register
+   * slot (mutually exclusive — both claim comment length).
+   */
+  shapeBlock?: string;
+  /** The gen-z "SPOKEN REGISTER" marker block, or undefined when none was offered. */
+  genzBlock?: string;
+  openingMoveBlock?: string;
+  energyHint?: string;
+  siblingBlock?: string;
+  priorReplies?: string[];
+  recentPhrasings?: string[];
+}): string {
+  const angleList = args.allowedAngles.join(", ");
+  const draftsShape = args.allowedAngles
+    .map((a) => `{"angle":"${a}","body":"…","char_count":N}`)
+    .join(",");
+  // When targeting a comment, the drafts reply UNDER that comment (the digest of
+  // the OTHER comments still gives room context). Otherwise reply to the post.
+  const target = args.commentTarget
+    ? "the specific comment quoted above (a reply UNDER it), not the whole post"
+    : "the post above";
+  return [
+    ...renderLeadContext({
+      postText: args.postText,
+      postTitle: args.postTitle,
+      authorName: args.authorName,
+      subreddit: args.subreddit,
+      imageCaption: args.imageCaption,
+      topComments: args.topComments,
+      commentTarget: args.commentTarget,
+      fenceUntrusted: args.fenceUntrusted,
+    }),
+    ...(args.energyHint ? ["", args.energyHint] : []),
+    ...(args.siblingBlock ? ["", args.siblingBlock] : []),
+    ...priorRepliesBlock(args.priorReplies),
+    ...recentPhrasingsBlock(args.recentPhrasings),
+    ...(args.registerBlock ? ["", args.registerBlock] : args.shapeBlock ? ["", args.shapeBlock] : []),
+    ...(args.genzBlock ? ["", args.genzBlock] : []),
+    ...(args.openingMoveBlock ? ["", args.openingMoveBlock] : []),
+    "",
+    "Voice anchors from the operator's knowledge base (use these to ground tone + specific opinions, not as topics to force):",
+    args.anchors.length
+      ? args.anchors.map((a, i) => `[${i + 1}] ${a}`).join("\n")
+      : "(none — draft from general voice)",
+    ...knowledgeBlock(args.knowledgeAnchors),
+    "",
+    `This lead has already been judged worth a substantial reply by the upstream gate. Draft exactly ${args.allowedAngles.length} comment${args.allowedAngles.length > 1 ? "s" : ""} (angles: ${angleList}), each a reply to ${target}. Do NOT output a skip — the gate already decided.`,
+    "",
+    "OUTPUT FORMAT — STRICT JSON, NO PREAMBLE, NO MARKDOWN FENCES:",
+    "The very first character of your response MUST be `{` and the last `}`.",
+    `  {"drafts":[${draftsShape}]}`,
+    // SHAPE-AWARE, and it has to be. This is the LAST line of the user message,
+    // i.e. BELOW the shape block, so the shape's own "overrides the rules above"
+    // cannot reach it. A fixed "1-4 sentences" here silently competes with every
+    // shape outside that band — MICRO asks for one to eight WORDS — and the
+    // closing line wins, which would put the whole new shape lane straight back
+    // into the default band with every test still green.
+    args.shapeBlock
+      ? "Each comment's length and sentence count are EXACTLY what THIS REPLY'S ASSIGNED SHAPE above asks for, which REPLACES the default 1-4 sentences. A shape may legitimately ask for a handful of words. Do not pad a short shape or compress a long one. Pick one thread, not a summary of the post."
+      : "Each comment matches the thread's energy and length: 1-4 sentences, conversational and human (markdown is fine), no corporate tone. Pick one thread, not a summary of the post.",
+    "Output the comment drafts (one per listed angle, in that order). There is NO DM.",
+  ].join("\n");
+}
+
+function renderLightPrompt(args: {
+  postText: string;
+  postTitle: string | null;
+  authorName: string | null;
+  subreddit: string | null;
+  knowledgeAnchors: string[];
+  imageCaption: string;
+  topComments?: RedditPayload["topComments"];
+  commentTarget?: RedditTopComment | null;
+  fenceUntrusted?: boolean;
+  registerBlock?: string;
+  /**
+   * The standalone "THIS REPLY'S ASSIGNED SHAPE" block, rendered in the register
+   * slot (mutually exclusive — both claim comment length).
+   */
+  shapeBlock?: string;
+  /** The gen-z "SPOKEN REGISTER" marker block, or undefined when none was offered. */
+  genzBlock?: string;
+  openingMoveBlock?: string;
+  energyHint?: string;
+  siblingBlock?: string;
+  priorReplies?: string[];
+  recentPhrasings?: string[];
+}): string {
+  return [
+    ...renderLeadContext({
+      postText: args.postText,
+      postTitle: args.postTitle,
+      authorName: args.authorName,
+      subreddit: args.subreddit,
+      imageCaption: args.imageCaption,
+      topComments: args.topComments,
+      commentTarget: args.commentTarget,
+      fenceUntrusted: args.fenceUntrusted,
+    }),
+    ...(args.energyHint ? ["", args.energyHint] : []),
+    ...(args.siblingBlock ? ["", args.siblingBlock] : []),
+    ...knowledgeBlock(args.knowledgeAnchors),
+    ...priorRepliesBlock(args.priorReplies),
+    ...recentPhrasingsBlock(args.recentPhrasings),
+    ...(args.registerBlock ? ["", args.registerBlock] : args.shapeBlock ? ["", args.shapeBlock] : []),
+    ...(args.genzBlock ? ["", args.genzBlock] : []),
+    ...(args.openingMoveBlock ? ["", args.openingMoveBlock] : []),
+    "",
+    // Shape-aware: "short" is a LENGTH word and it sits below the shape block,
+    // so the shape's "overrides the rules above" cannot reach it. It competes
+    // with RUN_ON (~160-230 ch) and THREE_BEAT (~190-240).
+    args.shapeBlock
+      ? "This is a win / launch / milestone / question post that calls for ONE warm, specific comment in the operator's voice, at exactly the length THIS REPLY'S ASSIGNED SHAPE above asks for. No pitch, no link."
+      : "This is a win / launch / milestone / question post that calls for ONE short, warm, specific comment in the operator's voice. No pitch, no link.",
+    "",
+    "OUTPUT FORMAT — STRICT JSON, NO PREAMBLE, NO MARKDOWN FENCES:",
+    "The very first character of your response MUST be `{` and the last `}`.",
+    '  {"drafts":[{"angle":"empathetic","body":"…","char_count":N}]}',
+    // Shape-aware for the same reason as the substantial path above.
+    args.shapeBlock
