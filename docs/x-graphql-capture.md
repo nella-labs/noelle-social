@@ -1,151 +1,36 @@
-# Capturing X GraphQL queryIds
+# X transport diagnostics
 
-The X intern workers talk to `x.com/i/api/graphql/<queryId>/<OperationName>` to
-discover tweets, look up handles, and post replies. X rotates these `queryId`
-hashes on every web-client release (roughly every few months). When discovery
-or send starts logging `404` from graphql, the hashes in
-`apps/x-intern/src/lib/x-graphql-ids.ts` need to be re-captured from a
-logged-in x.com session and the workers redeployed.
+X workers no longer use manually maintained GraphQL query IDs. Diagnose the active transport and its configured account or provider connection.
 
-Three operations have to be captured:
+## Transport owners
 
-| Operation          | Used by                         | How to trigger                                              |
-|--------------------|---------------------------------|-------------------------------------------------------------|
-| `UserTweets`       | discovery worker                | visit any profile page (e.g. your own)                      |
-| `UserByScreenName` | discovery + send (handle → id)  | type a handle into the X search bar and pick a result       |
-| `CreateTweet`      | send worker                     | reply to any tweet and click **Send**                       |
+| Operation | Current owner |
+| --- | --- |
+| Discovery reads | The configured Apify token pool and `@noelle/x-apify`. Discovery does not require X session cookies. |
+| API reply and original-post workers | The official X API clients in `packages/x-client`, with the configured OAuth access and publication gates. |
+| Cookie-backed GraphQL operations | The shared Bird adapter in `packages/x-client`. Bird owns query ID lookup and refresh. The manual reply API retains this adapter as a fallback. |
 
-## 1. Open a logged-in x.com session
+Bird can use cached or bundled query IDs and refresh after a 404. The former constants file is removed. The `update-x-graphql-ids.sh` and `verify-x-graphql.sh` entrypoints are retired; they stop before changing files or making requests.
 
-1. Open `https://x.com` in Chrome (or any Chromium browser) and make sure you
-   are signed in as the account the workers run on (the configured account).
-2. Open DevTools (`Cmd+Opt+I` on macOS).
-3. Switch to the **Network** tab.
-4. In the filter box at the top of the Network panel, type `graphql`. This
-   hides the noise from images, scripts, etc.
-5. Tick **Preserve log** so requests stick around across page navigations.
+## Inspect the installation
 
-Every request you care about will have a URL of the form:
+From a built repository, use the managed runtime commands:
 
-```
-https://x.com/i/api/graphql/<queryId>/<OperationName>?variables=…&features=…
+```sh
+node apps/cli/dist/index.js status
+node apps/cli/dist/index.js health
+node apps/cli/dist/index.js logs noelle-discovery
+node apps/cli/dist/index.js logs noelle-send
 ```
 
-The string between `/graphql/` and `/<OperationName>` is the `queryId`. It is
-22 characters of `[A-Za-z0-9_-]` (base64url-ish), e.g.
-`E3opETHurmVJflFsUBVuUQ`.
+These process names come from the shared service manifest. Workers are optional, and `noelle-send` is excluded from autonomous startup. A missing or stopped process alone does not prove an account authentication failure. Use the configured installation's logs and [runtime checks](runbook.md) to identify the sender actually handling the request.
 
-## 2. Capture `UserTweets`
+## Follow the failing lane
 
-1. With DevTools open and the `graphql` filter active, visit your own profile
-   (`https://x.com/<your-handle>`).
-2. Look in the Network panel for the request whose name starts with
-   `UserTweets`.
-3. Click it, copy the **Request URL**, and pull out the `queryId`:
+- For missing discovery results, inspect the discovery lane, selected sources or watchlist, Apify connection pool and recorded worker error.
+- For a cookie-backed GraphQL failure, inspect the shared client error and account connection. Updating the removed constants cannot repair this transport.
+- For API authentication failures, check the configured X account connection and its OAuth credentials. Credentials belong to the installation; keep them out of source, screenshots and issue reports.
+- For missing publication, inspect the actual sender's enabled lane, write access and budget. Browser actuation, API replies and original posts have separate execution paths.
+- Preserve account halt and rate-limit states. Reconcile an unknown write outcome before retrying so a transport error does not create a duplicate.
 
-   ```
-   https://x.com/i/api/graphql/E3opETHurmVJflFsUBVuUQ/UserTweets?variables=…
-                              ^^^^^^^^^^^^^^^^^^^^^^^
-                              this is the queryId
-   ```
-
-Save that 22-char string somewhere; you'll paste it into the updater script
-in a minute.
-
-## 3. Capture `UserByScreenName`
-
-1. Click the search box at the top of x.com and type any handle (e.g.
-   `elonmusk`).
-2. In the search dropdown, click the result for that account.
-3. In the Network panel, find the `UserByScreenName` request.
-4. Copy the `queryId` segment, same shape as before:
-
-   ```
-   https://x.com/i/api/graphql/G3KGOASz96M-Qu0nwmGXNg/UserByScreenName?variables=…
-                              ^^^^^^^^^^^^^^^^^^^^^^^
-   ```
-
-## 4. Capture `CreateTweet`
-
-This one requires actually posting something, so use a throwaway reply.
-
-1. Pick any tweet (your own, ideally) and click **Reply**.
-2. Type something innocuous (`.` works).
-3. Click **Reply** to send.
-4. In the Network panel, find the `CreateTweet` request. It uses `POST`.
-5. Copy the `queryId`:
-
-   ```
-   https://x.com/i/api/graphql/oB-5XsHNAbjvARJEc8CZFw/CreateTweet
-                              ^^^^^^^^^^^^^^^^^^^^^^^
-   ```
-
-6. (Optional) Delete the throwaway reply from x.com once you've grabbed the ID.
-
-## 5. Write the new IDs into the repo
-
-You now have three 22-char strings. There are two ways to commit them.
-
-### Option A, interactive updater (recommended)
-
-From the repo root:
-
-```bash
-./scripts/update-x-graphql-ids.sh
-```
-
-It prompts for each queryId, validates the shape, rewrites
-`apps/x-intern/src/lib/x-graphql-ids.ts` in place, and prints the next steps.
-
-### Option B, edit by hand
-
-Open `apps/x-intern/src/lib/x-graphql-ids.ts` and update each `queryId:` line
-inside the `X_GRAPHQL` object. Leave `operationName` alone.
-
-## 6. Verify against the live X API
-
-Before redeploying, confirm the new `UserByScreenName` hash works against
-x.com with the production cookies:
-
-```bash
-./scripts/verify-x-graphql.sh
-```
-
-The script pulls `noelle-worker-x-cookies-ct0` and
-`noelle-worker-x-cookies-auth-token` from GCP Secret Manager (project
-`noelle-agents`) and hits `UserByScreenName` for the `twitter` account
-(guaranteed to exist). On success it prints `OK` and the resolved
-`rest_id`. On failure it prints the HTTP status and the first few hundred
-bytes of the body so you can see if it was 404 (stale queryId) or 401 (stale
-cookies).
-
-## 7. Ship it
-
-Once the verifier passes:
-
-```bash
-git add apps/x-intern/src/lib/x-graphql-ids.ts
-git commit -m "chore(x-intern): rotate X graphql queryIds"
-git push -u origin HEAD
-gh pr create
-```
-
-After review and publication, update the configured installation through
-[the managed runtime](runbook.md). The optional legacy VM deploy script
-requires an explicitly configured repository and infrastructure.
-
-## Troubleshooting
-
-- **The Network tab is empty.** Make sure the `graphql` filter is set on the
-  Network panel filter row, not in the global address bar. Reload the page
-  with DevTools already open.
-- **`UserTweets` shows up but no `queryId` in the URL.** You probably clicked
-  a `TweetDetail` or `HomeTimeline` request by mistake. Those are different
-  operations. Look specifically for `/UserTweets?…`.
-- **The verifier returns 401.** Cookies are stale. Re-capture `ct0` and
-  `auth_token` from `https://x.com` (DevTools → Application → Cookies) and
-  push them to GCP Secret Manager per `docs/runbook.md` §
-  "Rotate X cookies".
-- **The verifier returns 404 with a fresh hash.** Double-check you copied the
-  segment **after** `/graphql/` and **before** `/UserByScreenName`. The
-  22-char check in the updater script catches most paste errors.
+See [worker and publication setup](self-host.md#workers-and-publication), [credential ownership](secrets.md), [reply transport](reply-actuation-strategy.md) and [runtime operation](runbook.md). A passing health check does not verify provider credentials or prove publication.
