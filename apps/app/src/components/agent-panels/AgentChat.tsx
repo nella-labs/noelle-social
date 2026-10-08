@@ -598,3 +598,203 @@ function AgentChatSession({
         style={{
           display: "flex",
           flexDirection: "column",
+          gap: 14,
+          // Fill mode: grow to fill the bounded parent and pin the composer to
+          // the bottom. Default: the original fixed cap on the agent detail page.
+          ...(fillHeight ? { flex: 1, minHeight: 0 } : { maxHeight: 380 }),
+          overflowY: "auto",
+          padding: "4px 2px 14px",
+        }}
+      >
+        {chat.map((m, i) => (
+          <ChatRow
+            key={i}
+            m={m}
+            agentRole={agentRole}
+            agentName={agentName}
+            userInitial={userInitial}
+            userName={userName}
+            onPick={canSend ? send : undefined}
+            canApply={!!instanceId && !!orgSlug}
+            applying={applyingIdx === i}
+            applyDisabled={busy}
+            onApply={m.proposal ? () => applyProposal(i, m.proposal!) : undefined}
+            onCancel={m.proposal ? () => cancelProposal(i) : undefined}
+            applyingVault={applyingVaultIdx === i}
+            vaultApplyDisabled={busy}
+            onApplyVaultEdit={m.vaultEdit ? () => applyVaultEditMsg(i) : undefined}
+            onRefreshVaultEdit={m.vaultEdit ? () => send(`Read the complete current file ${m.vaultEdit!.path} and propose this change while preserving its other rules: ${m.vaultEdit!.summary}`, { vaultPath: m.vaultEdit!.path }) : undefined}
+            onCancelVaultEdit={m.vaultEdit ? () => cancelVaultEdit(i) : undefined}
+            canApplyScriptEdit={!!onApplyScriptEdit && !busy}
+            onApplyScriptEdit={m.scriptEdit ? () => applyScriptEditMsg(i, m.scriptEdit!) : undefined}
+            onCancelScriptEdit={m.scriptEdit ? () => cancelScriptEdit(i) : undefined}
+          />
+        ))}
+        {thinking ? (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              fontSize: 12,
+              color: "var(--ink-muted)",
+            }}
+          >
+            <Avatar role={agentRole as AvatarRole} size={22} />
+            <span style={{ fontFamily: "var(--mono)" }}>{agentName}</span>
+            <span style={{ display: "inline-flex", gap: 3 }}>
+              {[0, 1, 2].map((j) => (
+                <span
+                  key={j}
+                  style={{
+                    width: 5,
+                    height: 5,
+                    borderRadius: "50%",
+                    background: "var(--ink-soft)",
+                    animation: "pulse 1.2s infinite ease-out",
+                    animationDelay: `${j * 150}ms`,
+                  }}
+                />
+              ))}
+            </span>
+          </div>
+        ) : null}
+      </div>
+
+      <div
+        style={{
+          padding: "10px 12px",
+          background: "var(--paper-2)",
+          borderRadius: 12,
+          boxShadow: "0 0 0 0.5px var(--rule)",
+          opacity: instanceId ? 1 : 0.6,
+        }}
+      >
+        <textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          disabled={!instanceId}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send(draft);
+          }}
+          placeholder={
+            instanceId
+              ? `Ask ${agentName}… e.g. "what should I focus on today?"  (⌘↵ to send)`
+              : `${agentName} isn't provisioned yet — chat unlocks once the agent is hired.`
+          }
+          rows={2}
+          style={{
+            width: "100%",
+            border: 0,
+            background: "transparent",
+            outline: "none",
+            resize: "none",
+            fontFamily: "var(--body)",
+            fontSize: 13.5,
+            lineHeight: 1.5,
+            color: "var(--ink)",
+          }}
+        />
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, flexWrap: "wrap" }}>
+          <span
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 10.5,
+              color: "var(--ink-muted)",
+            }}
+          >
+            {instanceId
+              ? `Remembers this chat · ${prettyModel(model)}`
+              : "Read-only preview"}
+          </span>
+          {onApplyScriptEdit && chat.length > 1 ? (
+            <button
+              type="button"
+              className="btn btn-sm"
+              style={{ marginLeft: "auto" }}
+              disabled={!canSend}
+              title="Turn Nova's latest suggestion into an edit and drop it into the storyboard"
+              onClick={applyLastToScript}
+            >
+              ✎ Apply to script
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost"
+            style={onApplyScriptEdit && chat.length > 1 ? undefined : { marginLeft: "auto" }}
+            title="Start a fresh conversation (your earlier chats are kept)"
+            onClick={() => {
+              invalidate();
+              conversationStarted.current = false;
+              setError(null);
+              setDraft("");
+              setThinking(false);
+              setLastSent(null);
+              setModel(null);
+              setApplyingIdx(null);
+              setApplyingVaultIdx(null);
+              // Detach from the current thread so the next message starts a new
+              // one. The earlier conversation stays persisted in the DB.
+              setConversationId(null);
+              setChat([
+                { who: "agent", at: "just now", body: fallback.body, suggestions: fallback.suggestions },
+              ]);
+              void loadGreeting(false);
+            }}
+          >
+            New chat
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm btn-accent"
+            onClick={() => send(draft)}
+            disabled={!canSend || !draft.trim()}
+            style={
+              !canSend || !draft.trim()
+                ? { opacity: 0.5, cursor: "not-allowed" }
+                : undefined
+            }
+          >
+            Send ↵
+          </button>
+        </div>
+        {error ? (
+          <div
+            style={{
+              marginTop: 6,
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              fontSize: 11.5,
+              color: "var(--warn)",
+              fontFamily: "var(--mono)",
+            }}
+          >
+            <span style={{ flex: 1 }}>{error}</span>
+            {lastSent && !thinking ? (
+              <button
+                type="button"
+                onClick={() => send(lastSent.message, { isRetry: true, vaultPath: lastSent.vaultPath })}
+                style={{
+                  border: 0,
+                  background: "transparent",
+                  color: "var(--accent)",
+                  cursor: "pointer",
+                  fontFamily: "var(--mono)",
+                  fontSize: 11.5,
+                  textDecoration: "underline",
+                  padding: 0,
+                }}
+              >
+                Retry
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ChatRow({
