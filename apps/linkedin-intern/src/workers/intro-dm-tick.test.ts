@@ -198,3 +198,41 @@ describe("runIntroDmTick", () => {
     expect(runner.draft).not.toHaveBeenCalled();
     expect(postOutbound).not.toHaveBeenCalled();
   });
+});
+
+describe("SYSTEM_LINKEDIN_INTRO + renderIntroDmPrompt (relationship, not pitch)", () => {
+  it("asks about the person's work and carries NO pitch language", () => {
+    const sys = SYSTEM_LINKEDIN_INTRO.toLowerCase();
+    // It is explicitly about asking what they're building, not selling.
+    expect(sys).toContain("relationship");
+    expect(sys).toContain("no pitch");
+    expect(sys).toMatch(/what they're (building|working)|building or working/);
+    // Product links, install commands, and prices must not become outreach CTAs.
+    expect(sys).not.toContain("example.test"); // no product URL to drop
+    expect(sys).not.toMatch(/npx .*@example/); // no install command
+    expect(sys).not.toMatch(/free 5k|\$9\/\$29\/\$49/); // no pricing surface
+    expect(sys).toContain("do not mention any product"); // it BANS the pitch explicitly
+    // Reuses the shared NEVER-DO voice rules.
+    expect(sys).toContain("em dash");
+    expect(sys).toContain("as a fellow");
+  });
+
+  it("renderIntroDmPrompt grounds in the profile, uses the first name, and asks the question", () => {
+    const p = renderIntroDmPrompt({
+      name: "Maya Lopez",
+      publicId: "maya-builds",
+      headline: "Founder @ Loop",
+      objective: "learn what she's building",
+      summary: "Ships dev tools fast.",
+      topics: ["agents", "dx"],
+      tone: "earnest",
+      engagementNotes: "be concrete",
+    });
+    expect(p).toContain("Maya"); // first name in the greeting steer
+    expect(p).toContain("Ships dev tools fast."); // profile summary woven in
+    expect(p).toContain("agents, dx"); // topics
+    expect(p.toLowerCase()).toMatch(/ask what they're building|building \/ working on/);
+    expect(p.toLowerCase()).toContain("no pitch");
+    expect(p).toContain('{"body":"…","char_count":N}'); // strict JSON shape
+  });
+});

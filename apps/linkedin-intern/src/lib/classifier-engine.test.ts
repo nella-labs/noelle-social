@@ -198,3 +198,51 @@ describe("classifier", () => {
     expect(out.usage).toEqual({ inputTokens: 0, outputTokens: 0 });
   });
 });
+
+describe("buildClassifierSystem", () => {
+  it("returns the base triage prompt with no custom objective", () => {
+    const base = buildClassifierSystem();
+    expect(base).toContain("triage LinkedIn posts");
+    expect(base.toLowerCase()).not.toContain("founder's mission");
+  });
+
+  it("encodes the substantial/light/skip routing rules", () => {
+    const base = buildClassifierSystem();
+    expect(base).toContain("substantial");
+    expect(base).toContain("light");
+    expect(base).toContain("skip");
+  });
+
+  it("weaves the mission into the triage definition", () => {
+    const out = buildClassifierSystem("target LLM eval tooling buyers");
+    expect(out).toContain("triage LinkedIn posts");
+    expect(out).toContain("target LLM eval tooling buyers");
+  });
+
+  it("uses the supplied q threshold in the prompt", () => {
+    const out = buildClassifierSystem(null, 82);
+    expect(out).toContain("q >= 82");
+  });
+});
+
+describe("budget admission failures", () => {
+  it.each([
+    new BudgetExceededError({ layer: "instance", spent_cents: 8, cap_cents: 10, estimated_cents: 8 }),
+    new PgOperationError("deadline"),
+  ])("does not turn %s into a legacy fail-open verdict", async (error) => {
+    const call = vi.fn().mockRejectedValue(error);
+    const classifier = createClassifier({ backend: { call }, evaluateChoice: async () => ({ kind: "unavailable", provider: "jev" }) });
+    await expect(classifier.classify({ postText: "specific engineering question" })).rejects.toBe(error);
+    expect(call).toHaveBeenCalledOnce();
+  });
+  it("does not dispatch a legacy classifier after its optional scout admission is rejected", async () => {
+    const error = new BudgetExceededError({ layer: "org", spent_cents: 10, cap_cents: 10, estimated_cents: 1 });
+    const call = vi.fn().mockRejectedValue(error);
+    const classifier = createClassifier({ backend: { call }, vipScout: true,
+      evaluateChoice: async () => ({ kind: "choice", choice: "substantial", probability: 0.99, probabilities: { substantial: 0.99 }, provider: "jev" }),
+      evaluateBoolean: async () => ({ kind: "unavailable", provider: "jev" }),
+    });
+    await expect(classifier.classify({ postText: "question" })).rejects.toBe(error);
+    expect(call).toHaveBeenCalledOnce();
+  });
+});

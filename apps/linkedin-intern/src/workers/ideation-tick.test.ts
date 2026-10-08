@@ -198,3 +198,53 @@ describe("runIdeationTick", () => {
           ideas: [
             {
               hook: "Every sales dashboard hides one floor problem.",
+              thesis: "The good automation ideas come from watching the actual handoff fail.",
+              angle: "observation",
+              pillar: "sales",
+              inspiration_tags: ["R1"],
+            },
+          ],
+        }),
+        engine: "bedrock",
+        model: "m",
+      }),
+    };
+    const sink = vi.fn().mockResolvedValue({ idea_ids: ["x1"] });
+
+    const n = await runIdeationTick({
+      log,
+      instance,
+      request: req(),
+      gather: async () => ({
+        repliedPosts: [
+          {
+            leadId: "lead-r1",
+            url: "https://li/r1",
+            author: "carla",
+            post: "CRM reporting keeps missing what reps actually do between calls.",
+            reply: "the between-calls bit is where the real process lives",
+            repliedAt: "2026-09-14T10:00:00Z",
+          },
+        ],
+        topAuthors: [],
+        keywordPosts: [],
+        playbooks: [],
+        voiceAnchors: [],
+        pillars: [],
+      }),
+      runner,
+      sink,
+      idFactory: () => "x1",
+      defaultCount: 5,
+    });
+
+    expect(n).toBe(1);
+    expect(runner.draft).toHaveBeenCalledOnce();
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("[R1]");
+    expect(prompt).toContain("operator replied:");
+    expect(sink.mock.calls[0]![0][0]).toMatchObject({
+      inspirationRefs: [{ kind: "replied_post", leadId: "lead-r1", url: "https://li/r1" }],
+    });
+  });
+});
