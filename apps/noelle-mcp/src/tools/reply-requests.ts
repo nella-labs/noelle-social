@@ -198,3 +198,65 @@ export async function requestReply(
       throw new NoelleError(`Lead ${leadId} is already being processed. Wait for it to finish before requesting another reply.`);
     }
     const marker = {
+      reply_requested: true,
+      reply_request_instructions: instructions,
+      reply_request: {
+        request_key: requestKey,
+        requested_by: ctx.operatorId(),
+        requested_at: new Date().toISOString(),
+        instructions,
+        force_human_review: true,
+        source: "noelle_request_reply",
+      },
+    };
+    const updated = await ctx.sql<LeadRow[]>`
+      update noelle.leads
+      set status = 'classified', payload = coalesce(payload, '{}'::jsonb) || ${ctx.sql.json(marker)}::jsonb, updated_at = now()
+      where id = ${leadId} and org_id = ${org.orgId}
+        and status not in ('drafting', 'classifying')
+        and (coalesce(payload->>'reply_requested', 'false') <> 'true' or status in ('drafted', 'errored', 'skipped'))
+      returning id, platform, status, author_handle, payload`;
+    if (updated.length === 0) {
+      const [fresh] = await ctx.sql<LeadRow[]>`
+        select id, platform, status, author_handle, payload
+        from noelle.leads where id = ${leadId} and org_id = ${org.orgId}`;
+      const freshRequest = fresh ? storedRequest(payloadOf(fresh)) : {};
+      if (freshRequest.request_key !== requestKey) {
+        throw new NoelleError(
+          `Lead ${leadId} is already being processed (${String(freshRequest.request_key ?? "unknown")}). Read it or wait for it to finish before requesting another.`,
+        );
+      }
+    }
+  }
+  const status = await pollUntil(
+    () => readStatus(ctx, org.name, org.orgId, leadId, requestKey),
+    (value) =>
+      value.state === "completed" ||
+      value.state === "needs_review" ||
+      value.state === "review_pending" ||
+      value.lead.status === "errored" ||
+      value.lead.status === "skipped",
+    waitSeconds,
+  );
+  return render(status);
+}
+
+export async function getReplyRequestStatus(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const leadId = reqStr(args, "leadId");
+  const waitSeconds = readWaitSeconds(args);
+  const requestKey = optStr(args, "requestKey");
+  return render(await pollUntil(
+    () => readStatus(ctx, org.name, org.orgId, leadId, requestKey),
+    (value) =>
+      value.state === "completed" ||
+      value.state === "needs_review" ||
+      value.state === "review_pending" ||
+      value.lead.status === "errored" ||
+      value.lead.status === "skipped",
+    waitSeconds,
+  ));
+}
