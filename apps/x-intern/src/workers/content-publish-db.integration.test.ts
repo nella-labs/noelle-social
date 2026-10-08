@@ -198,3 +198,203 @@ describe.skipIf(!url)("X publishing storage boundary (dedicated PostgreSQL)", ()
       await p.tick();
       expect(p.posts).toHaveLength(0);
       expect(await sql`select * from noelle.x_api_write_budget`).toHaveLength(0);
+    },
+  );
+
+  it.each(["foreign org", "foreign instance", "other platform", "uploading"])(
+    "never uploads %s media attached by a soft tenant relationship",
+    async (fault) => {
+      const d = await seed();
+      await image(d.draftId, {
+        ...(fault === "foreign org" ? { ownerOrg: foreignOrg } : {}),
+        ...(fault === "foreign instance" ? { ownerInstance: foreignInstance } : {}),
+        ...(fault === "other platform" ? { platform: "linkedin" } : {}),
+        ...(fault === "uploading" ? { status: "uploading" } : {}),
+      });
+      const p = publisher();
+      await p.tick();
+      expect(p.posts).toHaveLength(1);
+      expect(p.uploads()).toBe(0);
+    },
+  );
+
+  it.each(["cancelled", "rebound", "send disabled", "API disabled"])(
+    "honors a committed %s change during media preparation",
+    async (change) => {
+      const d = await seed();
+      await image(d.draftId);
+      const other = change === "rebound" ? await seed() : null;
+      if (other)
+        await sql`update noelle.content_schedule_slots set draft_id=null,status='skipped' where id=${other.slotId}`;
+      const p = publisher({
+        beforeUpload: async () => {
+          if (change === "cancelled")
+            await sql`update noelle.content_schedule_slots set status='skipped' where id=${d.slotId}`;
+          if (change === "rebound")
+            await sql`update noelle.content_schedule_slots set draft_id=${other!.draftId},idea_id=${other!.ideaId} where id=${d.slotId}`;
+          if (change === "send disabled")
+            await sql`update noelle.agent_instances set send_enabled=false where id=${instance}`;
+          if (change === "API disabled")
+            await sql`update noelle.agent_instances set x_api_write_enabled=false where id=${instance}`;
+        },
+      });
+      await p.tick();
+      expect(p.posts).toHaveLength(0);
+      expect(
+        (await sql<{ used: number }[]>`select used from noelle.x_api_write_budget`)[0]?.used ?? 0,
+      ).toBe(0);
+      if (change === "cancelled")
+        expect(
+          (await sql`select status from noelle.content_schedule_slots where id=${d.slotId}`)[0]
+            ?.status,
+        ).toBe("skipped");
+      if (change === "rebound")
+        expect(
+          (await sql`select draft_id from noelle.content_schedule_slots where id=${d.slotId}`)[0]
+            ?.draft_id,
+        ).toBe(other!.draftId);
+    },
+  );
+
+  it("holds the instance after an ambiguous original instead of dispatching the next overdue slot", async () => {
+    await seed();
+    await seed();
+    const p = publisher({ uncertain: true });
+    expect((await p.tick())[0]?.status).toBe("uncertain");
+    expect(await p.tick()).toEqual([]);
+    expect(p.posts).toHaveLength(1);
+    expect(
+      (await sql<{ used: number }[]>`select used from noelle.x_api_write_budget`)[0]?.used,
+    ).toBe(1);
+  });
+
+  it("allows native draft FK insertion while authorization holds parent locks", async () => {
+    const d = await seed();
+    const p = publisher({
+      beforePost: async () => {
+        await sql.begin(async (tx) => {
+          await tx`set local lock_timeout='1s'`;
+          await tx`insert into noelle.post_drafts(org_id,agent_instance_id,idea_id,platform,body)
+          values (${org},${instance},${d.ideaId},'x','Next version')`;
+        });
+      },
+    });
+    expect((await p.tick())[0]?.status).toBe("published");
+    expect(await sql`select id from noelle.post_drafts where idea_id=${d.ideaId}`).toHaveLength(2);
+  });
+
+  it("refreshes and persists a real coordinated token with only two pool connections during dispatch", async () => {
+    await seed();
+    await sql`insert into noelle.x_api_tokens(org_id,agent_instance_id,access_token,refresh_token,access_token_expires_at)
+      values (${org},${instance},'expired-fixture','fixture-refresh',now()-interval '1 minute')`;
+    const smallPool = postgres(url!, { max: 2, onnotice: () => {} });
+    const calls: string[] = [];
+    try {
+      const client = createXApiClient({
+        role: "x_intern",
+        sendEnabled: true,
+        xApiWriteEnabled: true,
+        handle: "operator",
+        tokens: { accessToken: "expired-fixture", refreshToken: "fixture-refresh", expiresAt: 1 },
+        clientId: "fixture-client",
+        refreshCoordinator: makeRefreshCoordinator(smallPool, instance),
+        onTokensRefreshed: async (t) => {
+          await smallPool`update noelle.x_api_tokens set access_token=${t.accessToken} where agent_instance_id=${instance}`;
+        },
+        fetchFn: (async (input) => {
+          const target = String(input);
+          calls.push(target);
+          return new Response(
+            JSON.stringify(
+              target.includes("/oauth2/token")
+                ? {
+                    access_token: "rotated-fixture",
+                    refresh_token: "next-fixture",
+                    expires_in: 7200,
+                  }
+                : { data: { id: "123" } },
+            ),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }) as typeof fetch,
+      });
+      const outcomes = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          runContentPublishTick({
+            sql: smallPool,
+            instanceId: instance,
+            orgId: org,
+            cap: 30,
+            minSpacingMs: 60_000,
+            client,
+          }),
+        ),
+      );
+      expect(outcomes.flat().filter((outcome) => outcome.status === "published")).toHaveLength(1);
+      expect(calls.filter((target) => target.includes("/oauth2/token"))).toHaveLength(1);
+      expect(calls.filter((target) => target.endsWith("/tweets"))).toHaveLength(1);
+      expect(
+        (
+          await sql`select access_token from noelle.x_api_tokens where agent_instance_id=${instance}`
+        )[0]?.access_token,
+      ).toBe("rotated-fixture");
+    } finally {
+      await smallPool.end();
+    }
+  });
+
+  it("retains a confirmed receipt when the final publish transaction fails at commit", async () => {
+    const d = await seed();
+    await sql.unsafe(`create or replace function noelle.reject_publish_receipt_fixture() returns trigger language plpgsql as $$
+      begin raise exception 'fixture receipt commit failed'; end $$`);
+    await sql.unsafe(`create constraint trigger reject_publish_receipt after update on noelle.content_schedule_slots
+      deferrable initially deferred for each row when (new.status='published') execute function noelle.reject_publish_receipt_fixture()`);
+    const p = publisher();
+    expect((await p.tick())[0]).toMatchObject({
+      status: "uncertain",
+      reconciliationPersisted: true,
+      receipt: { id: "1", url: "https://x.com/operator/status/1" },
+    });
+    expect(
+      (
+        await sql`select status,posted_tweet_id from noelle.content_schedule_slots where id=${d.slotId}`
+      )[0],
+    ).toEqual({ status: "failed", posted_tweet_id: "1" });
+    expect(await p.tick()).toEqual([]);
+    expect(p.posts).toHaveLength(1);
+    expect(
+      (await sql<{ used: number }[]>`select used from noelle.x_api_write_budget`)[0]?.used,
+    ).toBe(1);
+  });
+
+  it("uses a final edit committed during media preparation as the actual post body", async () => {
+    const d = await seed();
+    await image(d.draftId);
+    const p = publisher({
+      beforeUpload: async () => {
+        await sql`update noelle.post_drafts set final_body='Reviewed latest original' where id=${d.draftId}`;
+      },
+    });
+    expect((await p.tick())[0]?.status).toBe("published");
+    expect(p.posts).toEqual(["Reviewed latest original"]);
+  });
+
+  it("refunds a cancelled dispatch once when restoring its durable claim fails", async () => {
+    const d = await seed();
+    await image(d.draftId);
+    await sql`insert into noelle.x_api_write_budget(org_id,agent_instance_id,day,used)
+      values (${org},${instance},${new Date().toISOString().slice(0, 10)}::date,3)`;
+    await sql.unsafe(`create or replace function noelle.reject_publish_restore_fixture() returns trigger language plpgsql as $$
+      begin raise exception 'fixture restore failed'; end $$`);
+    await sql.unsafe(`create trigger reject_publish_restore before update on noelle.content_schedule_slots
+      for each row when (new.status='ready') execute function noelle.reject_publish_restore_fixture()`);
+    const p = publisher({
+      beforeUpload: async () => {
+        await sql`update noelle.agent_instances set send_enabled=false where id=${instance}`;
+      },
+    });
+    expect((await p.tick())[0]).toMatchObject({ status: "cancelled", claimRetained: true });
+    expect(p.posts).toHaveLength(0);
+    expect(
+      (await sql`select status from noelle.content_schedule_slots where id=${d.slotId}`)[0]?.status,
+    ).toBe("publishing");
