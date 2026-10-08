@@ -198,3 +198,203 @@ async function startRun(
       });
       armedSend = (await enableSendForManualRun()) || inherited;
       if (armedSend) await setPendingArm(epoch, Date.now());
+    });
+  }
+  // Hoisted so the pinned tab is available both to the RunState below (inside the
+  // try) and to cdp.attach after it. Assigned once the run is committed.
+  let tabId: number | null = null;
+  try {
+    const api = new ActuatorApi(cfg);
+    const queue = await api.fetchQueue();
+    const rng = makeRng((Date.now() & 0xffffffff) >>> 0);
+    const startMs = Date.now();
+
+    // Session persona + warm-up window: drawn once at run start and held for the
+    // whole session (the "session-level entropy" that prevents a repeated
+    // signature). persona.wpm threads into every reading-dwell call below.
+    const persona = makeSessionPersona((Date.now() & 0xffffffff) >>> 0);
+    // Warm-up suppresses writes for the first N ms (arrive/read before acting). Cap
+    // it at 10% of the window so a short run isn't dominated by warm-up — a 30-min
+    // window warms up ≤3 min, not the full ~4 min a long run would.
+    const warmupSuppressMs = Math.min(
+      warmupSuppressWritesMs(rng),
+      Math.round(params.windowHours * 3600_000 * 0.1),
+    );
+
+    // Multi-day warm-up: a newly-automated identity ramps to full volume over ~4
+    // weeks. Persist the automation start once (first run), then scale the daily
+    // caps by the ramp multiplier so early sessions run lighter.
+    const startStore = await chrome.storage.local.get("actuator.automationStartMs");
+    let automationStartMs = startStore["actuator.automationStartMs"] as number | undefined;
+    if (typeof automationStartMs !== "number") {
+      automationStartMs = startMs;
+      await chrome.storage.local.set({ "actuator.automationStartMs": automationStartMs });
+    }
+    const warm = warmupCapMultiplier(automationStartMs, startMs);
+    // Reddit is REPLY-ONLY: likes/dms caps are hard-zero so the scheduler plans zero
+    // like/dm slots, and the daily reply cap is clamped to the Reddit-safe ceiling
+    // (default 8) before the warm-up ramp scales it up over ~4 weeks.
+    const dailyReplyCap = Math.min(cfg.caps.comments, REDDIT_DEFAULTS.repliesPerDay);
+    const effectiveCaps = {
+      likes: 0,
+      comments: Math.round(dailyReplyCap * warm),
+      dms: 0,
+    };
+    // Belt-and-suspenders: force targetLikes:0 at the planner regardless of caller,
+    // so no code path can ever schedule a vote/like slot on Reddit.
+    const runParams = { ...params, targetLikes: 0 };
+
+    const { actions: planned } = planTimeline({
+      params: runParams, approvedDms: 0, caps: effectiveCaps, startMs,
+      deepNightTaper: cfg.deepNightTaper, maxWritesPerHour: cfg.maxWritesPerHour ?? REDDIT_DEFAULTS.maxWritesPerHour, rng,
+    });
+    const actions: SlotAction[] = planned.map((a) => ({ kind: a.kind, atMs: a.atMs, executed: false }));
+
+    // Pin the run to the tab it starts on. tickOnce passes s.tabId back to
+    // findRedditTab, so a permalink/profile tab the operator opens later can never
+    // hijack the run; the pin is only re-picked when this tab closes.
+    tabId = await findRedditTab();
+    const state: RunState = {
+      sessionId: crypto.randomUUID(), epoch, startMs, windowHours: params.windowHours, actions,
+      persona, warmupSuppressMs, tabId: tabId ?? undefined,
+      // Reddit is reply-only: the planner is fed targetLikes:0 + caps.likes/dms:0,
+      // so it emits ONLY comment (reply) slots — likes/dms targets are hard 0.
+      targets: {
+        likes: 0,
+        comments: actions.filter((a) => a.kind === "comment").length,
+        dms: 0,
+      },
+      done: { likes: 0, comments: 0, dms: 0 },
+      commentPool: queue.comments.map(toPoolItem),
+      dmPool: [], // Reddit never DMs.
+      upvoteAtMs: [], // idle-upvote timestamps (rolling-15-min ≤10 cap anchor)
+      doneDraftIds: [], lastPollMs: startMs, status: "running",
+      armedSend, // true iff this manual run flipped reply_send_enabled ON itself
+      // Idle-upvote min-gap jitter, drawn ONCE per session (see RunState) — a
+      // per-tick redraw would bias the effective gap toward the 60s floor.
+      upvoteGapJitter: rng.float(1, 1.8),
+    };
+    await saveState(state);
+    // The arm is now accounted for: RunState carries armedSend, so endRun owns
+    // the disarm from here. Inside the serial lock so it can't interleave with
+    // checkAutonomy's classify-then-disarm of the same marker (which also runs
+    // under the lock and re-reads the marker inside it).
+    if (armedSend) await withSendSwitch(() => clearPendingArm(epoch));
+  } catch (e) {
+    // A throw between the landed arm and the persisted RunState (e.g. a
+    // transient api-vm 5xx from fetchQueue) would otherwise LEAK the arm: no
+    // RunState means endRun never sees armedSend, autonomous runs never disarm
+    // by design, and /api/actionable-reddit gates on reply_send_enabled ONLY —
+    // so the next lights-out run would post replies under a consent flag the
+    // operator never chose to leave standing. Roll the arm back OFF
+    // (best-effort; the durable marker keeps autonomy fail-closed if even the
+    // rollback fails) before surfacing the start failure.
+    await rollbackArmAfterFailedStart(cfg, epoch, armedSend);
+    throw e;
+  }
+
+  if (tabId != null) await cdp.attach(tabId).catch(() => {}); // banner appears
+  await chrome.alarms.create(ALARM, { periodInMinutes: 0.5 });
+  // chrome.alarms can't fire faster than ~30s; kick a few early ticks so the
+  // first action happens within seconds (the SW stays alive right after Run).
+  for (const ms of [3500, 8000, 15000, 22000]) setTimeout(() => void tick(), ms);
+}
+
+// Map an api.ts EngineQueueItem onto the Reddit pool item, carrying the target
+// TYPE (post | comment) + commentId through to doReply.
+function toPoolItem(c: EngineQueueItem): RedditPoolItem {
+  return Object.assign({
+    approvalId: c.approval_id, draftId: c.draft_id, body: c.body,
+    url: c.target.url, targetType: c.target.type, commentId: c.target.commentId,
+  }, { capturedReply: c.capturedReply });
+}
+
+// Drain mode: post ALL approved replies a gap apart (4 min + 0–900s), filling each
+// gap with ambient browsing AND operator-opt-in idle-UPVOTES (upvote-only, capped
+// ≤10/15min; never a downvote, never a scheduled vote slot). Reuses the whole tick
+// engine — it just builds a drain schedule and flags the run mode:"drain" (which
+// makes each reply return to the Reddit feed so the gap browses + upvotes the feed).
+// Newest post first (the /api/actionable-reddit queue is served newest-first).
+// Epoch-based supersede, same as startRun — no warm-up suppression (drain is explicit).
+async function startDrain(opts?: { manual?: boolean }) {
+  const cfg = await getConfig();
+  if (!cfg) throw new Error("not configured");
+  // Fresh cancellation handle for this drain. Abort any prior one first so a
+  // superseded run's in-flight dwells collapse now instead of lingering.
+  runAbort.abort();
+  runAbort = new AbortController();
+  const epoch = await bumpEpoch();
+  // Enable sending after claiming the epoch, before fetchQueue (see startRun) —
+  // with the same durable pending-arm stamp + failed-start rollback, so a drain
+  // that dies between the landed arm and saveState can never leak the switch ON.
+  // And the same supersession hand-off: a drain that supersedes a live run
+  // which armed the switch itself (or an unaccounted pending-arm marker)
+  // inherits the arm — its saveState is about to erase the predecessor's
+  // armedSend record, so ownership of the disarm must move with it (see
+  // inheritsArmOnSupersede + the startRun arm block).
+  let armedSend = false;
+  if (opts?.manual) {
+    await withSendSwitch(async () => {
+      const superseded = await loadState();
+      const inherited = inheritsArmOnSupersede({
+        supersededStatus: superseded?.status,
+        supersededArmedSend: superseded?.armedSend,
+        pendingArm: await getPendingArm(),
+      });
+      armedSend = (await enableSendForManualRun()) || inherited;
+      if (armedSend) await setPendingArm(epoch, Date.now());
+    });
+  }
+  // Hoisted so the pinned tab is available both to the RunState below (inside the
+  // try) and to cdp.attach after it. Assigned once the drain is committed.
+  let tabId: number | null = null;
+  try {
+    const api = new ActuatorApi(cfg);
+    const queue = await api.fetchQueue();
+    const rng = makeRng((Date.now() & 0xffffffff) >>> 0);
+    const startMs = Date.now();
+    const persona = makeSessionPersona((Date.now() & 0xffffffff) >>> 0);
+    // Per-session drain temperament, drawn from its OWN seed (NOT the plan rng, so
+    // the plan stream is untouched). Persisted on RunState so every auto-continue
+    // round shares the same mood (see maybeExtendDrain). TIMING-ONLY: reddit's drain
+    // is reply-only, so the archetype carries only the gap-band mix + optional long
+    // break — never a like/vote knob.
+    const drainStyle = pickDrainArchetype(makeRng((Date.now() ^ 0x9e3779b1) >>> 0));
+
+    const nComments = queue.comments.length;
+    // Reddit drain is REPLY-ONLY: likesPerGap*=0 makes planDrainTimeline emit zero
+    // like slots, and we defensively filter to comment slots so no vote can ever be
+    // scheduled even if the shared planner changes. drainStyle contributes ONLY the
+    // timing knobs (bandWeights + longBreakMs) — it has no like field, so the
+    // reply-only invariant holds regardless of the spread order.
+    const planned = planDrainTimeline({
+      approvedComments: nComments,
+      startMs,
+      rng,
+      shortBandProb: cfg.drainShortBandProb,
+      likesPerGapMin: 0,
+      likesPerGapMax: 0,
+      ...drainStyle,
+    }).filter((a) => a.kind === "comment");
+    const actions: SlotAction[] = planned.map((a) => ({ kind: a.kind, atMs: a.atMs, executed: false }));
+    const lastAt = actions.reduce((m, a) => Math.max(m, a.atMs), startMs);
+    const windowHours = (lastAt - startMs) / 3600_000 + 0.15; // pad so the last slot fits
+
+    // Pin the run to the tab it starts on (reused via s.tabId in tickOnce), so a
+    // permalink/profile tab the operator opens later can never hijack the drain.
+    tabId = await findRedditTab();
+    const state: RunState = {
+      sessionId: crypto.randomUUID(), epoch, startMs, windowHours, actions,
+      persona, drainStyle, warmupSuppressMs: 0, mode: "drain", manualDrain: opts?.manual === true, tabId: tabId ?? undefined,
+      targets: { likes: 0, comments: nComments, dms: 0 },
+      done: { likes: 0, comments: 0, dms: 0 },
+      commentPool: queue.comments.map(toPoolItem),
+      dmPool: [],
+      upvoteAtMs: [], // idle-upvote timestamps (rolling-15-min ≤10 cap anchor)
+      doneDraftIds: [], lastPollMs: startMs, status: "running",
+      armedSend, // true iff this manual drain flipped reply_send_enabled ON itself
+      // Idle-upvote min-gap jitter, drawn ONCE per session (see RunState) — a
+      // per-tick redraw would bias the effective gap toward the 60s floor.
+      upvoteGapJitter: rng.float(1, 1.8),
+    };
+    await saveState(state);
