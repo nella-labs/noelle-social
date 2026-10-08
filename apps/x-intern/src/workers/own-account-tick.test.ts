@@ -198,3 +198,10 @@ describe("runOwnAccountTick", () => {
     expect(puts).toHaveLength(0);
   });
 
+  it("reports no_reader when there is nothing to read from at all", async () => {
+    const { bus, puts } = fakeBus();
+    const res = await runOwnAccountTick({ bus, api: null, apify: null, fallbackHandle: null, now: NOW });
+    expect(res.outcome).toBe("no_reader");
+    expect(puts).toHaveLength(0);
+  });
+});
