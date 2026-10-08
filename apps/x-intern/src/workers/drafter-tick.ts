@@ -398,3 +398,203 @@ export interface RunDrafterTickArgs {
    * them and injects "THE POST'S IMAGE SHOWS:" into the prompt so the drafter can
    * react to the visual. Omit (no key, vision disabled) and drafting proceeds
    * with no caption — fail-open throughout.
+   */
+  captionFn?: CaptionFn;
+  /**
+   * Voice variety (NOELLE_DRAFTER_VARIETY). When enabled, each lead is assigned a
+   * random "register" (ultra-short / hype / slang / punchy / normal) injected into
+   * the REPLY-drafting prompt so replies vary in length + energy across the feed.
+   * `rng` is injectable for deterministic tests (defaults to Math.random in the
+   * worker). When disabled / omitted, no register is injected and drafts are
+   * byte-identical to today. Only the reply drafts get a register — the DM is
+   * untouched, and runDmRequestTick never touches this path.
+   */
+  variety?: {
+    enabled: boolean;
+    rng?: () => number;
+    /**
+     * Per-reply SHAPE rotation (X_FORM_VARIANTS). Injectable so tests are
+     * deterministic; defaults to the module-level process-wide rotation so
+     * consecutive replies never share a shape across leads AND across ticks.
+     */
+    formVariantRotation?: {
+      next: (rng?: () => number, exclude?: readonly string[]) => FormVariant;
+    };
+    /**
+     * Per-reply gen-z MARKER rotation. Same reason as the shape rotation: the
+     * lane's whole point is that the feed does not repeat a marker, and only a
+     * process-wide instance has the memory to enforce that. Injectable for
+     * deterministic tests.
+     */
+    genzMarkerRotation?: {
+      next: (rng?: () => number, energy?: PostEnergy | null) => GenZMarker | null;
+    };
+    /**
+     * Share of leads offered a gen-z marker. Defaults to
+     * genzMarkerRateFromEnv() (22%, `NOELLE_GENZ_MARKERS=0` to disable). Held
+     * separately from `enabled` because the RATE is the design: the operator
+     * asked for gen-z wording and for it not to be overdone in the same breath.
+     */
+    genzMarkerRate?: number;
+  };
+  /**
+   * Post-energy mirroring (NOELLE_DRAFTER_ENERGY, default off). When enabled the
+   * drafter detects the post's energy (celebration/joke/hot_take/vent/question/
+   * analytical) and (a) picks an energy-aware register when variety is on — HYPE only
+   * on a celebration, DEADPAN on a joke, never snark on a question — and (b) injects a
+   * one-line energy hint so the reply MIRRORS the post: answer satire with satire, not
+   * philosophy. Off/omitted → blind register + celebration/neutral style only,
+   * byte-identical to today.
+   */
+  energy?: { enabled: boolean };
+  /**
+   * Sibling-comment "read the room" fetch (NOELLE_DRAFTER_COMMENT_ENERGY). When
+   * provided, the tick fetches the top OTHER replies on each lead's post and injects a
+   * digest so the reply matches the room's energy and never echoes a take already
+   * made. The worker owns the Apify client / credential / spend + budget; this closure
+   * just returns the normalized comments (or []). Fail-open: a throw is caught and
+   * treated as no room context. Undefined → off, byte-identical to today.
+   */
+  fetchSiblingComments?: (lead: LeadRow) => Promise<SiblingComment[]>;
+  /**
+   * Recently-sent reply bodies used as the near-duplicate corpus for the
+   * reply-diversity gate (NOELLE_REPLY_DIVERSITY_GATE). Empty/undefined → the
+   * gate is a no-op and drafting is byte-identical to today.
+   */
+  replyPriors?: string[];
+  /**
+   * Per-person memory: the reply bodies Vega has ALREADY produced for one author
+   * (sent + pending), newest first. Injected into the prompt as a do-not-repeat
+   * list AND passed to the verifier as `priorRepliesToPerson`, which grades a
+   * `novelty` dimension and regenerates a draft that re-says an old take.
+   * Without it, a watchlist person who posts often gets the same angle every
+   * time. Fail-open: a throw is caught and treated as no history.
+   */
+  getPriorReplies?: (a: {
+    authorHandle: string | null;
+    authorId?: string | null;
+    excludeLeadId?: string | null;
+    limit: number;
+  }) => Promise<string[]>;
+  /** How many prior replies to this person to inject. Default 3. */
+  priorRepliesTopK?: number;
+  /**
+   * Feed-wide memory: Vega's most recent reply bodies across ALL authors. Fetched
+   * ONCE per tick. Injected as an avoid-list so openers/phrasings vary feed-wide,
+   * and passed to the verifier as `recentReplies`, whose deterministic diversity
+   * leg regenerates a reply too structurally alike a recent one. This is the
+   * prompt-side complement to the existing post-hoc `replyPriors` gate: that one
+   * REJECTS a near-duplicate after the fact, this one prevents it being written.
+   */
+  getRecentPhrasings?: (a: {
+    excludeLeadId?: string | null;
+    limit: number;
+  }) => Promise<string[]>;
+  /** How many feed-wide recent replies to inject. Default 12. */
+  recentPhrasingsTopK?: number;
+  /**
+   * Prompt-injection fence (NOELLE_DRAFTER_FENCE, default OFF). Passed straight
+   * into renderPrompt.fenceUntrusted for every lead. Off/omitted → drafts
+   * byte-identical to today.
+   */
+  fenceUntrusted?: boolean;
+}
+
+const DEFAULT_RELEVANCE_THRESHOLD = 6;
+
+/**
+ * Faithful multi-voice pool restriction, pure so it's unit-testable. When MORE
+ * than one faithful voice is pinned, restrict a lead's exemplar pool to the ONE
+ * voice picked for it — deterministic per lead (seeded on the post text) and
+ * rotating across the feed, optionally biased by `weights` (parallel to
+ * `voices`, e.g. 60/40). Fail-open: a chosen voice with no corpus returns the
+ * full pool. Zero or one voice ⇒ the pool is returned untouched (a single pin
+ * is already restricted at load time — byte-identical to today).
+ */
+export function poolForFaithfulLead(
+  pool: StyleExemplarRow[],
+  voices: string[],
+  postText: string,
+  weights?: number[],
+): StyleExemplarRow[] {
+  if (voices.length <= 1) return pool;
+  const chosen = pickFaithfulVoice(voices, postText, weights);
+  const filtered = pool.filter((c) => c.account_handle === chosen);
+  return filtered.length ? filtered : pool;
+}
+
+export function xReplyStyleCorpusPlan(
+  config: unknown,
+  faithful: boolean,
+): { primary: ("post" | "comment")[]; fallback: ("post" | "comment")[] } {
+  const rawKinds = config && typeof config === "object"
+    ? (config as { styleExemplarKinds?: unknown }).styleExemplarKinds
+    : undefined;
+  const hasExplicitKinds = Array.isArray(rawKinds)
+    && rawKinds.length > 0
+    && rawKinds.every((kind) => kind === "post" || kind === "comment");
+  if (hasExplicitKinds) {
+    return { primary: readStyleExemplarKinds(config), fallback: [] };
+  }
+  return faithful
+    ? { primary: ["comment"], fallback: ["post"] }
+    : { primary: ["post"], fallback: [] };
+}
+
+export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> {
+  const {
+    log,
+    instance,
+    claimedLeads,
+    runner,
+    kb,
+    postOutbound,
+    markStatus,
+    relevanceThreshold = DEFAULT_RELEVANCE_THRESHOLD,
+    voiceDirs,
+    knowledgeDirs,
+    knowledgeTopK = 4,
+    examples,
+    verify,
+    qualityThreshold = 0,
+    opusLikesThreshold = 0,
+    opusRepliesThreshold = 0,
+    sql,
+    bus,
+    captionFn,
+    variety,
+    replyPriors,
+    getPriorReplies,
+    priorRepliesTopK = 3,
+    getRecentPhrasings,
+    recentPhrasingsTopK = 12,
+    fenceUntrusted = false,
+  } = args;
+  const voiceOpts =
+    voiceDirs && voiceDirs.length ? { filterDirs: voiceDirs } : undefined;
+  let processed = 0;
+
+  // Operator brand config (persona/product/pitch/styles), parsed once per tick.
+  const brand = parseBrandConfig(instance.brand_config);
+  const operatorFacts = renderOperatorFacts(brand);
+
+  // Feed-wide recent phrasings, fetched ONCE per tick (not per lead) — the
+  // avoid-list that keeps openers varied across the whole feed. Fail-open.
+  const recentPhrasings = getRecentPhrasings
+    ? await getRecentPhrasings({ limit: recentPhrasingsTopK }).catch(() => [])
+    : [];
+
+  // Per-watchlist-person objectives (keyed by lowercased handle), fetched once
+  // per tick. Empty for leads whose author isn't a watchlist person.
+  const objectivesByHandle: Map<string, WatchlistObjectiveEntry> = sql
+    ? await getWatchlistObjectives(sql, instance.id)
+    : new Map();
+
+  // Per-watchlist-person PROFILES (summary/topics/tone/engagement), keyed by
+  // lowercased handle, fetched once per tick. The profiler writes these but the
+  // drafter never read them — profiles were orphaned on X. We now ground every
+  // watchlist reply in who the person actually is. Empty for non-watchlist leads.
+  const profilesByHandle: Map<string, WatchlistProfileRow> = sql
+    ? await getWatchlistProfiles(sql, instance.id)
+    : new Map();
+
