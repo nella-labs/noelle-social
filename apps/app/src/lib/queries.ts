@@ -398,3 +398,203 @@ export type ApprovalSourceFilter = "real" | "synthetic" | "all";
 /**
  * Watchlist filter. `all` (default) shows every lead; `only` shows just
  * watchlist-person leads (leads.priority = true, the always-reply accounts);
+ * `exclude` hides them so the operator can sweep non-watchlist leads. Keyed off
+ * the discovery worker's `priority` flag, the same signal that marks a lead as
+ * coming from a watchlisted author.
+ */
+export type ApprovalWatchlistFilter = "all" | "only" | "exclude";
+
+export interface ListPendingApprovalsOptions {
+  /**
+   * Reviewer-facing quality floor (0..1). When set, approvals tied to leads
+   * with `classifier_score < minScore` are dropped from the inbox. NULL
+   * scores (pre-classifier-mirror rows) always pass through so the inbox
+   * never silently swallows historical work where the classifier hadn't yet
+   * mirrored.
+   */
+  minScore?: number | null;
+  /** Approval status to show. Defaults to `pending` (the review queue). */
+  status?: ApprovalStatusFilter;
+  /** Lead source. Defaults to `real` — synthetic seed leads are hidden. */
+  source?: ApprovalSourceFilter;
+  /** Watchlist membership. Defaults to `all`. */
+  watchlist?: ApprovalWatchlistFilter;
+  /**
+   * Ordering. `score` (default) ranks by classifier quality; `newest_post`
+   * ranks by the POST's own creation time (leads.payload.posted_at) so the
+   * freshest tweets surface first, regardless of when the lead was drafted.
+   */
+  sort?: ApprovalSort;
+  /**
+   * "Last batch" filter. When set to an ISO timestamp, only approvals created
+   * at/after it are returned — used to show just the most recent goal-run's
+   * output (the instance's last_goal_started_at). NULL/undefined = no filter.
+   */
+  lastBatchSince?: string | null;
+}
+
+/** Approval inbox ordering. */
+export type ApprovalSort = "score" | "newest_post";
+
+export async function listPendingApprovalsForOrg(
+  orgId: string,
+  limit = 50,
+  options: ListPendingApprovalsOptions = {},
+): Promise<PendingApprovalRow[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+
+  const minScore =
+    options.minScore != null && Number.isFinite(options.minScore)
+      ? Math.max(0, Math.min(1, options.minScore))
+      : null;
+  const status: ApprovalStatusFilter = options.status ?? "pending";
+  const source: ApprovalSourceFilter = options.source ?? "real";
+  const watchlist: ApprovalWatchlistFilter = options.watchlist ?? "all";
+  const sort: ApprovalSort = options.sort ?? "score";
+  const lastBatchSince = options.lastBatchSince ?? null;
+
+  const rows = await readSql<JoinedRowRaw[]>`
+    select
+      a.id              as a_id,
+      a.org_id          as a_org_id,
+      a.agent_instance_id as a_agent_instance_id,
+      a.draft_id        as a_draft_id,
+      a.lead_id         as a_lead_id,
+      a.status          as a_status,
+      a.decided_at      as a_decided_at,
+      a.decided_by      as a_decided_by,
+      a.skip_reason     as a_skip_reason,
+      a.auto_send_target_at as a_auto_send_target_at,
+      a.created_at      as a_created_at,
+      a.updated_at      as a_updated_at,
+      d.id              as d_id,
+      d.lead_id         as d_lead_id,
+      d.org_id          as d_org_id,
+      d.payload         as d_payload,
+      d.synced_at       as d_synced_at,
+      l.id              as l_id,
+      l.external_id     as l_external_id,
+      l.org_id          as l_org_id,
+      l.payload         as l_payload,
+      l.synced_at       as l_synced_at,
+      l.tier            as l_tier,
+      l.classifier_label as l_classifier_label,
+      l.classifier_score as l_classifier_score,
+      l.priority        as l_priority
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    where a.org_id = ${orgId}
+      -- This is the X intern (Vega) inbox: exclude LinkedIn-platform leads,
+      -- which queue in Lyra's own draft-only stream (?stream=linkedin-intern).
+      -- platform defaults to 'x' (cloudsql/0005), so null/'x' both stay.
+      and (l.platform is null or l.platform = 'x')
+      and (${status} = 'all' or a.status = ${status})
+      and (${source} = 'all'
+           or (${source} = 'synthetic' and l.external_id like 'synthetic-%')
+           or (${source} = 'real'
+               and (l.external_id is null or l.external_id not like 'synthetic-%')))
+      and (${minScore}::numeric is null
+           or l.classifier_score is null
+           or l.classifier_score >= ${minScore}::numeric)
+      and (${watchlist} = 'all'
+           or (${watchlist} = 'only' and l.priority = true)
+           or (${watchlist} = 'exclude' and (l.priority is null or l.priority = false)))
+      and (${lastBatchSince}::timestamptz is null
+           or a.created_at >= ${lastBatchSince}::timestamptz)
+    order by
+      case when a.status = 'pending' then 0 else 1 end,
+      case when ${sort} = 'newest_post'
+           then (l.payload->>'posted_at')::timestamptz end desc nulls last,
+      l.classifier_score desc nulls last,
+      a.created_at desc
+    limit ${limit}
+  `;
+
+  // Defensive filter: pre-2026-05-26 drafter runs occasionally produced
+  // approvals whose draft bodies were SKIP prose (model wedged the skip into
+  // the angle payload instead of returning {skip:"…"}). New runs normalise via
+  // drafter-tick's safeJsonParse — this drops the historical residue (and any
+  // future regression). Such a draft has no usable angle text, so it renders
+  // as a broken card under ANY status filter; hide it everywhere (the rows
+  // stay in the DB). See `lib/is-skip-draft.ts`.
+  return rows
+    .map((r) => unpackJoined(r))
+    .filter((row) => !isAllSkipDraft(draftPayload(row.draft)));
+}
+
+/**
+ * Count of *real* pending approvals for an org — synthetic seed leads
+ * (external_id LIKE 'synthetic-%') excluded. Drives the X-intern stream
+ * badge so it always reflects genuine work to review, independent of the
+ * status/source filters the user may have applied to the visible list.
+ * Cheap: a COUNT over the status-indexed approvals table.
+ */
+export const countPendingApprovalsForOrg = cache(async (
+  orgId: string,
+): Promise<number> => {
+  const userId = await getRequiredUserId();
+  await assertMember(orgId, userId);
+  // Count distinct visible leads, not raw approval rows. The drafter writes ~4
+  // approvals per reply lead (3 reply angles + 1 legacy companion DM). The tab
+  // badge is the replies backlog; the shared Show DMs control reveals and
+  // counts DMs separately inside the active stream.
+  // Approvals with no lead still count once via the id coalesce.
+  const rows = await readSql<Array<{ n: number }>>`
+    select count(distinct coalesce(l.id::text, a.id::text))::int as n
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    where a.org_id = ${orgId}
+      and a.status = 'pending'
+      -- X intern (Vega) badge only — LinkedIn leads belong to Lyra's stream.
+      and (l.platform is null or l.platform = 'x')
+      and (l.external_id is null or l.external_id not like 'synthetic-%')
+      and coalesce(d.payload->>'kind', 'reply') <> 'dm'
+  `;
+  return rows[0]?.n ?? 0;
+});
+
+/**
+ * Lifetime count of approvals genuinely SENT for an org (status = 'sent' only
+ * — skipped drafts are NOT sends). Drives the "Sent" KPI. Excludes synthetic
+ * seed leads, matching the pending/visible surfaces.
+ *
+ * Note: 'sent' is forward-only — deleting the reply/DM on X does not decrement
+ * it, and a hand-dispatched DM is marked 'sent' without Noelle posting. So this
+ * reflects "approvals marked sent", not "currently-live posts".
+ */
+export async function countSentApprovalsForOrg(orgId: string): Promise<number> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<Array<{ n: number }>>`
+    select count(*)::int as n
+    from noelle.approvals a
+    left join noelle.leads l on l.id = a.lead_id
+    where a.org_id = ${orgId}
+      and a.status = 'sent'
+      and (l.external_id is null or l.external_id not like 'synthetic-%')
+  `;
+  return rows[0]?.n ?? 0;
+}
+
+/** One agent's sent-message tally, sliced by recency and reply-vs-DM. */
+export interface SentStatsByAgentRow {
+  instanceId: string;
+  /** 'x_intern' (Vega) | 'linkedin_intern' (Lyra) | … */
+  role: string;
+  displayName: string;
+  /** Platform the role posts to — derived from role, for the UI label. */
+  platform: "x" | "linkedin" | "other";
+  /** Sent since 00:00 UTC today. */
+  today: number;
+  /** Sent in the trailing 7 days (today + 6). */
+  last7: number;
+  /** Lifetime sent. */
+  total: number;
+  /** Of `total`, how many were DMs (drafts.payload.kind = 'dm'). */
+  dms: number;
+  /** Of `total`, how many were replies (everything that isn't a DM). */
