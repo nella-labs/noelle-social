@@ -398,3 +398,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
 
     // Age cutoff (opt-in via maxPostAgeHours): a claimed lead whose post is
     // older than the cutoff is terminally skipped, not drafted — its live upvote
+    // window has closed, so a reply there earns no ranking curve and just spends
+    // budget + an approval slot. Checked before the daily-cap defer so a stale
+    // lead exits instead of rolling to a later day (where it is only older).
+    // Skipped only when we actually know the post age (posted_at present).
+    if (maxPostAgeHours > 0) {
+      const postedAt = readSourceTimestamp((lead.payload as RedditPayload).posted_at);
+      const postedMs = postedAt ? Date.parse(postedAt) : NaN;
+      if (!Number.isNaN(postedMs)) {
+        const ageHours = (Date.now() - postedMs) / 3_600_000;
+        if (ageHours > maxPostAgeHours) {
+          log.info(
+            { leadId: lead.id, ageHours: Math.round(ageHours), maxPostAgeHours },
+            "drafter skipped lead past max post age",
+          );
+          await markStatus({
+            leadId: lead.id,
+            status: "skipped",
+            meta: { skip_reason: `post-too-old (${Math.round(ageHours)}h > ${maxPostAgeHours}h)` },
+          });
+          continue;
+        }
+      }
+    }
+
+    if (remaining[replyKind] <= 0) {
+      log.info(
+        { leadId: lead.id, replyKind, cap: replyKind === "light" ? lightCap : substantialCap },
+        "daily draft cap reached for kind; leaving lead classified for a later day",
+      );
+      await deferLeadToClassified({ sql, leadId: lead.id, replyKind });
+      continue;
+    }
+
+    const payload = lead.payload as RedditPayload;
+    // A Reddit post is title + body. The title carries most posts (link posts have
+    // no body); combine both so the model sees the whole thread starter.
+    const postText = buildPostText(payload);
+    if (!postText) {
+      await markStatus({ leadId: lead.id, status: "skipped", meta: { skip_reason: "empty post text" } });
+      continue;
+    }
+
+    try {
+      // Voice retrieval, scoped to voiceDirs when configured. Fail-open to none.
+      const anchors = await kb.search(postText, 8, voiceOpts).catch((err) => {
+        log.warn({ err: (err as Error).message }, "knowledge base search failed; drafting with no anchors");
+        return [];
+      });
+
+      // Retrieval-score gate. LIGHT leads bypass it. SUBSTANTIAL leads must clear it.
+      const topAnchorScore = anchors.length === 0 ? 0 : Math.max(...anchors.map((a) => a.score));
+      if (replyKind === "substantial" && topAnchorScore < relevanceThreshold) {
+        log.info(
+          { leadId: lead.id, topAnchorScore, relevanceThreshold },
+          "drafter skipped substantial lead below relevance threshold",
+        );
+        await markStatus({
+          leadId: lead.id,
+          status: "skipped",
+          meta: {
+            skip_reason: `below-relevance-threshold (score=${topAnchorScore.toFixed(3)} < ${relevanceThreshold})`,
+            top_anchor_score: topAnchorScore,
+            relevance_threshold: relevanceThreshold,
+          },
+        });
+        continue;
+      }
+
+      // Second, KNOWLEDGE retrieval pass. Skipped when no knowledge dirs configured.
+      const knowledge =
+        knowledgeDirs && knowledgeDirs.length && knowledgeTopK > 0
+          ? await kb
+              .search(postText, knowledgeTopK, { filterDirs: knowledgeDirs })
+              .catch((err) => {
+                log.warn({ err: (err as Error).message }, "knowledge retrieval failed; drafting without product knowledge");
+                return [];
+              })
+          : [];
+      const knowledgeAnchors = knowledge.map((k) => k.snippet);
+
+      // Optional vision failure is empty context; denied admission stops drafting.
+      const imageCaption = await captionImages({
+        imageUrls: payload.images ?? [],
+        postText,
+        ...(captionFn ? { captionFn } : {}),
+      });
+
+      // Score-based Opus tiering: Opus is reserved for genuinely high-engagement
+      // posts (decideOpus on score/comments). Engagement comes from Apify (payload).
+      const decision = decideOpus({
+        score: payload.score,
+        comments: payload.numComments,
+        scoreThreshold: opusScoreThreshold,
+        commentsThreshold: opusCommentsThreshold,
+      });
+      const useSmartest = decision.useOpus;
+      const routing: ModelRouting = useSmartest ? opusOverrideRouting(baseRouting, opusModel) : baseRouting;
+      log.info(
+        {
+          leadId: lead.id,
+          score: decision.score,
+          comments: decision.comments,
+          useOpus: useSmartest,
+          model: routing.primary.model,
+        },
+        useSmartest ? "drafter using Opus for high-engagement lead" : "drafter using default model for lead",
+      );
+
+      // Detect the post's ENERGY once (label-first: a persisted energy label, then
+      // classifier_label, then text heuristics). Drives the energy-aware register + the
+      // "POST ENERGY" hint. Gated NOELLE_DRAFTER_ENERGY; off → null, byte-identical.
+      const postEnergy = args.energy?.enabled
+        ? detectPostEnergy(postText, {
+            classifierLabel: lead.classifier_label,
+            energyLabel: (payload as { energy?: string | null }).energy ?? null,
+          })
+        : null;
+
+      // Voice variety: assign a register (comments only). Energy-aware when energy is
+      // on (DEADPAN on a joke, never HYPE on a serious thread); blind pick otherwise.
+      // SHAPE lane, new for Orion. Every comment used to be drafted in the same
+      // default 1-4 sentence band with only the register varying, which made
+      // his feed the most uniform of the three. Same machinery as Vega's, same
+      // mutual exclusion with the register (both claim comment length), same
+      // tone-first split so a joke or a vent still varies in FORM and not only
+      // in tone.
+      const toneFirst = postEnergy != null && TONE_FIRST_ENERGIES.has(postEnergy);
+      const toneFirstShape =
+        toneFirst && variety?.enabled
+          ? (variety.rng ?? Math.random)() < TONE_FIRST_SHAPE_SHARE
+          : false;
+      const isLight = lead.classifier_label === "light";
+      // A SUBSTANTIAL lead asks for one draft per angle in a single call (T1
+      // wants empathetic + technical + contrarian), and ONE assigned shape
+      // governs the whole prompt. A shape that prescribes a STANCE therefore
+      // contradicts the angles it is sitting next to: "answer with the joke,
+      // and nothing else" cannot also produce an empathetic body. Each angle
+      // becomes its own queued reply and a queued Reddit reply is auto-sent, so
+      // the contradiction would ship unreviewed.
+      const angleCount = isLight ? 1 : (TIER_ANGLES[lead.tier ?? "T3"]?.length ?? 1);
+      const formVariant =
+        variety?.enabled && (!toneFirst || toneFirstShape)
+          ? (variety.formVariantRotation ?? redditFormVariantRotation).next(variety.rng, [
+              ...(isLight ? LIGHT_EXCLUDED_VARIANT_IDS : []),
+              ...(angleCount > 1 ? STANCE_SHAPE_IDS : []),
+              ...(toneFirstShape ? shapesExcludedForEnergy(postEnergy, REDDIT_FORM_VARIANTS) : []),
+            ])
+          : undefined;
+      const shapeBlock = formVariant ? renderAssignedShapeBlock(formVariant) : undefined;
+
+      const registerBlock =
+        variety?.enabled && !formVariant
+          ? renderRegisterBlock(
+              postEnergy ? pickRegisterForEnergy(postEnergy, variety.rng) : pickRegister(variety.rng),
+              "the comment",
+            )
+          : undefined;
+      // The opening move only applies to shapes that leave the opener free; the
+      // short shapes have no opening distinct from the whole comment, and the
+      // rest prescribe their own. On a lead with no shape there is nothing to
+      // conflict with, so it applies there as before.
+      const openingMoveBlock =
+        variety?.enabled && (!formVariant || SHAPES_WITH_FREE_OPENER.includes(formVariant.id))
+          ? renderOpeningMoveBlock(
+              pickOpeningMove(
+                variety.rng,
+                // TWO_FLAT / RUN_ON / RIFF / FLAT_DISAGREE forbid a question,
+                // which the QUESTION move would order.
+                formVariant && SHAPES_BANNING_QUESTIONS.includes(formVariant.id)
+                  ? OPENING_MOVES.filter((m) => m.id !== "QUESTION")
+                  : undefined,
+              ),
+            )
+          : undefined;
+
+      // Gen-z SPOKEN REGISTER: word choice only, so it does not compete with
+      // the shape or the register for the length slot and is not suppressed by
+      // either.
+      const genzMarkerRate = variety?.genzMarkerRate ?? genzMarkerRateFromEnv();
+      const genzMarker =
+        variety?.enabled && genzMarkerRate > 0 && (variety.rng ?? Math.random)() < genzMarkerRate
+          ? (variety.genzMarkerRotation ?? redditGenZMarkerRotation).next(variety.rng, postEnergy)
+          : null;
+      const genzBlock = genzMarker ? renderGenZMarkerBlock(genzMarker) : undefined;
+
+      // "Read the room": the top OTHER comments on this thread (free reddit .json), so
+      // the comment mirrors the room's energy + avoids echoing an existing take.
+      // Fail-open — any error → no room context for this lead.
+      let siblingBlock: string | undefined;
+      if (args.fetchSiblingComments) {
+        const siblings = await args.fetchSiblingComments(lead).catch((err) => {
+          log.warn(
+            { leadId: lead.id, err: (err as Error).message },
+            "sibling-comment fetch failed; drafting without room context",
+          );
+          return [] as SiblingComment[];
+        });
+        const digest = renderCommentDigest(siblings, { sampleMax: 8 });
+        if (digest) siblingBlock = digest;
+      }
