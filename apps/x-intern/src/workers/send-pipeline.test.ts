@@ -198,3 +198,13 @@ describe("approval → send pipeline (end-to-end, in-memory)", () => {
     expect(
       store.drafts.filter((d) => d.sent_external_id != null),
     ).toHaveLength(1);
+    // Both sibling approvals are skipped, not pending — they won't haunt the inbox.
+    const siblings = store.approvals.filter(
+      (a) => a.id !== empatheticApproval.id,
+    );
+    expect(siblings.map((a) => a.status)).toEqual(["skipped", "skipped"]);
+    expect(siblings.every((a) => a.skip_reason === "sibling-angle-sent")).toBe(true);
+    // X was called exactly once — no double-posting of the other angles.
+    expect(xClient.createTweet).toHaveBeenCalledTimes(1);
+  });
+});
