@@ -198,3 +198,203 @@ describe("the whole threading path on the real capture", () => {
     const target = `urn:li:comment:${THEIRS}`;
 
     const button = locateCommentReplyButton(root, target);
+    expect(button.ok).toBe(true);
+
+    // (the click happens via CDP; the fixture already shows the post-click DOM)
+    const editor = locateReplyComposer(root, { afterCommentId: target });
+    expect(editor.ok).toBe(true);
+    expect(replyComposerMention(root, { afterCommentId: target })).toBe("Malena M.");
+
+    const submit = locateReplySubmit(root, { afterCommentId: target });
+    expect(submit.ok).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Everything below was added after an adversarial review proved the first cut
+// could target the WRONG composer while reporting success. The fixture now
+// carries THREE composers — the post-level one (submit "Comment"), Malena's
+// open reply box, and Mateu's — so "pick the right one" is genuinely exercised
+// rather than being true by there only ever being one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("a target that resolves to nothing must REFUSE, never fall back", () => {
+  // The original fell through to "the first composer on the page". With a real
+  // post-level composer present that is the operator's own "Add a comment"
+  // box — so a conversation reply would have been typed into it. The comment
+  // list is a virtualized LazyColumn, so an anchor really can vanish between
+  // the Reply click and this read.
+  it("refuses when the comment id is not on the page", () => {
+    const root = mount(page());
+    const r = locateReplyComposer(root, { afterCommentId: "9999999999999999999" });
+    expect(r.ok).toBe(false);
+    expect(r.skipReason).toBe("reply-composer:comment-not-found");
+  });
+
+  it("refuses an unparseable target rather than guessing", () => {
+    const r = locateReplyComposer(mount(page()), { afterCommentId: "urn:li:activity:123" });
+    expect(r.ok).toBe(false);
+    expect(r.skipReason).toBe("reply-composer:bad-target-id");
+  });
+
+  it("the submit refuses too — the whole path is closed, not just one end", () => {
+    const r = locateReplySubmit(mount(page()), { afterCommentId: "9999999999999999999" });
+    expect(r.ok).toBe(false);
+    expect(r.skipReason).toBe("reply-composer:comment-not-found");
+  });
+
+  it("never reports a mention for a target that does not exist", () => {
+    expect(replyComposerMention(mount(page()), { afterCommentId: "9999999999999999999" })).toBeNull();
+  });
+});
+
+describe("the composer must BELONG to the comment, not merely follow it", () => {
+  // If the target's box never opened (missed click, render race, a box left
+  // open by an earlier run) the NEXT comment's box is also "below" the anchor.
+  // The "Reply" label check cannot catch this — every reply box says Reply.
+  it("refuses when another comment sits between the anchor and the box", () => {
+    const root = mount(page());
+    // Malena's own composer is removed, so the next box below her is Mateu's —
+    // with Mateu's comment in between.
+    root.querySelector('[componentkey^="commentBox-Ki8K"]')!.closest(".ae29cd27")!.remove();
+    const r = locateReplyComposer(root, { afterCommentId: THEIRS });
+    expect(r.ok).toBe(false);
+    expect(r.skipReason).toBe("reply-composer:not-this-comments-box");
+  });
+
+  it("picks each comment's OWN box when both are open", () => {
+    const root = mount(page());
+    expect(replyComposerMention(root, { afterCommentId: THEIRS })).toBe("Malena M.");
+    expect(replyComposerMention(root, { afterCommentId: OTHER })).toBe("Mateu Rojas Comella");
+  });
+
+  it("never resolves to the POST-level composer, which sits above every comment", () => {
+    const root = mount(page());
+    // It is first in document order, so a naive boxes[0] would take it.
+    expect(root.querySelector('[componentkey^="commentBox-POSTLEVEL"]')).not.toBeNull();
+    expect(replyComposerMention(root, { afterCommentId: THEIRS })).toBe("Malena M.");
+  });
+});
+
+describe("expectMention — independent proof of who we are answering", () => {
+  it("accepts when the chip names the expected person", () => {
+    const r = locateReplySubmit(mount(page()), { afterCommentId: THEIRS, expectMention: "Malena M." });
+    expect(r.ok).toBe(true);
+  });
+
+  it("REFUSES when the box names somebody else", () => {
+    const r = locateReplySubmit(mount(page()), { afterCommentId: THEIRS, expectMention: "Mateu Rojas Comella" });
+    expect(r.ok).toBe(false);
+    expect(r.skipReason).toBe("reply-submit:wrong-person");
+  });
+});
+
+describe("reply composer ownership across comment containers", () => {
+  const containers = [
+    ["data-id", "urn:li:comment:"],
+    ["id", "replaceableComment_urn:li:comment:"],
+    ["componentkey", "CommentComponentReference_urn:li:comment:"],
+  ] as const;
+  const box = '<div class="comments-comment-box"><div contenteditable="true" role="textbox">Reply body</div><div id="commentButtonSection"><button>Reply</button></div></div>';
+  it.each(containers)("rejects a following %s comment's editor", (attribute, prefix) => {
+    const root = mount(`<article data-id="urn:li:comment:(ugcPost:123,111)"></article><article ${attribute}="${prefix}(ugcPost:123,222)">${box}</article>`);
+    expect(locateReplyComposer(root, { afterCommentId: "111" }).ok).toBe(false);
+    expect(locateReplySubmit(root, { afterCommentId: "111" }).ok).toBe(false);
+  });
+  it.each(containers)("rejects a nested foreign %s comment's editor", (attribute, prefix) => {
+    const root = mount(`<article data-id="urn:li:comment:(ugcPost:123,111)"><article ${attribute}="${prefix}(ugcPost:123,222)">${box}</article></article>`);
+    expect(locateReplyComposer(root, { afterCommentId: "111" }).ok).toBe(false);
+    expect(locateReplySubmit(root, { afterCommentId: "111" }).ok).toBe(false);
+  });
+  it.each(containers)("accepts nested %s wrappers for the same target", (attribute, prefix) => {
+    const root = mount(`<article data-id="urn:li:comment:(ugcPost:123,111)"><div ${attribute}="${prefix}(ugcPost:123,111)">${box}</div></article>`);
+    expect(locateReplyComposer(root, { afterCommentId: "111" }).ok).toBe(true);
+    expect(locateReplySubmit(root, { afterCommentId: "111" }).ok).toBe(true);
+  });
+});
+
+describe("zero-rect and disabled guards, matching every sibling locator", () => {
+  it("refuses a zero-sized target instead of clicking the viewport corner", () => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0, toJSON: () => ({}),
+    } as DOMRect);
+    const r = locateCommentReplyButton(mount(page()), THEIRS);
+    expect(r.ok).toBe(false);
+    expect(r.skipReason).toBe("comment-reply:zero-rect");
+  });
+
+  it("refuses a disabled submit — clicking it is a silent no-op", () => {
+    const root = mount(page());
+    const btn = Array.from(root.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "Reply" && b.closest('[id*="commentButtonSection"]'),
+    )!;
+    btn.setAttribute("aria-disabled", "true");
+    const r = locateReplySubmit(root, { afterCommentId: THEIRS });
+    expect(r.ok).toBe(false);
+  });
+});
+
+describe("the componentkey fallback only accepts real comment containers", () => {
+  it("does not scope to a replies-thread wrapper keyed by the same urn", () => {
+    // Such a wrapper holds OTHER people's comments, so scoping to it would
+    // return the wrong person's Reply button while reporting success.
+    const root = mount(`
+      <div>
+        <div componentkey="replaceableComment_urn:li:comment:(urn:li:ugcPost:1,444)">
+          <button aria-label="Reply" id="right"></button>
+        </div>
+        <div componentkey="repliesThread_urn:li:comment:(urn:li:ugcPost:1,444)">
+          <div componentkey="replaceableComment_urn:li:comment:(urn:li:ugcPost:1,555)">
+            <button aria-label="Reply" id="wrong"></button>
+          </div>
+        </div>
+      </div>`);
+    const el = locateCommentByUrn(root, "444");
+    expect(el).not.toBeNull();
+    expect(el!.querySelector("button")!.id).toBe("right");
+  });
+});
+
+// LinkedIn can hide the target comment behind a load-more control. Expand it
+// before treating an absent comment as a locator failure.
+describe("reaching the comment before looking for it", () => {
+  it("finds the expander on the real captured page", () => {
+    const r = locateLoadMoreComments(mount(page()));
+    expect(r.ok).toBe(true);
+  });
+
+  it("matches the phrasings LinkedIn uses", () => {
+    for (const label of ["See 33 more comments", "Load more comments", "Show previous comments", "See more comments"]) {
+      const root = mount(`<div><div role="button"><p>${label}</p></div></div>`);
+      expect(locateLoadMoreComments(root).ok, label).toBe(true);
+    }
+  });
+
+  it("does not mistake an ordinary button for the expander", () => {
+    const root = mount(`<div><button>Comment</button><button>Reply</button><button>See profile</button></div>`);
+    expect(locateLoadMoreComments(root).ok).toBe(false);
+  });
+
+  it("reports not-found rather than guessing when the thread is fully expanded", () => {
+    const root = mount(page());
+    root.querySelector('[id*="replaceableLoadMoreComments"]')!.remove();
+    const r = locateLoadMoreComments(root);
+    expect(r.ok).toBe(false);
+    expect(r.skipReason).toBe("load-more-comments:not-found");
+  });
+});
+
+describe("commentDeepLink — arrive where a human would", () => {
+  const POSTURL = "https://www.linkedin.com/feed/update/urn:li:ugcPost:7486054278927835136/";
+
+  it("rebuilds the TUPLE urn LinkedIn needs from what the sweep stored", () => {
+    // The sweep stores the flat `urn:li:comment:<id>`; the deep link needs
+    // `urn:li:comment:(<post>,<id>)`.
+    const out = commentDeepLink(POSTURL, "urn:li:ugcPost:7486054278927835136", `urn:li:comment:${THEIRS}`);
+    expect(out).toContain("commentUrn=");
+    expect(decodeURIComponent(out)).toContain(
+      `urn:li:comment:(urn:li:ugcPost:7486054278927835136,${THEIRS})`,
+    );
+  });
+
+  it("returns the url UNCHANGED when it cannot build one — never a reason to skip", () => {
