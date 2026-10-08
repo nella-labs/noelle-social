@@ -198,3 +198,33 @@ it("does not invalidate another key's pending fill", async () => {
   const cache = new MemoryCache();
   const started = deferred<void>(), value = deferred<string>();
   const compute = vi.fn(() => { started.resolve(); return value.promise; });
+  const older = cache.getOrCompute("key", 60, compute);
+  await started.promise;
+  let joined: Promise<string> | undefined;
+  try {
+    await cache.set("other", "explicit", 60);
+    joined = cache.getOrCompute("key", 60, compute);
+    value.resolve("computed");
+    expect(await Promise.all([older, joined])).toEqual(["computed", "computed"]);
+    expect(compute).toHaveBeenCalledOnce();
+    expect(await cache.get("key")).toBe("computed");
+    expect(await cache.get("other")).toBe("explicit");
+  } finally {
+    value.resolve("computed");
+    await Promise.allSettled([older, joined]);
+  }
+});
+
+it("preserves an explicit write made before a miss starts its callback", async () => {
+  const cache = new MemoryCache(), value = deferred<string>();
+  const older = cache.getOrCompute("key", 60, () => value.promise);
+  await cache.set("key", "explicit-new", 60);
+  try {
+    value.resolve("computed-old");
+    expect(await older).toBe("computed-old");
+    expect(await cache.get("key")).toBe("explicit-new");
+  } finally {
+    value.resolve("computed-old");
+    await older;
+  }
+});
