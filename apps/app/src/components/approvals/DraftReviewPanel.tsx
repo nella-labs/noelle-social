@@ -398,3 +398,139 @@ export function DraftReviewPanel({
           ) : null}
         </div>
       </div>
+
+      <div
+        className="action-bar-phone"
+        style={{
+          display: "flex",
+          gap: 10,
+          marginTop: 22,
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={onSkip}
+          disabled={pending || !!success}
+        >
+          Skip
+        </button>
+        <input
+          type="url"
+          value={manualUrl}
+          onChange={(e) => setManualUrl(e.target.value)}
+          disabled={pending || !!success}
+          placeholder="paste X link (optional)"
+          title="If you posted this on X by hand, paste the link to your reply so it shows a live 'view reply'"
+          className="input"
+          style={{ width: 190, fontSize: 12 }}
+        />
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={onMarkSent}
+          disabled={pending || !!success}
+          title="I already posted this reply on X by hand — just record it as sent (no re-post). Paste the link first to capture it."
+        >
+          Mark sent (manual)
+        </button>
+        <div
+          className="action-bar-primary"
+          style={{
+            marginLeft: "auto",
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+          }}
+        >
+          {sendResult && !sendResult.ok ? (
+            <span
+              className="tag"
+              style={{ color: "var(--danger)", fontSize: 11.5 }}
+            >
+              {friendlySendError(sendResult.error.code, sendResult.error.message)}
+            </span>
+          ) : null}
+          {skipResult && !skipResult.ok ? (
+            <span
+              className="tag"
+              style={{ color: "var(--danger)", fontSize: 11.5 }}
+            >
+              {skipResult.error.message}
+            </span>
+          ) : null}
+          {markSentResult && !markSentResult.ok ? (
+            <span
+              className="tag"
+              style={{ color: "var(--danger)", fontSize: 11.5 }}
+            >
+              {markSentResult.error.message}
+            </span>
+          ) : null}
+          {sendResult?.ok ? (
+            sendResult.sentUrl ? (
+              <a
+                href={sendResult.sentUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="tag tag-ok"
+                style={{ textDecoration: "none" }}
+              >
+                Sent ✓ · view on X ↗
+              </a>
+            ) : (
+              <span className="tag tag-ok">Sent ✓</span>
+            )
+          ) : skipResult?.ok ? (
+            <span className="tag">skipped</span>
+          ) : markSentResult?.ok ? (
+            <span className="tag tag-ok">Marked sent ✓</span>
+          ) : null}
+          {/* Undo a reversible action (skip / manual mark-sent) — restores the
+              lead to the queue and cancels the auto-advance. A live Send → can't
+              be recalled, so no undo is offered there. */}
+          {canUndo ? (
+            <button
+              type="button"
+              className="btn btn-sm btn-ghost"
+              onClick={onUndo}
+              disabled={pending}
+              title="Undo — bring this lead back to the queue"
+              style={{ borderColor: "var(--accent)", color: "var(--accent)" }}
+            >
+              {pending ? "Undoing…" : `Undo (${undoLeft})`}
+            </button>
+          ) : undone ? (
+            <span className="tag">restored ↩</span>
+          ) : null}
+          {/* Fast manual path: open the X reply composer pre-filled in your
+              logged-in browser session — one click to send, no copy-paste. */}
+          <a
+            href={buildXReplyUrl(postId, draft.trim() ? draft : selected?.text)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn btn-ghost"
+            style={{ textDecoration: "none" }}
+            title="Open the X reply composer pre-filled (you send it from X)"
+          >
+            Open in X ↗
+          </a>
+          {/* Agent posts it to X for you, via the stored cookies. Red because
+              it tweets immediately — no copy-paste, the agent does the send. */}
+          <button
+            type="button"
+            className="btn"
+            onClick={onApprove}
+            disabled={pending || !!success || !selected}
+            style={{ background: "var(--danger)", color: "#fff", borderColor: "var(--danger)" }}
+            title="The agent posts this reply to X now, using your connected account"
+          >
+            {pending && !skipResult ? "Sending…" : "Send →"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
