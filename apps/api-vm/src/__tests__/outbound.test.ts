@@ -798,3 +798,203 @@ describe("POST /api/outbound", () => {
     expect(fakeState.leads!.rows).toEqual([]);
     expect(fakeState.drafts!.rows).toEqual([]);
     expect(fakeState.approvals!.rows).toEqual([]);
+  });
+
+  it("keeps a passed requested reply actor-ready without persisting a human review gate", async () => {
+    const db = makeFakeDb({
+      agent_instances: { rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "paused" }] },
+      leads: { rows: [] }, drafts: { rows: [] }, approvals: { rows: [] },
+    });
+    __setDbClientForTests(db);
+    const res = await postOutbound(createApp(), {
+      ...basePayload(), owner: { orgId: ORG_ID, agentInstanceId: INSTANCE_ID }, replyRequestKey: "requested-revision-1",
+    });
+    expect(res.status).toBe(200);
+    const state = (db as unknown as { __state: Record<string, TableState> }).__state;
+    expect(state.drafts!.rows).toHaveLength(3);
+    for (const draft of state.drafts!.rows) {
+      expect(draft.payload).toMatchObject({ reply_request_key: "requested-revision-1" });
+      expect((draft.payload as Row).human_review_required).toBeUndefined();
+    }
+    expect(state.approvals!.rows.filter((a) => a.status === "pending")).toHaveLength(1);
+    expect(state.approvals!.rows.filter((a) => a.status === "skipped")).toHaveLength(2);
+  });
+
+  it("selects the first passing X reply after rejected variants and skips later passing siblings", async () => {
+    const db = makeFakeDb({
+      agent_instances: { rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }] },
+      leads: { rows: [] }, drafts: { rows: [] }, approvals: { rows: [] },
+    });
+    __setDbClientForTests(db);
+    const payload = basePayload();
+    const failed = {
+      pass: false,
+      scores: { voice: 0.9, grounding: 0.9, relevance: 0.9, format: 1 },
+      attempts: 1,
+      reasons: ["failed"],
+      judgeOk: true,
+      judgeProvider: "jev" as const,
+    };
+    Object.assign(payload.drafts[0]!, { verifierMeta: failed });
+
+    const res = await postOutbound(createApp(), payload);
+
+    expect(res.status).toBe(200);
+    expect(db.__state.approvals!.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        draft_id: DRAFT_ID_E,
+        status: "skipped",
+        decided_by: "automatic-review",
+        skip_reason: "automatic-review-failed",
+      }),
+      expect.objectContaining({ draft_id: DRAFT_ID_T, status: "pending" }),
+      expect.objectContaining({
+        draft_id: DRAFT_ID_C,
+        status: "skipped",
+        decided_by: "automatic-review",
+        skip_reason: "automatic-review-sibling",
+      }),
+    ]));
+  });
+
+  it.each([
+    ["missing", undefined, "automatic-review-missing"],
+    [
+      "failed",
+      {
+        pass: false,
+        scores: { voice: 0.9, grounding: 0.9, relevance: 0.9, format: 1 },
+        attempts: 2,
+        reasons: ["grounding failed"],
+        judgeOk: true,
+        judgeProvider: "jev" as const,
+      },
+      "automatic-review-failed",
+    ],
+    [
+      "invalid judge",
+      {
+        pass: true,
+        scores: { voice: 0.9, grounding: 0.9, relevance: 0.9, format: 1 },
+        attempts: 2,
+        reasons: ["judge unavailable"],
+        judgeOk: false,
+        judgeProvider: "none" as const,
+      },
+      "automatic-review-invalid-judge",
+    ],
+  ])("stores an X reply with a %s review as skipped", async (_label, verifierMeta, reason) => {
+    const db = makeFakeDb({
+      agent_instances: { rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }] },
+      leads: { rows: [] }, drafts: { rows: [] }, approvals: { rows: [] },
+    });
+    __setDbClientForTests(db);
+
+    const res = await postOutbound(createApp(), { ...basePayload(), verifierMeta });
+
+    expect(res.status).toBe(200);
+    expect(db.__state.approvals!.rows).toHaveLength(3);
+    for (const approval of db.__state.approvals!.rows) {
+      expect(approval).toMatchObject({
+        status: "skipped",
+        decided_by: "automatic-review",
+        skip_reason: reason,
+      });
+      expect(approval.decided_at).toEqual(expect.any(String));
+    }
+  });
+
+  it("stores a LinkedIn reply below the resolved voice floor as skipped", async () => {
+    process.env.LINKEDIN_AUTOSEND_VOICE_FLOOR = "0.7";
+    const linkedinInstance = "00000000-0000-4000-8000-000000000222";
+    const db = makeFakeDb({
+      agent_instances: { rows: [{ id: linkedinInstance, org_id: ORG_ID, role: "linkedin_intern", status: "active" }] },
+      leads: { rows: [] }, drafts: { rows: [] }, approvals: { rows: [] },
+    });
+    __setDbClientForTests(db);
+    const verifierMeta = {
+      pass: true,
+      scores: { voice: 0.69, grounding: 0.9, relevance: 0.9, format: 1 },
+      attempts: 0,
+      reasons: [],
+      judgeOk: true,
+      judgeProvider: "jev" as const,
+    };
+
+    try {
+      const res = await postOutbound(createApp(), {
+        ...basePayload(),
+        platform: "linkedin",
+        owner: { orgId: ORG_ID, agentInstanceId: linkedinInstance },
+        verifierMeta,
+      });
+
+      expect(res.status).toBe(200);
+      expect(db.__state.approvals!.rows).toHaveLength(3);
+      expect(db.__state.approvals!.rows.every((approval) =>
+        approval.status === "skipped"
+        && approval.decided_by === "automatic-review"
+        && approval.skip_reason === "automatic-review-low-voice"
+      )).toBe(true);
+    } finally {
+      delete process.env.LINKEDIN_AUTOSEND_VOICE_FLOOR;
+    }
+  });
+
+  it("rejects a relationship DM without an explicit owner", async () => {
+    const db = makeFakeDb({
+      agent_instances: {
+        rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }],
+        error: null,
+      },
+      leads: { rows: [], error: null },
+      drafts: { rows: [], error: null },
+      approvals: { rows: [], error: null },
+    });
+    __setDbClientForTests(db);
+
+    const res = await postOutbound(createApp(), relationshipPayload());
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_body" });
+  });
+
+  it("rejects a relationship DM with auto-send", async () => {
+    const db = makeFakeDb({
+      agent_instances: {
+        rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }],
+        error: null,
+      },
+      leads: { rows: [], error: null },
+      drafts: { rows: [], error: null },
+      approvals: { rows: [], error: null },
+    });
+    __setDbClientForTests(db);
+
+    const res = await postOutbound(
+      createApp(),
+      relationshipPayload({
+        owner: { orgId: ORG_ID, agentInstanceId: INSTANCE_ID },
+        autoSend: {
+          chosenDraftId: "relationship-draft-1",
+          targetAt: "2026-05-17T18:05:00.000Z",
+        },
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_body" });
+  });
+
+  it("stores a valid LinkedIn relationship DM as drafted lead + pending approval with no send permission", async () => {
+    const linkedinInstance = "00000000-0000-4000-8000-000000000222";
+    const db = makeFakeDb({
+      agent_instances: {
+        rows: [{ id: linkedinInstance, org_id: ORG_ID, role: "linkedin_intern", status: "active" }],
+        error: null,
+      },
+      leads: { rows: [], error: null },
+      drafts: { rows: [], error: null },
+      approvals: { rows: [], error: null },
+    });
+    __setDbClientForTests(db);
+
+    const res = await postOutbound(
