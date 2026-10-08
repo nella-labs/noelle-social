@@ -198,3 +198,43 @@ for (const r of rows) {
       instanceId: r.id, name: r.name,
       verdict: "supply",
       detail: `slot ${r.dailyTime} passed ${r.slotDueMin}m ago, not running, and only ${r.leads} leads in ${LEAD_WINDOW_MIN}m — re-firing cannot fix a supply drought`,
+    });
+    continue;
+  }
+
+  const action = await refire(r.id);
+  findings.push({
+    instanceId: r.id, name: r.name,
+    verdict: "fixed",
+    detail: `slot ${r.dailyTime} passed ${r.slotDueMin}m ago with no run and ${r.leads} leads waiting — ${action}`,
+  });
+}
+
+// Verify: re-read, and say whether the re-fire took.
+const fixed = findings.filter((f) => f.verdict === "fixed");
+if (fixed.length > 0 && !DRY) {
+  await new Promise((r) => setTimeout(r, 75_000)); // one scheduler poll + margin
+  const after = await readState();
+  for (const f of fixed) {
+    const row = after.find((a) => a.id === f.instanceId);
+    f.verified = row ? row.goalActive || (row.status === "active" && row.drafterOn) : false;
+    if (!f.verified) {
+      await alert(`lead-flow watchdog: re-fired ${f.name} but it did NOT start — scheduler may be down`);
+    }
+  }
+}
+
+for (const f of findings.filter((x) => x.verdict === "supply")) {
+  await alert(`lead-flow watchdog: ${f.name} — ${f.detail}`);
+}
+
+if (JSON_OUT) {
+  console.log(JSON.stringify({ at: new Date().toISOString(), findings }, null, 2));
+} else {
+  for (const f of findings) {
+    const mark = f.verdict === "ok" ? "ok  " : f.verdict === "fixed" ? (f.verified ? "FIXED" : "FIX?") : "SUPPLY";
+    console.log(`${mark.padEnd(6)} ${f.name.padEnd(8)} ${f.detail}`);
+  }
+}
+
+process.exit(findings.some((f) => f.verdict === "supply" || f.verified === false) ? 1 : 0);
