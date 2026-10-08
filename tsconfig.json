@@ -1,0 +1,14 @@
+{
+  "//": "Root tsconfig is solution-style for editor/IDE root resolution only. We deliberately do NOT use TypeScript project references (composite builds) at 0.0.1 — turbo handles cross-package build orchestration, and project refs add ceremony (declaration outputs, build-info, ordering) we don't need yet. Each workspace package owns its own tsconfig that extends tsconfig.base.json. Revisit if/when we hit cross-package type-check speed issues.",
+  "files": [],
+  "include": [],
+  "references": [
+    { "path": "packages/ui" },
+    { "path": "packages/contracts" },
+    { "path": "packages/types" },
+    { "path": "packages/agents" },
+    { "path": "packages/runtime" },
+    { "path": "apps/app" },
+    { "path": "apps/api-vm" }
+  ]
+}
