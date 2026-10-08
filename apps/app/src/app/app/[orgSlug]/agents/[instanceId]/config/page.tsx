@@ -598,3 +598,203 @@ export default async function AgentConfigPage({
               <CfgRow
                 label="Exclude retweets (keyword search)"
                 hint="Drop native retweets from keyword search (X -filter:nativeretweets)."
+              >
+                <SwitchField name="discExcludeRetweets" defaultChecked={disc.excludeRetweets ?? false} disabled={!canEdit} />
+              </CfgRow>
+              <CfgRow
+                label="Reply to original posts only"
+                hint="Drop replies/comments so the agent answers top-level posts, not posts buried under someone else's tweet. Applies to both the watchlist and keyword lanes. On by default."
+              >
+                <SwitchField name="discExcludeReplies" defaultChecked={disc.excludeReplies ?? true} disabled={!canEdit} />
+              </CfgRow>
+              <CfgRow
+                label="Language (keyword search)"
+                hint="Two-letter code (e.g. en) to restrict keyword search by language (X lang:). Blank = any language."
+              >
+                <input
+                  type="text"
+                  name="discLang"
+                  defaultValue={disc.lang ?? ""}
+                  maxLength={2}
+                  disabled={!canEdit}
+                  placeholder="any"
+                  style={{
+                    width: 80,
+                    padding: "8px 10px",
+                    borderRadius: 7,
+                    fontFamily: "var(--mono)",
+                    fontSize: 13,
+                    textTransform: "lowercase",
+                    background: "var(--paper)",
+                    color: "var(--ink)",
+                    border: "none",
+                    boxShadow: "0 0 0 0.5px var(--rule)",
+                    opacity: canEdit ? 1 : 0.55,
+                  }}
+                />
+              </CfgRow>
+            </CfgSection>
+          ) : null}
+
+          {isLinkedinIntern ? (
+            <CfgSection
+              id="discovery"
+              title="Discovery"
+              sub="The saved default for which posts Lyra pulls each run, across both lanes — watched connections and keyword search. Override per-run from the agent's Pipeline panel (Start all → Tailor this run)."
+            >
+              <CfgRow
+                label="Posts from the last (hours)"
+                hint="Only draft for posts newer than this many hours (both lanes). Blank = no window (any age)."
+              >
+                <DiscNumInput name="discWindowHours" defaultValue={disc.timeWindowHours ?? null} disabled={!canEdit} placeholder="No window" min={1} max={168} />
+              </CfgRow>
+              <CfgRow
+                label="Posts per connection"
+                hint="How many recent posts to sweep per watched connection each tick. Blank = 20. Range 5–100."
+              >
+                <DiscNumInput name="discPostsPerSource" defaultValue={disc.postsPerSource ?? null} disabled={!canEdit} placeholder="20" min={5} max={100} />
+              </CfgRow>
+              <CfgRow
+                label="Min reactions"
+                hint="Reaction floor: filters watched-connection posts AND sets the keyword search lane's high-engagement floor. Blank = the worker default (10) for search; no floor on watched connections."
+              >
+                <DiscNumInput name="discMinReactions" defaultValue={disc.minReactions ?? null} disabled={!canEdit} placeholder="Search default 10" min={0} max={1000000} />
+              </CfgRow>
+              <CfgRow
+                label="Min comments"
+                hint="Drop watched-connection posts below this comment count. Blank = no floor."
+              >
+                <DiscNumInput name="discMinComments" defaultValue={disc.minComments ?? null} disabled={!canEdit} placeholder="No floor" min={0} max={1000000} />
+              </CfgRow>
+            </CfgSection>
+          ) : null}
+
+          {isRedditIntern ? (
+            <CfgSection
+              id="discovery"
+              title="Discovery"
+              sub="The saved default for which threads Orion pulls each run, across your watched subreddits. Override per-run from the agent's Pipeline panel (Start all → Tailor this run)."
+            >
+              <CfgRow
+                label="Posts from the last (hours)"
+                hint="Only draft for threads newer than this many hours. Blank = no window (any age)."
+              >
+                <DiscNumInput name="discWindowHours" defaultValue={disc.timeWindowHours ?? null} disabled={!canEdit} placeholder="No window" min={1} max={168} />
+              </CfgRow>
+              <CfgRow
+                label="Posts per subreddit"
+                hint="How many recent threads to sweep per watched subreddit each tick. Blank = 20. Range 5–100."
+              >
+                <DiscNumInput name="discPostsPerSource" defaultValue={disc.postsPerSource ?? null} disabled={!canEdit} placeholder="20" min={5} max={100} />
+              </CfgRow>
+              <CfgRow
+                label="Min upvotes"
+                hint="Upvote floor: skip threads below this score. Blank = the worker default."
+              >
+                <DiscNumInput name="discMinReactions" defaultValue={disc.minReactions ?? null} disabled={!canEdit} placeholder="Default" min={0} max={1000000} />
+              </CfgRow>
+              <CfgRow
+                label="Min comments"
+                hint="Drop threads below this comment count. Blank = no floor."
+              >
+                <DiscNumInput name="discMinComments" defaultValue={disc.minComments ?? null} disabled={!canEdit} placeholder="No floor" min={0} max={1000000} />
+              </CfgRow>
+            </CfgSection>
+          ) : null}
+
+          <CfgSection
+            id="backpressure"
+            title="Pipeline caps"
+            sub="Soft pauses that stop the workers when the queue is too deep to be useful. Costs nothing while paused — workers skip the tick before touching any model. Blank input means no cap."
+          >
+            <CfgRow
+              label="Pause drafter when pending drafts ≥"
+              hint="When the approval inbox has this many pending drafts for this agent, discovery, classifier, AND drafter all skip their tick. Resumes automatically once you review enough to drop below the threshold."
+            >
+              <CapInput
+                name="pendingDraftsCap"
+                defaultValue={pendingDraftsCap}
+                disabled={!canEdit}
+                placeholder="No cap"
+              />
+            </CfgRow>
+            <CfgRow
+              label="Pause discovery when lead backlog ≥"
+              hint="When undrafted leads (new / classifying / classified / drafting) hit this many, discovery alone skips its tick. Classifier and drafter keep draining the existing backlog."
+            >
+              <CapInput
+                name="leadBacklogCap"
+                defaultValue={leadBacklogCap}
+                disabled={!canEdit}
+                placeholder="No cap"
+              />
+            </CfgRow>
+          </CfgSection>
+
+          <CfgSection
+            id="alerts"
+            title="Alerts"
+            sub={
+              pushover.connected
+                ? "Pushover pings fire to your device when these conditions trip."
+                : "Alerts are delivered over Pushover. These toggles save, but nothing will ping until Pushover is connected."
+            }
+          >
+            {!pushover.connected ? (
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  padding: "10px 12px",
+                  marginBottom: 14,
+                  borderRadius: 8,
+                  border: "1px solid var(--rust, #b4532a)",
+                  background: "color-mix(in srgb, var(--rust, #b4532a) 8%, transparent)",
+                  fontSize: 12.5,
+                }}
+              >
+                <span>
+                  <strong>Pushover isn’t connected.</strong> The alerts below
+                  will save but won’t fire until you add your Pushover user key
+                  and app token.
+                </span>
+                <Link href={connectionsHref} className="btn btn-sm">
+                  Connect Pushover →
+                </Link>
+              </div>
+            ) : null}
+            <CfgRow
+              label="Cap alert threshold"
+              hint="Threshold for the spend-vs-cap alert. Fires at most once per (agent, calendar month)."
+            >
+              <PercentPicker
+                name="budgetAlertPct"
+                options={[50, 75, 90, 100]}
+                defaultValue={alertPct}
+                disabled={!canEdit}
+              />
+            </CfgRow>
+            <CfgRow
+              label="Low-confidence notify"
+              hint="Ping when a classifier score drops below the on-brand floor."
+            >
+              <SwitchField
+                name="notifyLowConfidence"
+                defaultChecked={notifyLowConf}
+                disabled={!canEdit}
+              />
+            </CfgRow>
+          </CfgSection>
+
+          <CfgSection
+            id="escalation"
+            title="Escalation rules"
+            sub="What the agent does when something goes wrong."
+          >
+            <CfgRow
+              label="Route to inbox on cap"
+              hint="When a draft is blocked by the monthly cap, record the event into noelle.budget_escalations."
+            >
