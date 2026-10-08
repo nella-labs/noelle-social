@@ -198,3 +198,15 @@ describe("renderEnergyHint", () => {
     for (const e of ["joke", "hot_take", "vent", "celebration", "question"] as PostEnergy[]) {
       expect(renderEnergyHint(e).startsWith("POST ENERGY:")).toBe(true);
     }
+  });
+});
+
+describe("isPostEnergy", () => {
+  it("guards the enum", () => {
+    expect(isPostEnergy("joke")).toBe(true);
+    expect(isPostEnergy("celebration")).toBe(true);
+    expect(isPostEnergy("nope")).toBe(false);
+    expect(isPostEnergy(null)).toBe(false);
+    expect(isPostEnergy(3)).toBe(false);
+  });
+});
