@@ -198,3 +198,63 @@ export function RedditApprovalDetailView({
             </div>
           </div>
         </div>
+      </div>
+    </>
+  );
+}
+
+/** Quiet resolved banner shown once every draft for this thread has been actioned. */
+function ResolvedBanner({ detail }: { detail: RedditApprovalDetail }) {
+  const all = detail.replies;
+  const sent = all.find((v) => v.status === "sent");
+  const status = sent ? "sent" : "actioned";
+  const label = sent ? "Marked sent" : "Resolved";
+  const tone = sent ? "var(--accent)" : "var(--ink-muted)";
+
+  return (
+    <div>
+      <div className="eyebrow" style={{ marginBottom: 12 }}>
+        Resolved
+      </div>
+      <div
+        className="card"
+        style={{
+          padding: 18,
+          borderColor: tone,
+          boxShadow: `0 0 0 0.5px color-mix(in oklch, ${tone} 40%, var(--rule))`,
+          marginBottom: 18,
+        }}
+      >
+        <div
+          style={{
+            fontFamily: "var(--display)",
+            fontSize: 18,
+            color: tone,
+            marginBottom: 6,
+          }}
+        >
+          {label}
+        </div>
+        <div style={{ fontSize: 12.5, color: "var(--ink-muted)" }}>
+          {status === "sent"
+            ? "This reply was posted to Reddit."
+            : "Every draft for this thread has been actioned."}
+        </div>
+      </div>
+
+      <div className="angle-stack" style={{ opacity: 0.7 }}>
+        {all.map((v) => (
+          <div key={v.approvalId} className="angle">
+            <h4>
+              <span className="num">•</span>
+              <span>Reply</span>
+            </h4>
+            <div className="text" style={{ whiteSpace: "pre-wrap" }}>
+              {v.body}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}

@@ -198,3 +198,142 @@ export async function autoRedeemEmailInvite(): Promise<{ ok: boolean }> {
 const slugRegex = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 const createOrgSchema = z.object({
+  name: z
+    .string()
+    .min(2, "Org name must be at least 2 characters.")
+    .max(80, "Org name is too long.")
+    .transform((s) => s.trim()),
+  slug: z
+    .string()
+    .min(2, "Slug must be at least 2 characters.")
+    .max(48, "Slug is too long.")
+    .regex(slugRegex, "Slug must be lowercase letters, numbers, and dashes."),
+});
+
+export interface CreateOrgResult {
+  ok: boolean;
+  error?: string;
+  fieldErrors?: Partial<Record<"name" | "slug" | "inviteCode", string>>;
+}
+
+interface AgentSeed {
+  role: AgentRole;
+  display_name: string;
+  status: AgentInstanceStatus;
+  budget_cap_cents: number;
+}
+
+export async function createOrgFromOnboarding(
+  _prev: CreateOrgResult | undefined,
+  formData: FormData,
+): Promise<CreateOrgResult> {
+  const user = await getUserFromCookies();
+  if (!user) {
+    return { ok: false, error: "Sign in first." };
+  }
+
+  const cookieStore = await cookies();
+  let cookieCode: string | null = null;
+  let invite: Invitation | null = null;
+  if (!isLocalAuth()) {
+    cookieCode = verifyInviteCookie(cookieStore.get(INVITE_COOKIE)?.value);
+    if (!cookieCode) return { ok: false, error: "Invite code missing or expired. Re-enter it." };
+    const resolved = await resolveInvite(cookieCode);
+    if (!resolved.valid) return { ok: false, error: "Invite code is no longer valid." };
+    invite = resolved.invite;
+    if (invite?.email && invite.email.trim().toLowerCase() !== (user.email || "").trim().toLowerCase()) {
+      return { ok: false, error: "This invite is for a different email address." };
+    }
+  }
+
+  const parsed = createOrgSchema.safeParse({
+    name: formData.get("name"),
+    slug: formData.get("slug"),
+  });
+  if (!parsed.success) {
+    const fieldErrors: CreateOrgResult["fieldErrors"] = {};
+    for (const issue of parsed.error.issues) {
+      const path = issue.path[0];
+      if (path === "name" || path === "slug" || path === "inviteCode") {
+        fieldErrors[path] = issue.message;
+      }
+    }
+    return {
+      ok: false,
+      error: "Fix the highlighted fields.",
+      fieldErrors,
+    };
+  }
+
+  const { name, slug } = parsed.data;
+
+  const seeds: AgentSeed[] = [{
+    role: "x_intern",
+    display_name: "Vega",
+    status: "paused",
+    budget_cap_cents: 10000,
+  }];
+
+  // Phase 4 (Supabase → Cloud SQL): the three inserts (org, owner
+  // membership, agent seeds) must be atomic — a partial commit would leave
+  // an orphan org with no members. Wrap the lot in a single transaction.
+  // postgres.js rolls back on any throw inside `sql.begin`.
+  let createdOrg: { id: string; slug: string };
+  try {
+    createdOrg = await withTx(async (tx) => {
+      await tx`set local lock_timeout = '2s'`;
+      await tx`set local idle_in_transaction_session_timeout = '1s'`;
+      if (invite && cookieCode) await lockInvitationForRedemption(tx, invite.id, cookieCode, user.email || "");
+      const orgRows = await tx<{ id: string; slug: string }[]>`
+        insert into noelle.organizations (name, slug, plan)
+        values (${name}, ${slug}, 'alpha')
+        returning id, slug
+      `;
+      const newOrg = orgRows[0];
+
+      await tx`
+        insert into noelle.org_members (org_id, user_id, role)
+        values (${newOrg.id}, ${user.id}, 'owner')
+      `;
+
+      // Bulk insert agents. postgres.js doesn't expose Supabase's array
+      // overload; do it explicitly so the SQL is readable.
+      for (const s of seeds) {
+        await tx`
+          insert into noelle.agent_instances
+            (org_id, role, status, display_name, budget_cap_cents, send_enabled, auto_send_enabled, reply_send_enabled)
+          values
+            (${newOrg.id}, ${s.role}, ${s.status}, ${s.display_name}, ${s.budget_cap_cents}, false, false, false)
+        `;
+      }
+
+      // Environment codes have no single-use row. Database invitations require
+      // their exact acknowledgment before any organization changes can commit.
+      if (invite) await redeemLockedInvitation(tx, invite.id, user.id, newOrg.id);
+
+      return newOrg;
+    });
+  } catch (err) {
+    // Postgres unique-violation code is '23505' — same as before, just via
+    // postgres.js error shape (`.code` on `PostgresError`).
+    const e = err as { code?: string; message?: string };
+    if (e.code === "23505") {
+      return {
+        ok: false,
+        error: "That slug is taken. Try another.",
+        fieldErrors: { slug: "Slug is taken." },
+      };
+    }
+    return {
+      ok: false,
+      error: e.message ?? "Couldn't create org. Try again.",
+    };
+  }
+
+  // Burn the invite cookie now that it's been spent.
+  if (cookieCode) cookieStore.delete(INVITE_COOKIE);
+
+  // Open the new social workspace.
+  revalidatePath(`/app/${createdOrg.slug}`);
+  redirect(`/app/${createdOrg.slug}`);
+}
