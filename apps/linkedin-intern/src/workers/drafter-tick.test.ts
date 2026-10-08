@@ -1998,3 +1998,203 @@ describe("runDrafterTick — verifier (grounded-drafting)", () => {
     const routes = runner.draft.mock.calls.map((call) => (call[0] as { routing: { primary: { model: string }; fallback?: { model: string } } }).routing);
     expect(routes.map((route) => route.primary.model)).toEqual(["claude-opus-4-6", "claude-opus-4-6"]);
     expect(routes[1]?.fallback?.model).toBe("claude-sonnet-4-6");
+  });
+
+  it.each(["substantial", "light"] as const)("records the winning Opus browser %s rewrite as its actual model", async (replyKind) => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const output = replyKind === "light" ? oneLight : fullSubstantial;
+    runner.draft.mockImplementation(async ({ routing }: { routing: { primary: { engine: string; model: string } } }) => ({
+      text: JSON.stringify(output),
+      engine: routing.primary.engine,
+      model: routing.primary.model,
+    }));
+    const judge = vi.fn().mockResolvedValueOnce(verdict(false)).mockResolvedValueOnce(verdict(false)).mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3", classifier_label: replyKind, payload: { ...leadPayload, source: "extension_observed" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, voiceFloor: 0.8, makeCalls: () => [judge] },
+    });
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({
+      status: "drafted", meta: expect.objectContaining({ engine: "bedrock", model: "claude-opus-4-6" }),
+    }));
+  });
+
+  it("keeps the post's uncertainty and sentence-case rule in browser repair feedback", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValueOnce(verdict(false)).mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { ...leadPayload, source: "extension_observed", text: "If prospects see seven posts, they may warm up; separately, one prospect visited my profile." } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 1, makeCalls: () => [judge] },
+    });
+    const repair = (runner.draft.mock.calls[1]![0] as { prompt: string }).prompt;
+    expect(repair).toContain("REVIEW FEEDBACK");
+    expect(repair).toMatch(/keep.*conditional.*source/i);
+    expect(repair).toMatch(/capital.*start.*no full stops/i);
+  });
+
+  it("gives up after `retries`, queues the best attempt with a failing verdict", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValue(verdict(false)); // always fails
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(3); // initial + 2 retries
+    expect(postOutbound).toHaveBeenCalledTimes(1); // still queued
+    const meta = postOutbound.mock.calls[0]![0].verifierMeta;
+    expect(meta.pass).toBe(false);
+    expect(meta.attempts).toBe(2);
+  });
+
+  it("verifier machinery runs whatever judge panel makeCalls returns (here 3)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", priority: true })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: (priority) => (priority ? [judge, judge, judge] : [judge]) },
+    });
+    expect(judge).toHaveBeenCalledTimes(12); // 3 judges on the set and each reply angle
+  });
+
+  it("does NOT flag a long LinkedIn comment on length (no charLimit)", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    // A 600-char comment — would blow X's 250 cap, but LinkedIn omits charLimit,
+    // so the format dimension must NOT fail it. The judge passes the content dims;
+    // the verdict should pass (no length penalty).
+    const longBody = "a".repeat(600);
+    const longDraft = JSON.stringify({
+      drafts: [
+        { angle: "empathetic", body: longBody, char_count: 600 },
+        { angle: "technical", body: "t", char_count: 1 },
+        { angle: "contrarian", body: "c", char_count: 1 },
+      ],
+    });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: longDraft, engine: "bedrock", model: "m" }) };
+    // Real judge wiring would be an LLM; here the judge passes content dims so the
+    // ONLY thing that could fail is the deterministic format/length check.
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(1); // passed → no regenerate
+    const meta = postOutbound.mock.calls[0]![0].verifierMeta;
+    expect(meta.pass).toBe(true);
+    expect(meta.scores.format).toBe(1); // no length penalty applied
+  });
+
+  it("verifies the LIGHT path too (one supportive comment)", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(postOutbound.mock.calls[0]![0].verifierMeta.pass).toBe(true);
+  });
+
+  const browserDraft = {
+    drafts: [
+      { angle: "empathetic", body: "The customer feedback loop you described gives the launch a useful direction.", char_count: 75 },
+      { angle: "technical", body: "The event stream makes this easier to debug.", char_count: 43 },
+      { angle: "contrarian", body: "Speed can hide maintenance cost.", char_count: 32 },
+    ],
+    dm: { body: "A separate cold outreach message that must not be reviewed or queued.", char_count: 67 },
+  };
+
+  const productBrand = {
+    persona: { name: "Ari", bio: "Building a social workspace" },
+    product: { name: "Noelle", description: "A social content workspace", surfaces: [], fits_when: [] },
+    pitch_policy: "when_relevant",
+    qa: [{ q: "How does Noelle work?", a: "Click approve; nothing auto-posts." }],
+    reply_style: {
+      voice_notes: "Direct, specific, warm, and curious.",
+      never_do: ["Avoid stale filler closers from my style notes", "Never bolt Noelle onto unrelated posts"],
+    },
+  };
+
+  it("keeps browser-observed substantial replies focused on the post, without product FAQ or mission", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    runner.draft.mockResolvedValue({ text: JSON.stringify(browserDraft), engine: "bedrock", model: "m" });
+    kb.search.mockResolvedValue([{ ...anchorHit(8), snippet: "Noelle approval workflow voice anchor." }]);
+
+    const drafted = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o", objective: "Grow Noelle through approval clicks", brand_config: productBrand } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { ...leadPayload, source: "extension_observed", text: "I shipped a code editor with local-first sync." } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      knowledgeDirs: ["product"],
+      knowledgeTopK: 1,
+      relevanceThreshold: 6,
+    });
+
+    expect(drafted).toBe(1);
+    expect(kb.search).not.toHaveBeenCalled();
+    const call = runner.draft.mock.calls[0]![0] as { system: string; prompt: string };
+    expect(call.system).toContain("Ari");
+    expect(call.system).toContain("Direct, specific, warm, and curious.");
+    expect(call.system).toContain("Avoid stale filler closers from my style notes");
+    expect(call.system).toContain("Never bolt Noelle onto unrelated posts");
+    expect(call.system + call.prompt).not.toContain("Click approve; nothing auto-posts.");
+    expect(call.system + call.prompt).not.toContain("Grow Noelle through approval clicks");
+    expect(call.prompt).not.toContain("Noelle approval workflow voice anchor.");
+    expect(call.prompt).toContain("I shipped a code editor with local-first sync.");
+  });
+
+  it("keeps browser-observed light replies free of the product mission and knowledge", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    kb.search.mockImplementation(async (_query: string, _topK: number, opts?: { filterDirs?: string[] }) =>
+      opts?.filterDirs?.includes("02-brand")
+        ? [{ ...anchorHit(8), snippet: "Noelle approval workflow voice anchor." }]
+        : [{ ...anchorHit(8), snippet: "A concrete peer observation." }]);
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o", objective: "Grow Noelle through approval clicks", brand_config: productBrand } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null, payload: { ...leadPayload, source: "extension_observed", text: "We launched our code editor today!" } })] as never,
