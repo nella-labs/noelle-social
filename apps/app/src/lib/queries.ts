@@ -3798,3 +3798,203 @@ export interface LinkedInWatchlistPersonRow {
   objective: string | null;
   added_at: string;
   profiled: boolean;
+}
+
+/**
+ * Everyone on the LinkedIn intern's watchlist (its whole targeting model), for
+ * the dashboard editor. Joins the profiler output so the UI can show who's been
+ * profiled. Tenancy piggybacks on getAgentInstance (assertOrgMember).
+ */
+export async function getLinkedInWatchlistPeopleForInstance(
+  instanceId: string,
+): Promise<LinkedInWatchlistPersonRow[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+  const rows = await readSql<LinkedInWatchlistPersonRow[]>`
+    select
+      wp.id,
+      wp.fsd_profile_id,
+      wp.public_id,
+      wp.name,
+      wp.headline,
+      wp.objective,
+      wp.added_at,
+      (pr.refreshed_at is not null and pr.summary is not null) as profiled
+    from noelle.linkedin_watchlist_people wp
+    left join noelle.linkedin_watchlist_profiles pr
+      on pr.agent_instance_id = wp.agent_instance_id
+     and pr.fsd_profile_id = wp.fsd_profile_id
+    where wp.agent_instance_id = ${inst.id} and wp.org_id = ${inst.org_id}
+    order by wp.added_at asc
+  `;
+  return [...rows];
+}
+
+/** Count of pending approvals for the LinkedIn intern instance. */
+export async function countPendingLinkedInApprovals(
+  instanceId: string,
+): Promise<number> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return 0;
+  // Per-REPLY-LEAD count. The drafter writes up to 4 approvals per lead (3 reply
+  // angles + 1 DM), so collapse to distinct leads — AND count only leads with a
+  // pending REPLY, so post-less intro DMs (kind='dm', relationship outreach) don't
+  // inflate "N drafts from Lyra". A reply lead with an attached DM still counts
+  // once. Matches the goal count + the dashboard's leads_ready.
+  const rows = await readSql<Array<{ n: number }>>`
+    select count(distinct l.id)::int as n
+    from noelle.approvals a
+    join noelle.drafts d on d.id = a.draft_id
+    join noelle.leads  l on l.id = d.lead_id
+    where a.agent_instance_id = ${inst.id}
+      and a.status = 'pending'
+      and coalesce(d.payload->>'kind', 'reply') = 'reply'
+  `;
+  return rows[0]?.n ?? 0;
+}
+
+/** One LinkedIn approval, flattened for the inbox + detail surfaces. */
+export interface LinkedInApprovalView {
+  approvalId: string;
+  status: string;
+  createdAt: string;
+  kind: "reply" | "dm";
+  /** Display name (from watchlist people), falling back to public id. */
+  authorName: string;
+  authorHeadline: string | null;
+  authorPublicId: string | null;
+  /** Public LinkedIn profile URL (built from public id when present). */
+  profileUrl: string | null;
+  postText: string | null;
+  postUrl: string | null;
+  /** The post's own creation time (ISO), when discovery captured it. */
+  postedAt: string | null;
+  /** Lead category, e.g. standalone Friendly DMs. */
+  postKind?: string | null;
+  /** Resolved body (edited_body → body). */
+  body: string | null;
+  /** Persisted review verdict and explicit human-send consent (when required). */
+  verifierMeta?: unknown;
+  humanReviewRequired?: boolean;
+  humanSendApproved?: boolean;
+  /** Reply angle, null for DMs. */
+  angle: "empathetic" | "technical" | "contrarian" | null;
+  charCount: number | null;
+  /**
+   * Account-Feeder style-source blend: the human accounts whose FORM shaped this
+   * draft, each with its share (0..1) of the chosen style exemplars (sorted
+   * desc). Null ⇒ base voice (Mars) only — no badge.
+   */
+  styleSource: { blend: Array<{ handle: string; weight: number }> } | null;
+  /**
+   * Relationship-scout verdict for this post's author, or null when unflagged.
+   * Optional: the mapper always sets it, but fixtures/speedrun rows that predate
+   * the field omit it (the detail surfaces a required `vipSignal` of its own).
+   */
+  vipSignal?: VipSignal | null;
+}
+
+/** Internal: shape one joined LinkedIn approval row into a LinkedInApprovalView. */
+interface LinkedInJoinedRow {
+  approval_id: string;
+  status: string;
+  created_at: string;
+  draft_payload: unknown;
+  lead_payload: unknown;
+  lead_author_handle: string | null;
+  lead_vip_signal?: unknown;
+  wp_name: string | null;
+  wp_headline: string | null;
+}
+
+function toLinkedInApprovalView(r: LinkedInJoinedRow): LinkedInApprovalView {
+  const dp = draftPayload({ payload: r.draft_payload } as NoelleDraft);
+  const lp = linkedinLeadPayload({ payload: r.lead_payload } as NoelleLead);
+  const publicId = lp.authorPublicId ?? r.lead_author_handle ?? null;
+  // Name: watchlist person row first (survives the drafter's payload overwrite),
+  // then the discovery-stage payload, then the public id, then a stable label.
+  const authorName =
+    r.wp_name?.trim() ||
+    lp.authorName?.trim() ||
+    (publicId ? publicId : "a LinkedIn connection");
+  const body = bodyForSelectedAngle(dp) ?? null;
+  const kind = dp.kind === "dm" ? "dm" : "reply";
+  return {
+    approvalId: r.approval_id,
+    status: r.status,
+    createdAt: r.created_at,
+    kind,
+    authorName,
+    authorHeadline: r.wp_headline ?? lp.authorHeadline ?? null,
+    authorPublicId: publicId,
+    profileUrl: publicId ? `https://www.linkedin.com/in/${publicId}/` : null,
+    postText: lp.postText ?? null,
+    postUrl: lp.postUrl ?? null,
+    postedAt: lp.postedAt ?? null,
+    postKind: lp.postKind ?? null,
+    body,
+    verifierMeta: dp.verifier_meta,
+    humanReviewRequired: dp.human_review_required,
+    humanSendApproved: dp.human_send_approved,
+    angle: dp.kind === "dm" ? null : (dp.angle ?? null),
+    charCount: dp.char_count ?? (body ? body.length : null),
+    styleSource: dp.style_source ?? null,
+    vipSignal: parseVipSignal(r.lead_vip_signal),
+  };
+}
+
+/**
+ * Pending LinkedIn approvals for the intern instance, one representative row
+ * per lead (the inbox is per-lead; the detail page assembles every angle + the
+ * DM). Prefers a reply over the DM as the representative.
+ *
+ * Tenancy: piggybacks on getAgentInstance (assertOrgMember inside).
+ */
+/** Filter/sort options for the LinkedIn approvals inbox (mirrors the X queue's
+ *  filters, minus score/source which don't exist on LinkedIn). */
+export interface ListPendingLinkedInApprovalsOptions {
+  /** Default 'pending'. 'all' drops the status filter. */
+  status?: ApprovalStatusFilter;
+  /** Default 'all'. 'only' = watched connections (lead.priority), 'exclude' = not. */
+  watchlist?: ApprovalWatchlistFilter;
+  /** Default 'newest_post' (newest first). 'oldest' flips it. */
+  sort?: "newest_post" | "oldest";
+  /** When set, only approvals created at/after this timestamp (last goal-run). */
+  lastBatchSince?: string | null;
+  /** Default true: collapse to one representative row per post (the review
+   *  inbox). Pass false for Speedrun, which groups every reply angle per post. */
+  dedupe?: boolean;
+}
+
+export async function listPendingLinkedInApprovals(
+  instanceId: string,
+  limit = 300,
+  opts: ListPendingLinkedInApprovalsOptions = {},
+): Promise<LinkedInApprovalView[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+  const status = opts.status ?? "pending";
+  const watchlist = opts.watchlist ?? "all";
+  const sort = opts.sort ?? "newest_post";
+  const lastBatchSince = opts.lastBatchSince ?? null;
+  // Dynamic filters/sort use BOUND VALUES + SQL case/or — NOT conditional `sql`
+  // fragments. postgres.js doesn't compose `${cond ? sql`…` : sql``}` mid-
+  // statement here (it produced "syntax error near order"/"near desc"); the
+  // proven pattern (mirrored from listPendingApprovalsForOrg) passes the param
+  // and branches inside the SQL.
+  const rows = await readSql<LinkedInJoinedRow[]>`
+    select
+      a.id            as approval_id,
+      a.status        as status,
+      a.created_at    as created_at,
+      d.payload       as draft_payload,
+      l.payload       as lead_payload,
+      l.author_handle as lead_author_handle,
+      l.vip_signal    as lead_vip_signal,
+      wp.name         as wp_name,
+      wp.headline     as wp_headline
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    left join noelle.linkedin_watchlist_people wp
+      on wp.agent_instance_id = a.agent_instance_id
