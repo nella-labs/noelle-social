@@ -598,3 +598,203 @@ async function observeVisiblePosts(tabId: number, api: ActuatorApi, instanceId: 
     send: (id) => send<{ ok: boolean; items?: VisiblePost[] }>(id, { cmd: "harvestVisiblePosts" }),
     recoverReceiver: async (id) => {
       const isCurrent = async () => !stopped() && s.epoch === (await currentEpoch()) &&
+        !(await remoteStopped()) && await browserDiscoveryEnabled();
+      const recovered = await recoverReceiverWithBuildHandoff({
+        isCurrent,
+        checkNewBuild: async () => {
+          try { return await checkSelfReload({ receiverSlotIsCurrent: isCurrent }); }
+          catch (error) {
+            sinkLog("warn", "browser receiver build check failed", { instanceId, error: discoveryError(error) });
+            return false;
+          }
+        },
+        recoverPage: () => recoverMissingDiscoveryReceiver({
+          tabId: id,
+          buildStamp: typeof __BUILD_STAMP__ === "string" ? __BUILD_STAMP__ : "unknown",
+          now: Date.now,
+          isCurrent,
+          waitForLoad: async () => { await waitTabComplete(id); await sleep(500); },
+          onSkip: (reason) => sinkLog("warn", "browser receiver recovery skipped", { instanceId, reason }),
+        }),
+      });
+      if (recovered) sinkLog("info", "browser receiver recovery started", { instanceId, tabId: id });
+      return recovered;
+    },
+    onVisible: (items) => { visibleFingerprints = [...new Set(items.map((item) => item.fingerprint))]; },
+    submit: (items) => api.postObservations(items),
+    report: reportBrowserDiscovery,
+  });
+  if (deferredOnly || !status || (status.result === "failed" && status.accepted === 0) || stopped() || !(await browserDiscoveryEnabled())) return;
+  // The classifier wakes on the observation notification. Hold the same card
+  // briefly for its Jev verdict, then resolve only a qualified card's link.
+  // These are API reads, not extra LinkedIn navigation or browser requests.
+  const attempted = new Set<string>();
+  // Jev classifies a bounded batch one card at a time. Poll only the backend
+  // while those cards are processing; the page stays in this existing read slot.
+  const maxPolls = status.accepted > 0 ? 20 : 1;
+  for (let attempt = 0; attempt < maxPolls; attempt++) {
+    try {
+      const result = await resolveQualifiedVisiblePost(tabId, api, rng, visibleFingerprints, attempted, s);
+      if (result !== "classifying") break;
+    } catch (error) {
+      await reportBrowserDiscovery({
+        at: new Date().toISOString(), instanceId, result: "failed", stage: "identity",
+        observed: status.observed, accepted: status.accepted,
+        duplicates: status.duplicates, invalid: status.invalid, error: discoveryError(error),
+      });
+      break;
+    }
+    if (attempt < maxPolls - 1 && !stopped()) await sleep(500);
+  }
+}
+
+async function ambientBrowse(
+  s: RunState,
+  cfg: ActuatorConfig,
+  tabId: number,
+  rng: ReturnType<typeof makeRng>,
+  now: number,
+): Promise<void> {
+  const api = new ActuatorApi(cfg);
+  const canary = await browserDiscoveryEnabled();
+  const gate = await withDiscoveryBrowseGate({
+    enabled: canary, lastReadMs: s.lastDiscoveryReadMs ?? 0, nowMs: now,
+    capacity: async () => (await api.fetchDiscoveryCapacity()).available,
+    stillCurrent: async () => !stopped() && s.epoch === (await currentEpoch()),
+    onCapacityError: async (error) => reportBrowserDiscovery({
+        at: new Date(now).toISOString(), instanceId: cfg.instanceId,
+        result: "failed", stage: "capacity", observed: 0, accepted: 0, duplicates: 0, invalid: 0,
+        error: discoveryError(error),
+    }),
+    browse: async (available) => {
+      if (available !== null && hasDeferredCanonicalObservations(s.deferredObservations)) {
+        await observeVisiblePosts(tabId, api, cfg.instanceId, rng, s, available, true);
+        return;
+      }
+      // Re-assert the feed only for a browse that the capacity gate permits.
+      await ensureOnFeed(tabId, rng);
+      if (stopped() || s.epoch !== (await currentEpoch())) return;
+      const readEnabled = cfg.ambientReadActions !== false; // undefined ⇒ ON
+      const sinceRead = now - (s.lastAmbientReadMs ?? 0);
+      const readActionsAllowed = readEnabled && sinceRead > AMBIENT_READ_MIN_GAP_MS * rng.float(1, 2.6);
+      const kind = chooseAmbient(rng, { readActionsAllowed });
+      let discovery: Awaited<ReturnType<ActuatorApi["fetchDiscoveryTarget"]>> = null;
+      if (available !== null && kind === "navigate") {
+        try {
+          discovery = await api.fetchDiscoveryTarget();
+        } catch (error) {
+          await reportBrowserDiscovery({
+            at: new Date(now).toISOString(), instanceId: cfg.instanceId,
+            result: "failed", stage: "target", observed: 0, accepted: 0, duplicates: 0, invalid: 0,
+            error: discoveryError(error),
+          });
+        }
+      }
+      let readDiscoveryPage = false;
+      const did = await runAmbient(tabId, kind, {
+        cdp, rng, sleep, send, wpm: s.persona.wpm,
+        navigate: (id, url) => navigateTab(id, url, rng, async () => !stopped() && (!discovery || await browserDiscoveryEnabled())),
+        ...(discovery ? { navigationTarget: discovery.url, onPageRead: async (id: number) => {
+          readDiscoveryPage = true;
+          await observeVisiblePosts(id, api, cfg.instanceId, rng, s, available!);
+        } } : {}),
+      }).catch(() => null);
+      if (available !== null && !readDiscoveryPage) await observeVisiblePosts(tabId, api, cfg.instanceId, rng, s, available);
+      if (did === "expand" || did === "comments") s.lastAmbientReadMs = now;
+    },
+  });
+  if (gate.checked) s.lastDiscoveryReadMs = now; // pace full and failed checks too
+}
+
+// Deliver a reaction to the Like button at `likeRect`, WITH VARIETY: most often
+// a plain Like, but per the weighted mix (cfg.reactionWeights, default inclined
+// to Like → Support → applause/Celebrate) sometimes another reaction. For a
+// non-Like pick we hover the Like button to reveal LinkedIn's six-reaction
+// flyout, give it a beat to appear, then click the chosen reaction. If the
+// flyout never opens or the reaction can't be located, we fall back to a plain
+// Like on the still-hovered button — so a react attempt never costs us the like.
+// Returns the reaction actually landed (LIKE on the fallback path).
+async function reactWithVariety(
+  tabId: number,
+  likeRect: Rect,
+  cfg: ActuatorConfig,
+  rng: ReturnType<typeof makeRng>,
+): Promise<ReactionType> {
+  const type = pickReaction(rng, cfg.reactionWeights);
+  if (type === "LIKE") {
+    await cdp.moveAndClick(tabId, likeRect, rng, sleep);
+    return "LIKE";
+  }
+  await cdp.hover(tabId, likeRect, rng, sleep); // reveal the reaction flyout
+  await sleep(rng.float(220, 520)); // let it finish opening before we locate
+  const r = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect }>(
+    tabId, { cmd: "locateReaction", reaction: type },
+  ).catch(() => null);
+  if (r?.ok && r.x != null) {
+    await cdp.moveAndClick(tabId, rectFrom(r), rng, sleep);
+    return type;
+  }
+  await cdp.moveAndClick(tabId, likeRect, rng, sleep); // fallback: plain like
+  return "LIKE";
+}
+
+// Like one hydrated feed post as a human would: make sure we're on the feed,
+// scroll-and-poll until a likeable post attaches, read it (dwelling proportional
+// to its length, sometimes expanding "…more" first), then land a trusted click.
+// Returns true iff a like was actually landed; increments s.done.likes and pushes
+// the activity event on success, or a skip event on a miss. Shared by the
+// scheduled 'like' slot and idle-liking so both behave identically.
+async function likeAFeedPost(
+  tabId: number,
+  s: RunState,
+  cfg: ActuatorConfig,
+  rng: ReturnType<typeof makeRng>,
+  events: LinkedInActivityEvent[],
+  at: string,
+): Promise<boolean> {
+  // A standalone feed-like must run ON the feed. After a comment (non-drain mode)
+  // the tab is left on a post permalink, where findFeedPosts finds no feed cards →
+  // every like skipped `no-likeable-post(posts=0)`. Pull it back first (shared
+  // guard, also used by the ambient browse). Best-effort — a failed nav just
+  // falls through to the scan.
+  await ensureOnFeed(tabId, rng);
+  // Scroll-and-poll: the like button only attaches once a post is hydrated near
+  // the viewport, so one blind scroll + immediate locate often finds nothing
+  // likeable. Retry with small scrolls + waits to let posts hydrate.
+  type LikeLoc = {
+    ok: boolean; x?: number; y?: number; rect?: Rect;
+    observed?: {
+      activity_urn?: string; author_name?: string;
+      wordCount?: number; hasMedia?: boolean; isTruncated?: boolean;
+      seeMoreRect?: Rect;
+    };
+    skipReason?: string;
+  };
+  let loc: LikeLoc | null = null;
+  const preferWatchlist = cfg.preferWatchlistRatio > rng.next();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (stopped()) break; // STOP mid-scan — abandon the hunt
+    await cdp.wheel(tabId, { x: 400, y: 400 }, attempt === 0 ? Math.round(rng.float(480, 820)) : Math.round(rng.float(300, 540)), rng, sleep);
+    await sleep(rng.float(450, 1350)); // let the social-action bar hydrate
+    loc = await send<LikeLoc>(tabId, { cmd: "locateLike", preferWatchlist, watchlistNames: [] }).catch(() => null);
+    if (loc?.ok && loc.x != null && loc.y != null) break;
+  }
+  if (loc?.ok && loc.x != null && loc.y != null) {
+    // Read the post like a human BEFORE reacting: dwell proportional to its
+    // length, and sometimes expand "…more" then read the fuller text.
+    let wc = loc.observed?.wordCount ?? 0;
+    const media = loc.observed?.hasMedia ?? false;
+    const trunc = loc.observed?.isTruncated ?? false;
+    const seeMoreRect = loc.observed?.seeMoreRect;
+    const stop = decideStop(rng, wc, { hasMedia: media });
+    if (stop && trunc && seeMoreRect && rng.next() < 0.7) {
+      // expand-then-read: itself a strong human decoy action
+      await cdp.moveAndClick(tabId, seeMoreRect, rng, sleep);
+      await sleep(rng.float(300, 1100));
+      wc = Math.round(wc * 2.2); // fuller text now visible → longer read
+    }
+    await sleep(stop ? readingDwellMs(rng, wc, { hasMedia: media }, s.persona.wpm) : glanceMs(rng));
+    throwIfAborted(runAbort.signal); // STOP during the read → don't land the like
+    // Re-locate the like button immediately before clicking. The rect captured
+    // before the read goes STALE: expanding "…more" grows the post in place, and
+    // lazy-loaded media above it shifts it down — so the pre-read coordinates now
