@@ -198,3 +198,135 @@ export function renderPatternRulesBlock(rules: PatternRuleForPrompt[]): string {
  * model writes, so "don't repeat yourself" is the freshest instruction.
  */
 export function buildDrafterSystem(
+  objective?: string | null,
+  brand?: BrandConfig | null,
+  patternRules?: PatternRuleForPrompt[] | null,
+  /**
+   * The operator's approved replies paired with the posts they answered.
+   * Layered last among the voice blocks: the frozen style examples teach
+   * shape, these teach the move. Empty ⇒ no push ⇒ byte-identical prompt.
+   */
+  voiceExemplars?: ReadonlyArray<VoiceExemplar>,
+): string {
+  const mission = objective?.trim();
+  const patternBlock = patternRules?.length ? renderPatternRulesBlock(patternRules) : "";
+  const useBrand = brand != null && brandConfigHasContent(brand);
+  const parts = useBrand ? [renderBrandBlock(brand), "", SYSTEM_REDDIT_BASE] : [SYSTEM_REDDIT_BASE];
+  if (mission) {
+    parts.push(
+      "",
+      "OPERATOR MISSION (set by the operator for this agent)",
+      `The operator framed this agent's job as: "${mission}"`,
+      "Let that mission steer which angle leads and what you emphasise. When a post clearly relates to the mission, lean into it. It does NOT override anything above: keep the voice, the NEVER-DO list, and the strict JSON output shape exactly as specified. Never fabricate a connection to the mission — if a post doesn't relate, write the best honest peer comment anyway.",
+    );
+  }
+  if (patternBlock) {
+    parts.push("", patternBlock);
+  }
+  // The operator's real POST -> REPLY pairs, last among the voice layers.
+  const exemplarBlock = voiceExemplars?.length ? renderVoiceExemplars(voiceExemplars) : "";
+  if (!useBrand && !mission && !patternBlock && !exemplarBlock) return SYSTEM_REDDIT_BASE;
+  if (exemplarBlock) parts.push(exemplarBlock);
+
+  return parts.join("\n");
+}
+
+// ---- LIGHT (short supportive) drafter ------------------------------------
+// The quality classifier routes lower-scoring-but-still-worthwhile posts (wins,
+// launches, milestones, "I shipped / launched / hit X" posts) to a LIGHT reply:
+// ONE short, warm, specific reaction. No three angles, no pitch — just a genuine
+// peer reaction. This is the variant the drafter uses when classifier_label='light'.
+export const SYSTEM_REDDIT_LIGHT = `You are drafting ONE short, supportive Reddit comment for an operator commenting in subreddits as a peer.
+
+${WRITING_STRUCTURE_GUIDANCE}
+
+This post is a win, launch, milestone, or "I shipped / launched / hit X" moment. It does NOT call for a heavy, value-adding reply — it calls for a brief, genuine reaction from a peer who is happy for them, in the operator's own voice. Reddit-style: real and a little blunt, never a LinkedIn "congratulations" card.
+
+WHAT TO WRITE
+- Exactly ONE comment. 1 to 2 sentences. Short — unless a THIS REPLY'S ASSIGNED SHAPE block appears below; then the assigned shape's length and sentence count win, and it may legitimately ask for more than two sentences.
+- Specific: name the actual thing they shipped/launched so it doesn't read as a canned "nice". One concrete detail from their post is enough.
+- A peer's genuine reaction or light encouragement. A small honest forward-looking note is welcome.
+
+ASSIGNED REGISTER (when present)
+A block labelled "ASSIGNED REGISTER FOR THIS REPLY" may appear below the post. When it does, it OVERRIDES the default length and energy — follow it exactly, including ALL-CAPS, exclamations, very short fragments, and slang when the register calls for them. It does NOT relax any NEVER DO rule below (still no pitch, no em dashes, no corporate-speak, no echoing the post, the emoji allowlist).
+
+${ASSIGNED_SHAPE_RULE}
+
+${GENZ_MARKER_RULE}
+
+${EMOJI_RULE}
+
+${NO_COMMITMENTS_RULE}
+
+NEVER DO
+- Do NOT pitch. No product mention, no link, no CTA. This is a reaction, not outreach.
+- Do NOT invent personal history — no made-up anecdotes or "I did this too" stories you weren't given.
+- Do NOT manufacture a fake-conversion arc or self-diminish to flatter.
+- Em dashes (—, –, ―, --). Use commas, parentheses, or periods.
+- Any emoji outside 💀 😭 😛, and even those only when the post itself uses emoji.
+- Hollow engagement-bait ("This.", "Great post!", "Congrats! 🎉" alone). Be specific instead.
+- Corporate / LinkedIn-speak: unlock, empower, leverage, streamline, delight, supercharge, revolutionize, seamless, synergy.
+- Echoing the post back at them or quoting their words.
+- Reaction clichés + insight-bait + fake-curiosity: "hits different", "this hits", "the gap between X is where most…", "curious to hear how it lands".
+- Choppy "sentence. sentence. sentence." staccato. Glue clauses with connectors — one warm line, not stacked fragments.
+- The word "babysit" / "hand-holding" as buzzwords.
+- Multiple comments, multiple angles, or a DM. Exactly ONE comment — short by default, or exactly the length an ASSIGNED SHAPE block asks for when one is present.
+
+OUTPUT FORMAT — STRICT JSON, NO MARKDOWN FENCES, NO PREAMBLE
+The very first character of your response MUST be \`{\` and the last \`}\`. Output exactly:
+
+  {"drafts":[{"angle":"empathetic","body":"…","char_count":N}]}
+
+Exactly ONE draft with angle "empathetic". \`char_count\` must equal the actual length of \`body\`. Do NOT output a "skip" — the upstream gate already decided this lead is worth a reply.`;
+
+/**
+ * Compose the LIGHT (short supportive) drafter system prompt. Reuses the operator
+ * brand persona (so the reply still sounds like the operator) but with the
+ * react-don't-pitch discipline of SYSTEM_REDDIT_LIGHT. The operator objective is
+ * appended for tone/voice steering only; it never re-enables the pitch.
+ */
+export function buildLightDrafterSystem(
+  objective?: string | null,
+  brand?: BrandConfig | null,
+  patternRules?: PatternRuleForPrompt[] | null,
+): string {
+  const mission = objective?.trim();
+  const patternBlock = patternRules?.length ? renderPatternRulesBlock(patternRules) : "";
+  const useBrand = brand != null && brandConfigHasContent(brand);
+  // When the operator has a brand, prepend WHO they are (persona/voice) but keep
+  // the light, no-pitch instructions authoritative. We deliberately do NOT pass
+  // the product/pitch policy block — a light reply never pitches.
+  const parts = useBrand
+    ? [renderLightBrandBlock(brand), "", SYSTEM_REDDIT_LIGHT]
+    : [SYSTEM_REDDIT_LIGHT];
+  if (mission) {
+    parts.push(
+      "",
+      "OPERATOR MISSION (for tone only)",
+      `The operator framed this agent's job as: "${mission}". Let it colour your voice, but a light reply is still a genuine reaction with NO pitch and NO product mention.`,
+    );
+  }
+  if (patternBlock) {
+    parts.push("", patternBlock);
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Light-mode brand block: persona/voice ONLY (name + bio + any voice notes). The
+ * product, pitch policy, and Q&A are intentionally omitted — a light reply
+ * reacts, it never sells.
+ */
+function renderLightBrandBlock(brand: BrandConfig): string {
+  const lines: string[] = ["OPERATOR BRAND (who you are — voice only; do NOT pitch in a light reply)"];
+  if (brand.persona?.name)
+    lines.push(
+      `You ARE ${brand.persona.name}. Write in the FIRST PERSON as ${brand.persona.name} ("I", "me", "my") — never refer to ${brand.persona.name} in the third person or narrate them by name as if they were someone else.`,
+    );
+  if (brand.persona?.bio) lines.push(`About you: ${brand.persona.bio}`);
+  if (brand.reply_style?.voice_notes) lines.push(`Voice notes: ${brand.reply_style.voice_notes}`);
+  if (brand.reply_style?.never_do?.length) {
+    lines.push(`Additional NEVER-DO: ${brand.reply_style.never_do.join("; ")}.`);
+  }
+  return lines.join("\n");
+}
