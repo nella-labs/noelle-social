@@ -198,3 +198,109 @@ describe("runSendTick", () => {
 
     const outcomes = await runSendTick({
       log: makeLog(),
+      pendingDrafts: [
+        { draft_id: "d1", body: "one", in_reply_to_id: "t1", lead_id: "L1" },
+        { draft_id: "d2", body: "two", in_reply_to_id: "t2", lead_id: "L2" },
+      ],
+      xClient: xClient as never,
+      markSent,
+      markErrored,
+    });
+
+    expect(outcomes.map((o) => o.status)).toEqual(["reply_forbidden", "sent"]);
+    // A lone per-conversation 403 is NOT systemic — the caller must not halt.
+    expect(outcomes.every((o) => o.systemic !== true)).toBe(true);
+    expect(markErrored).toHaveBeenCalledTimes(1);
+    expect(markSent).toHaveBeenCalledTimes(1);
+  });
+
+  it("abandons the batch as systemic after consecutive reply-restriction 403s (the 07-11 storm shape)", async () => {
+    const xClient = makeXClient({
+      createTweet: vi.fn().mockRejectedValue(new XReplyRestrictedError("x api not been mentioned")),
+    });
+    const markSent = vi.fn().mockResolvedValue(undefined);
+    const markErrored = vi.fn().mockResolvedValue(undefined);
+
+    const drafts = ["d1", "d2", "d3", "d4", "d5"].map((id) => ({
+      draft_id: id,
+      body: "b",
+      in_reply_to_id: "t",
+      lead_id: `L-${id}`,
+    }));
+    const outcomes = await runSendTick({
+      log: makeLog(),
+      pendingDrafts: drafts,
+      xClient: xClient as never,
+      markSent,
+      markErrored,
+    });
+
+    // Only REPLY_FORBIDDEN_TRIP rows are consumed — the other 3 are never
+    // attempted (the caller releases them), instead of 5 terminal errors.
+    expect(outcomes.map((o) => o.status)).toEqual(
+      Array(REPLY_FORBIDDEN_TRIP).fill("reply_forbidden"),
+    );
+    expect(xClient.createTweet).toHaveBeenCalledTimes(REPLY_FORBIDDEN_TRIP);
+    expect(markErrored).toHaveBeenCalledTimes(REPLY_FORBIDDEN_TRIP);
+    // Only the LAST row (the one that broke the batch) is flagged systemic —
+    // that flag, not a count, is what the caller keys the account halt off.
+    expect(outcomes.at(-1)?.systemic).toBe(true);
+    expect(outcomes.slice(0, -1).every((o) => o.systemic !== true)).toBe(true);
+  });
+
+  it("a successful send resets the reply-restriction streak", async () => {
+    const xClient = makeXClient({
+      createTweet: vi
+        .fn()
+        .mockRejectedValueOnce(new XReplyRestrictedError("no reply"))
+        .mockResolvedValueOnce({ id: "T2", url: "https://x.com/me/status/T2" })
+        .mockRejectedValueOnce(new XReplyRestrictedError("no reply")),
+    });
+    const markSent = vi.fn().mockResolvedValue(undefined);
+    const markErrored = vi.fn().mockResolvedValue(undefined);
+
+    const outcomes = await runSendTick({
+      log: makeLog(),
+      pendingDrafts: [
+        { draft_id: "d1", body: "a", in_reply_to_id: "t1", lead_id: "L1" },
+        { draft_id: "d2", body: "b", in_reply_to_id: "t2", lead_id: "L2" },
+        { draft_id: "d3", body: "c", in_reply_to_id: "t3", lead_id: "L3" },
+      ],
+      xClient: xClient as never,
+      markSent,
+      markErrored,
+    });
+
+    // Non-consecutive restrictions never trip the systemic break — the
+    // interleaved 'sent' resets the streak, so NEITHER 403 is systemic even
+    // though the tick's total reply_forbidden count is 2 (== REPLY_FORBIDDEN_TRIP).
+    // This is the exact array send.ts must NOT treat as an account-wide halt.
+    expect(outcomes.map((o) => o.status)).toEqual(["reply_forbidden", "sent", "reply_forbidden"]);
+    expect(outcomes.filter((o) => o.status === "reply_forbidden").length).toBe(REPLY_FORBIDDEN_TRIP);
+    expect(outcomes.every((o) => o.systemic !== true)).toBe(true);
+    expect(xClient.createTweet).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not throw if markErrored throws — only logs", async () => {
+    const xClient = makeXClient({
+      createTweet: vi.fn().mockRejectedValue(new XError("x 400", 400)),
+    });
+    const markSent = vi.fn().mockResolvedValue(undefined);
+    const markErrored = vi.fn().mockRejectedValue(new Error("db down"));
+    const log = makeLog();
+
+    await expect(
+      runSendTick({
+        log,
+        pendingDrafts: [
+          { draft_id: "d1", body: "one", in_reply_to_id: "t1", lead_id: "L1" },
+        ],
+        xClient: xClient as never,
+        markSent,
+        markErrored,
+      }),
+    ).resolves.toEqual([
+      { draftId: "d1", status: "errored", reason: "x 400" },
+    ]);
+  });
+});
