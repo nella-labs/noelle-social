@@ -398,3 +398,203 @@ function Editor({
   const rawSpecs = (Array.isArray(draft.graph_specs) ? draft.graph_specs : []) as LooseSpec[];
 
   // Place each visual on its beat by timing; surface anything that can't be placed.
+  const board = useMemo(() => {
+    const specs = rawSpecs.map((raw, index) => ({ raw, index, sec: graphSpecSeconds(raw) }));
+    const beatOf = (sec: number | null): number => {
+      if (sec == null || beats.length === 0) return -1;
+      for (let i = 0; i < beats.length; i++) {
+        const a = num(beats[i].tStart), b = num(beats[i].tEnd);
+        if (sec >= a && (sec < b || i === beats.length - 1)) return i;
+      }
+      return sec >= num(beats[beats.length - 1].tStart) ? beats.length - 1 : -1;
+    };
+    const perBeat: Array<typeof specs> = beats.map(() => []);
+    const unplaced: typeof specs = [];
+    for (const s of specs) {
+      const bi = beatOf(s.sec);
+      if (bi < 0) unplaced.push(s);
+      else perBeat[bi].push(s);
+    }
+    return { perBeat, unplaced };
+  }, [rawSpecs, beats]);
+
+  // Footage cues per beat are parsed OUT of the spoken line and shown as tags.
+  const placedCues = new Set(beatLines.flatMap((l) => footageCues(l)));
+  const extraCues = footageCues(script).filter((c) => !placedCues.has(c));
+
+  const persist = (ready: boolean) => {
+    const submitted = buffer;
+    start(async () => {
+      setMessage(null);
+      try {
+        if (submitted.linesDirty) {
+          const structure = submitted.beats.map((beat, index) => ({
+            tStart: num(beat.tStart), tEnd: num(beat.tEnd),
+            purpose: String(beat.purpose ?? ""), line: submitted.beatLines[index] ?? "",
+          }));
+          const result = await saveVideoDraftStructure({ orgSlug, draftId: draft.id, structure });
+          if (!result.ok) return setMessage("Could not save the storyboard — try again.");
+          onConfirmed(submitted, "lines");
+        }
+        if (ready) {
+          const result = await markVideoDraftReady({
+            orgSlug, draftId: draft.id,
+            ...(submitted.scriptDirty ? { editedScript: submitted.script } : {}),
+          });
+          if (!result.ok) return setMessage("Could not mark this draft ready — try again.");
+          if (submitted.scriptDirty) onConfirmed(submitted, "script");
+        } else if (submitted.scriptDirty) {
+          const result = await saveVideoDraftScript({ orgSlug, draftId: draft.id, script: submitted.script });
+          if (!result.ok) return setMessage("Could not save the script — try again.");
+          onConfirmed(submitted, "script");
+        }
+      } catch {
+        setMessage("Could not confirm the change. Your unsaved edits are still here; try again.");
+      }
+    });
+  };
+  const saveAll = () => persist(false);
+  const dirty = linesDirty || scriptDirty;
+  const markReady = () => persist(true);
+  const dismiss = () => start(async () => {
+    setMessage(null);
+    try {
+      const result = await dismissStudioItem({ orgSlug, target: "draft", id: draft.id });
+      if (!result.ok) return setMessage("Could not dismiss this draft — try again.");
+      onCleared();
+    } catch {
+      setMessage("Could not confirm dismissal — try again.");
+    }
+  });
+
+  // ── Export (live editor state) ──
+  const [copied, setCopied] = useState(false);
+  const exportInput = (): ScriptExportInput => ({
+    hook: draft.idea_hook,
+    status: draft.status,
+    sounds: sounds.map((s) => String(s.name ?? s.trackName ?? "").trim()).filter(Boolean),
+    beats: beats.map((b, i) => {
+      const { spoken, cues } = splitCues(beatLines[i] ?? "");
+      return {
+        tStart: num(b.tStart), tEnd: num(b.tEnd), purpose: String(b.purpose ?? ""),
+        line: spoken, cues, visuals: (board.perBeat[i] ?? []).map((s) => specLabel(s.raw)),
+      };
+    }),
+    script,
+  });
+  const slug = scriptFilenameSlug(draft.idea_hook);
+  const copyScript = async () => {
+    try {
+      await navigator.clipboard.writeText(buildPlainTextScript(exportInput()));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard blocked — the .txt/.md buttons still work */ }
+  };
+  const downloadTxt = () => downloadTextFile(`${slug}.txt`, buildPlainTextScript(exportInput()), "text/plain");
+  const downloadMd = () => downloadTextFile(`${slug}.md`, buildMarkdownScript(exportInput()), "text/markdown");
+
+  return (
+    <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+      {/* Header: agent · status · nav · refine · dismiss */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "13px 18px", borderBottom: "1px solid var(--rule-soft)" }}>
+        <Avatar role="video-intern" size={26} accent={NOVA_ACCENT} />
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 13.5, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Video · Nova</div>
+          <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--ink-muted)" }}>Nova · {draft.status}</div>
+        </div>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+          {navPos ? (
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+              <button className="btn btn-sm" disabled={!onPrev} onClick={onPrev} aria-label="Previous draft" style={{ padding: "0 9px" }}>‹</button>
+              <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--ink-muted)", minWidth: 40, textAlign: "center" }}>{navPos.idx} / {navPos.total}</span>
+              <button className="btn btn-sm" disabled={!onNext} onClick={onNext} aria-label="Next draft" style={{ padding: "0 9px" }}>›</button>
+            </div>
+          ) : null}
+          <button className="btn btn-sm" onClick={onRefine} title="Talk to Nova — it can rewrite lines and apply them here">✎ Refine</button>
+          <button onClick={dismiss} disabled={pending} title="Remove this draft" aria-label="Remove draft"
+                  style={{ width: 30, height: 28, border: 0, borderRadius: 7, background: "transparent", color: "var(--ink-soft)", cursor: "pointer", fontSize: 14 }}>🗑</button>
+        </div>
+      </div>
+
+      <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 16 }}>
+        {/* Verifier trace — the same four-dimension quality grade the other interns
+            show, now that Nova runs the post-draft verifier on its scripts. */}
+        {draft.verifier_meta ? <VerifierTraceCard meta={draft.verifier_meta as VerifierTrace} /> : null}
+
+        {/* The hook line — what the video opens on */}
+        <div style={{ fontSize: 15.5, lineHeight: 1.3, color: "var(--ink)", fontWeight: 500 }}>{draft.idea_hook}</div>
+
+        {/* Inspired by — the source reels + teardown; tap to verify what Nova learned */}
+        <InspirationStrip
+          clips={draft.inspiration}
+          heading={draft.inspirationIsFallback ? "Top reels from your watched creators — model yours on these" : "Inspired by — model your video on these"}
+          onOpen={onVerifyClip}
+        />
+
+        {/* Soundtrack */}
+        {sounds.length > 0 ? (
+          <Field label="Soundtrack">
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              {sounds.map((s, i) => (
+                <span key={i} className="tag tag-acc" title={String(s.reason ?? "")}>
+                  ♪ {String(s.name ?? s.trackName ?? "sound")}{s.trending ? " · trending" : ""}
+                </span>
+              ))}
+            </div>
+          </Field>
+        ) : null}
+
+        {/* Storyboard — each beat pairs the (editable) voice line with its visual + footage tags */}
+        {beats.length > 0 ? (
+          <div>
+            <div style={{ display: "flex", alignItems: "baseline", marginBottom: 6 }}>
+              <span className="eyebrow" style={{ fontSize: 9.5 }}>Storyboard</span>
+              <span style={{ marginLeft: 8, fontFamily: "var(--mono)", fontSize: 10, color: "var(--ink-soft)" }}>edit any line</span>
+              {linesDirty ? (
+                <button className="btn btn-xs btn-primary" style={{ marginLeft: "auto" }} disabled={pending} onClick={saveAll}>
+                  {pending ? "Saving…" : "Save"}
+                </button>
+              ) : null}
+            </div>
+            <div style={{ display: "grid", gap: 10 }}>
+              {beats.map((b, i) => {
+                const into = i > 0 ? transitions.find((t) => parseAt(t.at) === num(b.tStart)) : undefined;
+                const { spoken, cues } = splitCues(beatLines[i] ?? "");
+                return (
+                  <div key={i}>
+                    {into ? (
+                      <div style={{ display: "flex", justifyContent: "center", margin: "2px 0" }}>
+                        <span className="tag" style={{ height: 18, fontSize: 9.5 }}>⤳ {String(into.type)}</span>
+                      </div>
+                    ) : null}
+                    <div className="clay-flat" style={{ padding: 12, borderRadius: 12, display: "grid", gap: 10 }}>
+                      <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                        <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: NOVA_ACCENT, background: `color-mix(in oklch, ${NOVA_ACCENT} 12%, var(--paper))`, padding: "2px 7px", borderRadius: 999 }}>
+                          {num(b.tStart)}–{num(b.tEnd)}s
+                        </span>
+                        <span style={{ fontSize: 11, color: "var(--ink-soft)" }}>{String(b.purpose ?? "")}</span>
+                      </div>
+                      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-start" }}>
+                        {/* Voice — editable spoken text (cues live as tags below, not inline) */}
+                        <div style={{ flex: "1 1 260px", minWidth: 220 }}>
+                          <div className="studio-sub" style={{ fontSize: 10 }}>🎙 Voice</div>
+                          <textarea
+                            value={spoken}
+                            onChange={(e) => {
+                              setBeatLines((prev) => { const next = [...prev]; next[i] = joinCues(e.target.value, cues); return next; });
+                            }}
+                            spellCheck
+                            style={growTextarea}
+                          />
+                          {cues.length > 0 ? (
+                            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+                              {cues.map((c, k) => <FootageChip key={k} cue={c} />)}
+                            </div>
+                          ) : null}
+                        </div>
+                        {/* Visual(s) on screen during this beat */}
+                        {board.perBeat[i].length > 0 ? (
+                          <div style={{ flex: "0 0 auto" }}>
+                            <div className="studio-sub" style={{ fontSize: 10 }}>🖼 On screen</div>
+                            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                              {board.perBeat[i].map((s) => (
