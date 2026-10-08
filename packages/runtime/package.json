@@ -1,0 +1,200 @@
+{
+  "name": "@noelle/runtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "description": "Model routing helper (callAgentModel), budgetBucket, nellaClient, and the shared intern runtime modules.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./src/index.ts"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js",
+      "default": "./src/types.ts"
+    },
+    "./prior-replies": {
+      "types": "./dist/priorReplies.d.ts",
+      "import": "./dist/priorReplies.js",
+      "default": "./src/priorReplies.ts"
+    },
+    "./opening-move": {
+      "types": "./dist/openingMove.d.ts",
+      "import": "./dist/openingMove.js",
+      "default": "./src/openingMove.ts"
+    },
+    "./icp-gate": {
+      "types": "./dist/icpGate.d.ts",
+      "import": "./dist/icpGate.js",
+      "default": "./src/icpGate.ts"
+    },
+    "./shard": {
+      "types": "./dist/shard.d.ts",
+      "import": "./dist/shard.js",
+      "default": "./src/shard.ts"
+    },
+    "./voice-spec": {
+      "types": "./dist/voiceSpec.d.ts",
+      "import": "./dist/voiceSpec.js",
+      "default": "./src/voiceSpec.ts"
+    },
+    "./playbooks-db": {
+      "types": "./dist/playbooksDb.d.ts",
+      "import": "./dist/playbooksDb.js",
+      "default": "./src/playbooksDb.ts"
+    },
+    "./apify-health-sweep": {
+      "types": "./dist/apifyHealthSweep.d.ts",
+      "import": "./dist/apifyHealthSweep.js",
+      "default": "./src/apifyHealthSweep.ts"
+    },
+    "./apify-usage": {
+      "types": "./dist/apifyUsage.d.ts",
+      "import": "./dist/apifyUsage.js",
+      "default": "./src/apifyUsage.ts"
+    },
+    "./apify-usage-db": {
+      "types": "./dist/apifyUsageDb.d.ts",
+      "import": "./dist/apifyUsageDb.js",
+      "default": "./src/apifyUsageDb.ts"
+    },
+    "./dm-ladder": {
+      "types": "./dist/dmLadder.d.ts",
+      "import": "./dist/dmLadder.js",
+      "default": "./src/dmLadder.ts"
+    },
+    "./dm-ladder-db": {
+      "types": "./dist/dmLadderDb.d.ts",
+      "import": "./dist/dmLadderDb.js",
+      "default": "./src/dmLadderDb.ts"
+    },
+    "./budget": {
+      "types": "./dist/budgetBucket.d.ts",
+      "import": "./dist/budgetBucket.js",
+      "default": "./src/budgetBucket.ts"
+    },
+    "./bm25-index": {
+      "types": "./dist/bm25Index.d.ts",
+      "import": "./dist/bm25Index.js",
+      "default": "./src/bm25Index.ts"
+    },
+    "./dense-chunk-index": {
+      "types": "./dist/denseChunkIndex.d.ts",
+      "import": "./dist/denseChunkIndex.js",
+      "default": "./src/denseChunkIndex.ts"
+    },
+    "./voyage-context-embed": {
+      "types": "./dist/voyageContextEmbed.d.ts",
+      "import": "./dist/voyageContextEmbed.js",
+      "default": "./src/voyageContextEmbed.ts"
+    },
+    "./markdown-chunker": {
+      "types": "./dist/markdownChunker.d.ts",
+      "import": "./dist/markdownChunker.js",
+      "default": "./src/markdownChunker.ts"
+    },
+    "./nella": {
+      "types": "./dist/nellaClient.d.ts",
+      "import": "./dist/nellaClient.js",
+      "default": "./src/nellaClient.ts"
+    },
+    "./vault": {
+      "types": "./dist/vaultResolver.d.ts",
+      "import": "./dist/vaultResolver.js",
+      "default": "./src/vaultResolver.ts"
+    },
+    "./vault-storage": {
+      "types": "./dist/vaultStorage.d.ts",
+      "import": "./dist/vaultStorage.js",
+      "default": "./src/vaultStorage.ts"
+    },
+    "./vault-text": {
+      "types": "./dist/vaultText.d.ts",
+      "import": "./dist/vaultText.js",
+      "default": "./src/vaultText.ts"
+    },
+    "./vault-provision": {
+      "types": "./dist/vaultProvision.d.ts",
+      "import": "./dist/vaultProvision.js",
+      "default": "./src/vaultProvision.ts"
+    },
+    "./vault-template": {
+      "types": "./dist/vaultTemplate.d.ts",
+      "import": "./dist/vaultTemplate.js",
+      "default": "./src/vaultTemplate.ts"
+    },
+    "./gcs-anchors": {
+      "types": "./dist/gcsAnchorSource.d.ts",
+      "import": "./dist/gcsAnchorSource.js",
+      "default": "./src/gcsAnchorSource.ts"
+    },
+    "./bedrock": {
+      "types": "./dist/bedrockBackend.d.ts",
+      "import": "./dist/bedrockBackend.js",
+      "default": "./src/bedrockBackend.ts"
+    },
+    "./anthropic": {
+      "types": "./dist/anthropicBackend.d.ts",
+      "import": "./dist/anthropicBackend.js",
+      "default": "./src/anthropicBackend.ts"
+    },
+    "./openai": {
+      "types": "./dist/openaiBackend.d.ts",
+      "import": "./dist/openaiBackend.js",
+      "default": "./src/openaiBackend.ts"
+    },
+    "./call": {
+      "types": "./dist/callAgentModel.d.ts",
+      "import": "./dist/callAgentModel.js",
+      "default": "./src/callAgentModel.ts"
+    },
+    "./ratelimit": {
+      "types": "./dist/ratelimit.d.ts",
+      "import": "./dist/ratelimit.js",
+      "default": "./src/ratelimit.ts"
+    },
+    "./tenancy": {
+      "types": "./dist/tenancy.d.ts",
+      "import": "./dist/tenancy.js",
+      "default": "./src/tenancy.ts"
+    },
+    "./content-push": {
+      "types": "./dist/contentPush.d.ts",
+      "import": "./dist/contentPush.js",
+      "default": "./src/contentPush.ts"
+    },
+    "./content-storage": {
+      "types": "./dist/contentStorage.d.ts",
+      "import": "./dist/contentStorage.js",
+      "default": "./src/contentStorage.ts"
+    },
+    "./register": {
+      "types": "./dist/register.d.ts",
+      "import": "./dist/register.js",
+      "default": "./src/register.ts"
+    },
+    "./comment-digest": {
+      "types": "./dist/commentDigest.d.ts",
+      "import": "./dist/commentDigest.js",
+      "default": "./src/commentDigest.ts"
+    },
+    "./commitment-guard": {
+      "types": "./dist/commitmentGuard.d.ts",
+      "import": "./dist/commitmentGuard.js",
+      "default": "./src/commitmentGuard.ts"
+    },
+    "./notification-triage": {
+      "types": "./dist/notificationTriage.d.ts",
+      "import": "./dist/notificationTriage.js",
+      "default": "./src/notificationTriage.ts"
+    },
+    "./pattern-breaker-db": {
+      "types": "./dist/patternBreakerDb.d.ts",
+      "import": "./dist/patternBreakerDb.js",
+      "default": "./src/patternBreakerDb.ts"
+    },
+    "./apify-pool-db": {
+      "types": "./dist/apifyPoolDb.d.ts",
