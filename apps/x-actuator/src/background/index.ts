@@ -1398,3 +1398,203 @@ async function doComment(tabId: number, item: PoolItem, rng: ReturnType<typeof m
     // re-throwing so a stopped run leaves the tab as it found it.
     await clearComposer(tabId, rng);
     throw e;
+  }
+  // Reserve the numeric tweet ID after the composer is ready, immediately
+  // before any submit gesture. A denied or ambiguous claim cannot be retried:
+  // the server may have committed it even when the response was lost.
+  const claimed = await claimReplyBeforeSubmit(api, item.approvalId);
+  if (!claimed) {
+    await clearComposer(tabId, rng);
+    return { superseded: "claim-denied-or-unknown" };
+  }
+  if (stopped() || epoch !== (await currentEpoch())) {
+    await clearComposer(tabId, rng);
+    return { superseded: "stopped-after-claim" };
+  }
+  const res = await submitReply(tabId, rng, epoch);
+  // A landed reply clears the composer itself (that IS how `posted()` confirms
+  // it). Every other outcome leaves the typed text in the box, and the next
+  // chrome.tabs.update — the hop to the next permalink, or the return to the
+  // feed — would then navigate away from a dirty composer and raise Chromium's
+  // "Leave site? Changes you made may not be saved." That dialog blocks the
+  // renderer, freezes the content script's tick loop, and wedges the whole run
+  // until a human clicks it. It cannot be answered over CDP either: handling
+  // `beforeunload` via Page.handleJavaScriptDialog is broken upstream
+  // (puppeteer/puppeteer#9871), so removing the TRIGGER is the only fix.
+  if (!res.ok) await clearComposer(tabId, rng);
+  return res;
+}
+
+/**
+ * Every navigation this actuator makes. Binds the shared clear-then-navigate
+ * helper (see makeNavigateTab for why the clear belongs at the navigation and
+ * not only on the failure path) to Vega's composer.
+ *
+ * Declared as a `function` deliberately: ensureOnFeed calls it a thousand lines
+ * above clearComposer's definition, which only hoisting makes legal.
+ */
+function navigateTab(
+  tabId: number,
+  url: string,
+  rng: ReturnType<typeof makeRng>,
+  /**
+   * Re-checked AFTER the clear, immediately before the navigation. The clear
+   * can take a couple of seconds, so a caller that already checked a liveness
+   * condition (the notification sweep's epoch guard) would otherwise have that
+   * check go stale in the gap and still yank the operator's tab. Returning
+   * false makes the navigation a no-op.
+   */
+  stillWanted?: () => Promise<boolean>,
+): Promise<void> {
+  return makeNavigateTab({
+    clearComposer: (id) => clearComposer(id, rng),
+    updateTab: async (id, u) => {
+      await chrome.tabs.update(id, { url: u });
+    },
+    // Handed to the helper rather than checked inside updateTab, so it also
+    // runs BEFORE the clear: bailing only at the navigation would still have
+    // wiped the operator's draft on the way to a hop we then abandon.
+    ...(stillWanted ? { shouldProceed: stillWanted } : {}),
+  })(tabId, url);
+}
+
+/**
+ * Empty the reply composer and confirm it, so the next navigation cannot raise
+ * a `beforeunload` dialog. Best-effort and never throws: it runs on paths that
+ * have already decided the draft's fate, and it must not convert a handled
+ * reply failure into an unhandled tick error. A box that refuses to clear is
+ * logged (the sink is the only window in during a run) but not fatal — the
+ * dialog is a stall, not a correctness problem.
+ */
+async function clearComposer(tabId: number, rng: ReturnType<typeof makeRng>): Promise<void> {
+  const cleared = await runClearComposer({
+    focusBox: async () => {
+      const box = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect }>(
+        tabId, { cmd: "locateCommentBox" },
+      ).catch(() => null);
+      if (!box?.ok || box.x == null) return false;
+      await actorClick(tabId, rectFrom(box), rng);
+      return true;
+    },
+    clearKeys: () => cdp.clearFocusedEditor(tabId, sleep),
+    isEmpty: () => replyPosted(tabId), // "composer gone or empty" — the same read
+    sleep,
+  });
+  // Confirmed independently of the return value, the same way LinkedIn and
+  // Reddit now do it. runClearComposer reports success when the box cannot be
+  // FOCUSED, on the reasonable assumption that an unfocusable box is an absent
+  // one — but locateCommentBox refuses a zero rect (rightly: a synthesized 4x4
+  // box at the viewport corner is not a composer), so a present-but-hidden
+  // dirty composer takes that path and the warning is swallowed for the exact
+  // state that still arms the dialog. Positive test, so an unreadable content
+  // script does not warn either.
+  if (!cleared || (await replyBoxHasText(tabId))) {
+    sinkLog("warn", "composer would not clear; next navigation may raise a leave-site dialog", { tabId });
+  }
+}
+
+/** Can we POSITIVELY see text still in the reply composer? Distinct from
+ *  `!replyPosted`, which is also true when the box cannot be READ. */
+async function replyBoxHasText(tabId: number): Promise<boolean> {
+  const st = await send<{ ok: boolean; observed?: { present?: boolean; empty?: boolean } }>(
+    tabId, { cmd: "readCommentBox" },
+  ).catch(() => null);
+  return st?.observed?.present === true && st.observed?.empty === false;
+}
+
+// Read the composer state: has the just-typed reply posted? X clears the inline
+// composer (and unmounts the modal one) on a successful post, so an empty (or
+// vanished) box = landed, a populated box = did NOT land. Any read error is
+// treated as "not confirmed" (caller retries / falls back), never a false success.
+async function replyPosted(tabId: number): Promise<boolean> {
+  const st = await send<{ ok: boolean; observed?: { present?: boolean; empty?: boolean } }>(
+    tabId, { cmd: "readCommentBox" },
+  ).catch(() => null);
+  if (!st) return false;
+  return st.observed?.present === false || st.observed?.empty === true;
+}
+
+// Submit the just-typed reply and CONFIRM it actually landed. Thin adapter
+// over runSubmitReply (background/submit.ts — pure, unit-tested, NEVER throws:
+// a mid-gesture throw comes back as detail:"gesture-error" with the dispatched
+// flag preserved, so an operator dismissing the chrome.debugger infobar after
+// a click/chord went out still lands in drop-ambiguous, not a re-post).
+//
+// On failure the bare stage name is enriched with the diagnostics ported from
+// the LinkedIn actuator (#442/#444, background/detail.ts) so the DB skip row
+// is diagnosable without a live DevTools session:
+//   not-cleared(via=…,btn=…,type=…) → a submit was clicked/chorded but the
+//                      composer never cleared (submit rejected — a live
+//                      action-block — or the click hit a decoy; btn/via name
+//                      the exact button). A wall of `not-cleared` on the REAL
+//                      submit across posts is the signature of an X
+//                      action-block.
+//   submit-not-found(b=…,box=…,empty=…,wf=…,en=…,vis=…,top=…,dom=…,reg=…) →
+//                      no clickable submit ever appeared in the poll. The
+//                      composer read + search diagnostic split the causes:
+//                      box=present,empty=false = the reply is still sitting
+//                      there; wf=0 = no worded submit exists (selector model
+//                      wrong), en=0 = it never enabled (typing/state),
+//                      en>0,vis=0 = enabled but no layout box yet.
+async function submitReply(tabId: number, rng: ReturnType<typeof makeRng>, epoch: number): Promise<ReplyResult> {
+  // Descriptor of the last submit the click landed on (locateCommentSubmit's
+  // observed via/aria/text/type) — captured by the locate dep so a not-cleared
+  // failure names WHICH button was clicked (the real submit vs a decoy).
+  let clicked: SubmitObserved | undefined;
+  const res = await runSubmitReply({
+    now: Date.now,
+    sleep,
+    stale: async () => epoch !== (await currentEpoch()), // run stopped/superseded mid-submit
+    locateSubmit: async () => {
+      const submit = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect; observed?: SubmitObserved }>(tabId, { cmd: "locateCommentSubmit" });
+      if (submit.ok && submit.x != null) clicked = submit.observed;
+      return submit;
+    },
+    clickSubmit: (loc) => actorClick(tabId, rectFrom(loc), rng),
+    posted: () => replyPosted(tabId),
+    refocusComposer: async () => {
+      const box = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect }>(tabId, { cmd: "locateCommentBox" }).catch(() => null);
+      if (box?.ok && box.x != null) await actorClick(tabId, rectFrom(box), rng);
+    },
+    chord: (mod) => cdp.pressSubmitChord(tabId, mod),
+  });
+  if (res.ok) return res;
+  if (res.detail === "not-cleared") {
+    res.detail = notClearedDetail(clicked);
+  } else if (res.detail === "submit-not-found") {
+    const st = await send<{ ok: boolean; observed?: { present?: boolean; empty?: boolean } }>(
+      tabId, { cmd: "readCommentBox" },
+    ).catch(() => null);
+    // Why did the submit never resolve? diagnoseCommentSubmit re-walks the
+    // search and buckets the failure (an older content script without this
+    // command returns nothing → detail formats without the extra fields).
+    const dg = await send<{ ok: boolean; observed?: SubmitDiag }>(
+      tabId, { cmd: "diagnoseCommentSubmit" },
+    ).catch(() => null);
+    res.detail = submitNotFoundDetail(st?.observed, dg?.observed);
+  }
+  console.warn("[actuator] reply did not land", { detail: res.detail, dispatched: res.dispatched });
+  return res;
+}
+
+// ── Lights-out autonomy ────────────────────────────────────────────────────
+// A persistent alarm (survives service-worker suspend) checks a few times an
+// hour whether to auto-start the daily run, no manual Run click. Once started,
+// the content-script tick loop drives it as usual; a persisted day key enforces
+// one auto-start per day. Requires a logged-in x.com tab open (startRun
+// attaches to it); with none open the run pauses until a tab appears.
+const AUTO_START_DAY_KEY = "actuator.lastAutoStartDay";
+// Day key of the most recent challenge halt (stamped in endRun). Drives the
+// post-challenge cooldown/backoff + health safety gate below. Distinct from
+// AUTO_START_DAY_KEY so a suppressed tick never masks the once-per-day guard.
+const CHALLENGE_DAY_KEY = "actuator.lastChallengeDay";
+// Day key of the last manual STOP. A STOP must silence BOTH autonomy paths for
+// the rest of the day (the daily auto-start already stamps AUTO_START_DAY_KEY;
+// auto-drain has no daily guard, so it reads this instead).
+const STOP_DAY_KEY = "actuator.lastManualStopDay";
+// ms stamp of the last auto-drain start + the re-arm cooldown between starts.
+// The cooldown bounds the pathological loop of a drain that keeps dying with
+// items still queued (no x.com tab, reply-fail give-ups) — without it the 5-min
+// alarm would relaunch a doomed drain forever.
+const AUTO_DRAIN_MS_KEY = "actuator.lastAutoDrainMs";
+const AUTO_DRAIN_REARM_MIN = 30;
