@@ -598,3 +598,81 @@ function Editor({
                             <div className="studio-sub" style={{ fontSize: 10 }}>🖼 On screen</div>
                             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                               {board.perBeat[i].map((s) => (
+                                <VisualCard key={s.index} orgSlug={orgSlug} draftId={draft.id} index={s.index} raw={s.raw} />
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+
+        {/* Visuals Nova couldn't place on the timeline (still editable) */}
+        {board.unplaced.length > 0 ? (
+          <Field label="More visuals">
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {board.unplaced.map((s) => (
+                <VisualCard key={s.index} orgSlug={orgSlug} draftId={draft.id} index={s.index} raw={s.raw} />
+              ))}
+            </div>
+          </Field>
+        ) : null}
+
+        {/* Footage cues mentioned in the script but not tied to a beat */}
+        {extraCues.length > 0 ? (
+          <Field label="Other footage cues">
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {extraCues.map((c, i) => <FootageChip key={i} cue={c} />)}
+            </div>
+          </Field>
+        ) : null}
+
+        {/* Full script — editable, collapsible */}
+        <details>
+          <summary className="eyebrow" style={{ fontSize: 9.5, cursor: "pointer", display: "flex", alignItems: "center" }}>
+            Full script
+            {scriptDirty ? (
+              <button className="btn btn-xs btn-primary" style={{ marginLeft: "auto" }} disabled={pending} onClick={(e) => { e.preventDefault(); saveAll(); }}>
+                {pending ? "Saving…" : "Save"}
+              </button>
+            ) : null}
+          </summary>
+          <textarea
+            value={script}
+            onChange={(e) => setScript(e.target.value)}
+            spellCheck
+            style={{
+              width: "100%", minHeight: 160, marginTop: 8, padding: 12, borderRadius: 10, border: 0,
+              background: "var(--paper-2)", boxShadow: "0 0 0 0.5px var(--rule)",
+              fontFamily: "inherit", fontSize: 14, lineHeight: 1.6, color: "var(--ink-2)", resize: "vertical",
+            }}
+          />
+        </details>
+
+        {/* Still / thumbnail */}
+        <details>
+          <summary className="eyebrow" style={{ fontSize: 9.5, cursor: "pointer" }}>Generate a still / thumbnail</summary>
+          <StudioStillGenerator orgSlug={orgSlug} seedPrompt={`Vertical 9:16 thumbnail for a short-form video. Concept: ${draft.idea_hook}. Bold, scroll-stopping, minimal text.`} />
+        </details>
+
+        {/* Actions */}
+        {message ? <div role="status" style={{ color: "var(--ink-muted)", fontSize: 12 }}>{message}</div> : null}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, paddingTop: 12, borderTop: "1px dashed var(--rule)", flexWrap: "wrap" }}>
+          <button className="btn btn-sm btn-primary" disabled={pending} onClick={markReady}>Mark ready to film</button>
+          {dirty ? <button className="btn btn-sm" disabled={pending} onClick={saveAll}>{pending ? "Saving…" : "Save"}</button> : null}
+          <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <span className="eyebrow" style={{ fontSize: 9.5 }}>Export</span>
+            <button className="btn btn-sm" onClick={copyScript} title="Copy the script as plain text">{copied ? "Copied ✓" : "Copy"}</button>
+            <button className="btn btn-sm" onClick={downloadTxt} title="Download as plain text">.txt</button>
+            <button className="btn btn-sm" onClick={downloadMd} title="Download as Markdown (storyboard + script)">.md</button>
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
