@@ -198,3 +198,101 @@ export function LinkedInApprovalDetailView({
                   }}
                 >
                   View post ↗
+                </a>
+              ) : null}
+            </div>
+            <div className="tweet-body" style={{ whiteSpace: "pre-wrap" }}>
+              {primary.postText ?? "(post text not synced yet)"}
+            </div>
+            <div className="tweet-meta">
+              <span>LinkedIn</span>
+              {primary.authorPublicId ? (
+                <span>in/{primary.authorPublicId}</span>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="eyebrow">How Lyra works</div>
+            <div
+              style={{
+                marginTop: 10,
+                fontSize: 12.5,
+                color: "var(--ink-muted)",
+                lineHeight: 1.5,
+              }}
+            >
+              Lyra watches your LinkedIn connections and searches your keywords
+              for high-engagement posts, then drafts a reply for each. She is
+              draft-only: replies only (DMs off by default), no send worker, and
+              no LinkedIn write access. Copy the draft you like, send it on
+              LinkedIn yourself, then mark it sent.
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * Quiet resolved banner shown once every draft for this post has been actioned
+ * (marked sent or skipped). Mirrors the X detail page's ActionedBanner tone but
+ * without any X-specific "posted to X" deeplink (Lyra has no live post).
+ */
+function ResolvedBanner({ detail }: { detail: LinkedInApprovalDetail }) {
+  const all = [...detail.replies, ...(detail.dm ? [detail.dm] : [])];
+  const sent = all.find((v) => v.status === "sent");
+  const status = sent ? "sent" : "actioned";
+  const label = sent ? "Marked sent" : "Resolved";
+  const tone = sent ? "var(--accent)" : "var(--ink-muted)";
+
+  return (
+    <div>
+      <div className="eyebrow" style={{ marginBottom: 12 }}>
+        Resolved
+      </div>
+      <div
+        className="card"
+        style={{
+          padding: 18,
+          borderColor: tone,
+          boxShadow: `0 0 0 0.5px color-mix(in oklch, ${tone} 40%, var(--rule))`,
+          marginBottom: 18,
+        }}
+      >
+        <div
+          style={{
+            fontFamily: "var(--display)",
+            fontSize: 18,
+            color: tone,
+            marginBottom: 6,
+          }}
+        >
+          {label}
+        </div>
+        <div style={{ fontSize: 12.5, color: "var(--ink-muted)" }}>
+          {status === "sent"
+            ? "You marked this draft sent. Lyra never posted to LinkedIn — you dispatched it by hand."
+            : "Every draft for this post has been actioned."}
+        </div>
+      </div>
+
+      {/* Show the (historical) draft bodies so the operator remembers what they
+          approved. */}
+      <div className="angle-stack" style={{ opacity: 0.7 }}>
+        {all.map((v) => (
+          <div key={v.approvalId} className="angle">
+            <h4>
+              <span className="num">{v.kind === "dm" ? "DM" : "•"}</span>
+              <span>{v.kind === "dm" ? "Direct message" : v.angle ?? "Reply"}</span>
+            </h4>
+            <div className="text" style={{ whiteSpace: "pre-wrap" }}>
+              {v.body}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
