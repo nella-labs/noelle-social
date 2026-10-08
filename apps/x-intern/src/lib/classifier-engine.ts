@@ -398,3 +398,91 @@ export function createClassifier(opts: {
         const { text, usage } = await backend.call({
           system: system + BATCH_SUFFIX,
           prompt: JSON.stringify(legacyInputs.map((input, id) => ({ id, ...input }))),
+          model,
+        });
+        const callUsage = { inputTokens: usage.input_tokens, outputTokens: usage.output_tokens };
+        const arr = extractJsonArray(text);
+        // Whole-batch miss: report the usage (the call DID consume tokens) and
+        // let the caller fall back per lead. Never fabricate verdicts.
+        if (arr == null) return combine(legacyInputs.map(() => null), callUsage);
+
+        // Index by the id the model echoed rather than by array position: a
+        // model that reorders or drops one entry must not shift every verdict
+        // onto the wrong lead.
+        const byId = new Map<number, ClassifyOutput>();
+        for (const item of arr) {
+          if (typeof item !== "object" || item === null) continue;
+          const id = (item as { id?: unknown }).id;
+          if (typeof id !== "number" || !Number.isInteger(id)) continue;
+          if (id < 0 || id >= legacyInputs.length || byId.has(id)) continue;
+          const parsed = ClassifierOutput.safeParse(item);
+          if (!parsed.success) continue;
+          // Usage is recorded once for the whole call by the caller, so each
+          // verdict carries zero — otherwise the batch would be counted N times.
+          const verdict = buildVerdict(parsed.data, { inputTokens: 0, outputTokens: 0 });
+          byId.set(id, { ...verdict, raw: { ...parsed.data, judge: "legacy" } });
+        }
+        return combine(legacyInputs.map((_, i) => byId.get(i) ?? null), callUsage);
+      } catch (error) {
+        if (isBudgetAdmissionError(error)) throw error;
+        // The metered backend retains accounting for failures; missing verdicts may fall back.
+        return combine(legacyInputs.map(() => null), { inputTokens: 0, outputTokens: 0 });
+      }
+    },
+  };
+}
+
+/**
+ * Parse the model's text into a JSON object. Vertex Gemini, called without a
+ * forced JSON mime-type, sometimes wraps the object in a ```json fence or
+ * surrounds it with prose, so we strip fences and fall back to the first
+ * `{...}` span before giving up. Returns null when nothing parses.
+ */
+function extractJson(text: string): unknown {
+  const trimmed = text.trim();
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  for (const candidate of [unfenced, sliceBraces(unfenced)]) {
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+function sliceBraces(s: string): string | null {
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  return s.slice(start, end + 1);
+}
+
+function failOpen(
+  reason: string,
+  usage: { inputTokens: number; outputTokens: number } = { inputTokens: 0, outputTokens: 0 },
+): ClassifyOutput {
+  return {
+    on_brand: true,
+    on_brand_reason: `fail-open: ${reason}`,
+    kind: "other",
+    velocity_score: null,
+    // Fail-open: no score, and 'substantial' so the lead is NOT dropped just
+    // because the classifier could not reach a verdict. The drafter's own
+    // relevance gate and the post-draft verifier still apply downstream.
+    q: null,
+    reply_kind: "substantial",
+    comment_bait: false,
+    tier: null,
+    ai_slop: false,
+    ai_slop_reason: null,
+    // No scout verdict on a fail-open — the call gave us nothing to trust.
+    vip: null,
+    usage,
+    raw: { fail_open: reason },
+  };
+}
