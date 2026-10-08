@@ -398,3 +398,203 @@ function basePayload(): OutboundIn {
     ],
     qualityScore: 0.82,
     qualityGatePassed: true,
+    tier: "T1",
+    postKind: "opinion",
+    verifierMeta: {
+      pass: true,
+      scores: { voice: 0.9, grounding: 0.9, relevance: 0.9, format: 1 },
+      attempts: 0,
+      reasons: [],
+      judgeOk: true,
+      judgeProvider: "jev",
+    },
+  };
+}
+
+function relationshipPayload(overrides: Partial<OutboundIn> = {}): OutboundIn {
+  return {
+    ...basePayload(),
+    postKind: "relationship_dm",
+    drafts: [
+      {
+        id: "relationship-draft-1",
+        kind: "dm",
+        angle: null,
+        body: "Saw your saved notes and wanted to say hi.",
+        charCount: 42,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+async function postOutbound(app: ReturnType<typeof createApp>, payload: OutboundIn) {
+  const body = JSON.stringify(payload);
+  const ts = Math.floor(Date.now() / 1000);
+  const { signature } = signHmacBody(HMAC_SECRET, ts, body);
+  return app.request("/api/outbound", {
+    method: "POST",
+    body,
+    headers: {
+      "content-type": "application/json",
+      "x-noelle-timestamp": String(ts),
+      "x-noelle-signature": signature,
+    },
+  });
+}
+
+beforeEach(() => {
+  resetDbClientForTests();
+});
+
+describe("outbound notification receipts", () => {
+  type NotificationReceipt = {
+    approval_ids: string[];
+    approval_id: string;
+    pushover_fired: boolean;
+  };
+
+  beforeEach(() => {
+    vi.stubEnv("PUSHOVER_USER_KEY", "synthetic-global-user");
+    vi.stubEnv("PUSHOVER_APP_TOKEN", "synthetic-global-token");
+    vi.stubEnv("NOELLE_APP_BASE_URL", "https://console.invalid");
+    vi.stubEnv("NOELLE_NOTIFY_BATCH", "1");
+    resetEnvForTests();
+    __setDbClientForTests(makeFakeDb({
+      agent_instances: { rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }] },
+      leads: { rows: [] }, drafts: { rows: [] }, approvals: { rows: [] },
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    resetEnvForTests();
+  });
+
+  it.each([
+    { receipt: '{"status":0}', fired: false },
+    { receipt: '{"status":1,"request":"accepted"}', fired: true },
+  ])("reports provider acceptance $fired after saving the bundle", async ({ receipt, fired }) => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(receipt));
+    vi.stubGlobal("fetch", fetchImpl);
+    const response = await postOutbound(createApp(), basePayload());
+    expect(response.status).toBe(200);
+    const body = await response.json() as NotificationReceipt;
+    expect(body.approval_ids).toHaveLength(3);
+    expect(body.pushover_fired).toBe(fired);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const notification = new URLSearchParams(String(fetchImpl.mock.calls[0]![1]!.body));
+    expect(notification.get("user")).toBe("synthetic-global-user");
+    expect(notification.get("url")).toBe(`https://console.invalid/approvals/${body.approval_id}`);
+    expect(notification.get("url_title")).toBe("Review in Noelle");
+  });
+
+  it.each(["quality", "batch", "url"])("keeps the %s notification gate", async (gate) => {
+    const payload = basePayload();
+    if (gate === "quality") payload.qualityGatePassed = false;
+    if (gate === "batch") vi.stubEnv("NOELLE_NOTIFY_BATCH", "1000000");
+    if (gate === "url") vi.stubEnv("NOELLE_APP_BASE_URL", undefined);
+    resetEnvForTests();
+    const fetchImpl = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchImpl);
+    const response = await postOutbound(createApp(), payload);
+    expect(response.status).toBe(200);
+    const body = await response.json() as NotificationReceipt;
+    expect(body.approval_ids).toHaveLength(3);
+    expect(body.pushover_fired).toBe(false);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe("DM writing review attribution", () => {
+  it.each([true, false])("keeps reply verdicts off DMs (DM check present: %s)", async (withDmCheck) => {
+    const db = makeFakeDb({
+      agent_instances: { rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }] },
+      leads: { rows: [] }, drafts: { rows: [] }, approvals: { rows: [] },
+    });
+    __setDbClientForTests(db);
+    const payload = basePayload();
+    const verifierMeta = {
+      pass: true, scores: { voice: 0.9, grounding: 0.9, relevance: 0.9, format: 1 },
+      attempts: 0, reasons: [],
+    };
+    const dmVoiceCheck = { pass: true, attempts: 1, reasons: [] };
+    payload.verifierMeta = verifierMeta;
+    payload.drafts.push({
+      id: "dm-review-1", kind: "dm", angle: null, body: "hey, that demo deserved the win", charCount: 30,
+      ...(withDmCheck ? { dmVoiceCheck } : {}),
+    });
+    expect((await postOutbound(createApp(), payload)).status).toBe(200);
+    const rows = db.__state.drafts!.rows;
+    const dm = rows.find((row) => (row.payload as Row).kind === "dm")!.payload as Row;
+    const reply = rows.find((row) => (row.payload as Row).kind === "reply")!.payload as Row;
+    expect(reply.verifier_meta).toEqual(verifierMeta);
+    expect(dm.verifier_meta).toBeUndefined();
+    expect(dm.dm_voice_check).toEqual(withDmCheck ? dmVoiceCheck : undefined);
+  });
+
+  it("persists each reply angle's own verdict instead of copying a failed set verdict", async () => {
+    const db = makeFakeDb({
+      agent_instances: { rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }] },
+      leads: { rows: [] }, drafts: { rows: [] }, approvals: { rows: [] },
+    });
+    __setDbClientForTests(db);
+    const payload = basePayload();
+    payload.verifierMeta = {
+      pass: false, scores: { voice: 0.5, grounding: 0.9, relevance: 0.9, format: 1 },
+      attempts: 2, reasons: ["one angle failed"], judgeOk: true, judgeProvider: "legacy",
+    };
+    const passing = {
+      pass: true, scores: { voice: 0.93, grounding: 0.95, relevance: 0.94, format: 1 },
+      attempts: 0, reasons: [], judgeOk: true, judgeProvider: "jev" as const,
+    };
+    Object.assign(payload.drafts[0]!, { verifierMeta: passing });
+    expect((await postOutbound(createApp(), payload)).status).toBe(200);
+    expect((db.__state.drafts!.rows[0]!.payload as Row).verifier_meta).toEqual(passing);
+  });
+});
+
+describe("draftPushoverTitle", () => {
+  it("labels a LinkedIn (Lyra) draft as the LinkedIn Intern, not the X Intern", () => {
+    const title = draftPushoverTitle({ platform: "linkedin", tierLabel: "T2", authorHandle: "kaia-tham" });
+    expect(title).toBe("🤖 LinkedIn Intern: T2 draft from @kaia-tham");
+    expect(title).not.toContain("X Intern");
+  });
+
+  it("labels an X (Vega) draft as the X Intern", () => {
+    expect(draftPushoverTitle({ platform: "x", tierLabel: "T1", authorHandle: "elonmusk" })).toBe(
+      "🤖 X Intern: T1 draft from @elonmusk",
+    );
+  });
+
+  it("labels a Reddit draft as the Reddit Intern", () => {
+    expect(draftPushoverTitle({ platform: "reddit", tierLabel: "T?", authorHandle: "u_foo" })).toBe(
+      "🤖 Reddit Intern: T? draft from @u_foo",
+    );
+  });
+});
+
+describe("sanitizeForJsonb", () => {
+  it("strips a lone high surrogate (emoji split by a snippet slice) that breaks jsonb", () => {
+    // "\uD83D" alone is the front half of 😀 — Postgres jsonb rejects it with
+    // "invalid input syntax for type json".
+    expect(sanitizeForJsonb({ snippet: "great post \uD83D" }).snippet).toBe("great post ");
+  });
+  it("strips a lone low surrogate", () => {
+    expect(sanitizeForJsonb({ s: "\uDE00 trailing" }).s).toBe(" trailing");
+  });
+  it("keeps a valid surrogate pair (full emoji) intact", () => {
+    expect(sanitizeForJsonb({ s: "ship it 😀🔥" }).s).toBe("ship it 😀🔥");
+  });
+  it("strips NUL bytes", () => {
+    expect(sanitizeForJsonb({ s: "a" + String.fromCharCode(0) + "b" }).s).toBe("ab");
+  });
+  it("recurses into nested arrays/objects (the anchors + drafts payload)", () => {
+    const out = sanitizeForJsonb({
+      anchors: [{ snippet: "x \uD83D", score: 4.2 }],
+      drafts: [{ body: "ok \uDC00", char_count: 3 }],
+    });
+    expect(out.anchors[0]!.snippet).toBe("x ");
+    expect(out.anchors[0]!.score).toBe(4.2);
+    expect(out.drafts[0]!.body).toBe("ok ");
