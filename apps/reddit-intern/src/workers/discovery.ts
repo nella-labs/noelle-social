@@ -198,3 +198,79 @@ async function main() {
             recorder,
             credentialId: pool[i]!.credentialId,
             bus,
+          });
+        };
+
+        // Run shards concurrently, but with a CAP: at most NOELLE_APIFY_MAX_CONCURRENCY
+        // shards in flight at once, so at most that many Apify actor calls egress from
+        // this box simultaneously (firing every free token's shard at once is the
+        // cohort-ban trigger). The per-shard stagger inside runShard spreads the
+        // starts of each capped batch. A shard whose token exhausts mid-tick throws;
+        // runWithConcurrency keeps the other shards' results (allSettled semantics).
+        const settled = await runWithConcurrency(pool.slice(0, shardCount), env.NOELLE_APIFY_MAX_CONCURRENCY, (i) => runShard(i));
+        const inserted = settled.reduce((sum, r) => sum + (r.status === "fulfilled" ? r.value : 0), 0);
+        const exhaustions = settled.filter(
+          (r) => r.status === "rejected" && r.reason instanceof AllApifyTokensExhaustedError,
+        );
+        const otherError = settled.find(
+          (r) => r.status === "rejected" && !(r.reason instanceof AllApifyTokensExhaustedError),
+        );
+        if (otherError && otherError.status === "rejected") throw otherError.reason;
+        if (exhaustions.length === settled.length && settled.length > 0) {
+          throw (exhaustions[0] as PromiseRejectedResult).reason;
+        }
+        if (exhaustions.length > 0) {
+          log.warn(
+            { instance: inst.id, exhaustedShards: exhaustions.length, totalShards: settled.length },
+            "some apify tokens exhausted mid-tick; remaining shards completed",
+          );
+        }
+        await run.finish({ status: "ok", rowsProcessed: inserted });
+        // A successful fetch means at least one token works again — re-arm the alert.
+        apifyExhaustedNotified = false;
+      } catch (err) {
+        // Every Apify token is spent (all rotated + 403'd). Surface it: record the
+        // error so the dashboard shows "errored: …" instead of a silent "stalled",
+        // and ping the operator once per episode. NOT re-thrown — a dry token pool
+        // isn't a crash bug, and flapping the worker wouldn't refill it.
+        if (err instanceof AllApifyTokensExhaustedError) {
+          log.error({ instance: inst.id, tokens: err.tokenCount }, err.message);
+          await run.finish({ status: "error", errorMessage: err.message });
+          if (!apifyExhaustedNotified) {
+            apifyExhaustedNotified = true;
+            await notifier
+              .notify({
+                orgId: inst.org_id,
+                title: "Orion: Apify tokens exhausted",
+                message:
+                  `All ${err.tokenCount} Apify token${err.tokenCount === 1 ? "" : "s"} hit the ` +
+                  `monthly usage limit — Orion can't fetch Reddit posts until you add a working ` +
+                  `token in Connections.`,
+              })
+              .catch(() => {});
+          }
+          return;
+        }
+        // Apify rate limits (429 too many runs) are transient — defer to the next
+        // tick rather than flapping the worker. (402/403 are token-fatal and get
+        // rotated inside the client, surfacing as AllApifyTokensExhaustedError.)
+        if (err instanceof ApifyError && (err.status === 429 || err.status === 402)) {
+          log.info(
+            { instance: inst.id, status: err.status },
+            "apify rate/usage limit; deferring to next tick",
+          );
+          await run.finish({ status: "ok", rowsProcessed: 0 });
+          return;
+        }
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+  });
+}
+
+main().catch((err) => {
+  console.error("discovery fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
