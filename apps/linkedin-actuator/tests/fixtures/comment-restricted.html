@@ -1,0 +1,21 @@
+<!--
+  A post permalink whose author restricts commenting to connections. LinkedIn
+  shows the restriction banner IN PLACE of the composer, so no
+  div[role=textbox][contenteditable] ever renders. isCommentRestricted must
+  detect this so the actuator drops the draft (permanent) instead of retrying
+  box-not-found. Captured phrasing: "Only connections can comment on this post.
+  You can still react or share it."
+-->
+<main>
+  <div class="feed-shared-update-v2" data-urn="urn:li:activity:7480000000000000000">
+    <span class="update-components-actor__name">Restricted Author</span>
+    <div class="update-components-text">A post with comments limited to connections.</div>
+    <div class="social-actions">
+      <button aria-label="Reaction button state: no reaction" type="button">Like</button>
+      <button aria-label="Comment" type="button">Comment</button>
+    </div>
+    <div class="restriction-banner">
+      Only connections can comment on this post. You can still react or share it.
+    </div>
+  </div>
+</main>

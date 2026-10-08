@@ -1,0 +1,31 @@
+<!--
+  Simulates a LinkedIn feed AFTER a container-markup redesign: none of the known
+  container selectors (feed-shared-update-v2, data-urn=urn:li:activity,
+  data-finite-scroll-hotkey-item) are present. Only the "React Like" button and
+  the update-components-actor header survive. findFeedPosts must still recover
+  both posts via the like-button-derived fallback.
+-->
+<main>
+  <div class="xyz-feed-container">
+    <div class="xyz-list-item">
+      <article class="xyz-card">
+        <div class="update-components-actor"><span class="update-components-actor__name">Alice Rivera</span></div>
+        <div class="update-components-text">A normal, likeable post about shipping.</div>
+        <div class="xyz-action-bar">
+          <button aria-label="React Like to Alice Rivera's post" aria-pressed="false" type="button">Like</button>
+          <button aria-label="Comment on Alice Rivera's post" type="button">Comment</button>
+        </div>
+      </article>
+    </div>
+    <div class="xyz-list-item">
+      <article class="xyz-card">
+        <div class="update-components-actor"><span class="update-components-actor__name">Acme Corp</span></div>
+        <div class="xyz-subtitle">Promoted</div>
+        <div class="update-components-text">Buy our thing.</div>
+        <div class="xyz-action-bar">
+          <button aria-label="React Like to Acme Corp's post" aria-pressed="false" type="button">Like</button>
+        </div>
+      </article>
+    </div>
+  </div>
+</main>

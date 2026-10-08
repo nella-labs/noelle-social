@@ -1,0 +1,44 @@
+<!--
+  The live LinkedIn feed as of 2026-07-12 (captured from a real session). The
+  redesign fully obfuscates class names (_75228706, _3bc34f41, …) and drops
+  data-urn / feed-shared-update-v2 entirely, so EVERY container selector in
+  FEED_POST_SELECTORS misses — findFeedPosts must recover posts via the
+  like-button fallback. The action-bar like toggle is a real <button> labelled
+  `Reaction button state: no reaction` (unliked). The comment section contains a
+  reaction affordance that is a <div role="button"> wrapping an <svg role="img">
+  with the SAME label — it must NOT be mistaken for a like button (it isn't a
+  <button>, so the selectors skip it), else postContainerOf would find 2 "like
+  buttons" per post and collapse the container.
+-->
+<main>
+  <div role="listitem" componentkey="expandedAAA-FeedType_MAIN_FEED_RELEVANCE">
+    <div class="_58c79b9a _9d763823">
+      <a href="https://www.linkedin.com/in/ronwiener/"><span>Ron Wiener</span></a>
+      <p data-testid="expandable-text-box">A normal, likeable post about reusable rockets.</p>
+      <div class="a838e221 e54d4b63">
+        <button type="button" aria-label="Reaction button state: no reaction"><span>9</span></button>
+        <button type="button" aria-label="Open reactions menu"></button>
+        <button type="button" aria-label="Comment"><span>10</span></button>
+        <button type="button" aria-label="Repost"></button>
+      </div>
+      <div class="comments-section">
+        <div role="button" tabindex="0">
+          <svg role="img" aria-label="Reaction button state: no reaction"></svg>
+        </div>
+        <button type="button" aria-label="Reply"></button>
+      </div>
+    </div>
+  </div>
+
+  <div role="listitem" componentkey="expandedBBB-FeedType_MAIN_FEED_RELEVANCE">
+    <div class="_58c79b9a _9d763823">
+      <a href="https://www.linkedin.com/in/janedoe/"><span>Jane Doe</span></a>
+      <p data-testid="expandable-text-box">Another likeable post about shipping software.</p>
+      <div class="a838e221 e54d4b63">
+        <button type="button" aria-label="Reaction button state: like"><span>3</span></button>
+        <button type="button" aria-label="Open reactions menu"></button>
+        <button type="button" aria-label="Comment"><span>1</span></button>
+      </div>
+    </div>
+  </div>
+</main>
