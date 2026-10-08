@@ -598,3 +598,81 @@ function ArtDroppedSignal({ tone }: { tone: string }) {
         <circle cx="0" cy="-110" r="5" fill={tone} />
       </g>
       <path d="M 130 200 Q 145 160, 160 200 T 190 200 T 220 200" stroke={tone} strokeWidth="2.5" fill="none" />
+      <path d="M 220 200 Q 235 188, 250 200 T 280 200" stroke={tone} strokeWidth="1.6" fill="none" opacity="0.55" strokeDasharray="2 3" />
+      <circle cx="298" cy="200" r="3.5" fill={tone} opacity="0.5" />
+      <circle cx="312" cy="200" r="2.5" fill={tone} opacity="0.3" />
+      <circle cx="324" cy="200" r="1.5" fill={tone} opacity="0.15" />
+      <g transform="translate(180 280)">
+        <rect x="-58" y="-14" width="116" height="28" rx="14" fill="var(--paper)" stroke={tone} strokeWidth="1" />
+        <text x="0" y="4" textAnchor="middle" fontFamily="var(--mono)" fontSize="10" letterSpacing="0.18em" fill={tone}>
+          NO SIGNAL
+        </text>
+      </g>
+    </svg>
+  );
+}
+
+function ArtMoon({ tone }: { tone: string }) {
+  return (
+    <svg viewBox="0 0 360 360" width="100%" height="100%">
+      <defs>
+        <pattern id="errscreen-hatch" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+          <line x1="0" y1="0" x2="0" y2="6" stroke={tone} strokeWidth="1.2" opacity="0.45" />
+        </pattern>
+      </defs>
+      <circle cx="180" cy="180" r="100" fill="var(--paper)" stroke="var(--ink)" strokeWidth="1.5" />
+      <path d="M 180 180 L 180 80 A 100 100 0 0 1 266 230 Z" fill="url(#errscreen-hatch)" stroke={tone} strokeWidth="1" />
+      {Array.from({ length: 12 }).map((_, i) => {
+        const a = (i / 12) * Math.PI * 2 - Math.PI / 2;
+        const r1 = 92,
+          r2 = 100;
+        const x1 = 180 + Math.cos(a) * r1,
+          y1 = 180 + Math.sin(a) * r1;
+        const x2 = 180 + Math.cos(a) * r2,
+          y2 = 180 + Math.sin(a) * r2;
+        return <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke="var(--ink)" strokeWidth={i % 3 === 0 ? 1.6 : 0.8} />;
+      })}
+      <line x1="180" y1="180" x2="180" y2="110" stroke="var(--ink)" strokeWidth="2.5" strokeLinecap="round" />
+      <line x1="180" y1="180" x2="232" y2="180" stroke={tone} strokeWidth="2" strokeLinecap="round" />
+      <circle cx="180" cy="180" r="5" fill="var(--ink)" />
+    </svg>
+  );
+}
+
+function ArtDimmedAgent({ tone }: { tone: string }) {
+  const others = [
+    { x: 90, y: 110, label: "@1" },
+    { x: 270, y: 110, label: "@2" },
+    { x: 90, y: 260, label: "@3" },
+  ];
+  return (
+    <svg viewBox="0 0 360 360" width="100%" height="100%">
+      <g stroke="var(--rule)" strokeWidth="1" fill="none">
+        <line x1="90" y1="110" x2="270" y2="110" />
+        <line x1="90" y1="110" x2="90" y2="260" />
+        <line x1="270" y1="110" x2="270" y2="260" strokeDasharray="3 4" />
+        <line x1="90" y1="260" x2="270" y2="260" strokeDasharray="3 4" />
+      </g>
+      {others.map((w) => (
+        <g key={w.label}>
+          <circle cx={w.x} cy={w.y} r="26" fill="var(--paper)" stroke="var(--ink)" strokeWidth="1.5" />
+          <text x={w.x} y={w.y + 4} textAnchor="middle" fontFamily="var(--mono)" fontSize="11" fill="var(--ink)">
+            {w.label}
+          </text>
+        </g>
+      ))}
+      <g transform="translate(270 260)">
+        <circle r="34" fill="none" stroke={tone} strokeWidth="1.5" strokeDasharray="4 4" opacity="0.7" />
+        <circle r="26" fill="color-mix(in oklch, var(--paper-deep) 80%, var(--paper))" stroke={tone} strokeWidth="1.5" />
+        <text x="0" y="4" textAnchor="middle" fontFamily="var(--mono)" fontSize="11" fill={tone}>
+          @4
+        </text>
+        <g transform="translate(22 -22)">
+          <circle r="9" fill="var(--paper)" stroke={tone} strokeWidth="1.4" />
+          <line x1="-4" y1="-4" x2="4" y2="4" stroke={tone} strokeWidth="2" strokeLinecap="round" />
+          <line x1="4" y1="-4" x2="-4" y2="4" stroke={tone} strokeWidth="2" strokeLinecap="round" />
+        </g>
+      </g>
+    </svg>
+  );
+}
