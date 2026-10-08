@@ -198,3 +198,203 @@ describe("runDiscoveryTick (reddit / apify)", () => {
       dailyExtractCap: CAP,
       alreadyExtractedToday: 0,
       upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "hi" }));
+  });
+
+  it("a score floor of 0 never filters (default behaviour)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi.fn().mockResolvedValue([post("a", { score: 0 })]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistSubreddits: [{ ...sub, minScore: 0 }],
+      postsSource: { subredditPosts },
+      discoveryLimit: 15,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(1);
+  });
+
+  it("is gentle: fetches by subreddit (sort=new) with the limit + added_at as sinceISO", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi.fn().mockResolvedValue([]);
+
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistSubreddits: [sub],
+      postsSource: { subredditPosts },
+      discoveryLimit: 15,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(subredditPosts).toHaveBeenCalledWith({
+      subreddit: "SaaS",
+      sort: "new",
+      maxItems: 15,
+      sinceISO: "2026-06-01T00:00:00.000Z",
+    });
+  });
+
+  it("continues to the next subreddit when one fetch throws", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("apify error"))
+      .mockResolvedValueOnce([post("9")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistSubreddits: [sub, { ...sub, id: "ws2", subreddit: "ExperiencedDevs" }],
+      postsSource: { subredditPosts },
+      discoveryLimit: 15,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "9" }));
+  });
+
+  it("does NOT fetch when already at the daily extract cap", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi.fn().mockResolvedValue([post("1")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistSubreddits: [sub],
+      postsSource: { subredditPosts },
+      discoveryLimit: 15,
+      dailyExtractCap: 80,
+      alreadyExtractedToday: 80,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(0);
+    expect(subredditPosts).not.toHaveBeenCalled();
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("stops inserting mid-tick the moment the running total hits the daily extract cap", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi.fn().mockResolvedValue([post("1"), post("2"), post("3"), post("4"), post("5")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistSubreddits: [sub],
+      postsSource: { subredditPosts },
+      discoveryLimit: 15,
+      dailyExtractCap: 80,
+      alreadyExtractedToday: 78,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(2);
+    expect(upsert).toHaveBeenCalledTimes(2);
+  });
+
+  it("only counts genuinely-new inserts (re-seen posts don't burn cap budget)", async () => {
+    const upsert = vi
+      .fn()
+      .mockResolvedValueOnce({ id: "L1", inserted: false })
+      .mockResolvedValueOnce({ id: "L2", inserted: true });
+    const subredditPosts = vi.fn().mockResolvedValue([post("1"), post("2")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistSubreddits: [sub],
+      postsSource: { subredditPosts },
+      discoveryLimit: 15,
+      dailyExtractCap: 80,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledTimes(2);
+  });
+
+  it("dedupes a crosspost surfaced by two watched subreddits into ONE lead", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi
+      .fn()
+      .mockResolvedValueOnce([post("dup")])
+      .mockResolvedValueOnce([post("dup")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistSubreddits: [sub, { ...sub, id: "ws2", subreddit: "ExperiencedDevs" }],
+      postsSource: { subredditPosts },
+      discoveryLimit: 15,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("watchlist repoll gate (per-subreddit cooldown)", () => {
+  const baseArgs = <P, U>(subredditPosts: P, upsert: U) => ({
+    log,
+    instance: { id: "i", org_id: "o" } as never,
+    postsSource: { subredditPosts },
+    discoveryLimit: 15,
+    dailyExtractCap: CAP,
+    alreadyExtractedToday: 0,
+    upsertLead: upsert,
+  });
+
+  it("skips a subreddit that is not due; a due subreddit is still fetched", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi.fn().mockResolvedValue([post("1")]);
+    const gate = createRepollGate(2 * 3600_000, () => 0);
+    gate.stamp("saas"); // r/SaaS was polled moments ago (keys are lowercased)
+    const other = { ...sub, id: "ws2", subreddit: "ExperiencedDevs" };
+
+    await runDiscoveryTick({
+      ...baseArgs(subredditPosts, upsert),
+      watchlistSubreddits: [sub, other],
+      repollGate: gate,
+    });
+
+    expect(subredditPosts).toHaveBeenCalledTimes(1);
+    expect(subredditPosts).toHaveBeenCalledWith(expect.objectContaining({ subreddit: "ExperiencedDevs" }));
+  });
+
+  it("stamps a subreddit on attempt, so the next tick within the window skips it", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi.fn().mockResolvedValue([post("1")]);
+    const gate = createRepollGate(2 * 3600_000, () => 0);
+
+    await runDiscoveryTick({ ...baseArgs(subredditPosts, upsert), watchlistSubreddits: [sub], repollGate: gate });
+    await runDiscoveryTick({ ...baseArgs(subredditPosts, upsert), watchlistSubreddits: [sub], repollGate: gate });
+
+    expect(subredditPosts).toHaveBeenCalledTimes(1);
+  });
+
+  it("stamps even when the subreddit's fetch throws (a failing subreddit is not re-hammered)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi.fn().mockRejectedValue(new Error("apify error"));
+    const gate = createRepollGate(2 * 3600_000, () => 0);
+
+    await runDiscoveryTick({ ...baseArgs(subredditPosts, upsert), watchlistSubreddits: [sub], repollGate: gate });
