@@ -598,3 +598,203 @@ describe("ageMinutesFromText never guesses on foreign-language time text", () =>
   it("a months-old notification can never look minutes old", () => {
     // The property behind all of the above: nothing that is not really recent
     // may parse to a small number. Null is a skip; a small number is a reply.
+    for (const [text] of wrongAndFresh) {
+      const age = ageMinutesFromText(text);
+      expect(age === null || age > MAX_AGE_MINUTES).toBe(true);
+    }
+  });
+
+  it("still reads every English form LinkedIn actually renders", () => {
+    expect(ageMinutesFromText("6h")).toBe(360);
+    expect(ageMinutesFromText("6h ago")).toBe(360);
+    expect(ageMinutesFromText("3 mos")).toBe(129_600);
+    expect(ageMinutesFromText("3 wks")).toBe(30_240);
+    expect(ageMinutesFromText("2 yrs")).toBe(1_051_200);
+  });
+});
+
+// The structural fallback used to take the FIRST age-shaped token in document
+// order. On a real card the human's comment renders BEFORE the timestamp, so a
+// reply that merely reads like an age would become the card's age.
+describe("cardAgeMinutes cannot read an age out of somebody's comment", () => {
+  const drifted = (comment: string, age: string) => `
+    <article class="nt-card">
+      <a class="nt-card__headline" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A1&highlightedUpdateType=REPLIED_TO_YOUR_COMMENT">
+        <strong>Ann</strong> replied to your comment
+      </a>
+      <p class="nt-card-content__body-text">${comment}</p>
+      <span class="renamed-by-linkedin">${age}</span>
+    </article>`;
+
+  it("ignores a comment that reads exactly like an age token", () => {
+    // "how long did it take?" / "5 min" is an ordinary exchange. Reading it as
+    // the age would put a 2-day-old reply straight through the 6h window.
+    const root = mount(drifted("5 min", "2d"));
+    expect(cardAgeMinutes(root.querySelector("article")!)).toBe(2880);
+  });
+
+  it("still reads the real age when the comment is ordinary prose", () => {
+    const root = mount(drifted("this is a normal reply about shipping", "2d"));
+    expect(cardAgeMinutes(root.querySelector("article")!)).toBe(2880);
+  });
+
+  it("prefers the LAST age token, so document order saves it if the body class also drifted", () => {
+    const root = mount(`
+      <article class="nt-card">
+        <p class="also-renamed">5 min</p>
+        <span class="renamed-by-linkedin">2d</span>
+      </article>`);
+    expect(cardAgeMinutes(root.querySelector("article")!)).toBe(2880);
+  });
+});
+
+// cardsIn's bare article/li fallback levels also match a WRAPPER (it "contains
+// a notification link" — it contains all of them). That wrapper harvests as a
+// chimera: one card's identity with another card's timestamp, then dedupes the
+// real card away by external_id.
+describe("nested cards: a wrapper never wears a sibling's timestamp", () => {
+  const card = (name: string, urn: string, age: string) => `
+    <article>
+      <a class="nt-card__headline" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A${urn}&highlightedUpdateType=REPLIED_TO_YOUR_COMMENT">
+        <strong>${name}</strong> replied to your comment
+      </a>
+      <a data-view-name="notification-card-image" href="/in/${name.toLowerCase()}"></a>
+      <p class="nt-card-content__body-text">a real question for you?</p>
+      <p class="nt-card__time-ago">${age}</p>
+    </article>`;
+
+  it("harvests the inner cards, not the container", () => {
+    // Ann is 3 DAYS old, Bo is 5 minutes. The container would take Ann's
+    // identity and Bo's age, and answer a 3-day-old reply.
+    const root = mount(`<article><div>${card("Ann", "1", "3d")}${card("Bo", "2", "5m")}</div></article>`);
+    const items = harvestNotifications(root);
+    expect(items.map((i) => [i.name, i.age_minutes])).toEqual([
+      ["Ann", 4320],
+      ["Bo", 5],
+    ]);
+  });
+
+  it("so the stale one is dropped and only the fresh one is answered", () => {
+    const root = mount(`<article><div>${card("Ann", "1", "3d")}${card("Bo", "2", "5m")}</div></article>`);
+    const picked = selectRepliesToMe(harvestNotifications(root), { seen: [], max: 5 });
+    expect(picked.map((p) => p.name)).toEqual(["Bo"]);
+  });
+});
+
+// Mutation testing showed these two defenses were UNTESTED: deleting either one
+// left 514/514 green. The fixtures happened to be shaped so the other defense
+// covered for it.
+describe("cardAgeMinutes: each defense holds on its own", () => {
+  it("returns null when the ONLY age-shaped text is inside the comment body", () => {
+    // Last-match cannot save this one — there is no other candidate. Without
+    // the HUMAN_TEXT_SEL skip this reads 5, and a comment saying "5 min" would
+    // become the card's age.
+    const root = mount(`
+      <article class="nt-card">
+        <div class="nt-card__headline">Ann replied to your comment</div>
+        <p class="nt-card-content__body-text">5 min</p>
+      </article>`);
+    expect(cardAgeMinutes(root.querySelector("article")!)).toBeNull();
+  });
+
+  it("ignores the comment even when it renders AFTER the timestamp", () => {
+    // Here document order works against us, so only the subtree skip can win.
+    const root = mount(`
+      <article class="nt-card">
+        <span class="renamed-by-linkedin">2d</span>
+        <p class="nt-card-content__body-text">5 min</p>
+      </article>`);
+    expect(cardAgeMinutes(root.querySelector("article")!)).toBe(2880);
+  });
+});
+
+describe("nested cards: the wrapper's age really can come from the wrong card", () => {
+  // The previous test could not fail: the wrapper inherited card 1's identity
+  // AND its .nt-card__time-ago, so the chimera was byte-identical to the real
+  // card and dedup hid it. The divergence only appears once the direct class
+  // lookup misses and the structural LAST-match fallback runs.
+  const card = (name: string, urn: string, age: string) => `
+    <article>
+      <a class="nt-card__headline" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A${urn}&highlightedUpdateType=REPLIED_TO_YOUR_COMMENT">
+        <strong>${name}</strong> replied to your comment
+      </a>
+      <a data-view-name="notification-card-image" href="/in/${name.toLowerCase()}"></a>
+      <p class="nt-card-content__body-text">a real question for you?</p>
+      <span class="time-ago-renamed">${age}</span>
+    </article>`;
+
+  it("keeps each card's OWN age when the time-ago class has drifted", () => {
+    const root = mount(`<article><div>${card("Ann", "1", "3d")}${card("Bo", "2", "5m")}</div></article>`);
+    const items = harvestNotifications(root);
+    // Without the leaves filter the container harvests as Ann-with-Bo's-5m and
+    // dedups the real Ann away — a 3-day-old reply gets answered.
+    expect(items.map((i) => [i.name, i.age_minutes])).toEqual([
+      ["Ann", 4320],
+      ["Bo", 5],
+    ]);
+    expect(selectRepliesToMe(items, { seen: [], max: 5 }).map((p) => p.name)).toEqual(["Bo"]);
+  });
+
+  it("does NOT drop a real card that merely contains an incidental link", () => {
+    // The opposite failure: over-eager leaf selection would discard the real
+    // card in favour of a headline-less fragment and harvest zero.
+    const root = mount(`
+      <article>
+        <a class="nt-card__headline" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A9&highlightedUpdateType=REPLIED_TO_YOUR_COMMENT">
+          <strong>Cy</strong> replied to your comment
+        </a>
+        <a data-view-name="notification-card-image" href="/in/cy"></a>
+        <p class="nt-card-content__body-text">a real question for you?</p>
+        <p class="nt-card__time-ago">1h</p>
+        <article><a href="/feed/update/urn:li:activity:9/">see more</a></article>
+      </article>`);
+    expect(harvestNotifications(root).map((i) => i.name)).toEqual(["Cy"]);
+  });
+});
+
+describe("ageBuckets agrees with the gate at the exact boundary", () => {
+  const mk = (age: number | null) => ({
+    external_id: "x", public_id: "a", name: "A", text: "t", url: "u",
+    activity_urn: null, post_context: "", age_minutes: age,
+  });
+
+  it("counts exactly-12h as recent, matching withinAgeWindow", () => {
+    // If these two ever disagree, the panel says "0 within 6h" while the sweep
+    // answers one — or the reverse.
+    expect(ageBuckets([mk(MAX_AGE_MINUTES)], MAX_AGE_MINUTES).recent).toBe(1);
+    expect(withinAgeWindow(MAX_AGE_MINUTES, MAX_AGE_MINUTES)).toBe(true);
+    expect(ageBuckets([mk(MAX_AGE_MINUTES + 1)], MAX_AGE_MINUTES).stale).toBe(1);
+    expect(withinAgeWindow(MAX_AGE_MINUTES + 1, MAX_AGE_MINUTES)).toBe(false);
+  });
+});
+
+// Three "Change notification preferences" cards were harvested as comments,
+// ingested as leads, and reached the drafter — Lyra was seconds from queueing a
+// considered reply to a settings link. A reply lane must never mistake page
+// furniture for a person.
+describe("page furniture is never harvested as somebody's comment", () => {
+  it("recognises LinkedIn's control links", () => {
+    expect(isUiChrome("Change notification preferences")).toBe(true);
+    expect(isUiChrome("  change notification preferences  ")).toBe(true);
+    expect(isUiChrome("Manage notifications")).toBe(true);
+    expect(isUiChrome("See all")).toBe(true);
+  });
+
+  it("does not swallow a real reply that merely mentions notifications", () => {
+    expect(isUiChrome("your notification preferences UX is genuinely good, how did you land on it?")).toBe(false);
+    expect(isUiChrome("thanks! I changed my notification preferences after reading this")).toBe(false);
+    expect(isUiChrome("")).toBe(false);
+  });
+
+  it("drops such a card at harvest, before it can become a lead", () => {
+    const root = mount(`
+      <article class="nt-card">
+        <a class="nt-card__headline" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A1&highlightedUpdateType=REPLIED_TO_YOUR_COMMENT">
+          <strong>Someone</strong> replied to your comment
+        </a>
+        <a data-view-name="notification-card-image" href="/in/someone"></a>
+        <p class="nt-card-content__body-text">Change notification preferences</p>
+        <p class="nt-card__time-ago">2h</p>
+      </article>`);
+    expect(harvestNotifications(root)).toEqual([]);
+  });
