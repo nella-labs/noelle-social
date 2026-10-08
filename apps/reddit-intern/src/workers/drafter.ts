@@ -1,0 +1,200 @@
+import { loadEnv } from "../env.js";
+import { getVoiceExemplars } from "@noelle/runtime/prior-replies";
+import { createLogger } from "../lib/logger.js";
+import { noelleDb } from "../lib/db.js";
+import { listActiveRedditInternInstances, isWorkerEnabled } from "../lib/activation.js";
+import { effectiveDraftsCap, enforceGoal } from "../lib/goal.js";
+import { recordRun } from "../lib/worker-runs.js";
+import { busForInstance } from "../lib/bus.js";
+import { runBootChecks, EX_TEMPFAIL } from "../lib/boot.js";
+import { createSecretsClient, SecretAccessError } from "../lib/secrets.js";
+import { createReadyCache } from "@noelle/runtime/ready-cache";
+import {
+  claimLeadsForDrafting,
+  countDraftedTodayByKind,
+  countPendingApprovalsForInstance,
+  markLeadStatus,
+  type LeadRow,
+  reapStaleClaims,
+} from "../lib/leads-db.js";
+import { fetchRedditPostComments } from "@noelle/reddit-apify";
+import type { SiblingComment } from "@noelle/runtime/comment-digest";
+import { createCodexRunner } from "../lib/codex-runner.js";
+import { createOutboundClient } from "@noelle/runtime/outbound-client";
+import { getRecentRepliesToAuthor, getRecentReplyPhrasings } from "../lib/prior-replies-db.js";
+import { runWorkerLoop, installShutdown } from "./_runtime.js";
+import { runDrafterTick } from "./drafter-tick.js";
+import { runPatternBreakerTick, runPatternRefineTick } from "./pattern-breaker-tick.js";
+import {
+  loadRecentPosts,
+  loadActiveRuleLabels,
+  loadActivePatternRules,
+  loadRefiningAlerts,
+  persistPattern,
+  applyRefinedRule,
+  claimRefinement,
+} from "../lib/pattern-breaker-db.js";
+import {
+  createNellaClient,
+  createGcsNellaClientWithSdk,
+  createLocalFsKnowledgeBase,
+  knowledgeBaseFromNella,
+  parseIncludeDirs,
+  buildEngineRegistry,
+  createGeminiCaptionFn,
+  createVertexCaptionFn,
+} from "@noelle/runtime";
+import type { KnowledgeBase, CaptionFn, VerifierCall } from "@noelle/runtime";
+import { judgeRouting } from "../lib/routing.js";
+import { createPgSpendRecorder } from "@noelle/runtime/pg-spend-recorder";
+import { createPgBudgetAdapters, CAP_EXEMPT_ENGINES_APIFY } from "@noelle/runtime/pg-budget-adapters";
+
+// How many approved POST -> REPLY pairs to show the drafter. 0 disables the
+// block and restores the previous prompt exactly.
+const VOICE_EXEMPLAR_COUNT = Number(process.env.NOELLE_VOICE_EXEMPLARS ?? 6);
+
+async function main() {
+  const env = loadEnv();
+  const log = createLogger({ kind: "drafter", workerId: env.WORKER_ID });
+  const sql = noelleDb();
+  const secrets = createSecretsClient({ project: env.GCP_PROJECT });
+  const readyCache = createReadyCache();
+
+  const boot = await runBootChecks({
+    log,
+    checks: [
+      { name: "db.ping", kind: "transient", run: async () => { await sql`select 1 as ok`; } },
+    ],
+  });
+  if (!boot.ok) process.exit(boot.exitCode);
+
+  // Assemble the engine registry from whatever provider credentials this box has
+  // (Bedrock / Anthropic-direct / OpenAI-direct / Vertex). Empty registry → a
+  // lead fails loudly with EngineNotImplementedError on the first tick.
+  const engines = await buildEngineRegistry({
+    secrets,
+    log: (msg, meta) => log.info(meta ?? {}, msg),
+  });
+  if (Object.keys(engines).length === 0) {
+    log.warn(
+      {},
+      "no LLM provider credentials configured (Anthropic / OpenAI / Bedrock / Vertex); drafter will fail every tick until one is provisioned",
+    );
+  }
+
+  const recorder = createPgSpendRecorder(sql);
+  const budget = { adapters: createPgBudgetAdapters(sql, { exemptEngines: CAP_EXEMPT_ENGINES_APIFY }) };
+  const runner = createCodexRunner({
+    engines,
+    budget,
+    recorder,
+  });
+  const outbound = createOutboundClient({ baseUrl: env.CP_BASE_URL, hmacSecret: env.NOELLE_HMAC_SECRET });
+
+  // Knowledge base — the drafter's voice/anchor retrieval. `local` (self-host
+  // default) reads markdown from a local dir and BM25-ranks in-process. `gcs`
+  // (managed) wraps the GCS shim. `http` (legacy) wraps the per-org Nella HTTP
+  // client and is built per-tick because it needs a per-org key.
+  const kbBackend = env.NOELLE_KB_BACKEND ?? env.NOELLE_NELLA_BACKEND;
+  const kbWorkspace = env.NELLA_WORKSPACE;
+  let sharedKb: KnowledgeBase | null = null;
+  if (kbBackend === "gcs") {
+    const gcs = await createGcsNellaClientWithSdk({ bucket: env.NOELLE_VAULT_BUCKET });
+    sharedKb = knowledgeBaseFromNella(gcs, kbWorkspace);
+    log.info({ backend: "gcs", bucket: env.NOELLE_VAULT_BUCKET }, "knowledge base ready (gcs)");
+  } else if (kbBackend === "local") {
+    if (!env.NOELLE_VAULT_DIR) {
+      throw new Error("NOELLE_KB_BACKEND=local requires NOELLE_VAULT_DIR");
+    }
+    // Scope retrieval to the curated voice base when configured, so Orion grounds
+    // on the operator's voice — not docs that happen to share keywords with the
+    // post. Unset → whole-vault (back-compat).
+    const voiceDirs = parseIncludeDirs(env.NOELLE_VOICE_DIRS);
+    const knowledgeDirs = parseIncludeDirs(env.NOELLE_KNOWLEDGE_DIRS);
+    const includeDirs = [...new Set([...voiceDirs, ...knowledgeDirs])];
+    sharedKb = createLocalFsKnowledgeBase({
+      dir: env.NOELLE_VAULT_DIR,
+      cacheTtlMs: env.NOELLE_KB_CACHE_TTL_MS,
+      includeDirs,
+    });
+    log.info(
+      {
+        backend: "local",
+        dir: env.NOELLE_VAULT_DIR,
+        voiceDirs: voiceDirs.length ? voiceDirs : "(whole vault)",
+        knowledgeDirs: knowledgeDirs.length ? knowledgeDirs : "(none)",
+      },
+      "knowledge base ready (local fs bm25)",
+    );
+  }
+
+  log.info({}, "reddit drafter worker ready");
+  const shouldStop = installShutdown(log);
+
+  await runWorkerLoop({
+    log,
+    kind: "drafter",
+    pollMs: env.DRAFTER_POLL_MS,
+    idlePollMs: env.IDLE_POLL_MS,
+    listActive: () => listActiveRedditInternInstances(sql),
+    onTick: async (inst) => {
+      const postOutbound = (body: Parameters<typeof outbound.postOutbound>[0]) =>
+        outbound.postOutbound(body, { orgId: inst.org_id, agentInstanceId: inst.id });
+      // Pausing the instance puts Orion fully to sleep. Its only lane is the
+      // subreddit watchlist (not priority people, unlike Vega/Lyra — see
+      // discovery.ts), so the loop only ever sees ACTIVE instances; a paused Orion
+      // never reaches here and stops drafting entirely.
+      if (!isWorkerEnabled(inst, "drafter")) {
+        log.debug({ instance: inst.id }, "drafter disabled for instance; skipping");
+        return;
+      }
+      const bus = busForInstance(inst);
+      const run = await recordRun({ sql, kind: "drafter", bus });
+      try {
+        // Admit a complete current rule set before any writer work or new claims.
+        const patternRules = await loadActivePatternRules(sql, {
+          orgId: inst.org_id,
+          agentInstanceId: inst.id,
+          role: "reddit_intern",
+        });
+        // Recover leads stranded at 'drafting' by a crash/restart mid-claim —
+        // without this they are invisible to every future claim (see reapStaleClaims).
+        const reaped = await reapStaleClaims(sql, {
+          agentInstanceId: inst.id,
+          claimedStatus: "drafting",
+          requeueStatus: "classified",
+        });
+        if (reaped.requeued || reaped.expired) {
+          log.warn({ org_id: inst.org_id, ...reaped }, "reaped stale drafting claims");
+        }
+        // Goal auto-stop: once a goal-run has produced its N approvals, pause the
+        // instance and stop. Checked before any work/spend.
+        const goal = await enforceGoal(sql, inst, { stallMs: env.REDDIT_GOAL_STALL_MIN * 60_000 });
+        if (goal?.paused) {
+          log.info(
+            { org_id: inst.org_id, produced: goal.produced, target: goal.target, stalled: goal.stalled },
+            goal.stalled ? "goal stalled — pipeline paused" : "goal reached — pipeline paused",
+          );
+          await run.finish({ status: "ok", rowsProcessed: 0 });
+          return;
+        }
+
+        // Backpressure gate: when the operator's approval inbox is at the
+        // (effective) cap, generating more drafts just buries them.
+        const cap = effectiveDraftsCap(inst);
+        if (cap != null) {
+          const pending = await countPendingApprovalsForInstance(sql, inst.id);
+          if (pending >= cap) {
+            log.info({ org_id: inst.org_id, pending, cap }, "drafter paused: pending approvals at cap");
+            await run.finish({ status: "ok", rowsProcessed: 0 });
+            return;
+          }
+        }
+
+        // Resolve the knowledge base for this tick. local/gcs are shared from
+        // boot; the legacy http backend needs a per-org key, fetched here.
+        let kb: KnowledgeBase;
+        if (sharedKb) {
+          kb = sharedKb;
+        } else {
+          let nellaKey = "";
