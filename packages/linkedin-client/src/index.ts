@@ -398,3 +398,72 @@ export function createLinkedInClient(opts: CreateLinkedInClientOpts): LinkedInCl
       // Fall back to the first profile entity if the slug didn't match exactly.
       for (const e of entitiesOf(json)) {
         const p = parseProfileEntity(e);
+        if (p) return p;
+      }
+      return null;
+    },
+
+    async memberPosts({ fsdProfileId, limit = 5, sinceISO }) {
+      // GraphQL endpoint (the old REST finder voyagerFeedDashProfileUpdates is
+      // dead). The urn's colons are %3A-encoded; the RestLi structural chars
+      // ( ) : , stay literal. The query has no count param — it returns a page;
+      // we slice to `limit` after parsing.
+      const profileUrn = `urn%3Ali%3Afsd_profile%3A${encodeURIComponent(fsdProfileId)}`;
+      const variables = `(profileUrn:${profileUrn},sectionType:${profilePostsSectionType})`;
+      const qs = `includeWebMetadata=true&variables=${variables}&queryId=${profilePostsQueryId}`;
+      const json = await voyagerGet(`/graphql?${qs}`, {
+        headers: { "x-li-page-instance": `urn:li:page:${profilePostsPageType};${freshUuid()}` },
+      });
+      const since = sinceISO ? new Date(sinceISO).getTime() : 0;
+      const seen = new Set<string>();
+      const posts: LinkedInPost[] = [];
+      for (const e of entitiesOf(json)) {
+        const commentary = (e as { commentary?: { text?: { text?: string } } }).commentary;
+        const text = commentary?.text?.text;
+        if (!text) continue;
+        const blob = JSON.stringify(e);
+        const m = blob.match(/urn:li:activity:(\d+)/);
+        const id = m?.[1];
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const social = (e as {
+          ["*socialDetail"]?: unknown;
+          socialDetail?: { totalSocialActivityCounts?: { numLikes?: unknown; numComments?: unknown } };
+        }).socialDetail?.totalSocialActivityCounts;
+        const postedAt = timeFromActivityId(id);
+        posts.push({
+          id,
+          urn: `urn:li:activity:${id}`,
+          text,
+          url: `https://www.linkedin.com/feed/update/urn:li:activity:${id}/`,
+          postedAt,
+          reactions: asNumber(social?.numLikes),
+          comments: asNumber(social?.numComments),
+        });
+      }
+      const filtered = since
+        ? posts.filter((p) => !p.postedAt || new Date(p.postedAt).getTime() > since)
+        : posts;
+      return filtered.slice(0, limit);
+    },
+
+    async connections({ limit = 40, start = 0 } = {}) {
+      // Best-effort: the legacy relationships/connections endpoint returns
+      // miniProfile entities. If LinkedIn has retired it for this account the
+      // call throws and the caller falls back to manual watchlist entry.
+      const json = await voyagerGet(
+        `/relationships/connections?q=viewer&count=${limit}&start=${start}&sortType=RECENTLY_ADDED`,
+      );
+      const out: LinkedInProfile[] = [];
+      const seen = new Set<string>();
+      for (const e of entitiesOf(json)) {
+        const p = parseProfileEntity(e);
+        if (p && p.fsdProfileId && !seen.has(p.fsdProfileId)) {
+          seen.add(p.fsdProfileId);
+          out.push(p);
+        }
+      }
+      return out;
+    },
+  };
+}
