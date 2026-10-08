@@ -198,3 +198,74 @@ export async function runDiscoveryTick(args: RunDiscoveryTickArgs): Promise<numb
       }
       seen.add(post.id);
       const postedAt = readSourceTimestamp(post.createdAt);
+      try {
+        const res = await upsertLead({
+          orgId: instance.org_id,
+          agentInstanceId: instance.id,
+          platform: "reddit",
+          externalId: post.id,
+          authorHandle: post.author.username,
+          authorId: null,
+          payload: {
+            title: post.title,
+            text: post.body,
+            url: post.url,
+            postedAt,
+            subreddit: post.subreddit,
+            score,
+            numComments,
+            // Reddit-native context for the drafter: the post's image(s) (vision)
+            // and its most-upvoted comments (read-the-room + comment targeting).
+            // UNTRUSTED — the drafter fences the comment bodies + caption.
+            images: post.images ?? [],
+            topComments: post.topComments ?? [],
+          },
+          postedAt,
+          // Subreddit posts are graded by the classifier on their own merits — no
+          // priority clamp (Reddit has no hand-picked-person notion).
+          priority: false,
+        });
+        // Only a genuinely NEW lead counts toward the daily extract cap; a
+        // re-seen post (inserted=false) is a no-op and shouldn't burn budget.
+        if (res.inserted) {
+          inserted++;
+          extractedToday++;
+          await bus?.emit({
+            topic: "lead.discovered",
+            worker: "discovery",
+            summary: `discovered r/${post.subreddit}`,
+            payload: {
+              lead_id: res.id,
+              external_id: post.id,
+              subreddit: post.subreddit,
+              score,
+            },
+            correlationId: res.id,
+          });
+        }
+      } catch (err) {
+        log.error({ postId: post.id, err: (err as Error).message }, "lead upsert failed");
+      }
+    }
+  }
+
+  if (cooledDown > 0) {
+    log.info(
+      { cooledDown, watchlistSubreddits: watchlistSubreddits.length },
+      "watchlist: subreddits skipped by re-poll cooldown (fetched again once their window elapses)",
+    );
+  }
+
+  log.info(
+    {
+      inserted,
+      scanned,
+      filtered,
+      extractedToday,
+      dailyExtractCap,
+      subreddits: watchlistSubreddits.length,
+    },
+    "discovery tick complete",
+  );
+  return inserted;
+}
