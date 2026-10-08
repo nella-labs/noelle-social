@@ -398,3 +398,20 @@ async function main(): Promise<void> {
       await alert(env.NOELLE_DOCTOR_ALERT_CATEGORY, `[doctor] tick error: ${String(e).slice(0, 160)}`);
     }
     if (stopping) break;
+    await sleeper.sleep(env.NOELLE_DOCTOR_INTERVAL_MS);
+  }
+
+  logger.info("actuator-doctor stopped");
+  try {
+    await sql.end({ timeout: 5 });
+  } catch {
+    // ignore
+  }
+  process.exit(0);
+}
+
+main().catch((e) => {
+  // Last-resort: never exit silently.
+  console.error("actuator-doctor fatal:", e);
+  process.exit(1);
+});
