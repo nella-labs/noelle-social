@@ -398,3 +398,12 @@ describe("supersedeOlderPriorityLeads", () => {
       { unsafe: vi.fn(), json: (x: unknown) => x },
     ) as never;
 
+    await supersedeOlderPriorityLeads(sql, {
+      agentInstanceId: "i",
+      authorHandle: "u",
+      keepLeadId: "newest",
+    });
+
+    expect(fragments[0]).toMatch(/payload->>'reply_requested' is distinct from 'true'/);
+  });
+});

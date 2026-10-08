@@ -198,3 +198,25 @@ describe.skipIf(!url)("X source date handling (dedicated PostgreSQL)", () => {
   });
 
   it("does not retry a foreign approval that points to this instance's draft", async () => {
+    const held = await candidate(null, "sent");
+    await sql`insert into noelle.organizations(id,slug,name) values (${foreignOrg},'two','Two')`;
+    await sql`insert into noelle.agent_instances(id,org_id,role) values (${foreignInstance},${foreignOrg},'x_intern')`;
+    await sql`update noelle.approvals set org_id=${foreignOrg},agent_instance_id=${foreignInstance} where id=${held.approvalId}`;
+    expect(await listRetrySendDue(sql, { agentInstanceId: instance, orgId: org, maxAgeHours: 0 })).toEqual([]);
+  });
+
+  it("keeps coherent fresh or undateable retries and suppresses stale, dispatched and uncertain work", async () => {
+    const invalid = await candidate("2026-02-30T10:00:00Z", "sent");
+    const fresh = await candidate(new Date().toISOString(), "sent");
+    await candidate(new Date(Date.now()-72*3_600_000).toISOString(), "sent");
+    const posted = await candidate(null, "sent"), uncertain = await candidate(null, "sent");
+    await sql`update noelle.drafts set sent_at=now() where id=${posted.draftId}`;
+    const targetTweetId = "1987654321000000001";
+    await sql`update noelle.leads set external_id=${targetTweetId} where id=${uncertain.leadId}`;
+    await sql`insert into noelle.x_reply_claims(org_id,tweet_id,approval_id) values (${org},${targetTweetId},${uncertain.approvalId})`;
+    const rows = await listRetrySendDue(sql, { agentInstanceId: instance, orgId: org, maxAgeHours: 24 });
+    expect(rows.map(row => row.draft_id).sort()).toEqual([invalid.draftId,fresh.draftId].sort());
+    expect(rows.every(row => row.lead_id === (row.draft_id === fresh.draftId ? fresh.leadId : invalid.leadId))).toBe(true);
+  });
+
+});
