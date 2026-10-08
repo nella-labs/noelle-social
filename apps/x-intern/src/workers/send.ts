@@ -198,3 +198,203 @@ async function main() {
                   and coalesce(d.payload->>'kind', 'reply') <> 'dm') as retry,
               (select count(*)::int
                  from noelle.approvals
+                where agent_instance_id = ${inst.id}
+                  and status = 'pending'
+                  and auto_send_target_at is not null
+                  and auto_send_target_at <= now()) as stamped
+          `;
+          const dueTotal = (due?.retry ?? 0) + (due?.stamped ?? 0);
+          if (dueTotal > 0) {
+            await alerts.notify({
+              instanceId: inst.id,
+              kind: "no-write-client",
+              orgId: inst.org_id,
+              title: "X sender has no write client — replies waiting",
+              message:
+                `${dueTotal} due repl${dueTotal === 1 ? "y" : "ies"} (retry ${due?.retry ?? 0}, stamped ${due?.stamped ?? 0}) ` +
+                `but the send worker has no valid X API token. Reconnect the X account under Connections.`,
+              throttleMs: 6 * 60 * 60_000,
+            });
+          }
+          await run.finish({ status: "ok", rowsProcessed: 0 });
+          return;
+        }
+
+        // Approval send flow:
+        //   - dashboard's POST /api/drafts/:id/send only flips approvals.status
+        //     and stamps decided_at; it does NOT touch drafts.sent_at.
+        //   - draft text lives at payload->>'body' (or edited_body if the user
+        //     edited it in the UI before approving) — there is no drafts.body
+        //     column in the current schema.
+        //   - approvals join key is draft_id (no sent_draft_id column).
+        // 1. Retry queue: rows already flipped to 'sent' (by a founder click
+        //    or a prior auto-send claim) that the X post didn't complete on.
+        const pendingRows = await listRetrySendDue(sql, {
+          agentInstanceId: inst.id, orgId: inst.org_id, maxAgeHours: env.X_REPLY_MAX_AGE_HOURS,
+        });
+        let pending: PendingDraft[] = [...pendingRows];
+        // Belt-and-suspenders for the retry lane: an auto-claimed row that
+        // carries an external link must never post unattended, even via retry
+        // (a failed link-guard revert can leave one 'sent' with no external
+        // id). Human-decided rows keep their links — the operator approved
+        // them deliberately.
+        if (env.NOELLE_AUTOSEND_BLOCK_EXTERNAL_LINKS) {
+          const linkyRetry = pending.filter(
+            (r) => r.decided_by === "auto-send" && containsExternalLink(r.body),
+          );
+          if (linkyRetry.length > 0) {
+            await releaseAutoSendRowsForReview(sql, { draftIds: linkyRetry.map((r) => r.draft_id) })
+              .catch((e) => log.error({ err: (e as Error).message }, "failed to release link retry rows for review"));
+            log.warn(
+              { org_id: inst.org_id, released: linkyRetry.length },
+              "retry rows carried external links (auto-claimed); reverted to pending for human review",
+            );
+            pending = pending.filter((r) => !(r.decided_by === "auto-send" && containsExternalLink(r.body)));
+          }
+        }
+
+        // 2. Auto-send pickup: any approval whose auto_send_target_at is now
+        //    due — whether the drafter scheduled it (always-on auto-send mode)
+        //    OR the operator queued a batch from the inbox. NOT gated on
+        //    auto_send_enabled: a queued batch must fire on its staggered
+        //    schedule even with always-on mode off. Rolling half-hour, hour,
+        //    and daily budgets are checked atomically when claiming due work.
+        // Window gates BEFORE claiming new auto-sends. A 429 cooldown blocks ALL
+        // writes this tick (X is actively throttling); the overnight quiet
+        // window blocks only NEW auto-sends (a stuck-send retry may still
+        // complete). The half-hour budget bounds short bursts.
+        const nowMs = Date.now();
+        // Persisted 429 cooldown (X_PERSIST_SEND_COOLDOWN, default OFF). Read is
+        // gated behind the flag (off ⇒ zero extra query, exactly today's in-memory
+        // logic) and FAILS CLOSED: any read error ⇒ assume throttled and skip ALL
+        // sends this tick. Also seeds the in-memory streak so the ladder continues
+        // across a deploy-restart. Sits inside the onTick try (which rethrows).
+        let persistedCooldownUntil: number | null = null;
+        if (env.X_PERSIST_SEND_COOLDOWN) {
+          try {
+            const [row] = await sql<Array<{ until: Date | null; streak: number }>>`
+              select send_cooldown_until as until, rate_limit_streak as streak
+              from noelle.agent_instances where id = ${inst.id}`;
+            persistedCooldownUntil = row?.until ? new Date(row.until).getTime() : null;
+            const ps = Number(row?.streak ?? 0);
+            if (ps > 0 && !rateLimitStreak.has(inst.id)) rateLimitStreak.set(inst.id, ps); // continue the ladder across restart
+          } catch (e) {
+            persistedCooldownUntil = nowMs + 1; // FAIL CLOSED: can't read state -> assume throttled, skip sends this tick
+            log.warn({ instance: inst.id, err: (e as Error).message }, "cooldown read failed; failing closed");
+          }
+        }
+        const inCooldown = isInCooldown(persistedCooldownUntil, sendCooldownUntilMs.get(inst.id), nowMs);
+        const quiet = inQuietWindow(
+          new Date(nowMs),
+          env.AUTOSEND_QUIET_START_UTC,
+          env.AUTOSEND_QUIET_END_UTC,
+        );
+        // Cross-tick inter-send floor (NOELLE_AUTOSEND_INTERSEND_FLOOR, default OFF).
+        // When active, no send fires this tick (a jittered gap since the last
+        // successful post hasn't elapsed). Off ⇒ floorActive always false.
+        const floorEnabled = env.NOELLE_AUTOSEND_INTERSEND_FLOOR;
+        const floorActive =
+          floorEnabled &&
+          isWithinInterSendFloor({ nowMs, nextSendAllowedAtMs: nextSendAllowedAtMs.get(inst.id) });
+        let claimed: PendingDraft[] = [];
+        if (inCooldown) {
+          log.info(
+            { org_id: inst.org_id, cooldownUntil: sendCooldownUntilMs.get(inst.id) },
+            "send in 429 cooldown; skipping all sends this tick",
+          );
+        } else if (floorActive) {
+          log.debug(
+            { org_id: inst.org_id, nextAllowed: nextSendAllowedAtMs.get(inst.id) },
+            "send within inter-send floor; deferring all sends this tick",
+          );
+        } else if (quiet) {
+          log.debug({ org_id: inst.org_id }, "send in overnight quiet window; deferring new auto-sends");
+        } else {
+          claimed = await claimAutoSendDue(sql, {
+            agentInstanceId: inst.id,
+            budget: floorEnabled ? 1 : 2,
+            maxAgeHours: env.X_REPLY_MAX_AGE_HOURS,
+            maxPerDay: env.AUTOSEND_MAX_PER_DAY,
+            maxPer30Min: env.AUTOSEND_MAX_PER_30MIN,
+          });
+          if (claimed.length > 0) {
+            log.info({ org_id: inst.org_id, claimed: claimed.length }, "auto-send rows claimed within rolling budgets");
+            // Belt-and-suspenders link guard (default ON): the drafter already
+            // withholds link-bearing auto-sends, but revert any that were already
+            // stamped (or slipped through) so nothing with an external link posts
+            // unattended. Only claimed (decided_by='auto-send') rows are touched —
+            // never a human Send-button click. Fail closed: even if the DB revert
+            // errors, the row is still dropped from `claimed` so it can't post this
+            // tick.
+            if (env.NOELLE_AUTOSEND_BLOCK_EXTERNAL_LINKS && claimed.length > 0) {
+              const linky = claimed.filter((r) => containsExternalLink(r.body));
+              if (linky.length > 0) {
+                await releaseAutoSendRowsForReview(sql, { draftIds: linky.map((r) => r.draft_id) })
+                  .catch((e) => log.error({ err: (e as Error).message }, "failed to release link auto-sends for review"));
+                log.warn(
+                  { org_id: inst.org_id, released: linky.length },
+                  "auto-send rows carried external links; reverted to pending for human review",
+                );
+                claimed = claimed.filter((r) => !containsExternalLink(r.body));
+              }
+            }
+          }
+        }
+
+        // Cooldown OR floor active => send nothing this tick. Floor ON => at most ONE
+        // reply/tick (retry queue first, then an auto claim) so two rows can't post
+        // back-to-back; a lock/auth/429 inside runSendTick still short-circuits per-draft.
+        const toSend =
+          inCooldown || floorActive
+            ? []
+            : floorEnabled
+              ? [...pending, ...claimed].slice(0, 1)
+              : [...pending, ...claimed];
+        const outcomes = await runSendTick({
+          log,
+          // 429 cooldown also suspends the stuck-send retry queue — pounding X
+          // while throttled lengthens the lock.
+          pendingDrafts: toSend,
+          xClient,
+          reserveReply: (draft) => reserveXReplyClaim(sql, {
+            orgId: inst.org_id,
+            draftId: draft.draft_id,
+            targetTweetId: draft.in_reply_to_id,
+            mode: "worker",
+          }),
+          releaseReply: (claim) => releaseXReplyClaim(sql, claim),
+          markUncertain: async ({ draftId, reason, receipt }) => {
+            await sql`
+              update noelle.drafts
+              set payload = payload || ${sql.json({
+                send_reconciliation_required: true,
+                send_reconciliation_reason: reason,
+                ...(receipt ? { send_reconciliation_receipt: receipt } : {}),
+              } as unknown as JSONValue)}::jsonb
+              where id = ${draftId} and org_id = ${inst.org_id}
+            `;
+          },
+          markSent: async ({ draftId, sentExternalId, sentUrl }) => {
+            const rows = await sql<Array<{ id: string }>>`
+              update noelle.drafts
+              set sent_external_id = ${sentExternalId},
+                  posted_at = now(),
+                  payload = payload || ${sql.json({ sent_url: sentUrl } as unknown as JSONValue)}::jsonb
+              where id = ${draftId} and org_id = ${inst.org_id}
+              returning id
+            `;
+            if (!rows[0]) throw new Error("reply receipt row unavailable");
+          },
+          markErrored: async ({ draftId, reason }) => {
+            // Flip the approval row attached to this draft to 'errored'
+            // and stash the reason so the dashboard can show it. Failure
+            // here is logged but doesn't block the tick — the next tick
+            // will re-claim the row (because status is still 'sent') and
+            // hit the same error again, which is fine: idempotent retry.
+            try {
+              await sql`
+                update noelle.approvals
+                set status = 'errored',
+                    decided_at = coalesce(decided_at, now()),
+                    skip_reason = ${`send-failed: ${reason.slice(0, 480)}`}
+                where draft_id = ${draftId}
