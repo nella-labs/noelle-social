@@ -198,3 +198,22 @@ async function main() {
           recorder,
           credentialId: apify.credentialId,
         });
+        await run.finish({ status: "ok", rowsProcessed: profiled });
+      } catch (err) {
+        if (err instanceof AllApifyTokensExhaustedError) {
+          log.error({ org_id: inst.org_id, tokens: err.tokenCount }, "all apify tokens exhausted");
+          await run.finish({ status: "error", errorMessage: err.message });
+          return;
+        }
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+  });
+}
+
+main().catch((err) => {
+  console.error("profiler fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
