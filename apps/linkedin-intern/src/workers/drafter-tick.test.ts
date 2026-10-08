@@ -2798,3 +2798,203 @@ describe("runDrafterTick — faithful form-variant rotation", () => {
       variety: { enabled: true, rng: () => 0.4, formVariantRotation: createFormVariantRotation() },
     });
     const system = runner.draft.mock.calls[0]![0].system as string;
+    expect(system).toContain("THIS REPLY'S ASSIGNED SHAPE controls length and beat structure only");
+    expect(system).not.toContain("The whole reply is ONE genuine, specific question");
+  });
+
+  it("faithful pin with an empty corpus still gets a shape, just standalone", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      style: faithfulStyle({ loadPool: vi.fn().mockResolvedValue([]) }) as never,
+      variety: { enabled: true, rng: () => 0, formVariantRotation: createFormVariantRotation() },
+    });
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    // Empty pool ⇒ no style block to host the shape inline, so it falls back to
+    // the standalone block rather than to no shape at all.
+    expect(system).not.toContain("THIS REPLY'S ASSIGNED SHAPE controls length and beat structure only");
+    expect(prompt).toContain("THIS REPLY'S ASSIGNED SHAPE (follow it exactly");
+  });
+});
+
+describe("runDrafterTick — per-person prior-replies memory", () => {
+  it("fetches by author + injects the 'do not repeat' block into the comment prompt", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const getPriorReplies = vi
+      .fn()
+      .mockResolvedValue(["i said this exact take before", "and this opener too"]);
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      getPriorReplies,
+      priorRepliesTopK: 3,
+    });
+
+    expect(getPriorReplies).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authorHandle: "jane-builder",
+        authorId: "ABC123",
+        excludeLeadId: "L",
+        limit: 3,
+      }),
+    );
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("ALREADY SENT/QUEUED TO THIS PERSON");
+    expect(prompt).toContain("i said this exact take before");
+  });
+
+  it("omits the block when there is no history (byte-identical to today)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      getPriorReplies: vi.fn().mockResolvedValue([]),
+    });
+    expect(runner.draft.mock.calls[0]![0].prompt).not.toContain("ALREADY SENT/QUEUED");
+  });
+
+  it("fails open: a getPriorReplies error still drafts (no block)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      getPriorReplies: vi.fn().mockRejectedValue(new Error("db down")),
+    });
+    expect(n).toBe(1);
+    expect(runner.draft.mock.calls[0]![0].prompt).not.toContain("ALREADY SENT/QUEUED");
+  });
+});
+
+// ── Account Feeder STYLE injection (F6) ──────────────────────────────────────
+// The STYLE block is SYSTEM-only, so we assert on runner.draft(...).system.
+// "STYLE TO EMULATE" is the block header (lib/prompts.ts renderStyleBlock). A
+// fixed rng keeps the per-lead selection deterministic; no VOYAGE_API_KEY is set
+// so the fit ranker fails open to input order (no network).
+const STYLE_MARKER = "STYLE TO EMULATE";
+
+const stylePoolRow = (over: Record<string, unknown> = {}) => ({
+  external_id: "s1",
+  body: "one sharp line that earned the room",
+  like_count: 500,
+  comment_count: 40,
+  account_handle: "guru",
+  posted_at: null,
+  ...over,
+});
+
+const styleConfig = (
+  over: Record<string, unknown> = {},
+): {
+  enabled: boolean;
+  loadPool: () => Promise<ReturnType<typeof stylePoolRow>[]>;
+  loadUltraProfiles: () => Promise<never[]>;
+  config?: unknown;
+  rng?: () => number;
+} => ({
+  enabled: true,
+  loadPool: vi.fn().mockResolvedValue([stylePoolRow(), stylePoolRow({ external_id: "s2", like_count: 10 })]),
+  loadUltraProfiles: vi.fn().mockResolvedValue([]),
+  config: { maxStyleExemplars: 2, varietyTemperature: 0 },
+  rng: () => 0.5,
+  ...over,
+});
+
+describe("runDrafterTick — STYLE injection (F6)", () => {
+  it("injects the STYLE block into the SYSTEM prompt when style is ON + pool present", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      style: styleConfig() as never,
+    });
+    expect(n).toBe(1);
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    expect(system).toContain(STYLE_MARKER);
+    // FORM-not-content guardrail is present in the block.
+    expect(system).toContain("match the FORM");
+  });
+
+  it("light leads also get the STYLE block", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "claude-sonnet-4-6" }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      style: styleConfig() as never,
+    });
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    expect(system).toContain(STYLE_MARKER);
+  });
+
+  it("does NOT inject (byte-identical SYSTEM) when style is OFF — equals no-style call", async () => {
+    // Baseline: no style arg at all (today's behaviour).
+    const base = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_label: "substantial" })] as never,
+      runner: base.runner as never,
+      kb: base.kb as never,
+      postOutbound: base.postOutbound,
+      markStatus: base.markStatus,
+    });
+    const baselineSystem = base.runner.draft.mock.calls[0]![0].system as string;
+
+    // Same lead, style explicitly OFF — loaders must not even be called.
+    const off = deps();
+    const loadPool = vi.fn().mockResolvedValue([stylePoolRow()]);
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_label: "substantial" })] as never,
+      runner: off.runner as never,
+      kb: off.kb as never,
+      postOutbound: off.postOutbound,
+      markStatus: off.markStatus,
+      style: { enabled: false, loadPool, loadUltraProfiles: vi.fn().mockResolvedValue([]) } as never,
+    });
+    const offSystem = off.runner.draft.mock.calls[0]![0].system as string;
+
+    expect(offSystem).not.toContain(STYLE_MARKER);
+    expect(offSystem).toBe(baselineSystem); // byte-identical to today
+    expect(loadPool).not.toHaveBeenCalled(); // no work when off
+  });
+
+  it("does NOT inject when style is ON but the pool is EMPTY (still byte-identical)", async () => {
+    const base = deps();
+    await runDrafterTick({
