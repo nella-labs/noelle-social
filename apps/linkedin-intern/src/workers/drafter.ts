@@ -398,3 +398,203 @@ async function main() {
         // Return type pinned to runDrafterTick's parameter. Extracting the arg
         // set out of the call expression lost CONTEXTUAL typing, so every
         // callback in it (markStatus, pinNotification, getPriorReplies…) went
+        // implicit-any and the build failed even though `tsc --noEmit` — which
+        // runs a looser config here — was happy.
+          // The operator's real POST -> REPLY pairs, once per tick. Noelle already
+          // had this data and used it only as an avoid-list.
+          const voiceExemplars = await getVoiceExemplars(sql, {
+            agentInstanceId: inst.id,
+            limit: VOICE_EXEMPLAR_COUNT,
+            humanOnly: true,
+          });
+        const drafterArgs = (
+          claimedLeads: LeadRow[],
+          forceVerify = false,
+        ): Parameters<typeof runDrafterTick>[0] => ({
+          voiceExemplars,
+          log,
+          instance: inst,
+          claimedLeads,
+          patternRules,
+          runner,
+          kb,
+          postOutbound,
+          markStatus: (a) => markLeadStatus(sql, a),
+          // Pushover the operator for a notification too important to answer
+          // with an agent. Fail-soft: no Pushover channel ⇒ no_channel, no throw.
+          pinNotification: async ({ title, message, url }) => {
+            // Report DELIVERY, not just "we tried": the tick keeps the lead
+            // visible (status 'errored') when a pin does not actually land,
+            // so a real opportunity can never vanish into the skip pile.
+            const r = await notifier.notify({
+              orgId: inst.org_id,
+              title,
+              message,
+              ...(url ? { url, url_title: "open the thread" } : {}),
+            });
+            return r.status === "sent";
+          },
+          relevanceThreshold: env.DRAFTER_RELEVANCE_THRESHOLD,
+          // Daily volume rules: ≤ N substantial + ≤ M light posts drafted/day.
+          // When a kind's cap is hit, leads of that kind stay 'classified' for a
+          // later day (never downgraded). 0 = unlimited (the default); the tick
+          // normalizes that, so it is never a "draft nothing" instruction.
+          dailySubstantialCap: env.LINKEDIN_DAILY_SUBSTANTIAL_CAP,
+          dailyLightCap: env.LINKEDIN_DAILY_LIGHT_CAP,
+          bus,
+          draftedTodayByKind: (replyKind) =>
+            countDraftedTodayByKind(sql, { agentInstanceId: inst.id, replyKind }),
+          sql,
+          // Reaction-based Opus tiering: high-engagement source posts get the
+          // stronger model. Engagement is reused from Apify (payload), no API call.
+          opusLikesThreshold: env.LINKEDIN_OPUS_LIKES,
+          opusCommentsThreshold: env.LINKEDIN_OPUS_COMMENTS,
+          opusModel: env.NOELLE_DRAFTER_OPUS_MODEL,
+          // Comment-energy: read the room before drafting. Apify spend for the
+          // fetch is recorded (engine='apify') via the shared recorder, attributed
+          // to each attempted token.
+          fetchPostComments,
+          commentFetchMax: env.LINKEDIN_DRAFTER_COMMENT_MAX,
+          // ── Grounded drafting extras (default off until configured). ──
+          // Scope voice retrieval + run a second knowledge pass when configured.
+          voiceDirs: parseIncludeDirs(env.NOELLE_VOICE_DIRS),
+          knowledgeDirs: parseIncludeDirs(env.NOELLE_KNOWLEDGE_DIRS),
+          knowledgeTopK: env.NOELLE_DRAFTER_KNOWLEDGE_TOPK,
+          rerankGrounding: env.NOELLE_DRAFTER_GROUNDING_RERANK,
+          // Vision caption for posts with images (no-op when no key resolved).
+          captionFn,
+          // Reply verifier + regenerate loop (default on, explicit false allowed).
+          // Unattended auto-send (LINKEDIN_UNATTENDED_AUTOSEND) FORCES verify ON and
+          // lifts the floor to >=0.7 so the api-vm actuator gate has non-zero yield;
+          // it can only RAISE the bar, never lower it.
+          verify: (forceVerify || env.NOELLE_DRAFTER_VERIFY || env.LINKEDIN_UNATTENDED_AUTOSEND)
+            ? {
+                enabled: true,
+                retries: env.NOELLE_DRAFTER_VERIFY_RETRIES,
+                // Drop a draft whose best attempt still reads generic (voice
+                // below this) instead of serving slop. 0 disables the gate.
+                voiceFloor: env.LINKEDIN_UNATTENDED_AUTOSEND
+                  ? Math.max(env.NOELLE_DRAFTER_VOICE_FLOOR, 0.7)
+                  : env.NOELLE_DRAFTER_VOICE_FLOOR,
+                // Judge runs on Haiku (judgeRouting) — it scores, it doesn't
+                // write, so it never needs the drafting model. A single judge per
+                // draft: the 3-adversarial majority-vote panel for watchlist leads
+                // was tripling judge spend (all on Opus) for no measurable lift.
+                makeCalls: (_priority, options): VerifierCall[] => {
+                  const judge: VerifierCall = (system, prompt) =>
+                    runner
+                      .draft({
+                        bucket: "drafter-verify",
+                        routing: judgeRouting(),
+                        orgId: inst.org_id,
+                        instanceId: inst.id,
+                        worker: "drafter",
+                        agentRole: "linkedin_intern",
+                        system,
+                        prompt,
+                        ...(options?.directRouting ? { directRouting: true } : {}),
+                      })
+                      .then((r) => r.text);
+                  return [judge];
+                },
+              }
+            : undefined,
+          // Voice variety: per-lead random register injected into the comment
+          // prompt (gated on NOELLE_DRAFTER_VARIETY; default off → unchanged).
+          // Faithful-pin handling now lives IN THE TICK, per lead: a pinned lead
+          // whose style block loaded gets a FORM VARIANT (one of 10 shapes,
+          // never the previous reply's — see @noelle/runtime formVariants.ts)
+          // rendered inside the faithful STYLE block, and the random register /
+          // opening-move blocks are suppressed for that lead so a SLANG/HYPE
+          // register never fights the pinned voice. Only when the pin fails to
+          // reach the prompt (empty corpus, selection error) does the plain
+          // register variety fire as the fallback.
+          variety: { enabled: env.NOELLE_DRAFTER_VARIETY },
+          // Per-person memory: inject the replies already sent/queued to this
+          // post's author so the comment doesn't repeat a take Lyra already made.
+          getPriorReplies: (a) =>
+            getRecentRepliesToAuthor(sql, { ...a, agentInstanceId: inst.id }),
+          priorRepliesTopK: env.LINKEDIN_DRAFTER_SENT_TOPK,
+          // Global avoid-list: Lyra's recent replies across the whole feed, so
+          // openers/phrasings vary feed-wide (not just per person).
+          getRecentPhrasings: (a) =>
+            getRecentReplyPhrasings(sql, { ...a, agentInstanceId: inst.id }),
+          recentPhrasingsTopK: env.LINKEDIN_DRAFTER_RECENT_PHRASINGS_TOPK,
+          // Account Feeder STYLE injection (NOELLE_DRAFTER_STYLE; default OFF).
+          // Loaders fetch the style pool + ultra profiles ONCE per tick (reused
+          // across leads); the tick samples per-lead. Fail-open: off or any
+          // load/select error → no STYLE block, drafts exactly as today.
+          //
+          // WHICH KINDS: each source is stored as original posts (kind='post')
+          // and authored comments (kind='comment'). readStyleExemplarKinds reads
+          // account_feeder_config.styleExemplarKinds and defaults to POSTS ONLY —
+          // a person's original posts are their considered voice; their comments
+          // are often sloppy. We load every requested kind and concatenate into
+          // one pool that selectStyleExemplars then ranks by fit + engagement.
+          // (Set styleExemplarKinds to ['post','comment'] to fold comments back
+          // in — the older "pool both" behaviour.)
+          //
+          // FAITHFUL VOICE ("write like <named person(s)>"): when the operator
+          // pins one or more source accounts (account_feeder_config.faithfulVoices,
+          // or the single-voice pinnedStyleHandle), ground the reply STYLE block in
+          // ONLY those accounts' corpora + ultra profiles (enabled-independent),
+          // force style ON even if NOELLE_DRAFTER_STYLE is off, and bump the exemplar
+          // count so the named voice actually transfers. With MORE than one voice,
+          // the tick picks ONE deterministically per lead (rotating across the feed)
+          // so each reply faithfully sounds like a single real writer. No pin → the
+          // existing automatic blend over the enabled pool.
+          style: (() => {
+            const styleKinds = readStyleExemplarKinds(inst.account_feeder_config);
+            const faithfulVoices = readFaithfulVoices(inst.account_feeder_config);
+            const faithfulVoiceWeights = readFaithfulVoiceWeights(inst.account_feeder_config);
+            if (faithfulVoices.length >= 1) {
+              return {
+                enabled: true,
+                // Faithful voice: the operator hand-picked this/these writer(s), so
+                // the drafter should genuinely SOUND like them (adopt-the-voice
+                // STYLE block + no register cheer-penalty in exemplar selection).
+                faithful: true,
+                // Pass the list through so the tick can rotate ONE voice per lead.
+                faithfulVoices,
+                // Optional per-voice bias for that rotation (e.g. 60/40); undefined
+                // ⇒ uniform. Only meaningful with 2+ voices.
+                faithfulVoiceWeights,
+                loadPool: async () => {
+                  const pools = await Promise.all(
+                    faithfulVoices.flatMap((handle) =>
+                      styleKinds.map((kind) =>
+                        listStyleExemplarsForHandle(sql, {
+                          agentInstanceId: inst.id,
+                          platform: "linkedin",
+                          kind,
+                          handle,
+                          limit: env.NOELLE_DRAFTER_STYLE_POOL,
+                        }),
+                      ),
+                    ),
+                  );
+                  return pools.flat();
+                },
+                loadUltraProfiles: async () => {
+                  const profiles = await Promise.all(
+                    faithfulVoices.map((handle) =>
+                      getUltraProfileForHandle(sql, {
+                        agentInstanceId: inst.id,
+                        platform: "linkedin",
+                        handle,
+                      }),
+                    ),
+                  );
+                  return profiles.filter((p): p is NonNullable<typeof p> => p != null);
+                },
+                config: pinnedSelectConfig(inst.account_feeder_config),
+                dense: env.NOELLE_DRAFTER_DENSE,
+              };
+            }
+            return {
+              enabled: env.NOELLE_DRAFTER_STYLE,
+              loadPool: async () => {
+                const pools = await Promise.all(
+                  styleKinds.map((kind) =>
+                    listStyleExemplars(sql, {
+                      agentInstanceId: inst.id,
