@@ -398,3 +398,100 @@ describe("the sweep no longer misreports why it did nothing", () => {
   };
   const base = {
     cdp: { wheel: async () => undefined } as never,
+    rng: { float: () => 1, int: () => 1, normal: () => 40, gamma: () => 1, next: () => 0.5, pickWeighted: () => 0 } as never,
+    sleep: async () => undefined,
+    api: { postInboundReplies: async () => ({ accepted: 1, skipped: 0, results: [] }) } as never,
+    instanceId: "i",
+    wpm: 300,
+    stopped: () => false,
+    navigate: async () => undefined,
+    configuredHandle: "operator",
+  };
+  const cellsFor = (items: unknown[]) => async (_t: number, msg: { cmd: string }) =>
+    msg.cmd === "readSelfHandle" ? { ok: true, handle: "operator" } : { ok: true, items };
+
+  it("a page of fresh replies to OTHER people does not blame the 6h window", async () => {
+    setupChrome();
+    const out = await runNotificationSweep(1, {
+      ...base,
+      send: cellsFor([
+        { tweet_id: "1", handle: "ada", text: "hello there", url: "u", posted_at: FRESH(), replying_to: ["someoneelse"] },
+      ]),
+    } as never);
+    expect(out.fresh).toBe(0);
+    expect(out.detail).toBeUndefined(); // caller says "read N cells, none are new replies to you"
+  });
+
+  it("a fresh reply we already answered says so, instead of 'none within 6h'", async () => {
+    setupChrome(["9"]);
+    const out = await runNotificationSweep(1, {
+      ...base,
+      send: cellsFor([
+        { tweet_id: "9", handle: "ada", text: "a real question?", url: "u", posted_at: FRESH(), replying_to: ["operator"] },
+      ]),
+    } as never);
+    expect(out.fresh).toBe(0);
+    expect(out.detail).toMatch(/already ingested/);
+    expect(out.detail).not.toMatch(/none within/);
+  });
+
+  it("a genuinely stale reply DOES blame the window, correctly", async () => {
+    setupChrome();
+    const old = new Date(Date.now() - 48 * 60 * 60_000).toISOString();
+    const out = await runNotificationSweep(1, {
+      ...base,
+      send: cellsFor([
+        { tweet_id: "7", handle: "ada", text: "a real question?", url: "u", posted_at: old, replying_to: ["operator"] },
+      ]),
+    } as never);
+    expect(out.detail).toMatch(/1 replies, none within 12h \(1 older, 0 undated\)/);
+  });
+});
+
+// Mutation testing gap: every e2e page was homogeneous, so bucketing over the
+// CANDIDATES rather than over everything harvested was indistinguishable. A
+// mixed page is the whole point — the notifications page is mostly likes,
+// follows and our own tweets.
+describe("a MIXED page attributes the zero to the right cause", () => {
+  const setupChrome = () => {
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      storage: { local: { get: async () => ({}), set: async () => undefined } },
+    };
+  };
+  const base = {
+    cdp: { wheel: async () => undefined } as never,
+    rng: { float: () => 1, int: () => 1, normal: () => 40, gamma: () => 1, next: () => 0.5, pickWeighted: () => 0 } as never,
+    sleep: async () => undefined,
+    api: { postInboundReplies: async () => ({ accepted: 1, skipped: 0, results: [] }) } as never,
+    instanceId: "i",
+    wpm: 300,
+    stopped: () => false,
+    navigate: async () => undefined,
+    configuredHandle: "operator",
+  };
+
+  it("3 fresh cells aimed at OTHER people + 1 stale reply to us blames the window for ONE", async () => {
+    setupChrome();
+    const old = new Date(Date.now() - 48 * 60 * 60_000).toISOString();
+    const out = await runNotificationSweep(1, {
+      ...base,
+      send: async (_t: number, msg: { cmd: string }) =>
+        msg.cmd === "readSelfHandle"
+          ? { ok: true, handle: "operator" }
+          : {
+              ok: true,
+              items: [
+                { tweet_id: "1", handle: "ada", text: "hi", url: "u", posted_at: FRESH(), replying_to: ["someoneelse"] },
+                { tweet_id: "2", handle: "bo", text: "hi", url: "u", posted_at: FRESH(), replying_to: ["someoneelse"] },
+                { tweet_id: "3", handle: "cy", text: "hi", url: "u", posted_at: FRESH(), replying_to: ["someoneelse"] },
+                { tweet_id: "4", handle: "dee", text: "a real question?", url: "u", posted_at: old, replying_to: ["operator"] },
+              ],
+            },
+    } as never);
+    expect(out.fresh).toBe(0);
+    // Bucketing over all four would say "3 replies within 6h, all already
+    // handled" — three of which are not replies to us and none of which we
+    // handled. The truth is one stale candidate.
+    expect(out.detail).toBe("1 replies, none within 12h (1 older, 0 undated)");
+  });
+});
