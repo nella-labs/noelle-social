@@ -198,3 +198,139 @@ describe("decideAction (cap logic)", () => {
     expect(d).toEqual({ action: "page_human", capped: false });
   });
 });
+
+describe("decideAction (repeat-page dedup)", () => {
+  const ladder: RemediationAction[] = ["restart_worker", "page_human"];
+  const base = (now: number) => ({
+    ladder,
+    lastAction: "page_human" as RemediationAction,
+    counter: new RollingCounter(),
+    signatureId: "s",
+    maxPerHour: 3,
+    globalCap: 6,
+    now,
+  });
+  const HOUR = 3_600_000;
+
+  it("the FIRST page of an incident always fires", () => {
+    const d = decideAction({ ...base(1_000_000), lastPagedAt: null, repageMs: HOUR });
+    expect(d).toEqual({ action: "page_human", capped: false });
+  });
+
+  it("a repeat page inside the window is suppressed to none (a 60s tick must not page every minute)", () => {
+    const now = 1_000_000;
+    const d = decideAction({ ...base(now), lastPagedAt: now - 60_000, repageMs: HOUR });
+    expect(d).toEqual({ action: "none", capped: false });
+  });
+
+  it("re-pages once the window has passed", () => {
+    const now = 10_000_000;
+    const d = decideAction({ ...base(now), lastPagedAt: now - HOUR, repageMs: HOUR });
+    expect(d).toEqual({ action: "page_human", capped: false });
+  });
+
+  it("repageMs 0 disables dedup (legacy page-every-tick)", () => {
+    const now = 1_000_000;
+    const d = decideAction({ ...base(now), lastPagedAt: now - 1, repageMs: 0 });
+    expect(d).toEqual({ action: "page_human", capped: false });
+  });
+
+  it("a capped one-shot page is deduped on repeat too (keeps capped for the report)", () => {
+    const c = new RollingCounter();
+    const now = 1_000_000;
+    for (let i = 0; i < 3; i++) c.record("s", now);
+    const d = decideAction({
+      ladder,
+      lastAction: null, // fresh rung proposes restart_worker, cap swaps it for a page
+      counter: c,
+      signatureId: "s",
+      maxPerHour: 3,
+      globalCap: 6,
+      now,
+      lastPagedAt: now - 60_000,
+      repageMs: HOUR,
+    });
+    expect(d).toEqual({ action: "none", capped: true });
+  });
+});
+
+describe("isMutating", () => {
+  it("classifies the ladder", () => {
+    expect(isMutating("reload_extension")).toBe(true);
+    expect(isMutating("reconnect_bridge")).toBe(true);
+    expect(isMutating("restart_worker")).toBe(true);
+    expect(isMutating("engage_kill_switch")).toBe(true);
+    expect(isMutating("page_human")).toBe(false);
+    expect(isMutating("none")).toBe(false);
+  });
+});
+
+describe("remediate DRYRUN suppression", () => {
+  it("does NOT touch pm2 on a mutating action, but still alerts", async () => {
+    const env = testEnv({ NOELLE_DOCTOR_DRYRUN: true });
+    const { deps, alerts, pm2 } = makeDeps(env);
+    const res = await remediate("restart_worker", ctx, deps);
+    expect(pm2.restartApp).not.toHaveBeenCalled();
+    expect(res.mutated).toBe(false);
+    expect(alerts.length).toBe(1);
+    expect(alerts[0]![1]).toContain("DRY-RUN");
+  });
+
+  it("does NOT touch the DB on a kill switch in dry-run, but still alerts", async () => {
+    const env = testEnv({ NOELLE_DOCTOR_DRYRUN: true });
+    const { deps, alerts, db } = makeDeps(env);
+    const res = await remediate("engage_kill_switch", ctx, deps);
+    expect(db.engageKillSwitch).not.toHaveBeenCalled();
+    expect(res.mutated).toBe(false);
+    expect(alerts.length).toBe(1);
+  });
+});
+
+describe("remediate live mutations", () => {
+  it("restart_worker restarts each app and alerts", async () => {
+    const env = testEnv();
+    const { deps, alerts, pm2 } = makeDeps(env);
+    const res = await remediate(
+      "restart_worker",
+      { ...ctx, appsToRestart: ["noelle-drafter", "noelle-classifier"] },
+      deps,
+    );
+    expect(pm2.restartApp).toHaveBeenCalledTimes(2);
+    expect(pm2.restartApp).toHaveBeenCalledWith("noelle-drafter");
+    expect(pm2.restartApp).toHaveBeenCalledWith("noelle-classifier");
+    expect(res).toMatchObject({ ok: true, mutated: true });
+    expect(alerts.length).toBe(1);
+  });
+
+  it("engage_kill_switch flips the DB (fail-closed) and ALWAYS alerts", async () => {
+    const env = testEnv();
+    const { deps, alerts, db } = makeDeps(env);
+    const res = await remediate("engage_kill_switch", ctx, deps);
+    expect(db.engageKillSwitch).toHaveBeenCalledWith(ctx.instanceIds);
+    expect(res.mutated).toBe(true);
+    expect(alerts[0]![1]).toContain("KILL SWITCH");
+    expect(alerts[0]![1]).toContain("sending STOPPED");
+  });
+
+  it("page_human only alerts — never touches pm2 or the DB — even outside dry-run", async () => {
+    const env = testEnv();
+    const { deps, alerts, pm2, db } = makeDeps(env);
+    const res = await remediate("page_human", ctx, deps);
+    expect(pm2.restartApp).not.toHaveBeenCalled();
+    expect(db.engageKillSwitch).not.toHaveBeenCalled();
+    expect(res.mutated).toBe(false);
+    expect(alerts.length).toBe(1);
+    expect(alerts[0]![1]).toContain("PAGE");
+  });
+
+  it("reload_extension falls back to a bridge restart when the reload path is unavailable", async () => {
+    const env = testEnv();
+    const { deps, alerts, pm2, bridge } = makeDeps(env);
+    bridge.reloadExtension.mockResolvedValueOnce({ ok: false, fallback: true });
+    const res = await remediate("reload_extension", ctx, deps);
+    expect(bridge.reloadExtension).toHaveBeenCalled();
+    expect(pm2.restartApp).toHaveBeenCalledWith("chrome-bridge");
+    expect(res.mutated).toBe(true);
+    expect(alerts[0]![1]).toContain("reconnect_bridge");
+  });
+});
