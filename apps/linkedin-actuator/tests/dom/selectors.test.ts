@@ -598,3 +598,175 @@ describe("findCommentSubmit — 2026 migrated UI (obfuscated classes, bare-'Comm
     // post B below carries a live-capture-shaped toggle (aria 'Comment',
     // count-only text, zero SDUI hooks). It is wordy, enabled, and follows the
     // box — the count-span shape check is what rejects it.
+    const root = mount(
+      "<main><div class='_postA'><div role='textbox' contenteditable='true'>typed</div>" +
+        "<button type='button' class='_e5f6' aria-label='Show Emoji Picker'></button></div>" +
+        "<div class='_postB'><button type='button' class='_x9k2' aria-label='Comment'><span>3</span></button></div></main>",
+    );
+    expect(findCommentSubmit(root)).toBeNull();
+  });
+
+  it("findCommentBox skips an obfuscated chat pane by its accessible name", () => {
+    // If messaging classes get hashed like the feed's were, the pane's
+    // aria-label still says what it is — never anchor a comment there (typing
+    // + the ⌘/Ctrl+Enter chord would deliver it as a DM).
+    const both = mount(
+      "<div class='_zz1'><div role='textbox' contenteditable='true' aria-label='Write a message…'></div>" +
+        "<button type='submit' class='_h4x8'>Send</button></div>" +
+        "<div class='_9b8c7d6e'><div role='textbox' contenteditable='true' aria-label='Text editor for creating comment'></div>" +
+        "<button type='submit' class='_a1b2c3'>Comment</button></div>",
+    );
+    expect(findCommentBox(both)?.getAttribute("aria-label")).toBe("Text editor for creating comment");
+    const paneOnly = mount(
+      "<div class='_zz1'><div role='textbox' contenteditable='true' aria-label='Write a message…'></div>" +
+        "<button type='submit' class='_h4x8'>Send</button></div>",
+    );
+    expect(findCommentBox(paneOnly)).toBeNull();
+    expect(findCommentSubmit(paneOnly)).toBeNull();
+  });
+});
+
+describe("commentBoxText (post-submit verification signal)", () => {
+  it("returns the trimmed text of a populated composer", () => {
+    const t = commentBoxText(mount("<div role='textbox' contenteditable='true'>  hi there  </div>"));
+    expect(t).toBe("hi there");
+  });
+
+  it("returns '' for a cleared composer (posted)", () => {
+    expect(commentBoxText(mount("<div role='textbox' contenteditable='true'></div>"))).toBe("");
+  });
+
+  it("returns '' when only zero-width space / BOM remain", () => {
+    expect(commentBoxText(mount(`<div role='textbox' contenteditable='true'>${'\u200B\uFEFF'}</div>`))).toBe("");
+  });
+
+  it("returns null when there is no composer at all", () => {
+    expect(commentBoxText(mount("<div>no composer</div>"))).toBeNull();
+  });
+});
+
+describe("reaction flyout selectors", () => {
+  it("findReactionsMenu returns the open flyout, null when closed", () => {
+    expect(findReactionsMenu(mount(fx("reaction-menu.html")))).not.toBeNull();
+    expect(findReactionsMenu(mount(fx("feed-post.html")))).toBeNull();
+  });
+
+  it("findReactionButton resolves each reaction by its Voyager enum", () => {
+    const root = mount(fx("reaction-menu.html"));
+    expect(findReactionButton(root, "PRAISE", "Celebrate")?.getAttribute("aria-label")).toBe("Celebrate");
+    expect(findReactionButton(root, "EMPATHY", "Support")?.getAttribute("aria-label")).toBe("Support");
+    expect(findReactionButton(root, "ENTERTAINMENT", "Funny")?.textContent).toBe("Funny");
+  });
+
+  it("findReactionButton falls back to the label word when data-reaction-type is gone", () => {
+    const root = mount(`
+      <div class="feed-shared-social-action-bar">
+        <button aria-label="React Like to Nora Kim's post" aria-pressed="false">Like</button>
+        <div class="reactions-menu">
+          <button aria-label="Celebrate">Celebrate</button>
+          <button aria-label="Support">Support</button>
+        </div>
+      </div>`);
+    expect(findReactionButton(root, "EMPATHY", "Support")?.getAttribute("aria-label")).toBe("Support");
+  });
+
+  it("the label fallback never grabs the action-bar Like toggle for LIKE", () => {
+    // A label-only menu with a "Like" item AND the action-bar "React Like …to
+    // Nora's post" toggle: the "'s post" toggle is excluded, so LIKE resolves to
+    // the flyout item, not the toggle.
+    const root = mount(`
+      <div class="feed-shared-social-action-bar">
+        <button aria-label="React Like to Nora Kim's post" aria-pressed="false">Like</button>
+        <div class="reactions-menu">
+          <button aria-label="Like">Like</button>
+          <button aria-label="Support">Support</button>
+        </div>
+      </div>`);
+    const btn = findReactionButton(root, "LIKE", "Like");
+    expect(btn?.getAttribute("aria-label")).toBe("Like");
+    expect(btn?.getAttribute("aria-label")).not.toMatch(/'s post/);
+  });
+
+  it("findReactionButton returns null when the flyout is closed", () => {
+    expect(findReactionButton(mount(fx("feed-post.html")), "PRAISE", "Celebrate")).toBeNull();
+  });
+});
+
+describe("diagnoseCommentSubmit (splits the submit-not-found causes)", () => {
+  const noZero = () => false; // every element has a real box
+  const allZero = () => true; // every element measures zero (no layout)
+
+  it("enabled composer submit → wf=1,en=1,vis=1 (should have been found)", () => {
+    const d = diagnoseCommentSubmit(mount(fx("comment-box-2026.html")), noZero);
+    expect(d).toMatchObject({ box: true, wf: 1, en: 1, vis: 1 });
+    expect(d.top).toBe("Comment_ok");
+  });
+
+  it("dom descriptor captures the editor + submit state (sanitizer-safe)", () => {
+    const d = diagnoseCommentSubmit(mount(fx("comment-box-2026.html")), noZero);
+    // The box is div.tiptap[role=textbox] inside the tiptap wrapper → pm=1.
+    expect(d.dom).toMatch(/\bbx_div\b/);
+    expect(d.dom).toMatch(/\bpm_1\b/);
+    expect(d.dom).toMatch(/\bnce_1\b/);
+    expect(d.dom).toMatch(/\blen_\d+\b/);
+    // The composer submit is enabled in the fixture → dis_false.
+    expect(d.dom).toMatch(/\bdis_false\b/);
+    // Only sanitizer-safe characters so it survives into the reason verbatim.
+    expect(d.dom).toMatch(/^[A-Za-z0-9 _-]+$/);
+  });
+
+  it("region dump names each button's shape (pos/type/flags/group)", () => {
+    const d = diagnoseCommentSubmit(mount(fx("comment-box-2026.html")), noZero);
+    // The composer submit: follows the box, type=BUTTON (live shape), enabled,
+    // worded, NO group (it is NOT flagged as a toggle — the bug this locks in).
+    expect(d.region).toContain("Comment_fb_001_gn");
+    // The action-bar toggle: precedes the box, type=button, toggle-grouped (gt).
+    expect(d.region).toMatch(/Comment_pb_\d\d\d_gt/);
+    // Space-separated so it survives the reason sanitizer.
+    expect(d.region.split(" ").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("region exposes an icon-only (unworded) submit the counts would hide", () => {
+    // The exact shape the live wf=0 row points at: a real submit that carries
+    // no submit word (icon-only), so wf=0, but the region dump still shows a
+    // following submit-typed button with worded=0.
+    const root = mount(
+      "<div class='_c'><div role='textbox' contenteditable='true'>hi</div>" +
+        "<button type='submit' class='_z' aria-label='Add a comment'><svg></svg></button></div>",
+    );
+    const d = diagnoseCommentSubmit(root, noZero);
+    expect(d.wf).toBe(0); // 'Add a comment' isn't in the exact word list
+    expect(d.region).toContain("_fs_000_gn"); // …but the region shows a following submit (type=s), worded=0
+  });
+
+  it("disabled submit → wf=1,en=0 and top names it disabled (the enable-lag race)", () => {
+    const root = mount(fx("comment-box-2026.html"));
+    root.querySelector<HTMLButtonElement>("button[componentkey*='commentButtonSection']")!.disabled = true;
+    const d = diagnoseCommentSubmit(root, noZero);
+    expect(d).toMatchObject({ wf: 1, en: 0, vis: 0 });
+    expect(d.top).toBe("Comment_dis");
+  });
+
+  it("enabled but zero-rect → en=1,vis=0 and top flags the layout skip", () => {
+    const d = diagnoseCommentSubmit(mount(fx("comment-box-2026.html")), allZero);
+    expect(d).toMatchObject({ wf: 1, en: 1, vis: 0 });
+    expect(d.top).toBe("Comment_zr");
+  });
+
+  it("no composer submit, only the action-bar toggle → wf=0 and top=..._tog or _pre", () => {
+    // The submit removed; the only submit-worded button left is the toggle,
+    // which precedes the (now absent) composer / is toggle-classified.
+    const root = mount(fx("comment-box-2026.html"));
+    root.querySelector<HTMLButtonElement>("button[componentkey*='commentButtonSection']")!.remove();
+    const d = diagnoseCommentSubmit(root, noZero);
+    expect(d.wf).toBe(0);
+    expect(d.all).toBeGreaterThanOrEqual(1); // a 'Comment' toggle still exists
+    expect(["_tog", "_pre"].some((s) => d.top.endsWith(s))).toBe(true);
+  });
+
+  it("no box at all → box=false,wf=0,top=none-or-nobox", () => {
+    const d = diagnoseCommentSubmit(mount("<div>nothing here</div>"), noZero);
+    expect(d.box).toBe(false);
+    expect(d.wf).toBe(0);
+  });
+});
