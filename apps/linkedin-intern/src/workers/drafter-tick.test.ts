@@ -598,3 +598,203 @@ describe("runDrafterTick (linkedin quality pipeline)", () => {
   it("a NOTIFICATION lead bypasses the relevance gate — a reply to us is not a stranger", async () => {
     const { postOutbound, markStatus } = deps();
     const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    // The fixture score remains well below the cold-outbound threshold.
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(0.1)]) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({
+          tier: "T1",
+          priority: true,
+          payload: {
+            ...leadPayload,
+            source: "notification",
+            // Must be something the notification TRIAGE answers, or it is
+            // dropped upstream of the relevance gate and this test proves
+            // nothing. A real question from a real person.
+            text: "how do you handle the case where the agent never sees the dependency drift?",
+          },
+        }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+    expect(n).toBe(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    expect(markStatus).not.toHaveBeenCalledWith(
+      expect.objectContaining({ meta: expect.objectContaining({ relevance_threshold: 1.5 }) }),
+    );
+  });
+
+  // The exemption is keyed on SOURCE, not on `lead.priority`, because on
+  // LinkedIn essentially every lead is priority=true — profile_search, keyword
+  // and discovery all set it. Keying on priority would have switched the
+  // relevance gate off for the entire pipeline (1,340 non-notification priority
+  // leads in 14 days vs 17 notification ones) and flooded the queue with
+  // low-relevance cold outbound. This is the test that pins that distinction.
+  // "is weirdly making responses like one that starts" — Lyra had NO thread
+  // context at all (X built a <thread_context> block; LinkedIn built nothing),
+  // so it answered people mid-conversation as if commenting cold on a post.
+  it("a notification lead's prompt carries the CONVERSATION, not just the post", async () => {
+    const { postOutbound, markStatus } = deps();
+    const draft = vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" });
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(9)]) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({
+          tier: "T1",
+          priority: true,
+          payload: {
+            ...leadPayload,
+            source: "notification",
+            text: "how do you handle the case where the agent never sees the dependency drift?",
+            conversation: {
+              root_post_text: "shipping fast is a process problem, not a tooling one",
+              our_reply_text: "only if you ship rarely - the loop is what makes it safe",
+            },
+          },
+        }),
+      ] as never,
+      runner: { draft } as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+    expect(draft).toHaveBeenCalled();
+    const prompt: string = draft.mock.calls[0]![0].prompt;
+    expect(prompt).toContain("NOT a cold lead");
+    expect(prompt).toContain("shipping fast is a process problem");
+    expect(prompt).toContain("only if you ship rarely");
+    // ...and it comes FIRST, before the post, so the model frames the whole
+    // thing as a continuation rather than a cold comment.
+    expect(prompt.indexOf("NOT a cold lead")).toBeLessThan(prompt.indexOf("LinkedIn post by"));
+  });
+
+  it("a COLD lead's prompt is unchanged - no conversation block", async () => {
+    const { postOutbound, markStatus } = deps();
+    const draft = vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" });
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(9)]) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: { draft } as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+    expect(draft.mock.calls[0]![0].prompt).not.toContain("NOT a cold lead");
+  });
+
+  // Conversation replies below the voice floor still reach human review.
+  // Dropping them would mark notifications handled without an approval row.
+  it("a conversation reply below the voice floor is SERVED, never dropped", async () => {
+    const { postOutbound, markStatus } = deps();
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify(oneLight),
+        engine: "bedrock",
+        model: "m",
+        }),
+    };
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(9)]) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({
+          tier: "T1",
+          priority: true,
+          payload: {
+            ...leadPayload,
+            source: "notification",
+            text: "how do you handle the case where the agent never sees the dependency drift?",
+          },
+        }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+      // A floor high enough that any verdict fails it.
+      verify: { enabled: true, retries: 0, voiceFloor: 0.99, makeCalls: () => [] },
+    } as never);
+    // It must NOT have been skipped for low voice.
+    expect(markStatus).not.toHaveBeenCalledWith(
+      expect.objectContaining({ meta: expect.objectContaining({ skip_reason: "low-voice" }) }),
+    );
+    expect(n).toBeGreaterThan(0);
+  });
+
+  it("a PRIORITY lead that is NOT a notification is still gated", async () => {
+    const { postOutbound, markStatus } = deps();
+    const draft = vi.fn();
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(0.1)]) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      // Exactly how a profile_search / keyword lead arrives.
+      claimedLeads: [lead({ tier: "T1", priority: true })] as never,
+      runner: { draft } as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+    expect(n).toBe(0);
+    expect(draft).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "skipped",
+        meta: expect.objectContaining({ relevance_threshold: 1.5 }),
+      }),
+    );
+  });
+
+  it("substantial lead below the relevance threshold is skipped without an LLM call", async () => {
+    const { postOutbound, markStatus } = deps();
+    const draft = vi.fn();
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(0.1)]) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: { draft } as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+    expect(n).toBe(0);
+    expect(draft).not.toHaveBeenCalled();
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "skipped", meta: expect.objectContaining({ relevance_threshold: 1.5 }) }),
+    );
+  });
+
+  it("NEVER includes an autoSend field on the outbound payload (draft-only invariant)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      // auto_send_enabled has no meaning for Lyra; even if a stray flag were set,
+      // the drafter must never stamp an autoSend block.
+      instance: { id: "i", org_id: "o", auto_send_enabled: true } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.autoSend).toBeUndefined();
