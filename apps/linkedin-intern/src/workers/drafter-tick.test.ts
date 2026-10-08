@@ -798,3 +798,203 @@ describe("runDrafterTick (linkedin quality pipeline)", () => {
 
     const body = postOutbound.mock.calls[0]![0];
     expect(body.autoSend).toBeUndefined();
+    expect("autoSend" in body).toBe(false);
+  });
+
+  it("enforces the daily SUBSTANTIAL cap: defers the lead to 'classified', does not draft", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const sqlCalls: unknown[][] = [];
+    const sql = Object.assign(
+      vi.fn(async (_s: TemplateStringsArray, ...vals: unknown[]) => {
+        sqlCalls.push(vals);
+        return [];
+      }),
+      { json: (x: unknown) => x },
+    );
+    const n = await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      dailySubstantialCap: 30,
+      dailyLightCap: 20,
+      // Already drafted 30 substantial today → cap reached.
+      draftedTodayByKind: async (kind) => (kind === "substantial" ? 30 : 0),
+      sql: sql as never,
+    });
+
+    expect(n).toBe(0);
+    expect(runner.draft).not.toHaveBeenCalled();
+    expect(postOutbound).not.toHaveBeenCalled();
+    // The lead was re-set to 'classified' (deferred), not drafted/skipped.
+    expect(sqlCalls.flat()).toContain("L");
+  });
+
+  it("enforces the daily LIGHT cap independently of the substantial cap", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    const sql = Object.assign(
+      vi.fn(async () => []),
+      { json: (x: unknown) => x },
+    );
+    const n = await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      dailySubstantialCap: 30,
+      dailyLightCap: 20,
+      // Substantial budget is wide open, but light is exhausted → defer.
+      draftedTodayByKind: async (kind) => (kind === "light" ? 20 : 0),
+      sql: sql as never,
+    });
+
+    expect(n).toBe(0);
+    expect(runner.draft).not.toHaveBeenCalled();
+    expect(postOutbound).not.toHaveBeenCalled();
+  });
+
+  it("draws down the daily budget within a tick: 2nd substantial lead is deferred when cap=1", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const sql = Object.assign(vi.fn(async () => []), { json: (x: unknown) => x });
+    const n = await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ id: "L1", external_id: "1", tier: "T3", classifier_score: 77 }),
+        lead({ id: "L2", external_id: "2", tier: "T3", classifier_score: 77 }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      dailySubstantialCap: 1,
+      dailyLightCap: 20,
+      draftedTodayByKind: async () => 0,
+      sql: sql as never,
+    });
+
+    expect(n).toBe(1); // only the first lead drafted; second deferred.
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats cap=0 as UNLIMITED, not as 'draft nothing'", async () => {
+    // Regression guard. The defaults are 0 (= no daily cap). The destructuring
+    // default in runDrafterTick only fires for `undefined`, so a raw 0 arriving
+    // here must be normalized to unlimited — otherwise "remove the cap" would
+    // invert into "defer every lead", silently starving the approval queue.
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const sql = Object.assign(vi.fn(async () => []), { json: (x: unknown) => x });
+    const n = await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ id: "L1", external_id: "1", tier: "T3", classifier_score: 77 }),
+        lead({ id: "L2", external_id: "2", tier: "T3", classifier_score: 77 }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      dailySubstantialCap: 0,
+      dailyLightCap: 0,
+      // A big prior-day count must ALSO not re-impose a ceiling when uncapped.
+      draftedTodayByKind: async () => 500,
+      sql: sql as never,
+    });
+
+    expect(n).toBe(2);
+    expect(postOutbound).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips leads with empty post text", async () => {
+    const { postOutbound, markStatus } = deps();
+    const runner = { draft: vi.fn() };
+    const kb = { search: vi.fn().mockResolvedValue([]) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ payload: { text: "" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith({ leadId: "L", status: "skipped", meta: { skip_reason: "empty post text" } });
+  });
+
+  it("marks lead errored when drafter output schema fails", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: "not valid json", engine: "bedrock", model: "m" }) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith({ leadId: "L", status: "errored", meta: { error: "schema" } });
+  });
+
+  it("DEFERS the lead (not errored) when the runner throws BudgetExceededError", async () => {
+    // Budget exhaustion is a temporary, org-wide condition — the monthly cap
+    // resets and the operator can raise it — so it is NOT a defect of the lead.
+    // Marking it 'errored' stranded it permanently (recoverable only by a manual
+    // requeue). It must go back to 'classified' so a later tick re-drafts it.
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = {
+      draft: vi.fn(async () => {
+        throw new BudgetExceededError({ layer: "instance", spent_cents: 9999, cap_cents: 10000, estimated_cents: 200 });
+      }),
+    };
+    const statements: string[] = [];
+    const sqlValues: unknown[] = [];
+    const sql = Object.assign(
+      vi.fn(async (strings: unknown, ...vals: unknown[]) => {
+        statements.push((strings as string[] | undefined)?.join("?") ?? "");
+        sqlValues.push(...vals);
+        return [];
+      }),
+      { json: (x: unknown) => x },
+    );
+    await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      sql: sql as never,
+    });
+
+    expect(postOutbound).not.toHaveBeenCalled();
+    // Never stranded as errored.
+    expect(markStatus).not.toHaveBeenCalledWith(
+      expect.objectContaining({ status: "errored" }),
+    );
+    // Deferred back to 'classified', stamped with the budget reason.
+    const deferStmt = statements.find((s) => s.includes("status = 'classified'"));
+    expect(deferStmt).toBeDefined();
+    expect(sqlValues).toContain("L");
+    expect(sqlValues).toContainEqual({ budget_deferred: "substantial" });
+  });
+
+  it("stamps a budget-deferred LIGHT lead with kind 'light'", async () => {
