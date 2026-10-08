@@ -198,3 +198,203 @@ const ActuatorStateInput = z.object({
  * — the phone-facing half of the feature. Writes agent_instances.actuator_desired_state
  * (0089) and bumps actuator_command_at, which the extension long-polls
  * (GET /api/actuator/intent) and reconciles to within ~1s: 'running' resumes
+ * Full-automatic, 'stopped' ends any live run and gates autonomy off.
+ *
+ * IMPORTANT: 'running' means "hands ALLOWED to run", NOT send-consent. On X,
+ * replies still only post when reply_send_enabled is on (that separate kill
+ * switch stays authoritative) — so starting the actuator here never silently
+ * begins posting. Org-scoped, same guard as setReplySendEnabled.
+ */
+export async function setActuatorDesiredState(
+  input: z.infer<typeof ActuatorStateInput>,
+): Promise<{ ok: true } | { ok: false; error: { code: string; message: string } }> {
+  const parsed = ActuatorStateInput.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: { code: "bad_input", message: parsed.error.message } };
+  }
+  const { orgSlug, instanceId, desired } = parsed.data;
+
+  const user = await getCurrentUser();
+  if (!user) return { ok: false, error: { code: "unauthenticated", message: "Sign in first." } };
+
+  let org;
+  try {
+    org = await getOrgBySlug(orgSlug);
+  } catch (err) {
+    if (err instanceof OrgMembershipError)
+      return { ok: false, error: { code: "forbidden", message: "Not a member of this org." } };
+    throw err;
+  }
+  if (!org) return { ok: false, error: { code: "not_found", message: "Org not found." } };
+
+  const rows = await sql<{ id: string }[]>`
+    update noelle.agent_instances
+    set actuator_desired_state = ${desired}, actuator_command_at = now(), updated_at = now()
+    where id = ${instanceId}
+      and org_id = ${org.id}
+      and role in ${sql(INTERN_ROLES)}
+    returning id
+  `;
+  if (rows.length === 0) {
+    return { ok: false, error: { code: "not_found", message: "Agent instance not found." } };
+  }
+
+  revalidatePath(AGENT_PAGE_ROUTE, "page");
+  return { ok: true };
+}
+
+const LaneInput = z.object({
+  orgSlug: z.string().min(1),
+  instanceId: z.string().uuid(),
+  lane: z.enum(["replies", "dms", "posts"]),
+  enabled: z.boolean(),
+  // Only meaningful for the dms lane (proactive intro DMs).
+  introDmsEnabled: z.boolean().optional(),
+});
+
+const RelationshipDmsInput = z.object({
+  orgSlug: z.string().min(1),
+  instanceId: z.string().uuid(),
+  enabled: z.boolean(),
+});
+
+const RELATIONSHIP_DM_ROLES = ["linkedin_intern", "x_intern"] as const;
+
+/**
+ * Toggle a whole LANE on/off for the multi-lane agent. Each lane maps to the
+ * real gate the workers already honor, so there's ONE source of truth:
+ *   - replies → drafter_enabled (the reply drafter; DMs ride it)
+ *   - dms     → dm_autodraft_enabled (+ linkedin_intro_dm_enabled for intro DMs)
+ *   - posts   → lane_config.posts.enabled (the only lane without a column; the
+ *               ideation + post-drafter workers gate on it, 0049)
+ * Org-scoped UPDATE; the org_id match is the IDOR guard.
+ */
+export async function setLaneEnabled(
+  input: z.infer<typeof LaneInput>,
+): Promise<{ ok: true } | { ok: false; error: { code: string; message: string } }> {
+  const parsed = LaneInput.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: { code: "bad_input", message: parsed.error.message } };
+  }
+  const { orgSlug, instanceId, lane, enabled, introDmsEnabled } = parsed.data;
+
+  const user = await getCurrentUser();
+  if (!user) return { ok: false, error: { code: "unauthenticated", message: "Sign in first." } };
+
+  let org;
+  try {
+    org = await getOrgBySlug(orgSlug);
+  } catch (err) {
+    if (err instanceof OrgMembershipError)
+      return { ok: false, error: { code: "forbidden", message: "Not a member of this org." } };
+    throw err;
+  }
+  if (!org) return { ok: false, error: { code: "not_found", message: "Org not found." } };
+
+  let rows: { id: string }[];
+  if (lane === "replies") {
+    rows = await sql<{ id: string }[]>`
+      update noelle.agent_instances set drafter_enabled = ${enabled}, updated_at = now()
+      where id = ${instanceId} and org_id = ${org.id} and role in ${sql(INTERN_ROLES)}
+      returning id
+    `;
+  } else if (lane === "dms") {
+    if (introDmsEnabled == null) {
+      rows = await sql<{ id: string }[]>`
+        update noelle.agent_instances
+        set dm_autodraft_enabled = ${enabled}, updated_at = now()
+        where id = ${instanceId} and org_id = ${org.id} and role in ${sql(INTERN_ROLES)}
+        returning id
+      `;
+    } else {
+      rows = await sql<{ id: string }[]>`
+        update noelle.agent_instances
+        set dm_autodraft_enabled = ${enabled},
+            linkedin_intro_dm_enabled = ${introDmsEnabled},
+            updated_at = now()
+        where id = ${instanceId} and org_id = ${org.id} and role in ${sql(INTERN_ROLES)}
+        returning id
+      `;
+    }
+  } else {
+    // posts → read-modify-write lane_config so the other lanes' state is kept.
+    const current = await sql<{ lane_config: unknown }[]>`
+      select lane_config from noelle.agent_instances
+      where id = ${instanceId} and org_id = ${org.id} and role in ${sql(INTERN_ROLES)}
+      limit 1
+    `;
+    if (current.length === 0) {
+      return { ok: false, error: { code: "not_found", message: "Agent instance not found." } };
+    }
+    const cfg = resolveLaneConfig(current[0]!.lane_config);
+    cfg.posts = { enabled };
+    rows = await sql<{ id: string }[]>`
+      update noelle.agent_instances set lane_config = ${sql.json(cfg as never)}, updated_at = now()
+      where id = ${instanceId} and org_id = ${org.id} and role in ${sql(INTERN_ROLES)}
+      returning id
+    `;
+  }
+
+  if (rows.length === 0) {
+    return { ok: false, error: { code: "not_found", message: "Agent instance not found." } };
+  }
+  revalidatePath(AGENT_PAGE_ROUTE, "page");
+  return { ok: true };
+}
+
+/**
+ * Toggle the stored-context relationship-DM lane. It is intentionally separate
+ * from reply companion DMs and Lyra intro DMs: workers should only gate this
+ * lane on lane_config.dms.relationship_dms_enabled and an active-or-paused instance.
+ */
+export async function setRelationshipDmsEnabled(
+  input: z.infer<typeof RelationshipDmsInput>,
+): Promise<{ ok: true } | { ok: false; error: { code: string; message: string } }> {
+  const parsed = RelationshipDmsInput.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: { code: "bad_input", message: parsed.error.message } };
+  }
+  const { orgSlug, instanceId, enabled } = parsed.data;
+  const auth = await authorizeOrg(orgSlug);
+  if (auth.kind !== "ok") return { ok: false, error: { code: auth.kind, message: auth.kind } };
+
+  const current = await sql<{ lane_config: unknown }[]>`
+    select lane_config from noelle.agent_instances
+    where id = ${instanceId}
+      and org_id = ${auth.org.id}
+      and role in ${sql(RELATIONSHIP_DM_ROLES)}
+    limit 1
+  `;
+  if (current.length === 0) {
+    return { ok: false, error: { code: "not_found", message: "Agent instance not found." } };
+  }
+
+  const cfg = resolveLaneConfig(current[0]!.lane_config);
+  cfg.dms = { ...cfg.dms, relationship_dms_enabled: enabled };
+  const rows = await sql<{ id: string }[]>`
+    update noelle.agent_instances
+    set lane_config = ${sql.json(cfg as never)}, updated_at = now()
+    where id = ${instanceId}
+      and org_id = ${auth.org.id}
+      and role in ${sql(RELATIONSHIP_DM_ROLES)}
+    returning id
+  `;
+  if (rows.length === 0) {
+    return { ok: false, error: { code: "not_found", message: "Agent instance not found." } };
+  }
+
+  revalidatePath(AGENT_PAGE_ROUTE, "page");
+  return { ok: true };
+}
+
+const StartAllInput = z.object({
+  orgSlug: z.string().min(1),
+  instanceId: z.string().uuid(),
+  // optional goal-run target ("get me N leads ready"). 1..500; absent = no goal.
+  goalTarget: z.number().int().positive().max(500).optional(),
+  // optional "Tailor this run" discovery override for THIS run only. Absent =
+  // use the saved default (run_config is cleared so no stale override lingers).
+  runConfig: DiscoveryConfigSchema.optional(),
+});
+const StopAllInput = z.object({
+  orgSlug: z.string().min(1),
