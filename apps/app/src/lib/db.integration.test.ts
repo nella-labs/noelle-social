@@ -198,3 +198,93 @@ describe.skipIf(!url)("dashboard actual SQL wrapper with committed result loss",
     const result = await sql`insert into audit_retry.probe(label) values ('fixture') returning id`.then(() => ({ ok: true }), (error: unknown) => ({ ok: false, error }));
     const rows = await native`select id,label from audit_retry.probe order by id`;
     expect(state.dropped, `fixture injector: clients=${state.clients.length}, attempts=${state.attempts}`).toBe(true);
+    expect(rows).toHaveLength(1);
+    expect(result.ok).toBe(false);
+    expect(state.attempts).toBe(1);
+  });
+  it("never increments twice after a committed UPDATE result is lost", async () => {
+    await native`insert into audit_retry.probe(label) values ('fixture')`;
+    state.fault = "update";
+    const result = await sql`update audit_retry.probe set value=value+1 returning value`.then(() => ({ ok: true }), (error: unknown) => ({ ok: false, error }));
+    expect(state.dropped, `fixture injector: clients=${state.clients.length}, attempts=${state.attempts}`).toBe(true);
+    expect((await native`select value from audit_retry.probe`)[0]?.value).toBe(1);
+    expect(result.ok).toBe(false);
+    expect(state.attempts).toBe(1);
+  });
+  it("never replays a transaction callback after native COMMIT loses its result", async () => {
+    state.fault = "transaction";
+    const callback = vi.fn(async (tx: import("postgres").TransactionSql) => { await tx`insert into audit_retry.probe(label) values ('transaction')`; });
+    await expect(withTx(callback)).rejects.toMatchObject({ code: "ECONNRESET" });
+    expect(callback).toHaveBeenCalledOnce();
+    expect(await native`select label from audit_retry.probe`).toEqual([{ label: "transaction" }]);
+    expect(state.forcedEnds).toBe(0);
+  });
+  it("refuses a mutating SELECT function inside the actual read-only transaction", async () => {
+    const result = await readSql`select audit_retry.mutate()`.then(() => null, (error: { code?: string }) => error.code);
+    expect(result).toBe("25006");
+    expect(await native`select id from audit_retry.probe`).toHaveLength(0);
+    expect(await readSql`select count(*)::int as n from audit_retry.probe`).toEqual([{ n: 0 }]);
+  });
+  it("refuses a writable CTE inside the actual read-only transaction", async () => {
+    const result = await readSql`with changed as (insert into audit_retry.probe(label) values ('cte') returning id) select id from changed`.then(() => null, (error: { code?: string }) => error.code);
+    expect(result).toBe("25006");
+    expect(await native`select id from audit_retry.probe`).toHaveLength(0);
+  });
+  it("recovers a dropped read using the same pool without a forceful shutdown", async () => {
+    state.fault = "select";
+    expect(await readSql`select count(*)::int as n from audit_retry.probe`).toEqual([{ n: 0 }]);
+    expect(state.dropped).toBe(true);
+    expect(state.clients).toHaveLength(1);
+    expect(state.forcedEnds).toBe(0);
+  });
+  it("exhausted read retries release failed reservations through driver closure and allow the next reader", async () => {
+    state.fault = "select"; state.lossesRemaining = 3;
+    await expect(readSql`select count(*)::int as n from audit_retry.probe`).rejects.toMatchObject({ code: "ECONNRESET" });
+    expect(state.lossesRemaining).toBe(0);
+    expect(await readSql`select count(*)::int as n from audit_retry.probe`).toEqual([{ n: 0 }]);
+    expect(state.clients).toHaveLength(1);
+    expect(state.forcedEnds).toBe(0);
+  });
+  it("native statement cancellation rolls back read-only state and releases the connection for a writer", async () => {
+    state.statementTimeoutMs = 100;
+    await expect(readSql`select pg_sleep(1)`).rejects.toMatchObject({ code: "57014" });
+    expect(await readSql`select count(*)::int as n from audit_retry.probe`).toEqual([{ n: 0 }]);
+    await sql`insert into audit_retry.probe(label) values ('after canceled read')`;
+    expect(await native`select label from audit_retry.probe`).toEqual([{ label: "after canceled read" }]);
+    expect(state.clients).toHaveLength(1);
+    expect(state.forcedEnds).toBe(0);
+  });
+  it("reconnects after a real backend termination and preserves another in-flight transaction", async () => {
+    state.max = 2; // Exercise shared-pool concurrency through actual postgres.js connections.
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    let started!: () => void;
+    const writeStarted = new Promise<void>((resolve) => { started = resolve; });
+    const writing = sql.begin(async (tx) => {
+      await tx`set local idle_in_transaction_session_timeout='20s'`;
+      await tx`insert into audit_retry.probe(label) values ('surviving transaction')`;
+      started(); await barrier;
+    }).then(() => ({ ok: true }), (error: unknown) => ({ ok: false, error }));
+    try {
+      await withTimeout(writeStarted, 1000, "fixture write start");
+      const reading = readSql`select 1 as n, pg_sleep(2) as delay /* native_read_reconnect */`.then(() => ({ ok: true }), (error: unknown) => ({ ok: false, error }));
+      let pid: number | undefined;
+      const until = Date.now() + 2000;
+      while (!pid && Date.now() < until) {
+        const [row] = await native<{ pid: number }[]>`select pid from pg_stat_activity
+          where datname=current_database() and pid<>pg_backend_pid() and state='active'
+            and query like 'select 1 as n, pg_sleep%native_read_reconnect%' limit 1`;
+        pid = row?.pid;
+        if (!pid) await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(pid).toBeTypeOf("number");
+      await native`select pg_terminate_backend(${pid!})`;
+      const outcome = await withTimeout(reading, 12000, "fixture read recovery");
+      expect(outcome.ok).toBe(true);
+    } finally { release(); }
+    expect((await writing).ok).toBe(true);
+    expect(await native`select label from audit_retry.probe`).toEqual([{ label: "surviving transaction" }]);
+    expect(state.clients).toHaveLength(1);
+    expect(state.forcedEnds).toBe(0);
+  }, 15000);
+});
