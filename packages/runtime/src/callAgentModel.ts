@@ -598,3 +598,144 @@ async function invoke(opts: {
     await safeRecord(opts.recorder, {
       orgId: opts.args.orgId,
       instanceId: opts.args.instanceId,
+      agentRole: opts.args.agentRole,
+      worker: opts.args.worker,
+      engine: opts.engine.engine,
+      model: opts.engine.model,
+      bucket: opts.args.bucket,
+      inputTokens: accounting.inputTokens,
+      outputTokens: 0,
+      cents: accounting.cents,
+      costBasis: accounting.costBasis,
+      latencyMs,
+      status,
+      startedAt,
+      ...(attemptId ? { attemptId } : {}),
+    });
+    throw engineErr;
+  }
+}
+
+/**
+ * Estimate input tokens from prompt length (≈4 chars/token, typical for
+ * mixed English+code) and assume a 1KB output (≈250 tokens). The 1KB
+ * assumption matches the spec: small enough that the cap rarely false-
+ * positives on long-prompt calls, large enough that the cap actually
+ * catches runaway loops.
+ */
+function estimatePreflightCents(
+  engine: EngineHandle,
+  system: string,
+  prompt: string,
+): number {
+  const charCount = system.length + prompt.length;
+  const inputTokens = Math.ceil(charCount / 4);
+  const outputTokens = 250;
+  return safeEstimateCents(engine, inputTokens, outputTokens);
+}
+
+/**
+ * Buckets that need longer than the backend default. Everything absent keeps
+ * the default, so a slow drafter still fails fast rather than holding a worker.
+ *
+ * `ideation` is the pattern-breaker: it reads up to 100 posts and emits ~12,000
+ * tokens of findings. Observed over Aug 24-26 it finished in 157-175s when it
+ * finished at all, and blew the 180s default 54 times out of 66 — 82% of the
+ * lane. Each of those still paid for the input and the generation and kept
+ * nothing. 600s gives the job room while remaining a real ceiling for a task
+ * that runs once every six hours.
+ */
+const BUCKET_TIMEOUT_MS: Readonly<Record<string, number>> = {
+  ideation: Number(process.env.NOELLE_IDEATION_TIMEOUT_MS) || 600_000,
+};
+
+export function bucketTimeoutMs(bucket: string): number | undefined {
+  return BUCKET_TIMEOUT_MS[bucket];
+}
+
+/**
+ * Whether a spent Claude budget should fall through to the ChatGPT
+ * subscription. On by default once a codex-cli backend is wired — wiring one is
+ * already an explicit act. NOELLE_CODEX_FAILOVER=0 turns it off and restores
+ * "the cap stops the work".
+ */
+export function codexFailoverEnabled(): boolean {
+  return process.env.NOELLE_CODEX_FAILOVER !== "0";
+}
+
+/**
+ * The Codex pot's own ceiling, in cents. Separate from the Claude cap by
+ * design: the two are different subscriptions, and one running out says nothing
+ * about the other. Default $500/period, matching what the Claude side is set to.
+ */
+export function codexCapCents(): number {
+  const raw = Number(process.env.NOELLE_CODEX_CAP_CENTS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 50_000;
+}
+
+/**
+ * Whether the ChatGPT pot still has room this period.
+ *
+ * "Exempt from the Claude cap" was left meaning "unbounded", which is not a
+ * thing a budget system should have — the failover would have kept spending a
+ * second subscription with nothing watching it. This is the ceiling for that
+ * pot, measured over the same window the Claude cap uses.
+ *
+ * An adapter that cannot report per-engine spend (an older one, or a test stub)
+ * returns true: the failover then behaves as it did before this check existed,
+ * which is the fail-OPEN direction — deliberately. The alternative is refusing
+ * to fail over on a monitoring gap, i.e. going dark to protect a budget nobody
+ * is actually measuring.
+ */
+async function codexPotHasRoom(deps: CallAgentModelDeps, orgId: string): Promise<boolean> {
+  // Durable adapters check the separate pot atomically immediately before dispatch.
+  if (deps.budget.adapters.reserveAttempt) return true;
+  const read = deps.budget.adapters.fetchEngineSpend;
+  if (!read) return true;
+  try {
+    const spent = await read({ engine: "codex-cli", orgId });
+    return spent < codexCapCents();
+  } catch {
+    return true;
+  }
+}
+
+function safeEstimateCents(
+  engine: EngineHandle,
+  inputTokens: number,
+  outputTokens: number,
+): number {
+  try {
+    return estimateCallCents({
+      engine: engine.engine,
+      model: engine.model,
+      inputTokens,
+      outputTokens,
+    });
+  } catch {
+    return 0;
+  }
+}
+
+async function safeRecord(
+  recorder: SpendRecorder,
+  row: import("./spendRecorder.js").SpendRow,
+): Promise<void> {
+  try {
+    await recorder.record(row);
+  } catch {
+    // A durable admission remains held when receipt persistence fails.
+  }
+}
+
+function isTimeout(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const msg = ("message" in err && typeof (err as { message: unknown }).message === "string"
+    ? (err as { message: string }).message
+    : "").toLowerCase();
+  return msg.includes("timed out") || msg.includes("timeout") || msg.includes("etimedout");
+}
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
