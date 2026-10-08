@@ -598,3 +598,203 @@ async function cmdTunnel(): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// expose / autostart — phone access over Tailscale + Mac-login auto-start.
+//
+// These are HOST-side (the Mac): the dashboard + api-vm run inside the Lima VM
+// and can't touch the host's launchd or tailscale. They read the operator's app
+// port + remoteAccess settings from the VM's config.json (the source of truth)
+// via `limactl shell`, and write resolved state back the same way.
+// ---------------------------------------------------------------------------
+function requireDarwinHost(action: string): boolean {
+  if (platform() === "darwin") return true;
+  ui.err(`\`noelle ${action}\` runs on the Mac host, not inside the Linux VM.`);
+  ui.info("It manages launchd + tailscale, which only exist on the host.");
+  return false;
+}
+
+/**
+ * A stable absolute node for the LaunchAgent. `process.execPath` is a
+ * version-pinned Cellar path (e.g. .../node/25.8.1/bin/node) that breaks on the
+ * next `brew upgrade node`; the `which node` symlink (/opt/homebrew/bin/node)
+ * survives upgrades. Fall back to execPath if PATH has no node.
+ */
+async function resolveStableNode(): Promise<string> {
+  const r = await run("which", ["node"], { allowFailure: true });
+  const p = r.stdout.trim();
+  return r.code === 0 && p ? p : process.execPath;
+}
+
+/** Dirs to put on the LaunchAgent's PATH so limactl/tailscale/node resolve. */
+async function resolvePathDirs(): Promise<string[]> {
+  const dirs = new Set<string>([dirname(process.execPath), "/opt/homebrew/bin", "/usr/local/bin"]);
+  for (const bin of ["limactl", "tailscale"]) {
+    const r = await run("which", [bin], { allowFailure: true });
+    if (r.code === 0 && r.stdout.trim()) dirs.add(dirname(r.stdout.trim()));
+  }
+  return [...dirs];
+}
+
+function resolveMode(args: Args, fallback: TailscaleMode): TailscaleMode {
+  const m = str(args.flags, "mode");
+  return m === "http" || m === "https" ? m : fallback;
+}
+
+async function cmdExpose(args: Args): Promise<number> {
+  if (!requireDarwinHost("expose")) return 2;
+  const vm = str(args.flags, "vm") ?? "default";
+  if (!(await limaInstalled())) {
+    ui.err("limactl not found — this self-host runs inside a Lima VM.");
+    return 1;
+  }
+  const config = await readVmConfig(vm);
+  if (!config) {
+    ui.err(`Couldn't read ~/.noelle/config.json in VM "${vm}". Is it running + initialized?`);
+    return 1;
+  }
+  const appPort = config.ports.app;
+  const ts = config.remoteAccess.tailscale;
+
+  if (bool(args.flags, "off")) {
+    // Target only OUR listener (never `serve reset` — other apps may be served).
+    await tailscaleServeOff(ts.mode, ts.port);
+    ts.enabled = false;
+    ts.url = null;
+    await writeVmConfig(vm, config);
+    ui.ok(`Tailscale serve on :${ts.port} cleared. The dashboard is no longer published.`);
+    return 0;
+  }
+
+  if (!(await tailscaleInstalled())) {
+    ui.err(`tailscale not found. Install it: ${tailscaleInstallHint()}`);
+    return 1;
+  }
+  const mode = resolveMode(args, ts.mode);
+  const portFlag = str(args.flags, "port");
+  const port = portFlag !== undefined ? Number(portFlag) : ts.port;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    ui.err(`--port must be 1-65535 (got "${portFlag}")`);
+    return 2;
+  }
+
+  // Switching port/mode? Clear the old listener first so we don't leave a stale
+  // mapping behind (e.g. the previous 443 root the operator wanted off of).
+  if (ts.enabled && (ts.port !== port || ts.mode !== mode)) {
+    await tailscaleServeOff(ts.mode, ts.port);
+    ui.info(`cleared previous serve on :${ts.port}`);
+  }
+
+  ui.step(`Exposing dashboard (:${appPort}) over Tailscale [${mode} :${port}]`);
+  try {
+    await tailscaleServe(appPort, mode, port);
+  } catch (err) {
+    ui.err((err as Error).message);
+    if (mode === "https") {
+      ui.warn("If that's a cert error, enable HTTPS certs once in the Tailscale admin:");
+      ui.warn("  https://login.tailscale.com/admin/dns  → enable MagicDNS + HTTPS Certificates");
+    }
+    return 1;
+  }
+  const url = await tailscaleResolveUrl(mode, port);
+  config.remoteAccess.tailscale = { enabled: true, mode, port, url };
+  await writeVmConfig(vm, config);
+  ui.ok(`Exposed → ${url ?? "(couldn't resolve URL — see `tailscale serve status`)"}`);
+  ui.info("Open that URL on your phone (signed into the same tailnet). Survives reboots (--bg).");
+  ui.info("`noelle autostart install` also re-exposes it automatically on Mac login.");
+  return 0;
+}
+
+async function cmdAutostart(args: Args): Promise<number> {
+  if (!requireDarwinHost("autostart")) return 2;
+  const sub = args._[1] ?? "status";
+  const vm = str(args.flags, "vm") ?? "default";
+
+  if (sub === "install") {
+    if (!(await limaInstalled())) {
+      ui.err("limactl not found — this self-host runs inside a Lima VM.");
+      return 1;
+    }
+    const repoRoot = str(args.flags, "repo")
+      ? expandHome(str(args.flags, "repo")!)
+      : findRepoRoot();
+    ui.step("Installing the login LaunchAgent");
+    ui.info(`repo (host): ${repoRoot}`);
+    const vmUpCommand = await resolveVmUpCommand(vm);
+    const pathDirs = await resolvePathDirs();
+    const nodeBin = await resolveStableNode();
+    await autostartInstall({ repoRoot, nodeBin, pathDirs, vm });
+
+    const config = await readVmConfig(vm);
+    if (config) {
+      config.remoteAccess.autostart = { enabled: true, vm, vmUpCommand };
+      // Installing autostart implies we want login to also expose the port.
+      config.remoteAccess.tailscale.enabled = true;
+      await writeVmConfig(vm, config);
+    } else {
+      ui.warn(`LaunchAgent installed, but couldn't persist state to VM "${vm}" (start + init it).`);
+    }
+    ui.ok(`Installed (${AUTOSTART_LABEL}). Noelle starts on every login.`);
+    ui.info(`VM bring-up: ${vmUpCommand}`);
+    ui.info(`Test now without a reboot:  launchctl kickstart -k gui/$(id -u)/${AUTOSTART_LABEL}`);
+    return 0;
+  }
+  if (sub === "uninstall") {
+    await autostartUninstall();
+    const config = await readVmConfig(vm);
+    if (config) {
+      config.remoteAccess.autostart.enabled = false;
+      await writeVmConfig(vm, config);
+    }
+    ui.ok("LaunchAgent removed. Noelle will no longer start on login.");
+    return 0;
+  }
+  // status (default)
+  const st = await autostartStatus();
+  ui.step("Autostart (login LaunchAgent)");
+  ui.plain(`  loaded     ${st.loaded ? "✓ yes" : "· no"}`);
+  ui.plain(`  plist      ${st.plistExists ? st.plist : "(not installed)"}`);
+  if (st.lastLog) {
+    ui.plain("  recent log:");
+    for (const line of st.lastLog.split("\n")) ui.plain(`    ${line}`);
+  }
+  return 0;
+}
+
+/** Internal: invoked by the login LaunchAgent. Start VM → up → expose. */
+async function cmdAutostartRun(args: Args): Promise<number> {
+  const vm = str(args.flags, "vm") ?? "default";
+  ui.step(`[autostart-run] vm=${vm}`);
+  if (platform() !== "darwin") {
+    ui.err("autostart-run is host-only.");
+    return 2;
+  }
+  // Native install: bring the stack up on this Mac, no VM to boot.
+  const hostConfig = loadConfig();
+  if (isNativeRuntime(hostConfig)) return autostartRunNative(args, hostConfig!);
+  if (!(await limaInstalled())) {
+    ui.err("limactl not found.");
+    return 1;
+  }
+  await startVm(vm);
+  if (!(await waitVmReady(vm, 120_000))) {
+    ui.err("VM did not become ready within 120s.");
+    return 1;
+  }
+  ui.ok("VM ready");
+
+  const config = await readVmConfig(vm);
+  if (!config) {
+    ui.err("Could not read VM config; aborting.");
+    return 1;
+  }
+
+  const up = config.remoteAccess.autostart.vmUpCommand || "noelle up";
+  ui.step(`Bringing Noelle up in VM: ${up}`);
+  const upRes = await limaShell(vm, up);
+  ui.info(upRes.code === 0 ? "noelle up ok" : `noelle up exited ${upRes.code} (continuing)`);
+
+  if (config.remoteAccess.tailscale.enabled) {
+    const { mode, port } = config.remoteAccess.tailscale;
+    const appPort = config.ports.app;
+    if (await tailscaleInstalled()) {
+      try {
+        await tailscaleServe(appPort, mode, port);
