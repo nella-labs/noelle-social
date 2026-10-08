@@ -998,3 +998,203 @@ async function tickOnce() {
     await api.logActivity(s.sessionId, events).catch(() => {});
     return;
   }
+
+  // Warm-up: for the first warmupSuppressMs of the session, no writes — arrive,
+  // scroll, and read first (a human doesn't fire the instant they land). Defer
+  // the slot, run a short ambient browse, then skip.
+  if (isWrite && now - s.startMs < s.warmupSuppressMs) {
+    const d = deferLater(action, now, windowEndMs, rng);
+    action.atMs = d.atMs;
+    await ambientBrowse(s, cfg, tabId, rng, now);
+    // STOP race during the (now longer) warm-up read.
+    const cur = await loadState();
+    if (cur && cur.status !== "running") return;
+    events.push({ type: "skip", reason: "warming-up", at });
+    s.lastEvent = "warming up — reading first";
+    await saveIfCurrent(s);
+    await api.logActivity(s.sessionId, events).catch(() => {});
+    return;
+  }
+
+  // STOP (or a superseding Run) may have landed during the awaits above
+  // (replenish, challenge probe). Re-check the epoch before touching LinkedIn so
+  // a just-stopped run never fires one last action.
+  if (myEpoch !== (await currentEpoch())) return;
+
+  try {
+    if (action.kind === "like") {
+      // Bound total likes to the session budget: idle-likes (fired in the waits)
+      // and scheduled like slots share s.done.likes, so once the budget is met the
+      // idle-likes have already delivered this slot's like — skip it rather than
+      // over-liking past the cap.
+      if (s.done.likes >= s.targets.likes) {
+        events.push({ type: "skip", reason: "like-budget-met", at });
+      } else {
+        await likeAFeedPost(tabId, s, cfg, rng, events, at);
+      }
+      action.executed = true;
+    } else if (action.kind === "comment") {
+      // "comment" is the shared engine's write action — for X it posts a reply.
+      const item = s.commentPool.shift();
+      if (!item) {
+        // supply-aware: defer this slot later in the window, do NOT execute
+        const d = deferLater(action, now, s.startMs + s.windowHours * 3600_000, rng);
+        action.atMs = d.atMs;
+        events.push({ type: "skip", reason: "reply-awaiting-supply", at });
+      } else if (tweetDedupKey(item.url) && (s.actionedUrls ?? []).includes(tweetDedupKey(item.url)!)) {
+        // Per-tweet guard: already replied to this tweet this session. The queue
+        // can hold >1 draft for one tweet; two replies on a single tweet is a
+        // prime X spam signal. Keyed on the numeric status id (tweetDedupKey) so
+        // two drafts whose URLs differ only cosmetically still collapse. Drop
+        // the extra draft (mark done), don't post it.
+        s.doneDraftIds.push(item.draftId);
+        action.executed = true;
+        events.push({ type: "skip", reason: "duplicate-post", at });
+      } else {
+        // Pre-send revalidation (fail-closed). The queue fetch can be
+        // minutes-to-hours old; since then this approval may have been decided
+        // elsewhere (human skip / sent) or claimed by the x-intern API-autosend
+        // pipeline (auto_send_target_at stamped — claimAutoSendDue posts it via
+        // the official API). Posting anyway would duplicate a public reply, so
+        // only a JUST-verified pending+unstamped approval proceeds; a failed
+        // check retries under the normal cap (as a pre-dispatch failure)
+        // instead of posting unverified.
+        const gate = preSendDecision(await api.approvalState(item.approvalId).catch(() => null));
+        const res: CommentOutcome =
+          gate.action === "drop" ? { superseded: gate.reason }
+          : gate.action === "retry" ? { ok: false, detail: gate.reason, dispatched: false }
+          : await doComment(tabId, item, rng, s.persona.wpm, myEpoch, api);
+        if ("superseded" in res) {
+          // Another actor decided or owns this approval. Drop it locally so the
+          // slot frees up — but write NOTHING durable: no markSent (this client
+          // posted nothing) and no markSkipped (never clobber someone else's
+          // decision/claim; the server already reflects the real state).
+          s.doneDraftIds.push(item.draftId);
+          action.executed = true;
+          await wakeDiscoveryRead();
+          events.push({ type: "skip", reason: `reply-${res.superseded}`, tweet_id: tweetIdFrom(item.url) ?? undefined, at });
+        } else if ("unavailable" in res) {
+          // Permanent: the target tweet can never be replied to from this
+          // account — either the post is GONE (deleted by its author, a
+          // protected account, account suspended, a dead permalink / 404) or
+          // replies are restricted ("Who can reply?"). Either way no composer
+          // will ever render, so DROP the draft (mark done locally) instead of
+          // re-queueing it — the old path unshifted it to the FRONT of the
+          // pool, so the SAME dead permalink was re-opened on every slot,
+          // monopolizing the queue (and repeatedly navigating to a dead tweet
+          // is a bot tell). Do NOT markSent — nothing was posted. The specific
+          // cause rides in res.detail (post-unavailable | reply-restricted)
+          // for the skip reason.
+          s.doneDraftIds.push(item.draftId);
+          action.executed = true;
+          const reason = `reply-${res.detail ?? "post-unavailable"}`;
+          // Also mark it skipped SERVER-SIDE so the queue stops re-serving this
+          // permalink on every FUTURE run. The local drop only lasts the session;
+          // the approval otherwise stays 'pending' forever (markSent never fires
+          // for a tweet that can't be replied to), so each new run re-navigates
+          // to it and drops it again. Best-effort: a failure just means it's
+          // re-served next session.
+          await api.markSkipped(item.approvalId, reason).catch(() => {});
+          await wakeDiscoveryRead();
+          events.push({ type: "skip", reason, tweet_id: tweetIdFrom(item.url) ?? undefined, at });
+          // LEAVE the dead permalink — ALWAYS (not just drain mode): otherwise
+          // ambient browsing + the next like idle on a dead page. Epoch-guarded
+          // so a run stopped mid-attempt never moves the operator's tab.
+          if (myEpoch === (await currentEpoch())) {
+            await navigateTab(tabId, "https://x.com/home", rng).catch(() => {});
+          }
+        } else if (res.ok) {
+          // Record the send LOCALLY *before* the network-fragile markSent, so a
+          // transient "Failed to fetch" (e.g. api-vm restart) can't drop the
+          // record and cause the draft to be re-served — and re-posted (the old
+          // ordering: a markSent throw jumped to the catch below with the item
+          // already shift()ed off the pool but never in doneDraftIds, so
+          // maybeReplenish re-served it). markSent is then retried best-effort;
+          // if it never confirms we still don't re-post (the draft is in
+          // doneDraftIds), we just log it for reconcile.
+          s.doneDraftIds.push(item.draftId);
+          action.executed = true;
+          s.done.comments++;
+          const dk = tweetDedupKey(item.url);
+          if (dk) (s.actionedUrls ??= []).push(dk);
+          s.lastProgressMs = now; // a landed post = progress; the stall detector reads this
+          const marked = await markSentWithRetry(api, item.approvalId, myEpoch);
+          await wakeDiscoveryRead();
+          // Stamp the replied tweet's id + approval id onto the activity row.
+          // The tweet_id is the durable dedup-by-link record: written at post
+          // time (this logActivity is independent of markSent), it survives a
+          // failed markSent, and the queue (0086) filters future pulls against
+          // it. The approval_id also fixes the per-author daily cap, whose
+          // x_activity join was always empty on bare {type:'reply'} events.
+          const evt: XActivityEvent = { type: "reply", approval_id: item.approvalId, at };
+          const tid = tweetIdFrom(item.url);
+          if (tid) evt.tweet_id = tid;
+          events.push(evt);
+          if (!marked) events.push({ type: "skip", reason: "marksent-unconfirmed", at });
+          // Reply-also-likes (opt-in, cfg.replyAlsoLikes, DEFAULT OFF): a human
+          // often likes what they engage with, but likes on X are an extra
+          // uncapped behavioral write (docs/x-account-safety.md), so unlike the
+          // LinkedIn actuator this only runs when explicitly enabled.
+          // Best-effort + not counted against the like target.
+          if (cfg.replyAlsoLikes === true) {
+            // ...but not EVERY time. A 100%-consistent reply->like pairing is
+            // itself a fingerprint, so a small drifting fraction is skipped
+            // (rollLikeSkip; the rate re-rolls so it is not a static signature).
+            const { skip: skipLike, next: nextSkip } = rollLikeSkip(s.likeSkip, () => rng.next());
+            s.likeSkip = nextSkip;
+            if (!skipLike) {
+              const liked = await likeCurrentTweet(tabId, item, rng);
+              if (liked) events.push({ type: "like", tweet_id: tweetIdFrom(item.url) ?? undefined, at });
+            }
+          }
+          // Return to the timeline after replying — in EVERY mode, not just
+          // drain — so the follow-up likes + ambient browsing land on the feed
+          // (locateLike scrolls x.com/home), not on the just-replied tweet's
+          // detail page. Epoch-guarded: a run stopped/superseded mid-reply must
+          // never move the operator's tab.
+          if (myEpoch === (await currentEpoch())) {
+            await navigateTab(tabId, "https://x.com/home", rng).catch(() => {});
+            await waitTabComplete(tabId);
+          }
+        } else {
+          // Failure policy (replyFailureDecision, pure + unit-tested):
+          //
+          // 1) A submit gesture WAS dispatched (button click or ⌘/Ctrl+Enter
+          //    chord — details not-cleared / submit-not-found, whose chord
+          //    fallback also fires, and gesture-error, a mid-gesture throw):
+          //    the outcome is AMBIGUOUS. If the post actually landed but
+          //    replyPosted() false-negatived (a post landing slower than the
+          //    observation window, or composer drift leaving text readable
+          //    after success), a retry would re-navigate, re-type, and re-post
+          //    the SAME reply to the SAME tweet — the exact spam signal this
+          //    lane prevents. So: drop the draft locally (done, no markSent —
+          //    nothing confirmed), stamp the tweet into actionedUrls so a
+          //    sibling draft for the same tweet dies as duplicate-post, AND
+          //    stamp tweet_id onto the skip row: the server dedup counts
+          //    tweet_id-stamped skip rows as reply evidence (fail-closed), so
+          //    the still-pending approval is NEVER re-served — cross-session
+          //    retry of a maybe-landed submit is the same spam risk, just
+          //    later. The approval stays pending for the operator to reconcile
+          //    (send manually or reject) rather than being silently re-posted.
+          // 2) Pre-dispatch failure (box-not-found / stopped early): nothing
+          //    could have posted — retry, but BOUNDED (MAX_ACTION_TRIES) and
+          //    at the BACK of the pool, so one un-submittable draft can't be
+          //    retried every slot and starve every other pending reply.
+          const stage = res.detail ? `:${res.detail}` : "";
+          // 3) The PRE-SEND verify could not reach api-vm (restart, tunnel flap).
+          //    That is an infra blip, not a bad target: nothing was attempted
+          //    against X at all. Re-queue at the BACK and defer WITHOUT consuming
+          //    a try — otherwise three api-vm hiccups against one draft retire it
+          //    for the session, and a sustained outage silently drains the entire
+          //    pool without a single post.
+          const verifyUnreachable = res.dispatched !== true && res.detail === "verify-unreachable";
+          const decision = verifyUnreachable
+            ? ({ plan: "retry-back", tries: item.tries ?? 0 } as const)
+            : replyFailureDecision(res.dispatched === true, item.tries ?? 0);
+          if (decision.plan === "drop-ambiguous") {
+            s.doneDraftIds.push(item.draftId);
+            action.executed = true;
+            const dk = tweetDedupKey(item.url);
+            if (dk && !(s.actionedUrls ?? []).includes(dk)) (s.actionedUrls ??= []).push(dk);
+            const evt: XActivityEvent = { type: "skip", reason: `reply-failed${stage}:ambiguous-dropped`, at };
+            const tid = tweetIdFrom(item.url);
