@@ -598,3 +598,84 @@ export function createApifyLinkedInClient(opts: CreateApifyLinkedInClientOpts): 
         ...(postedLimit ? { postedLimit } : {}),
       }, maxPosts);
       return normalizeAll(items, maxPosts, sinceISO);
+    },
+
+    async searchProfiles({
+      searchQuery,
+      currentJobTitles,
+      locations,
+      seniorityLevelIds,
+      yearsOfExperienceIds,
+      industryIds,
+      schools,
+      maxItems = 25,
+      mode = "Short",
+    }) {
+      transport.beginOperation();
+      const items = await runActorSync<ApifyProfileItem>(profileSearchActorId, "linkedin-profile-search", {
+        ...(searchQuery ? { searchQuery } : {}),
+        ...(currentJobTitles && currentJobTitles.length ? { currentJobTitles } : {}),
+        ...(locations && locations.length ? { locations } : {}),
+        ...(seniorityLevelIds && seniorityLevelIds.length ? { seniorityLevelIds } : {}),
+        ...(yearsOfExperienceIds && yearsOfExperienceIds.length ? { yearsOfExperienceIds } : {}),
+        ...(industryIds && industryIds.length ? { industryIds } : {}),
+        ...(schools && schools.length ? { schools } : {}),
+        maxItems,
+        profileScraperMode: mode,
+      }, maxItems);
+      const seen = new Set<string>();
+      const out: CandidateProfile[] = [];
+      for (const item of items) {
+        const p = normalizeProfile(item);
+        if (!p || !p.publicId || seen.has(p.publicId)) continue;
+        seen.add(p.publicId);
+        out.push(p);
+      }
+      return out.slice(0, maxItems);
+    },
+
+    async postComments({ postUrl, maxComments = 40 }) {
+      transport.beginOperation();
+      if (!postUrl) throw new ApifyError("postComments requires postUrl", 0);
+      const items = await runActorSync<ApifyCommentItem>(postCommentsActorId, "linkedin-post-comments", {
+        postUrls: [postUrl],
+        maxItems: maxComments,
+      }, maxComments);
+      const seen = new Set<string>();
+      const out: LinkedInComment[] = [];
+      for (const item of items) {
+        const c = normalizeComment(item);
+        if (!c || seen.has(c.id)) continue;
+        seen.add(c.id);
+        out.push(c);
+      }
+      return out.slice(0, maxComments);
+    },
+
+    async authoredComments({ profileUrl, publicId, maxComments = 40, sinceISO }) {
+      transport.beginOperation();
+      const target = profileUrl ?? (publicId ? publicIdToUrl(publicId) : undefined);
+      if (!target) throw new ApifyError("authoredComments requires profileUrl or publicId", 0);
+      const postedLimit = sinceToPostedLimit(sinceISO);
+      const items = await runActorSync<ApifyAuthoredCommentItem>(profileCommentsActorId, "linkedin-profile-comments", {
+        // The actor targets by full profile URL (no publicIdentifier/targetUrls key).
+        profiles: [target],
+        maxItems: maxComments,
+        ...(postedLimit ? { postedLimit } : {}),
+      }, maxComments);
+      const since = readSourceTimestamp(sinceISO);
+      const seen = new Set<string>();
+      const out: LinkedInComment[] = [];
+      for (const item of items) {
+        const c = normalizeAuthoredComment(item);
+        if (!c || seen.has(c.id)) continue;
+        // Precise recency floor (the actor's postedLimit is only coarse). Keep
+        // items with no timestamp — dropping them would silently lose data.
+        if (since !== null && c.createdAt !== null && c.createdAt <= since) continue;
+        seen.add(c.id);
+        out.push(c);
+      }
+      return out.slice(0, maxComments);
+    },
+  };
+}
