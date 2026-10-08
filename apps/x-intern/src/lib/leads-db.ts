@@ -598,3 +598,7 @@ export async function reapStaleClaims(
       and status = ${args.claimedStatus}
       and payload->>'reply_requested' is distinct from 'true'
       and updated_at < now() - make_interval(hours => ${STALE_CLAIM_EXPIRE_HOURS})
+    returning id
+  `;
+  return { requeued: requeued.length, expired: expired.length };
+}
