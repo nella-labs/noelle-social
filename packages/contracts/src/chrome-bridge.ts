@@ -198,3 +198,82 @@ export type ExtEvent = z.infer<typeof ExtEventSchema>;
 // ---------------------------------------------------------------------------
 
 export const LogLevelSchema = z.enum(["debug", "info", "warn", "error"]);
+export type LogLevel = z.infer<typeof LogLevelSchema>;
+
+// A source is a stable slug for the emitter, e.g. "x-actuator",
+// "linkedin-actuator", "reddit-intern", "chrome-bridge-ext", "actuator-doctor".
+export const BridgeSourceSchema = z.string().min(1).max(64).regex(/^[a-z0-9][a-z0-9._-]*$/);
+
+export const LogEntrySchema = z.object({
+  source: BridgeSourceSchema,
+  level: LogLevelSchema.default("info"),
+  at: z.string(), // ISO timestamp minted by the emitter
+  msg: z.string(),
+  // free-form structured context (draft id, tab id, selector, cap name, ...).
+  data: z.record(z.string(), z.unknown()).optional(),
+  // optional correlation ids so the doctor can stitch a run together.
+  run_id: z.string().optional(),
+  session_id: z.string().optional(),
+  // optional pre-computed failure signature slug (see actuator-doctor.ts). When
+  // absent, the doctor derives one from level+msg.
+  signature: z.string().optional(),
+});
+export type LogEntry = z.infer<typeof LogEntrySchema>;
+
+export const LogIngestSchema = z.object({
+  source: BridgeSourceSchema,
+  entries: z.array(LogEntrySchema.omit({ source: true })).min(1).max(500),
+});
+export type LogIngest = z.infer<typeof LogIngestSchema>;
+
+// Heartbeat: "this actuator is alive and here is its shape-of-health right now".
+// The doctor turns a stale/absent heartbeat into a fault (when the lane is
+// switched on and inside its active window).
+export const HeartbeatSchema = z.object({
+  source: BridgeSourceSchema,
+  at: z.string(),
+  // coarse liveness state the emitter reports about itself.
+  state: z.enum(["idle", "running", "draining", "paused", "error"]),
+  detail: z
+    .object({
+      // e.g. how many actions this run, current tab url, cap remaining, last error.
+      run_id: z.string().optional(),
+      session_id: z.string().optional(),
+      tab_url: z.string().optional(),
+      actions_done: z.number().optional(),
+      actions_planned: z.number().optional(),
+      cap_remaining: z.number().optional(),
+      last_error: z.string().optional(),
+      build_stamp: z.string().optional(),
+      extra: z.record(z.string(), z.unknown()).optional(),
+    })
+    .optional(),
+});
+export type Heartbeat = z.infer<typeof HeartbeatSchema>;
+
+// GET /heartbeats response: latest heartbeat per source with a computed age.
+export const HeartbeatStatusSchema = HeartbeatSchema.extend({
+  age_ms: z.number(), // now - at, computed by the bridge at read time
+  stale: z.boolean(), // age_ms > the source's configured stale threshold
+});
+export type HeartbeatStatus = z.infer<typeof HeartbeatStatusSchema>;
+
+// GET /logs query result.
+export const LogQueryResultSchema = z.object({
+  source: BridgeSourceSchema.optional(),
+  count: z.number(),
+  entries: z.array(LogEntrySchema),
+});
+export type LogQueryResult = z.infer<typeof LogQueryResultSchema>;
+
+// GET /health for the bridge itself.
+export const BridgeHealthSchema = z.object({
+  ok: z.boolean(),
+  version: z.string(),
+  ext_connected: z.boolean(),
+  ext_version: z.string().optional(),
+  chrome_version: z.string().optional(),
+  sources: z.array(z.string()), // sources seen since boot
+  uptime_ms: z.number(),
+});
+export type BridgeHealth = z.infer<typeof BridgeHealthSchema>;
