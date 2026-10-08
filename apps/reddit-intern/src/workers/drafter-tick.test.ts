@@ -1598,3 +1598,158 @@ describe("runDrafterTick — comment targeting (REDDIT_COMMENT_TARGETING)", () =
     for (const d of body.drafts) expect(d.replyTarget).toBeUndefined();
     // Still shows the top comments as room context, but replies to the post.
     const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("Reddit post by u/jane_builder in r/SaaS:");
+    expect(prompt).toContain("TOP COMMENTS ON THIS POST");
+  });
+
+  it("stays post-targeted when targeting is disabled even with a high-score comment", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [commentLead([topComment({ score: 999 })])] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      commentTargeting: { enabled: false, minScore: 30 },
+    });
+    const body = postOutbound.mock.calls[0]![0];
+    for (const d of body.drafts) expect(d.replyTarget).toBeUndefined();
+  });
+
+  it("stays post-targeted when the post has no comments", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      commentTargeting: { enabled: true, minScore: 30 },
+    });
+    const body = postOutbound.mock.calls[0]![0];
+    for (const d of body.drafts) expect(d.replyTarget).toBeUndefined();
+  });
+});
+
+describe("decideCommentTarget (deterministic post-vs-comment rule)", () => {
+  const tc = (score: number, over: Record<string, unknown> = {}) => [
+    { id: "x", body: "a real comment", score, author: "a", permalink: "/r/SaaS/comments/abc123/title/x/", ...over },
+  ];
+
+  it("does not select a comment bound to a different post", () => {
+    expect(decideCommentTarget({ topComments: [{ id: "def456", body: "A measured trace", score: 50, author: "a",
+      permalink: "/r/SaaS/comments/other9/title/def456/" }], enabled: true, minScore: 30,
+      postId: "abc123", subreddit: "SaaS" })).toBeNull();
+  });
+
+  it("returns the top comment when enabled and score >= min", () => {
+    expect(decideCommentTarget({ postId: "abc123", topComments: tc(50), enabled: true, minScore: 30 })?.id).toBe("x");
+  });
+  it.each([null, undefined, NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1])("does not target an unknown/invalid measurement %j at floor zero", score => {
+    expect(decideCommentTarget({ postId: "abc123", topComments: tc(0, { score }), enabled: true, minScore: 0 })).toBeNull();
+  });
+  it("allows a measured zero to satisfy a zero floor", () => {
+    expect(decideCommentTarget({ postId: "abc123", topComments: tc(0), enabled: true, minScore: 0 })?.id).toBe("x");
+  });
+  it("null when the top comment is below min score", () => {
+    expect(decideCommentTarget({ postId: "abc123", topComments: tc(10), enabled: true, minScore: 30 })).toBeNull();
+  });
+  it("null when targeting is disabled", () => {
+    expect(decideCommentTarget({ postId: "abc123", topComments: tc(999), enabled: false, minScore: 30 })).toBeNull();
+  });
+  it("null when there are no comments or the body is empty", () => {
+    expect(decideCommentTarget({ postId: "abc123", topComments: [], enabled: true, minScore: 0 })).toBeNull();
+    expect(decideCommentTarget({ postId: "abc123", topComments: undefined, enabled: true, minScore: 0 })).toBeNull();
+    expect(decideCommentTarget({ postId: "abc123", topComments: tc(50, { body: "   " }), enabled: true, minScore: 0 })).toBeNull();
+  });
+});
+
+describe("runDrafterTick — reply freshness (post age)", () => {
+  const iso = (hoursAgo: number) => new Date(Date.now() - hoursAgo * 3_600_000).toISOString();
+
+  it("stamps the outbound with the post's REAL posted_at, not draft time", async () => {
+    // The linchpin: api-vm merges outbound.postedAt back onto the lead
+    // (excluded-wins), so stamping new Date() here silently overwrote
+    // discovery's posted_at and made every reply's post age read as "just now".
+    const posted = iso(5);
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ payload: { ...lead().payload, posted_at: posted } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(postOutbound.mock.calls[0]![0].postedAt).toBe(posted);
+  });
+
+  it("skips a lead past maxPostAgeHours (post-too-old), never drafting it", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ payload: { ...lead().payload, posted_at: iso(50) } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      maxPostAgeHours: 24,
+    });
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leadId: "L",
+        status: "skipped",
+        meta: expect.objectContaining({ skip_reason: expect.stringContaining("post-too-old") }),
+      }),
+    );
+  });
+
+  it("drafts a fresh lead even with maxPostAgeHours set", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ payload: { ...lead().payload, posted_at: iso(2) } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      maxPostAgeHours: 24,
+    });
+    expect(n).toBe(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+  });
+
+  it("never age-skips a lead with no posted_at and preserves unknown source time", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead()] as never, // base lead has no posted_at
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      maxPostAgeHours: 24,
+    });
+    expect(n).toBe(1);
+    expect(postOutbound.mock.calls[0]![0].postedAt).toBeNull();
+  });
+
+  it.each(["", "2026-02-30T00:00:00Z"])("keeps malformed source date %j unknown in outbound", async (posted_at) => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({ log, instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ payload: { ...lead().payload, posted_at } })] as never,
+      runner: runner as never, kb: kb as never, postOutbound, markStatus });
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    expect(postOutbound.mock.calls[0]![0].postedAt).toBeNull();
+  });
+});
