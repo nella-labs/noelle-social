@@ -198,3 +198,8 @@ describe("hydrating Copy control", () => {
       isCurrent: async () => { throw new Error("gate error"); },
       locate: async () => { reads++; return { ok: true, rect }; },
       wait: async () => {},
+    });
+    expect(found).toEqual({ ok: false, skipReason: "stopped" });
+    expect(reads).toBe(0);
+  });
+});

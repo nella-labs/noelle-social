@@ -1,0 +1,195 @@
+<!--
+  REAL captured comments section (linkedin.com feed, 2026-07-26), distilled.
+
+  Trimmed: SVG path data, profile <img> blobs, repeated icon markup. Every
+  attribute the locators key on is preserved VERBATIM from the capture:
+
+   - the per-comment id/componentkey carrying the FULL comment urn
+       replaceableComment_urn:li:comment:(urn:li:ugcPost:<POST>,<COMMENT>)
+     ...which is the only stable way to find one specific comment. The trailing
+     number is exactly what the notifications sweep stores as external_id.
+   - CommentComponentReference_urn:li:comment:(...) on the inner wrapper
+   - the per-comment  <button aria-label="Reply">  (its componentkey is a fresh
+     uuid per render, so aria-label + comment scoping is the locator)
+   - the reply composer that opens on click:
+       [componentkey^="commentBox-"]  →  .tiptap.ProseMirror[contenteditable]
+     pre-filled with a non-editable mention chip for the person being answered
+   - the composer's submit, whose label is "Reply" (the POST-level composer's
+     says "Comment" — that difference is the safety check that we are threading
+     and not about to publish a second top-level comment)
+
+  Comment 7486091099183251456 is OURS (renders "You"). 7487199472029192192 is
+  Malena replying TO us — the notification case.
+-->
+<main>
+<div class="_49700731 _1e74276c db09f18f ee7044f7" componentkey="commentsSectionContaineryOvv272rqQoZmXaCyhrkoMrfPaz6V16jMLVrRjkARmYFeedType_MAIN_FEED_RELEVANCE">
+  <div class="_49700731" data-testid="EgsIgIDLjIat5-PPAQ-commentList" data-component-type="LazyColumn">
+
+    <!-- ── the POST-level composer: always present, submit reads "Comment" ── -->
+    <div class="_49700731 postlevel" componentkey="commentBox-POSTLEVEL-Ki8KInVybjpsaTp1Z2NQb3N0">
+      <div class="c88d6641" data-testid="ui-core-tiptap-text-editor-wrapper">
+        <div contenteditable="true" role="textbox" aria-label="Text editor for creating comment" class="tiptap ProseMirror"><p></p></div>
+      </div>
+      <div class="ccf47613" id="POSTLEVEL-commentButtonSection">
+        <button class="b1c0ad9e" type="button"><span><span class="_687a5045">Comment</span></span></button>
+      </div>
+    </div>
+
+    <!-- ── OUR OWN comment ─────────────────────────────────────────────── -->
+    <div class="fe75eb61 b614e234" componentkey="replaceableComment_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7486091099183251456)">
+      <div class="adafeb81" data-display-contents="true">
+        <div class="ccf47613 _2d3af64c" id="replaceableComment_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7486091099183251456)" componentkey="replaceableComment_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7486091099183251456)" threadlinedecoration="[object Object]">
+          <div class="adafeb81" data-display-contents="true">
+            <div class="_227243f3" componentkey="CommentComponentReference_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7486091099183251456)">
+              <a tabindex="0" href="https://www.linkedin.com/in/demooperator/"><figure></figure></a>
+              <div class="_49700731 _218c12d6">
+                <div class="_6f81d1d9 _99e76580">
+                  <a tabindex="0" href="https://www.linkedin.com/in/demooperator/">
+                    <p class="_687a5045"><span><span class="_2ae05657">Alex Rivera  You</span><span aria-hidden="true">Alex Rivera<span class="_3ab7a3ad"><span> • You</span></span></span></span></p>
+                  </a>
+                  <div class="_9c74de59 _7787db38"><p class="_687a5045"><span>3d</span></p></div>
+                  <button type="button" aria-label="View more options for Alex Rivera’ comment." aria-expanded="false"></button>
+                </div>
+                <p class="_687a5045" componentkey="comment-commentary_8965b439-1f43-42fc-baad-aa7df6f0bef5">
+                  <span class="faab9d57" tabindex="-1" data-testid="expandable-text-box">a week to teach yourself advanced econometrics and python, on your own, as the only second-year in the room.</span>
+                </p>
+                <div class="f5430fc5">
+                  <div class="_45565655 c84cf9d1">
+                    <button class="b1c0ad9e" type="button" componentkey="defbbac1-5100-4d93-90b5-b982f824fe47" aria-label="Reply"><span></span></button>
+                    <div><p class="_687a5045"><span><span class="_2ae05657">1</span><span aria-hidden="true">1</span></span></p></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── THEIR reply to us — the notification case ───────────────────── -->
+    <div class="_63a6d4f2 b614e234">
+      <div class="adafeb81" data-display-contents="true">
+        <div class="ccf47613 _2d3af64c" id="replaceableComment_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7487199472029192192)" componentkey="replaceableComment_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7487199472029192192)" threadlinedecoration="[object Object]">
+          <div class="adafeb81" data-display-contents="true">
+            <div class="_227243f3" componentkey="CommentComponentReference_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7487199472029192192)">
+              <a tabindex="0" href="https://www.linkedin.com/in/malena-mir-garcia/"><figure></figure></a>
+              <div class="_49700731 _218c12d6">
+                <div class="_6f81d1d9 _99e76580">
+                  <a tabindex="0" href="https://www.linkedin.com/in/malena-mir-garcia/">
+                    <p class="_687a5045"><span>Malena M.</span></p>
+                  </a>
+                  <div class="_9c74de59 _7787db38"><p class="_687a5045"><span>8h</span></p></div>
+                  <button type="button" aria-label="View more options for Malena M.’s comment." aria-expanded="false"></button>
+                </div>
+                <p class="_687a5045" componentkey="comment-reply-commentary_1c3123db-17f9-4982-b585-02d831614941">
+                  <span class="faab9d57" tabindex="-1" data-testid="expandable-text-box">
+                    <a class="_00cb4a6c" href="https://www.linkedin.com/in/demooperator/"><span class="f373559d"><strong>Alex Rivera</strong></span></a>
+                    <span class="_320231c1"></span>
+                    thank you so much!! I will
+                  </span>
+                </p>
+                <div class="f5430fc5">
+                  <div class="_45565655 c84cf9d1">
+                    <button class="b1c0ad9e" type="button" componentkey="23f88326-d395-4a6e-b63c-12043e90a522" aria-label="Reply"><span></span></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── the REPLY composer, as it renders after clicking Reply ───────── -->
+    <div class="ae29cd27 b614e234" displayedexpression="[object Object]">
+      <div class="_49700731 c1215c4b" threadlinedecoration="[object Object]">
+        <div class="_1e74276c _527dbadb">
+          <figure aria-hidden="true"></figure>
+          <div class="_49700731 _218c12d6">
+            <div class="adafeb81" data-display-contents="true">
+              <div class="_49700731 _89202f1c">
+                <div class="_1e74276c _527dbadb">
+                  <div class="adafeb81" data-display-contents="true">
+                    <div class="_218c12d6 _7e93879e" componentkey="commentBox-Ki8KInVybjpsaTp1Z2NQb3N0Ojc0ODYwNTQyNzg5Mjc4MzUxMzYQgIDAsKKM-OPPAQ-yOvv272rqQoZmXaCyhrkoMrfPaz6V16jMLVrRjkARmYFeedType_MAIN_FEED_RELEVANCE">
+                      <div class="_2ae05657" role="status" aria-live="polite" aria-atomic="true"></div>
+                      <div class="c88d6641" data-testid="ui-core-tiptap-text-editor-wrapper">
+                        <div class="a9406364 d7c90a10 cde28a1b">
+                          <div contenteditable="true" role="textbox" dir="auto" tabindex="0" aria-label="Text editor for creating comment" translate="no" class="tiptap ProseMirror _558b06f6" componentkey="95647256-a07a-425e-9938-f8e7865ae4a4">
+                            <p><span data-allow-partial-delete="true" data-type="mention" contenteditable="false"><strong>Malena M.</strong></span>&nbsp;</p>
+                          </div>
+                        </div>
+                        <div class="_77e20d18" data-testid="ui-core-tiptap-text-editor-cursor"></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="_64d59fda fcbdb727">
+                  <div class="_1e74276c _527dbadb">
+                    <button class="b1c0ad9e" type="button" aria-label="Show Emoji Picker" aria-expanded="false"></button>
+                    <button class="b1c0ad9e" type="button" aria-label="Open GIF picker" aria-haspopup="dialog" aria-expanded="false"></button>
+                    <button class="b1c0ad9e" type="button" aria-label="Share photo"></button>
+                  </div>
+                  <div class="ccf47613 _2d3af64c" id="Ki8KInVybjpsaTp1Z2NQb3N0Ojc0ODYwNTQyNzg5Mjc4MzUxMzYQgIDAsKKM-OPPAQ-commentButtonSectionyOvv272rqQoZmXaCyhrkoMrfPaz6V16jMLVrRjkARmYFeedType_MAIN_FEED_RELEVANCE" componentkey="Ki8KInVybjpsaTp1Z2NQb3N0Ojc0ODYwNTQyNzg5Mjc4MzUxMzYQgIDAsKKM-OPPAQ-commentButtonSectionyOvv272rqQoZmXaCyhrkoMrfPaz6V16jMLVrRjkARmYFeedType_MAIN_FEED_RELEVANCE">
+                    <button class="b1c0ad9e" type="button" componentkey="2d2c97f7-7375-4507-98a1-14d3575156bf">
+                      <span class="_8cca8429"><span class="_687a5045 _8fc50b4b">Reply</span></span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── an unrelated third-party comment (must never be targeted) ────── -->
+    <div class="fe75eb61 b614e234" componentkey="replaceableComment_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7486071797881315328)">
+      <div class="adafeb81" data-display-contents="true">
+        <div class="ccf47613 _2d3af64c" id="replaceableComment_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7486071797881315328)" componentkey="replaceableComment_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7486071797881315328)">
+          <div class="adafeb81" data-display-contents="true">
+            <div class="_227243f3" componentkey="CommentComponentReference_urn:li:comment:(urn:li:ugcPost:7486054278927835136,7486071797881315328)">
+              <a tabindex="0" href="https://www.linkedin.com/in/mateu-rojas-comella-89a878337/"><figure></figure></a>
+              <div class="_49700731 _218c12d6">
+                <div class="_6f81d1d9 _99e76580">
+                  <a tabindex="0" href="https://www.linkedin.com/in/mateu-rojas-comella-89a878337/">
+                    <p class="_687a5045"><span><span class="_2ae05657">Mateu Rojas Comella Verified Profile 3rd+</span><span aria-hidden="true">Mateu Rojas Comella</span></span></p>
+                  </a>
+                  <div class="_9c74de59 _7787db38"><p class="_687a5045"><span>3d</span></p></div>
+                </div>
+                <p class="_687a5045" componentkey="comment-commentary_7cc82708-6373-4e40-8731-53294c41cdea">
+                  <span class="_6b146445" tabindex="-1" data-testid="expandable-text-box">Congratulations, Malena! What an incredible year.</span>
+                </p>
+                <div class="f5430fc5">
+                  <div class="_45565655 c84cf9d1">
+                    <button class="b1c0ad9e" type="button" componentkey="935fa925-c0c0-465c-9a07-1fb107d38250" aria-label="Reply"><span></span></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ── a SECOND open reply composer, belonging to Mateu's comment ────── -->
+    <div class="ae29cd27 b614e234">
+      <div class="_218c12d6" componentkey="commentBox-MATEU-Ki8KInVybjpsaTp1Z2NQb3N0">
+        <div class="c88d6641" data-testid="ui-core-tiptap-text-editor-wrapper">
+          <div contenteditable="true" role="textbox" aria-label="Text editor for creating comment" class="tiptap ProseMirror">
+            <p><span data-allow-partial-delete="true" data-type="mention" contenteditable="false"><strong>Mateu Rojas Comella</strong></span>&nbsp;</p>
+          </div>
+        </div>
+        <div class="ccf47613" id="MATEU-commentButtonSection">
+          <button class="b1c0ad9e" type="button"><span><span class="_687a5045">Reply</span></span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="ccf47613 _2d3af64c" id="EgsIgIDLjIat5-PPAQ-replaceableLoadMoreComments">
+    <div role="button" tabindex="0" componentkey="d34a32a1-4bca-4f21-a84a-cee5a11615df">
+      <p class="_687a5045">See 33 more comments</p>
+    </div>
+  </div>
+</div>
+</main>
