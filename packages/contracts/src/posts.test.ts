@@ -198,3 +198,77 @@ describe("PostDismissInSchema", () => {
   it("defaults scope to row and accepts set", () => {
     expect(PostDismissInSchema.parse({ target: "draft" }).scope).toBe("row");
     expect(PostDismissInSchema.parse({ target: "draft", scope: "set" }).scope).toBe("set");
+    expect(() => PostDismissInSchema.parse({ target: "draft", scope: "all" })).toThrow();
+  });
+});
+
+describe("PostReplaceOutSchema", () => {
+  it("accepts a dismissed idea with a queued replacement", () => {
+    const out = PostReplaceOutSchema.parse({
+      id: UUID_A,
+      status: "dismissed",
+      replacement_queued: true,
+    });
+    expect(out.status).toBe("dismissed");
+    expect(out.replacement_queued).toBe(true);
+  });
+  it("rejects a non-dismissed status (replace always dismisses the killed idea)", () => {
+    expect(() =>
+      PostReplaceOutSchema.parse({ id: UUID_A, status: "approved", replacement_queued: true }),
+    ).toThrow();
+  });
+});
+
+describe("resolveLaneConfig", () => {
+  it("empty object → legacy defaults (replies on, dms/posts off)", () => {
+    const r = resolveLaneConfig({});
+    expect(r).toEqual({
+      replies: { enabled: true },
+      dms: {
+        enabled: false,
+        intro_dms_enabled: false,
+        relationship_dms_enabled: false,
+      },
+      posts: { enabled: false },
+    });
+  });
+
+  it("respects explicit overrides", () => {
+    const r = resolveLaneConfig({
+      posts: { enabled: true },
+      dms: {
+        enabled: true,
+        intro_dms_enabled: true,
+        relationship_dms_enabled: true,
+      },
+    });
+    expect(r.posts.enabled).toBe(true);
+    expect(r.dms.intro_dms_enabled).toBe(true);
+    expect(r.dms.relationship_dms_enabled).toBe(true);
+  });
+
+  it("exports the platform daily caps for relationship DMs", () => {
+    expect(RELATIONSHIP_DM_DAILY_CAPS).toEqual({ linkedin: 40, x: 15 });
+  });
+
+  it("falls back to defaults on malformed config", () => {
+    const r = resolveLaneConfig({ posts: { enabled: "yes" } });
+    expect(r.posts.enabled).toBe(false);
+  });
+
+  it("LaneConfigSchema rejects unknown lanes", () => {
+    expect(() => LaneConfigSchema.parse({ stories: { enabled: true } })).toThrow();
+  });
+});
+
+describe.each([IdeationTriggerInSchema, ManualIdeaInSchema])("explicit creation owner", schema => {
+ const base = schema === ManualIdeaInSchema ? { hook: "An operator hook" } : {};
+ const orgId = "11111111-1111-4111-8111-111111111111", agentInstanceId = "22222222-2222-4222-8222-222222222222";
+ it("retains the canonical explicit owner pair", () => {
+  expect(schema.parse({ ...base, orgId, agentInstanceId })).toMatchObject({ orgId, agentInstanceId });
+ });
+ it("rejects a partial owner or malformed UUID", () => {
+  expect(() => schema.parse({ ...base, orgId })).toThrow();
+  expect(() => schema.parse({ ...base, orgId, agentInstanceId: "wrong" })).toThrow();
+ });
+});
