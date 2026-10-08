@@ -398,3 +398,117 @@ export function createApifyXClient(opts: CreateApifyXClientOpts): ApifyXClient {
       bio: firstString(r.description, r.bio, r.rawDescription) ?? null,
       followers: asCount(r.followers ?? r.followers_count ?? r.followersCount),
     };
+  }
+
+  return {
+    drainRunReceipts: transport.drainRunReceipts,
+    drainLastRunUsd: transport.drainLastRunUsd,
+    async userTweets({ handle, limit = 40, sinceISO, excludeReplies, excludeRetweets }) {
+      transport.beginOperation();
+      boundedLimit(limit, 500, "limit");
+      if (limit === 0) return { tweets: [], resultCount: 0 };
+      // kaito's `twitterHandles` input returns MOCK data; the supported way to
+      // pull a single user's timeline is the `from:` search operator (apidojo
+      // accepted twitterHandles, kaito does not). The actor honours `from:`
+      // server-side and returns that user's real, latest posts — and because it
+      // is a search query, the same advanced-search operators the keyword lane
+      // uses work here too. That matters for cost: the actor bills per RETURNED
+      // item, so a reply/retweet/out-of-window tweet excluded server-side is an
+      // item never paid for (they'd all be dropped client-side anyway).
+      const clean = handle.trim().replace(/^@/, "");
+      const parts = [`from:${clean}`];
+      if (excludeReplies) parts.push("-filter:replies");
+      if (excludeRetweets) parts.push("-filter:nativeretweets");
+      if (sinceISO) parts.push(`since_time:${Math.floor(new Date(sinceISO).getTime() / 1000)}`);
+      const items = await runActorSync({
+        searchTerms: [parts.join(" ")],
+        maxItems: limit,
+        sort: "Latest",
+      }, limit);
+      return normalizeAll(items, limit, sinceISO);
+    },
+
+    async searchTimeline({ query, limit = 40, sinceISO }) {
+      transport.beginOperation();
+      boundedLimit(limit, 500, "limit");
+      if (limit === 0) return { tweets: [], resultCount: 0 };
+      // `query` already carries X's native operators (min_faves, lang, since_time,
+      // -filter:replies, …) from buildSearchQuery, which the actor's advanced
+      // search syntax honours server-side. sinceISO is the client-side backstop.
+      const items = await runActorSync({
+        searchTerms: [query],
+        maxItems: limit,
+        sort: "Latest",
+      }, limit);
+      return normalizeAll(items, limit, sinceISO);
+    },
+
+    async scrapeFollowers({ seedHandles, maxUsers, getFollowers = true, getFollowing = false }) {
+      transport.beginOperation();
+      boundedLimit(maxUsers, 2000, "maxUsers");
+      const seeds = Array.from(
+        new Set(seedHandles.map((h) => h.trim().toLowerCase().replace(/^@/, "")).filter(Boolean)),
+      );
+      if (seeds.length > 5) throw new ApifyXError("at most 5 seed handles are supported", 400);
+      const directions = Number(getFollowers) + Number(getFollowing);
+      if (seeds.length === 0 || maxUsers === 0 || directions === 0) return { people: [], resultCount: 0 };
+      // The actor floors maxFollowers/maxFollowings at 200; asking for less is
+      // rejected, so clamp UP and let the caller's own cap do the real limiting
+      // (we slice the result below). This is pay-per-result, so the slice does
+      // not refund — the caller must size maxUsers deliberately.
+      const perList = Math.max(200, Math.floor(maxUsers / (seeds.length * directions)));
+      const paidLimit = perList * seeds.length * directions;
+      const { items, ...coverage } = await runActorSync(
+        {
+          user_names: seeds,
+          getFollowers,
+          getFollowing,
+          ...(getFollowers ? { maxFollowers: perList } : {}),
+          ...(getFollowing ? { maxFollowings: perList } : {}),
+        },
+        paidLimit, X_FOLLOWER_ACTOR_ID,
+      );
+      const seen = new Set<string>(seeds);
+      const people: XCandidatePerson[] = [];
+      for (const raw of items) {
+        const p = normalizePerson(raw);
+        // Drop the seeds themselves and any duplicate across seed lists.
+        if (!p || seen.has(p.handle)) continue;
+        seen.add(p.handle);
+        people.push(p);
+        if (people.length >= maxUsers) break;
+      }
+      return { people, ...coverage };
+    },
+
+    async conversationReplies({ conversationId, limit = 12, excludeHandle }) {
+      transport.beginOperation();
+      boundedLimit(limit, 50, "limit");
+      const id = String(conversationId).trim();
+      if (!id || limit === 0) return { tweets: [], resultCount: 0 };
+      // conversation_id:<id> returns the whole thread (root + replies). Sort "Top"
+      // surfaces the highest-engagement replies; we fetch a few extra to survive
+      // filtering out the root post + the operator's own replies, then rank by likes.
+      const itemLimit = Math.min(limit + 8, 50);
+      const { items, ...coverage } = await runActorSync({
+        searchTerms: [`conversation_id:${id}`],
+        maxItems: itemLimit,
+        sort: "Top",
+      }, itemLimit);
+      const excl = excludeHandle?.trim().replace(/^@/, "").toLowerCase();
+      const seen = new Set<string>();
+      const out: XTweet[] = [];
+      for (const item of items) {
+        const t = normalizeTweet(item);
+        if (!t || seen.has(t.id)) continue;
+        if (t.id === id) continue; // the root post itself, not a reply
+        if (excl && t.author.handle.toLowerCase() === excl) continue; // our own replies
+        seen.add(t.id);
+        out.push(t);
+      }
+      // Rank by engagement (likes) desc; unknown likes (null) sort last.
+      out.sort((a, b) => (b.likes ?? -1) - (a.likes ?? -1));
+      return { tweets: out.slice(0, limit), ...coverage };
+    },
+  };
+}
