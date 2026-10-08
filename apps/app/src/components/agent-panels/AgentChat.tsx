@@ -998,3 +998,203 @@ function summarizeApplied(applied?: AppliedSummary): string {
     applied.removedHandles + applied.removedKeywords + applied.removedPeople + applied.removedSubreddits;
   if (added > 0) parts.push(`added ${added} target${added === 1 ? "" : "s"}`);
   if (removed > 0) parts.push(`removed ${removed} target${removed === 1 ? "" : "s"}`);
+  if (applied.missionChanged) parts.push("updated your mission");
+  return parts.length ? parts.join(", ") : "already matched your targeting";
+}
+
+/**
+ * Apply/Cancel card for a targeting/mission change the agent proposed.
+ * The proposal is already validated server-side (TargetingProposalSchema);
+ * Apply replays it through the applyTargetingChange server action.
+ */
+function ProposalCard({
+  proposal,
+  agentRole,
+  state,
+  canApply,
+  applying,
+  applyDisabled,
+  onApply,
+  onCancel,
+}: {
+  proposal: TargetingProposal;
+  agentRole: string;
+  state: ProposalState;
+  canApply: boolean;
+  applying: boolean;
+  applyDisabled: boolean;
+  onApply?: () => void;
+  onCancel?: () => void;
+}) {
+  const rows: { sign: "+" | "−"; label: string }[] = [];
+  if (proposal.mission !== undefined) {
+    rows.push({ sign: "+", label: `mission → “${proposal.mission}”` });
+  }
+  const validRole = targetingProposalMatchesRole(proposal, agentRole);
+  proposal.addPeople.forEach((p) => rows.push({ sign: "+", label: `in/${p}` }));
+  proposal.removePeople.forEach((p) => rows.push({ sign: "−", label: `in/${p}` }));
+  proposal.addHandles.forEach((h) => rows.push({ sign: "+", label: `@${h}` }));
+  proposal.addKeywords.forEach((k) => rows.push({ sign: "+", label: `“${k}”` }));
+  proposal.removeHandles.forEach((h) => rows.push({ sign: "−", label: `@${h}` }));
+  proposal.removeKeywords.forEach((k) => rows.push({ sign: "−", label: `“${k}”` }));
+  proposal.addSubreddits.forEach((s) => rows.push({ sign: "+", label: `r/${s}` }));
+  proposal.removeSubreddits.forEach((s) => rows.push({ sign: "−", label: `r/${s}` }));
+
+  return (
+    <div
+      style={{
+        marginTop: 8,
+        padding: "10px 12px",
+        borderRadius: 10,
+        background: "var(--paper-2)",
+        boxShadow: "0 0 0 0.5px var(--rule)",
+      }}
+    >
+      <div className="eyebrow" style={{ marginBottom: 6 }}>
+        {state === "applied"
+          ? "Change applied"
+          : state === "cancelled"
+            ? "Change dismissed"
+            : "Proposed change · you confirm"}
+      </div>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 3,
+          fontFamily: "var(--mono)",
+          fontSize: 12,
+          opacity: state === "cancelled" ? 0.5 : 1,
+        }}
+      >
+        {rows.map((r, i) => (
+          <div
+            key={i}
+            style={{ color: r.sign === "+" ? "var(--accent)" : "var(--ink-muted)" }}
+          >
+            <span style={{ display: "inline-block", width: 14 }}>{r.sign}</span>
+            {r.label}
+          </div>
+        ))}
+      </div>
+      {state === "pending" ? (
+        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+          <button
+            type="button"
+            className="btn btn-sm btn-accent"
+            disabled={!canApply || !validRole || applyDisabled}
+            onClick={onApply}
+            title={!validRole ? "This proposal targets a different agent role" : canApply ? undefined : "Open this agent from your workspace to apply changes"}
+          >
+            {applying ? "Applying…" : "Apply"}
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost"
+            disabled={applying}
+            onClick={onCancel}
+          >
+            Cancel
+          </button>
+        </div>
+      ) : (
+        <div
+          style={{
+            marginTop: 8,
+            fontSize: 11.5,
+            fontFamily: "var(--mono)",
+            color: state === "applied" ? "var(--accent)" : "var(--ink-soft)",
+          }}
+        >
+          {state === "applied" ? "✓ Applied — live next sweep" : "Dismissed"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Apply/Cancel card for a vault edit the Head of Growth proposed. Validated
+ * server-side (VaultEditProposalSchema); Apply replays it through the
+ * applyVaultEdit server action — the only writer. Shows the target file + a
+ * preview of the new contents so the founder reviews before it's written.
+ */
+function VaultEditCard({
+  edit,
+  receipt,
+  state,
+  canApply,
+  applying,
+  applyDisabled,
+  onApply,
+  onRefresh,
+  onCancel,
+}: {
+  edit: VaultEditProposal;
+  receipt: VaultEditClientReceipt | null;
+  state: ProposalState;
+  canApply: boolean;
+  applying: boolean;
+  applyDisabled: boolean;
+  onApply?: () => void;
+  onRefresh?: () => void;
+  onCancel?: () => void;
+}) {
+  const eligible = !!receipt?.eligible && !!receipt.messageId;
+  return (
+    <div
+      style={{
+        marginTop: 8,
+        padding: "10px 12px",
+        borderRadius: 10,
+        background: "var(--paper-2)",
+        boxShadow: "0 0 0 0.5px var(--rule)",
+      }}
+    >
+      <div className="eyebrow" style={{ marginBottom: 6 }}>
+        {state === "applied"
+          ? "Vault edit applied"
+          : state === "cancelled"
+            ? "Vault edit dismissed"
+            : "Proposed vault edit · you confirm"}
+      </div>
+      <div style={{ fontFamily: "var(--mono)", fontSize: 12, marginBottom: 6, opacity: state === "cancelled" ? 0.5 : 1 }}>
+        <div style={{ color: "var(--accent)" }}>✎ {edit.path}</div>
+        <div style={{ color: "var(--ink-muted)", marginTop: 2 }}>{edit.summary}</div>
+      </div>
+      <pre
+        style={{
+          margin: 0,
+          maxHeight: 200,
+          overflow: "auto",
+          fontFamily: "var(--mono)",
+          fontSize: 11,
+          lineHeight: 1.5,
+          color: "var(--ink-2)",
+          background: "var(--paper)",
+          borderRadius: 8,
+          padding: "8px 10px",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          opacity: state === "cancelled" ? 0.5 : 1,
+        }}
+      >
+        {edit.content}
+      </pre>
+      {state === "pending" && !eligible ? <p style={{ margin: "8px 0 0", fontSize: 12, color: "var(--ink-muted)" }}>Refresh the complete current file before applying this proposal.</p> : null}
+      {state === "pending" ? (
+        <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className="btn btn-sm btn-accent"
+            disabled={!canApply || !eligible || applyDisabled}
+            onClick={onApply}
+            title={canApply ? undefined : "Open this agent from your workspace to apply changes"}
+          >
+            {applying ? "Applying…" : "Apply to vault"}
+          </button>
+          {!eligible ? <button type="button" className="btn btn-sm btn-ghost" disabled={!canApply || applyDisabled} onClick={onRefresh}>Refresh file</button> : null}
+          <button type="button" className="btn btn-sm btn-ghost" disabled={applying} onClick={onCancel}>
+            Cancel
+          </button>
+        </div>
