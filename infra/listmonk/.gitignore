@@ -1,0 +1,8 @@
+# Never commit env files — POSTGRES_PASSWORD comes from GCP Secret Manager
+.env
+.env.*
+*.local
+
+# Local data dirs (only created on the VM, but guard anyway)
+pgdata/
+uploads/
