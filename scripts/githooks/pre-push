@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Refuse to push a branch that local CI rejects.
+#
+# This is the gate GitHub Actions is not currently providing: every run since
+# 2026-08-25 comes back `startup_failure` with zero jobs. It matters here because
+# main deploys itself — post-commit fires `noelle sync`, and the
+# com.noelle.autoupdate LaunchAgent fast-forwards main every ~10 minutes.
+#
+# Fires for worktree pushes too, which is the point: that is where branches are
+# built. Scrub the inherited git env so ci-local.sh resolves the pushing
+# checkout rather than whatever repo invoked the hook.
+#
+# Escape hatch, for a genuinely broken tree you need to share:
+#   NOELLE_SKIP_CI=1 git push
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
+if [ "${NOELLE_SKIP_CI:-}" = "1" ]; then
+  echo "pre-push: NOELLE_SKIP_CI=1 — skipping local CI"
+  exit 0
+fi
+
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -x "$top/scripts/ci-local.sh" ] || exit 0   # branch predates local CI; don't block
+
+# git feeds us one line per ref being pushed:
+#   <local ref> <local sha> <remote ref> <remote sha>
+# A deletion has an all-zero local sha and no tree to validate. Tags point at
+# commits that were already gated when their branch was pushed. Skipping both
+# keeps `git push --delete` and `git push --tags` from paying for a full run —
+# and from being blocked by an unrelated red tree.
+head_sha="$(git rev-parse HEAD 2>/dev/null)"
+needs_ci=0
+mismatch=""
+
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+  [ -n "${local_ref:-}" ] || continue
+  # A deletion sends an all-zero sha. Matched by shape rather than against a
+  # 40-character literal, so this keeps working under SHA-256.
+  case "$local_sha" in
+    "") continue ;;
+    *[!0]*) ;;                              # has a non-zero digit: a real push
+    *) continue ;;                          # all zeros: a deletion
+  esac
+  case "$local_ref" in
+    refs/tags/*) continue ;;                # already gated as a branch
+  esac
+  needs_ci=1
+  # We validate the CHECKED-OUT tree. Pushing a ref that is not HEAD (e.g.
+  # `git push origin feature-x` from main) would otherwise report a pass for a
+  # tree that was never examined.
+  [ "$local_sha" = "$head_sha" ] || mismatch="$local_ref"
+done
+
+if [ "$needs_ci" = 0 ]; then
+  echo "pre-push: nothing to validate (deletions/tags only)"
+  exit 0
+fi
+
+if [ -n "$mismatch" ]; then
+  echo "pre-push: refusing to vouch for $mismatch — it is not the checked-out tree."
+  echo "  local CI validates the working tree, so pushing another ref would pass unexamined."
+  echo "  check it out and push from there, or: NOELLE_SKIP_CI=1 git push"
+  exit 1
+fi
+
+echo "pre-push: running local CI (NOELLE_SKIP_CI=1 to skip)"
+"$top/scripts/ci-local.sh" --pre-push
+rc=$?
+if [ $rc -ne 0 ]; then
+  echo ""
+  echo "pre-push: local CI failed — push blocked."
+  echo "  re-run with detail:  ./scripts/ci-local.sh"
+  echo "  push anyway:         NOELLE_SKIP_CI=1 git push"
+fi
+exit $rc
