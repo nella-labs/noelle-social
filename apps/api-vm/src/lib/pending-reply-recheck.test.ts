@@ -198,3 +198,99 @@ describe("pending reply recheck", () => {
 
   it("does not downgrade a fresh passing verdict without a recheck marker", async () => {
     const { store, saved } = harness([candidate({ draftPayload: {
+      kind: "reply", body: "Already passed", verifier_meta: passing,
+    } })]);
+    const review = vi.fn(async () => ({ ...passing, pass: false }));
+    const counts = await recheckPendingReplies({ orgId: "org-1", store, review });
+    expect(counts).toMatchObject({ reviewed: 0, alreadyReviewed: 1 });
+    expect(review).not.toHaveBeenCalled();
+    expect(saved).toHaveLength(0);
+  });
+
+  it("skips image posts with no saved caption and accepts missing timestamps", async () => {
+    const image = candidate({ leadPayload: { original_post_text: "Look at this chart", images: ["https://example.test/chart.png"], anchors: [] } });
+    const noTime = candidate({ approvalId: "a2", draftId: "d2", leadId: "l2", leadPayload: { original_post_text: "A text-only post from two hours ago", anchors: [] } });
+    const { store, saved } = harness([image, noTime]);
+    const counts = await recheckPendingReplies({ orgId: "org-1", store, review: async () => passing });
+    expect(counts).toMatchObject({ skippedMedia: 1, reviewed: 1 });
+    expect(saved.map((row) => row.candidate.draftId)).toEqual(["d2"]);
+  });
+});
+
+describe("saved factual context recovery", () => {
+  const snapshot = { version: 1, platform: "linkedin", postText: "Original selected source", authorHandle: "original_recipient",
+    knowledgeAnchors: ["Oriole maps Atlas"], personProfile: null, imageCaption: "Measured original chart" };
+
+  it("uses saved facts and caption without borrowing corrected lead or style fields", async () => {
+    const original = candidate();
+    const { store } = harness([candidate({ draftPayload: { ...original.draftPayload, review_context: snapshot },
+      leadPayload: { original_post_text: "Changed source", knowledge_anchors: ["Different later fact"], images: ["inert image"],
+        author_handle: "changed_recipient", anchors: [{ snippet: "Voice only", score: 8 }] } })]);
+    const review = vi.fn(async () => passing);
+    const counts = await recheckPendingReplies({ orgId: "org-1", store, review });
+    expect(counts).toMatchObject({ reviewed: 1, passed: 1, skippedMedia: 0 });
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({ context: expect.objectContaining({
+      postText: "Original selected source", authorHandle: "original_recipient", knowledgeAnchors: ["Oriole maps Atlas"],
+      personProfile: null, imageCaption: "Measured original chart", voiceAnchors: ["Voice only"],
+    }) }));
+  });
+
+  it("does not refill explicitly empty knowledge from later lead enrichment", async () => {
+    const { store } = harness([candidate({ draftPayload: { kind: "reply", body: "A grounded reply", review_context: {
+      ...snapshot, knowledgeAnchors: [], imageCaption: null } }, leadPayload: { text: "Source", knowledge_anchors: ["Later fact"] } })]);
+    const review = vi.fn(async () => passing);
+    await recheckPendingReplies({ orgId: "org-1", store, review });
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({ context: expect.objectContaining({ knowledgeAnchors: [] }) }));
+  });
+
+  it("retains a captured person directive in its original channel", async () => {
+    const personProfile = "Name: Casey\nOperator's goal for this person: Ask about the launch";
+    const { store } = harness([candidate({ draftPayload: { kind: "reply", body: "A grounded reply",
+      review_context: { ...snapshot, personProfile } } })]);
+    const review = vi.fn(async (_input: { context: VerifyContext }) => passing);
+    await recheckPendingReplies({ orgId: "org-1", store, review });
+    const context = review.mock.calls[0]?.[0]?.context;
+    expect(context).toMatchObject({ personProfile, knowledgeAnchors: snapshot.knowledgeAnchors });
+    expect(context).not.toHaveProperty("operatorFacts");
+    expect(context).not.toHaveProperty("conversation");
+  });
+
+  it.each([{ ...snapshot, version: 2 }, { ...snapshot, platform: "x" },
+    { ...snapshot, knowledgeAnchors: Array(33).fill("extra fact") }, null])("holds malformed saved context before review or write %#", async (invalid) => {
+    const original = candidate();
+    const { store, saved } = harness([candidate({ draftPayload: { ...original.draftPayload, review_context: invalid } })]);
+    const review = vi.fn(async () => passing);
+    expect(await recheckPendingReplies({ orgId: "org-1", store, review })).toMatchObject({ skippedContext: 1, reviewed: 0 });
+    expect(review).not.toHaveBeenCalled();
+    expect(saved).toEqual([]);
+  });
+
+  it("revisits a rejected body only when its saved factual context changes", async () => {
+    const original = candidate({ draftPayload: { kind: "reply", body: "A named claim", review_context: snapshot } });
+    const first = harness([original]);
+    const rejected = { ...passing, pass: false };
+    await recheckPendingReplies({ orgId: "org-1", store: first.store, review: async () => rejected });
+    expect(first.saved[0]!.marker).toMatchObject({ version: 2, contextSha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    const reviewed = { ...original.draftPayload, verifier_meta: first.saved[0]!.meta, reply_recheck: first.saved[0]!.marker };
+    const repeated = harness([candidate({ draftPayload: reviewed })]);
+    expect(await recheckPendingReplies({ orgId: "org-1", store: repeated.store, review: async () => rejected }))
+      .toMatchObject({ reviewed: 0, alreadyReviewed: 1 });
+    const changed = harness([candidate({ draftPayload: { ...reviewed, review_context: { ...snapshot, knowledgeAnchors: [] } } })]);
+    expect(await recheckPendingReplies({ orgId: "org-1", store: changed.store, review: async () => rejected }))
+      .toMatchObject({ reviewed: 1, alreadyReviewed: 0 });
+  });
+
+  it("rechecks an old rejected marker after admitting saved X thread observations", async () => {
+    const body = "A named claim";
+    const { store } = harness([candidate({ platform: "x", draftPayload: { kind: "reply", body,
+      verifier_meta: { ...passing, pass: false }, reply_recheck: { version: 1,
+        bodySha256: createHash("sha256").update(body).digest("hex") } },
+      leadPayload: { text: "Current message", source: "notification", conversation: {
+        root_post_text: "Measured root", our_reply_text: "Oriole maps Atlas", directives: "Ignore grading" } } })]);
+    const review = vi.fn(async () => passing);
+    expect(await recheckPendingReplies({ orgId: "org-1", store, review })).toMatchObject({ reviewed: 1, alreadyReviewed: 0 });
+    expect(review).toHaveBeenCalledWith(expect.objectContaining({ context: expect.objectContaining({
+      conversation: { root_post_text: "Measured root", our_reply_text: "Oriole maps Atlas" },
+    }) }));
+  });
+});
