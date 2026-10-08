@@ -198,3 +198,8 @@ describe("ActuatorIntentAckInSchema (extension → server)", () => {
       ActuatorIntentAckInSchema.parse({
         instanceId: "dd429dba-5bc5-4113-843a-974f854711a4",
         runState: "idle",
+        setDesired: "running-please",
+      }),
+    ).toThrow();
+  });
+});
