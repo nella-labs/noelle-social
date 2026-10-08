@@ -1398,3 +1398,203 @@ async function clearComposer(
    * navigation would have.
    *
    * `.msg-form` is neither. It is the messaging overlay that rides along on
+   * every LinkedIn page, the text in it is usually something the operator is
+   * writing, and LinkedIn RESTORES message drafts — so the "the navigation
+   * would have discarded it anyway" defence does not carry, and clearing it on
+   * routine ambient/ensureOnFeed hops would destroy a human's message for good.
+   *
+   * Passing the body rather than a boolean is what makes the DM path safe too:
+   * findMessageCompose returns the FIRST `.msg-form` editable and the messaging
+   * rail can hold several open bubbles, so even doDm's own unwind must confirm
+   * the box holds OUR draft before wiping it. Without that, a send-not-found or
+   * a STOP would erase an unrelated conversation.
+   */
+  ownDmBody?: string,
+  commentUrn?: string,
+): Promise<void> {
+  // Focus a composer by locate-command. false when that box isn't on the page.
+  const focus = async (cmd: string, targetCommentUrn?: string): Promise<boolean> => {
+    const loc = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect }>(
+      tabId, { cmd, ...(targetCommentUrn ? { commentUrn: targetCommentUrn } : {}) },
+    ).catch(() => null);
+    if (!loc?.ok || loc.x == null) return false;
+    await cdp.moveAndClick(tabId, rectFrom(loc), rng, sleep);
+    return true;
+  };
+
+  // 1) The comment/reply box — LinkedIn gives us a read, so this one is
+  //    verified: focus, clear, poll until the box reports empty.
+  await runClearComposer({
+    focusBox: () => commentUrn ? focus("locateReplyComposer", commentUrn) : focus("locateCommentBox"),
+    clearKeys: () => cdp.clearFocusedEditor(tabId, sleep),
+    isEmpty: () => commentPosted(tabId, commentUrn),
+    sleep,
+  });
+  // Confirmed independently, not from the return value — see the header: a
+  // present-but-unfocusable box makes runClearComposer report success.
+  //
+  // The test is POSITIVE ("can we still see our text?"), not `!empty`.
+  // commentPosted answers false for an unreadable composer too, so the negated
+  // form warns every time the content script is mid-reinject — noise in the one
+  // channel the comment-failed diagnostics have to survive in.
+  if (await commentBoxHasText(tabId, commentUrn)) {
+    sinkLog("warn", "comment box would not clear; next navigation may raise a leave-site dialog", { tabId });
+  }
+
+  // 2) The message compose — only for the caller that put the text there, and
+  //    only when the box still holds THAT text.
+  //
+  //    It was a blind focus + clear until the review on #559, on the grounds
+  //    that an unverified clear beats a certain stall. readMessageCompose makes
+  //    it verified: runClearComposer reads first, so an empty or absent box
+  //    costs one round trip with no click and no keystrokes.
+  //
+  //    But verified is not the same as safe. The box this clears is the
+  //    operator's messaging overlay, and a NON-empty one is precisely the case
+  //    where clearing destroys something a human typed — see ownDmBody.
+  if (ownDmBody === undefined) {
+    // Not ours to clear. A dirty overlay is still what would raise the dialog on
+    // the next hop, so it is worth saying — but ONCE. LinkedIn restores drafts
+    // and the bubble is on every page, so one un-sent operator message would
+    // otherwise log on every navigation for the rest of the run and flush the
+    // 200-entry sink ring, evicting exactly the comment-failed rows this change
+    // exists to make readable. Latched, and re-armed when the overlay goes clean.
+    if (await messageComposeHasText(tabId)) {
+      if (!warnedOverlayDirty) {
+        warnedOverlayDirty = true;
+        sinkLog("warn", "message compose holds text (left alone — operator's); a navigation may raise a leave-site dialog", { tabId });
+      }
+    } else {
+      warnedOverlayDirty = false;
+    }
+    return;
+  }
+  await runClearComposer({
+    focusBox: () => focus("locateMessageCompose"),
+    clearKeys: () => cdp.clearFocusedEditor(tabId, sleep),
+    // "Nothing for us to do here" covers both an empty box AND a box holding
+    // someone else's conversation: the messaging rail can have several bubbles
+    // open and findMessageCompose returns the first, so even our own unwind must
+    // not wipe a draft it cannot prove it wrote.
+    //
+    // NOT messageComposeStillHasText: its bias ("unreadable ⇒ not a miss") is
+    // right for deciding a send failed and wrong for deciding a box is clean.
+    // Inverted here, an unreadable composer would answer "already empty",
+    // clear nothing, and — since the confirmation below uses the positive
+    // predicate — log no warning either.
+    isEmpty: () => messageComposeClearOfOurDraft(tabId, ownDmBody),
+    sleep,
+  });
+  // Same independent confirmation, and this is the box it was written for: the
+  // messaging bubble is MINIMISED by default, which is exactly the present +
+  // dirty + zero-rect state that makes the helper's return value a lie.
+  if (await messageComposeStillHasText(tabId, ownDmBody)) {
+    sinkLog("warn", "message compose would not clear; next navigation may raise a leave-site dialog", { tabId });
+  }
+}
+
+/**
+ * Latch for the "operator's overlay is dirty" warning, so one un-sent message
+ * cannot log on every navigation for the rest of the run. Re-armed as soon as
+ * the overlay reads clean, so a genuinely new dirty episode is still reported.
+ */
+let warnedOverlayDirty = false;
+
+/** Can we POSITIVELY see text still in the comment composer? Distinct from
+ *  `!commentPosted`, which is also true when the box cannot be READ — the state
+ *  that would otherwise log a spurious "would not clear" on every reinject. */
+async function commentBoxHasText(tabId: number, commentUrn?: string): Promise<boolean> {
+  const st = await readCommentState(tabId, commentUrn);
+  return st?.ok === true && st.observed?.present === true && st.observed?.empty === false;
+}
+
+/**
+ * Is the message composer confirmed to be holding nothing OF OURS — either
+ * empty/absent, or occupied by a conversation that is not the draft we typed?
+ *
+ * Biased the opposite way to messageComposeStillHasText, deliberately. This one
+ * gates whether the clear runs, so an unreadable composer must answer FALSE
+ * ("not confirmed clean") and let the clear proceed; the other one gates whether
+ * a send is declared a miss, where an unreadable composer must answer "no
+ * evidence of a miss" so the DM is never sent twice. Same read, opposite
+ * default, because the costly mistake is opposite.
+ */
+async function messageComposeClearOfOurDraft(tabId: number, body: string): Promise<boolean> {
+  const st = await send<{ ok: boolean; observed?: { present?: boolean; empty?: boolean; text?: string } }>(
+    tabId, { cmd: "readMessageCompose" },
+  ).catch(() => null);
+  if (!st) return false; // unreadable → not confirmed clean → try to clear
+  if (st.observed?.present !== true || st.observed?.empty === true) return true;
+  return !sameDraft(st.observed.text ?? "", body); // someone else's draft → not ours to touch
+}
+
+/** Same positive read for the message composer, ownership aside. */
+async function messageComposeHasText(tabId: number): Promise<boolean> {
+  const st = await send<{ ok: boolean; observed?: { present?: boolean; empty?: boolean } }>(
+    tabId, { cmd: "readMessageCompose" },
+  ).catch(() => null);
+  return st?.observed?.present === true && st.observed?.empty === false;
+}
+
+/** Is the DM composer empty (or absent)? Mirrors commentPosted for the message
+ *  box. A read error is "not confirmed", never a false empty. */
+async function messageComposeEmpty(tabId: number): Promise<boolean> {
+  const st = await send<{ ok: boolean; observed?: { present?: boolean; empty?: boolean } }>(
+    tabId, { cmd: "readMessageCompose" },
+  ).catch(() => null);
+  if (!st) return false;
+  return st.observed?.present === false || st.observed?.empty === true;
+}
+
+/**
+ * Did the DM text POSITIVELY survive in the box? true only when the composer is
+ * readable, present, and still holding text.
+ *
+ * The distinction from `!messageComposeEmpty` is the whole point, and it is not
+ * symmetry for its own sake: on this actuator a "failed" DM is re-queued
+ * (pool.push) and re-sent from a later slot, so a wrong failure does not lose a
+ * message — it sends a SECOND one to a real person. A dropped message port, a
+ * suspended service worker, a content script mid-reinject: every one of those
+ * makes the read fail, and treating "could not read" as "did not send" would
+ * duplicate the DM.
+ *
+ * So the burden of proof sits on the failure: only text we can actually SEE
+ * still sitting there reports a miss. Every ambiguous answer keeps the previous
+ * behaviour of assuming the send landed.
+ */
+async function messageComposeStillHasText(tabId: number, body: string): Promise<boolean> {
+  const st = await send<{ ok: boolean; observed?: { present?: boolean; empty?: boolean; text?: string } }>(
+    tabId, { cmd: "readMessageCompose" },
+  ).catch(() => null);
+  if (!st) return false; // unreadable → not proof of a miss
+  if (st.observed?.present !== true || st.observed?.empty !== false) return false;
+  // It must be OUR text. findMessageCompose returns the FIRST `.msg-form`
+  // editable on the page, and LinkedIn's messaging rail can hold several open
+  // conversation bubbles — so a DM that actually went out can still find a
+  // non-empty box belonging to a different thread the operator is typing in.
+  // Reporting that as a miss re-queues the item and sends a SECOND DM to a real
+  // person, which is the precise harm this function exists to avoid.
+  return sameDraft(st.observed.text ?? "", body);
+}
+
+
+/**
+ * Every navigation this actuator makes. Binds the shared clear-then-navigate
+ * helper (see makeNavigateTab for why the clear belongs at the navigation and
+ * not only on the failure path) to Lyra's composers.
+ *
+ * Declared as a `function` deliberately: ensureOnFeed calls it hundreds of lines
+ * above clearComposer's definition, which only hoisting makes legal.
+ */
+function navigateTab(
+  tabId: number,
+  url: string,
+  rng: ReturnType<typeof makeRng>,
+  /**
+   * Re-checked AFTER the clear, immediately before the navigation. The clear
+   * can take a couple of seconds, so a caller that already checked a liveness
+   * condition (the notification sweep's epoch guard) would otherwise have that
+   * check go stale in the gap and still yank the operator's tab. Returning
+   * false makes the navigation a no-op.
+   */
+  stillWanted?: () => Promise<boolean>,
