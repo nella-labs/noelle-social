@@ -198,3 +198,203 @@ export async function runAccountFeederTick(deps: FeederTickDeps): Promise<Feeder
     }
   }
 
+  // ---- Phase 3: dense-embed corpus rows (one-time backfill + newly pulled) ---
+  // Voyage voyage-3-large → the pgvector `embedding` column the F4b hybrid ranker
+  // fuses with the rerank. Fail-open at every step: any missing dep, no key, an
+  // empty embed result, or an error leaves rows un-embedded (the ranker simply
+  // skips the dense half) and never fails the run.
+  let embeddedRows = 0;
+  if (deps.embed && deps.listUnembeddedStylePosts && deps.updateStylePostEmbeddings) {
+    try {
+      const missing = await deps.listUnembeddedStylePosts(instance.id, EMBED_MAX_PER_TICK);
+      for (let i = 0; i < missing.length; i += EMBED_CHUNK) {
+        const chunk = missing.slice(i, i + EMBED_CHUNK);
+        const vectors = await deps.embed(chunk.map((r) => r.body));
+        // Fail-open: voyageEmbed returns [] on any failure / a partial result.
+        if (vectors.length !== chunk.length) break;
+        const updates = chunk.map((r, j) => ({ id: r.id, body: r.body, embedding: vectors[j]! }));
+        embeddedRows += await deps.updateStylePostEmbeddings(updates);
+      }
+    } catch (err) {
+      log.warn(
+        { instance: instance.id, err: errMsg(err) },
+        "style embedding pass failed; corpus retained un-embedded (dense ranker falls back to rerank)",
+      );
+    }
+  }
+
+  log.info(
+    { instance: instance.id, sourcesPulled, corpusRows, profilesWritten, embeddedRows, quotaError: quotaError ?? null },
+    "account feeder tick complete",
+  );
+  return { sourcesPulled, corpusRows, profilesWritten, embeddedRows, ...(quotaError ? { quotaError } : {}) };
+}
+
+/** Pull a single source's posts + authored comments and normalize to corpus rows. */
+async function pullSourceCorpus(
+  deps: FeederTickDeps,
+  source: FeederSource,
+  limits: { postLimit: number; commentLimit: number },
+): Promise<StylePostUpsert[]> {
+  const { instance, recorder, credentialId } = deps;
+  const rows: StylePostUpsert[] = [];
+  const metered = <T>(actor: string, call: (operation: typeof deps.apify) => Promise<T>) =>
+    withMeteredApifyCall({ client: deps.apify, recorder, log: deps.log,
+      orgId: instance.org_id, instanceId: instance.id, agentRole: "linkedin_intern",
+      worker: "feeder", actor, startedAt: new Date(), credentialId: credentialId ?? null }, call);
+
+  // a) POSTS
+  const posts = await metered("linkedin-profile-posts", operation =>
+    operation.profilePosts({ publicId: source.handle, maxPosts: limits.postLimit }));
+  for (const p of posts) {
+    if (!p.id || !p.text) continue;
+    rows.push({
+      orgId: instance.org_id,
+      agentInstanceId: instance.id,
+      platform: source.platform,
+      accountHandle: source.handle,
+      externalId: p.id,
+      kind: "post",
+      body: p.text,
+      likeCount: readSourceCount(p.reactions),
+      commentCount: readSourceCount(p.comments),
+      raw: p,
+      postedAt: p.postedAt || null,
+    });
+  }
+
+  // b) AUTHORED COMMENTS (the account's real outbound reply voice)
+  const comments = await metered("linkedin-profile-comments", operation => operation.authoredComments({
+    publicId: source.handle, maxComments: limits.commentLimit,
+  }));
+  for (const c of comments) {
+    if (!c.id || !c.text) continue;
+    rows.push({
+      orgId: instance.org_id,
+      agentInstanceId: instance.id,
+      platform: source.platform,
+      accountHandle: source.handle,
+      externalId: c.id,
+      kind: "comment",
+      body: c.text,
+      likeCount: readSourceCount(c.reactions),
+      commentCount: readSourceCount(c.repliesCount),
+      raw: c,
+      postedAt: c.createdAt || null,
+    });
+  }
+
+  return rows;
+}
+
+/** Read one source's stored corpus, run the extractor, and upsert its profile. */
+async function extractAndUpsert(deps: FeederTickDeps, source: FeederSource): Promise<boolean> {
+  const { instance, log } = deps;
+  const corpus = await deps.getCorpus({
+    agentInstanceId: instance.id,
+    platform: source.platform,
+    accountHandle: source.handle,
+    limit: DEFAULT_CORPUS_FOR_EXTRACT,
+  });
+  if (corpus.length === 0) {
+    log.info({ source: source.handle }, "no stored corpus for source; skipping extraction");
+    return false;
+  }
+
+  const res = await deps.extractor.call({
+    system: SYSTEM_STYLE_EXTRACTOR,
+    prompt: renderExtractorPrompt(source, corpus),
+    model: STYLE_EXTRACTOR_MODEL,
+  });
+
+  const parsed = UltraProfileOutput.safeParse(extractJson(res.text));
+  if (!parsed.success) {
+    log.error(
+      { source: source.handle, raw: res.text.slice(0, 200) },
+      "style extractor output schema fail; skipping profile (corpus retained)",
+    );
+    return false;
+  }
+
+  const rollup = computePerfRollup(corpus);
+  await deps.upsertUltraProfile({
+    orgId: instance.org_id,
+    agentInstanceId: instance.id,
+    platform: source.platform,
+    accountHandle: source.handle,
+    voiceSummary: parsed.data.voice_summary,
+    tone: parsed.data.tone,
+    structureNotes: parsed.data.structure_notes,
+    hookPatterns: parsed.data.hook_patterns.slice(0, 8),
+    signaturePhrases: parsed.data.signature_phrases.slice(0, 8),
+    topTopics: parsed.data.top_topics.slice(0, 8),
+    avgLikeCount: rollup.avgLikeCount,
+    avgCommentCount: rollup.avgCommentCount,
+    postsAnalyzed: rollup.postsAnalyzed,
+    samplePostIds: rollup.samplePostIds,
+    model: STYLE_EXTRACTOR_MODEL,
+  });
+  return true;
+}
+
+function renderExtractorPrompt(source: FeederSource, corpus: CorpusItem[]): string {
+  const who = source.displayName ?? source.handle;
+  const posts = corpus.filter((c) => c.kind === "post");
+  const comments = corpus.filter((c) => c.kind === "comment");
+  const lines: string[] = [
+    `Extract the writing STYLE of this LinkedIn account: ${who} (linkedin.com/in/${source.handle}).`,
+    "",
+    `POSTS they wrote (${posts.length}), with engagement:`,
+    ...posts.map((p, i) => `[P${i + 1}] (${p.likeCount ?? "unknown"} reactions, ${p.commentCount ?? "unknown"} comments) ${oneLine(p.body)}`),
+  ];
+  if (comments.length > 0) {
+    lines.push(
+      "",
+      `COMMENTS they wrote on others' posts (${comments.length}) — their real reply voice:`,
+      ...comments.map((c, i) => `[C${i + 1}] (${c.likeCount ?? "unknown"} reactions) ${oneLine(c.body)}`),
+    );
+  }
+  lines.push(
+    "",
+    "Output the strict JSON style object specified in the system prompt. Ground every field ONLY in the text above; do not invent. First char `{`, last char `}`.",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Whether an error is an Apify quota/concurrency wall that must SURFACE (402 usage
+ * cap, 429 too-many-runs) or an "all tokens exhausted" rotation failure. Matched
+ * by ApifyError.status and by name (AllApifyTokensExhaustedError is thrown from
+ * the rotating client and isn't importable here without a cycle, so match by
+ * name) — both mean the operator hit their cost gate.
+ */
+export function isApifyQuotaError(err: unknown): boolean {
+  if (err instanceof ApifyError && (err.status === 402 || err.status === 429 || err.status === 403)) {
+    return true;
+  }
+  const name = (err as { name?: string } | null)?.name;
+  return name === "AllApifyTokensExhaustedError";
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function oneLine(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Parse the model's text into a JSON object. Vertex Gemini, called without a
+ * forced JSON mime-type, sometimes wraps the object in a ```json fence or
+ * surrounds it with prose, so strip fences and fall back to the first `{...}`
+ * span before giving up. Returns null when nothing parses. (Same shape as the
+ * x-intern classifier-engine extractJson.)
+ */
+function extractJson(text: string): unknown {
+  const trimmed = text.trim();
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  for (const candidate of [unfenced, sliceBraces(unfenced)]) {
