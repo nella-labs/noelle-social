@@ -398,3 +398,47 @@ describe("runPostDrafterTick — fail-open on style error", () => {
       runner,
       makeVerifierCalls: () => [],
       verifyRetries: 0,
+      sink,
+      release: vi.fn(),
+      postStyleEnabled: true,
+      stylePool: pool,
+      styleFetchImpl: badFetch,
+      styleApiKey: "fake-key",
+    });
+
+    // Draft still succeeds — fail-open.
+    expect(n).toBe(1);
+    const sunk = sink.mock.calls[0]![0];
+    expect(sunk.body).toBeTruthy();
+  });
+
+  it("with no VOYAGE_API_KEY and no fetchImpl, the ranker fails open to input order (no error, draft succeeds)", async () => {
+    // selectStyleExemplars' ranker fails open when no key is set → returns
+    // candidates in their original engagement order → still a valid selection.
+    const pool: StyleExemplarRow[] = [
+      styleRow({ external_id: "y1", body: "Great post body.", like_count: 200, comment_count: 20 }),
+    ];
+    const runner = makeRunner();
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d1" });
+
+    const n = await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
+      sink,
+      release: vi.fn(),
+      postStyleEnabled: true,
+      stylePool: pool,
+      // No styleApiKey, no styleFetchImpl → key-less → ranker degrades to input order
+    });
+
+    expect(n).toBe(1);
+    // The STYLE block IS present (selection succeeded in input-order mode).
+    const systemArg: string = runner.draft.mock.calls[0]![0].system;
+    expect(systemArg).toContain("STYLE TO EMULATE");
+  });
+});
