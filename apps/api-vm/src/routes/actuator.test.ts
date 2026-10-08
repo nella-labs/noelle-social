@@ -598,3 +598,203 @@ describe("capActionableXPerAuthor", () => {
     const rows = [reply({ approval_id: "a-1", author_handle: "jack" })];
     const out = capActionableXPerAuthor(buildActionableX(rows), rows, { cap: 1, writtenCounts: new Map([["jack", 1]]) });
     expect(out.replies).toHaveLength(0);
+  });
+
+  it("cap=2 serves one more reply after one send, then withholds the next", () => {
+    const rows = [
+      reply({ approval_id: "a-1", lead_id: "l-1", external_id: "200", author_handle: "jack" }),
+      reply({ approval_id: "a-2", lead_id: "l-2", external_id: "100", author_handle: "jack" }),
+    ];
+    const out = capActionableXPerAuthor(buildActionableX(rows), rows, {
+      cap: 2, writtenCounts: new Map([["jack", 1]]),
+    });
+    expect(out.replies.map((r) => r.approval_id)).toEqual(["a-1"]);
+  });
+
+  it("cap<1 fails safe to 1", () => {
+    const rows = [
+      reply({ approval_id: "a-1", lead_id: "l-1", author_handle: "jack" }),
+      reply({ approval_id: "a-2", lead_id: "l-2", author_handle: "jack" }),
+    ];
+    const out = capActionableXPerAuthor(buildActionableX(rows), rows, { cap: 0, writtenCounts: empty });
+    expect(out.replies).toHaveLength(1);
+  });
+});
+
+describe("dedupeAlreadyRepliedX (persistent dedup-by-link)", () => {
+  it("drops a reply whose tweet id was already replied to", () => {
+    const built = buildActionableX([xBase]); // tweet_id "123"
+    expect(built.replies).toHaveLength(1);
+    const out = dedupeAlreadyRepliedX(built, new Set(["123"]));
+    expect(out.replies).toHaveLength(0);
+  });
+
+  it("keeps a reply whose tweet id is NOT in the replied set", () => {
+    const built = buildActionableX([xBase]);
+    const out = dedupeAlreadyRepliedX(built, new Set(["999"]));
+    expect(out.replies).toHaveLength(1);
+  });
+
+  it("empty replied set is an identity passthrough", () => {
+    const built = buildActionableX([xBase]);
+    const out = dedupeAlreadyRepliedX(built, new Set());
+    expect(out.replies).toHaveLength(1);
+  });
+
+  it("drops only the already-replied tweet, keeps a fresh one in the same batch", () => {
+    const fresh: XJoinedRow = {
+      ...xBase,
+      approval_id: "44444444-4444-4444-4444-444444444444",
+      lead_id: "55555555-5555-5555-5555-555555555555",
+      external_id: "456",
+    };
+    const built = buildActionableX([xBase, fresh]);
+    expect(built.replies).toHaveLength(2);
+    const out = dedupeAlreadyRepliedX(built, new Set(["123"]));
+    expect(out.replies).toHaveLength(1);
+    expect(out.replies[0]!.target.tweet_id).toBe("456");
+  });
+
+  it("collapses two leads that resolve to the same tweet once one is replied", () => {
+    const sibling: XJoinedRow = {
+      ...xBase,
+      approval_id: "44444444-4444-4444-4444-444444444444",
+      lead_id: "55555555-5555-5555-5555-555555555555",
+      // same external_id "123" — a second lead on the same tweet
+    };
+    const built = buildActionableX([xBase, sibling]);
+    expect(built.replies).toHaveLength(2);
+    const out = dedupeAlreadyRepliedX(built, new Set(["123"]));
+    expect(out.replies).toHaveLength(0);
+  });
+
+  it("an ambiguous-dropped tweet id (skip-stamped, approval still pending) blocks re-serving", () => {
+    // Cross-session shape of the round-3 blocker: the extension dispatched a
+    // submit, could not confirm landing, dropped the draft WITHOUT markSent and
+    // stamped tweet_id on the skip row. The approval is still 'pending', so
+    // Source B misses it — the skip-stamped id from Source A must block it.
+    const built = buildActionableX([xBase]); // pending approval on tweet "123"
+    const out = dedupeAlreadyRepliedX(built, new Set(["123"])); // "123" via a skip row
+    expect(out.replies).toHaveLength(0);
+  });
+});
+
+describe("fetchXRepliedTweetIds (the dedup union's evidence sources)", () => {
+  type SqlParam = Parameters<typeof fetchXRepliedTweetIds>[0];
+  // Fake postgres.js tagged template: records the raw SQL text, returns canned rows.
+  function fakeSql(rows: Array<{ tweet_id: string }>) {
+    const queries: string[] = [];
+    const sql = ((strings: TemplateStringsArray, ..._vals: unknown[]) => {
+      queries.push(strings.raw.join("?")); // "?" marks each bound parameter
+      return Promise.resolve(rows);
+    }) as unknown as SqlParam;
+    return { sql, queries };
+  }
+
+  it("builds the set from the returned rows", async () => {
+    const { sql } = fakeSql([{ tweet_id: "123" }, { tweet_id: "456" }]);
+    expect(await fetchXRepliedTweetIds(sql, "org-1", ["123", "456"])).toEqual(new Set(["123", "456"]));
+  });
+
+  // THE round-3 regression: the union previously read ONLY type='reply' rows,
+  // so an ambiguous-dropped submit (a type='skip' row stamped with tweet_id,
+  // approval left 'pending') was invisible to the dedup and the same reply was
+  // re-served — and re-posted — in a later session. The evidence query must
+  // read skip rows too, and must still exclude 'like' rows (liked ≠ replied).
+  it("reads tweet_id-stamped skip rows (ambiguous-dropped), not just confirmed replies", async () => {
+    const { sql, queries } = fakeSql([]);
+    await fetchXRepliedTweetIds(sql, "org-1", ["123", "456"]);
+    expect(queries).toHaveLength(1);
+    const q = queries[0]!;
+    expect(q).toMatch(/type in \('reply', 'skip'\)/);
+    expect(q).toMatch(/tweet_id is not null/);
+    expect(q).not.toMatch(/'like'/);
+    // …and still unions the authoritative 'sent'-approvals history (Source B):
+    expect(q).toMatch(/union/);
+    expect(q).toMatch(/status = 'sent'/);
+    expect(q).toMatch(/from noelle\.x_reply_claims/);
+  });
+
+  it("propagates a query error so the route can fail CLOSED (empty queue)", async () => {
+    const sql = (() => Promise.reject(new Error("boom"))) as unknown as SqlParam;
+    await expect(fetchXRepliedTweetIds(sql, "org-1", ["123", "456"])).rejects.toThrow("boom");
+  });
+});
+
+describe("resolveXDailyWriteCap (daily write-cap fail-safe, ports #426)", () => {
+  it("a non-numeric env value falls back to 40 (never NaN → never fail-open)", () => {
+    expect(resolveXDailyWriteCap("garbage")).toBe(40);
+  });
+  it("an unset env value stays CAPPED at 40 — unlike LinkedIn, unset ≠ unlimited", () => {
+    expect(resolveXDailyWriteCap(undefined)).toBe(40);
+  });
+  it("a negative env value falls back to 40", () => {
+    expect(resolveXDailyWriteCap("-3")).toBe(40);
+  });
+  it("a valid numeric env value is honored (0 is respected = serve nothing)", () => {
+    expect(resolveXDailyWriteCap("25")).toBe(25);
+    expect(resolveXDailyWriteCap("0")).toBe(0);
+  });
+  it("only the explicit sentinel lifts the cap (case/whitespace tolerant)", () => {
+    expect(resolveXDailyWriteCap("off")).toBe(Number.POSITIVE_INFINITY);
+    expect(resolveXDailyWriteCap("unlimited")).toBe(Number.POSITIVE_INFINITY);
+    expect(resolveXDailyWriteCap(" OFF ")).toBe(Number.POSITIVE_INFINITY);
+  });
+  it("with the sentinel the trim branch never fires and telemetry reports null", () => {
+    const cap = resolveXDailyWriteCap("off");
+    const remaining = Math.max(0, cap - 0); // usage query is skipped ⇒ used = 0
+    expect(10 > remaining).toBe(false); // any served length ≤ Infinity
+    expect(Number.isFinite(cap) ? cap : null).toBeNull(); // x-health writeCap shape
+  });
+  it("with env='garbage' the served queue is TRIMMED to the fallback cap (the old Number(env ?? 40) parse left it un-trimmed)", () => {
+    const cap = resolveXDailyWriteCap("garbage"); // 40 (not NaN)
+    const usedToday = 38;
+    const remaining = Math.max(0, cap - usedToday); // 2
+    const served = Array.from({ length: 5 }, (_, i) => i); // 5 pending replies
+    // The bug being fixed: `served.length > NaN` is ALWAYS false → the cap never trims.
+    expect(served.length > Number("garbage")).toBe(false); // documents the old fail-OPEN
+    // The fix: a finite cap trims the queue down to the remaining budget.
+    expect(served.length > remaining).toBe(true);
+    expect(served.slice(0, remaining)).toHaveLength(2);
+  });
+});
+
+// A reddit lead: post id (t3 stripped) in external_id, subreddit + comments-page
+// permalink in payload, post author in author_handle. No reply_target ⇒ post target.
+const redditBase: RedditJoinedRow = {
+  approval_id: "11111111-1111-1111-1111-111111111111",
+  draft_id: "22222222-2222-2222-2222-222222222222",
+  lead_id: "33333333-3333-3333-3333-333333333333",
+  draft_payload: { kind: "reply", body: "great point, here's my take" },
+  lead_payload: {
+    subreddit: "SaaS",
+    url: "https://www.reddit.com/r/SaaS/comments/abc123/some_title/",
+    author_handle: "founder_jane",
+  },
+  author_handle: "founder_jane",
+  external_id: "abc123",
+};
+
+describe("buildActionableReddit", () => {
+  it.each([
+    ["foreign thread", "/r/SaaS/comments/other9/title/def456/"],
+    ["foreign host", "https://example.test/r/SaaS/comments/abc123/title/def456/"],
+    ["different comment", "/r/SaaS/comments/abc123/title/other9/"],
+    ["different subreddit", "/r/Other/comments/abc123/title/def456/"],
+  ])("withholds a persisted comment-grounded reply with %s", (_, permalink) => {
+    const row: RedditJoinedRow = { ...redditBase, draft_payload: { kind: "reply", body: "comment-specific detail",
+      reply_target: { kind: "comment", commentId: "def456", permalink } } };
+    expect(buildActionableReddit([row]).replies).toEqual([]);
+  });
+  it("does not repair a source post mismatch or an invalid declared ID from an alias", () => {
+    for (const change of [
+      { external_id: "other9" },
+      { external_id: "abc123!", lead_payload: { ...redditBase.lead_payload, original_post_id: "abc123" } },
+      { lead_payload: { ...redditBase.lead_payload, original_post_id: "other9" } },
+      { lead_payload: { ...redditBase.lead_payload, original_post_url: "https://www.reddit.com/r/SaaS/comments/other9/title/" } },
+    ]) expect(buildActionableReddit([{ ...redditBase, ...change }]).replies).toEqual([]);
+  });
+  it("maps a row with no reply_target to a POST target (source post comments permalink)", () => {
+    const out = buildActionableReddit([redditBase]);
+    expect(out.replies).toHaveLength(1);
+    expect(out.replies[0]).toMatchObject({
