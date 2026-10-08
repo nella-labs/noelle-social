@@ -1198,3 +1198,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
     }
 
     if (batchFellBack) {
+      // Fallback: process each batchable lead individually (today's behaviour).
+      for (const ctx of batchableLights) {
+        // Same org-wide short-circuit as the other two loops. These leads were
+        // gathered during pre-compute (ctx is cached), so this re-pays nothing
+        // — it just avoids N pointless pre-flight checks and defer writes.
+        if (budgetBlown) {
+          await deferLeadToClassified({
+            sql, leadId: ctx.lead.id, replyKind: "light", reason: "budget",
+          });
+          continue;
+        }
+        try {
+          const ok = await draftLight({
+            voiceExemplars: args.voiceExemplars,
+            lead: ctx.lead,
+            postText: ctx.postText,
+            payload: ctx.payload,
+            anchors: ctx.anchors,
+            knowledgeAnchors: ctx.knowledgeAnchors,
+            imageCaption: ctx.imageCaption,
+            personDirective: ctx.personDirective,
+            commentDigest: ctx.commentDigest,
+            brand,
+            instance,
+            routing: ctx.routing,
+            opusRepairRouting,
+            runner,
+            postOutbound,
+            markStatus,
+            log,
+            verify,
+            registerBlock: ctx.registerBlock,
+            shapeBlock: ctx.shapeBlock,
+            shapeAssigned: ctx.shapeAssigned,
+            openingMoveBlock: ctx.openingMoveBlock,
+            genzBlock: ctx.genzBlock,
+            priorReplies: ctx.priorReplies,
+            recentPhrasings,
+            replyRequest: ctx.replyRequest,
+            style: ctx.styleForLead,
+            postRegister: ctx.postRegister,
+            faithful: ctx.faithful,
+            patternRules,
+          });
+          if (ok) {
+            processed++;
+            remaining.light--;
+            await bus?.emit({
+              topic: "draft.created",
+              worker: "drafter",
+              summary: "drafted light reply (batch-fallback)",
+              payload: { lead_id: ctx.lead.id, reply_kind: "light", tier: ctx.lead.tier ?? null },
+              correlationId: ctx.lead.id,
+            });
+          }
+        } catch (err) {
+          if (err instanceof BudgetExceededError) {
+            log.warn(
+              { leadId: ctx.lead.id, layer: err.layer, spent_cents: err.spentCents },
+              "drafter blocked by budget cap (batch-fallback); deferring lead, will retry",
+            );
+            budgetBlown = true;
+            await deferLeadToClassified({
+              sql, leadId: ctx.lead.id, replyKind: "light", reason: "budget",
+            });
+          } else {
+            log.error(
+              { leadId: ctx.lead.id, err: (err as Error).message },
+              "drafter tick failed for light lead (batch-fallback)",
+            );
+            await markStatus({ leadId: ctx.lead.id, status: "errored", meta: { error: (err as Error).message } });
+          }
+        }
+      }
+    }
+  }
+
+  // ── Single-call path (substantial + non-batchable lights) ─────────────────
+  for (const { lead, replyKind, gatherLight, replyRequest: substantialReplyRequest } of singleLeads) {
+    // Org spend cap already tripped — defer the rest without paying for their
+    // pre-draft gathering (see `budgetBlown`).
+    if (budgetBlown) {
+      await deferLeadToClassified({ sql, leadId: lead.id, replyKind, reason: "budget" });
+      continue;
+    }
+    const payload = lead.payload as {
+      text?: string; url?: string; authorName?: string | null; authorHeadline?: string | null;
+      authorPublicId?: string | null; reactions?: number | null; comments?: number | null;
+      source?: string;
+      images?: string[];
+    };
+    const postText = payload.text ?? "";
+    if (!postText) {
+      await markStatus({ leadId: lead.id, status: "skipped", meta: { skip_reason: "empty post text" } });
+      continue;
+    }
+
+    if (replyKind === "light" && gatherLight) {
+      try {
+        const lightCtx = await gatherLight();
+        const ok = await draftLight({
+            voiceExemplars: args.voiceExemplars,
+          lead: lightCtx.lead,
+          postText: lightCtx.postText,
+          payload: lightCtx.payload,
+          anchors: lightCtx.anchors,
+          knowledgeAnchors: lightCtx.knowledgeAnchors,
+          imageCaption: lightCtx.imageCaption,
+          personDirective: lightCtx.personDirective,
+          commentDigest: lightCtx.commentDigest,
+          brand,
+          instance,
+          routing: lightCtx.routing,
+          opusRepairRouting,
+          runner,
+          postOutbound,
+          markStatus,
+          log,
+          verify,
+          registerBlock: lightCtx.registerBlock,
+          shapeBlock: lightCtx.shapeBlock,
+          shapeAssigned: lightCtx.shapeAssigned,
+          openingMoveBlock: lightCtx.openingMoveBlock,
+          genzBlock: lightCtx.genzBlock,
+          priorReplies: lightCtx.priorReplies,
+          recentPhrasings,
+          replyRequest: lightCtx.replyRequest,
+          style: lightCtx.styleForLead,
+          postRegister: lightCtx.postRegister,
+          faithful: lightCtx.faithful,
+          patternRules,
+        });
+        if (ok) {
+          processed++;
+          remaining.light--;
+          await bus?.emit({
+            topic: "draft.created",
+            worker: "drafter",
+            summary: "drafted light reply",
+            payload: { lead_id: lead.id, reply_kind: "light", tier: lead.tier ?? null },
+            correlationId: lead.id,
+          });
+        }
+      } catch (err) {
+        if (err instanceof BudgetExceededError) {
+          log.warn(
+            { leadId: lead.id, layer: err.layer, spent_cents: err.spentCents, cap_cents: err.capCents },
+            "drafter blocked by budget cap; deferring lead, will retry",
+          );
+          budgetBlown = true;
+          await deferLeadToClassified({ sql, leadId: lead.id, replyKind: "light", reason: "budget" });
+        } else {
+          log.error({ leadId: lead.id, err: (err as Error).message }, "drafter tick failed for light lead");
+          await markStatus({ leadId: lead.id, status: "errored", meta: { error: (err as Error).message } });
+        }
+      }
+      continue;
+    }
+
+    // SUBSTANTIAL path: gather context here (we deferred it above).
+    try {
+      // Browser qualification already ran through Jev. Keep its voice lookup
+      // inside curated folders, and avoid a whole-vault search when none exist.
+      const browserObserved = payload.source === "extension_observed";
+      const anchorDirs = browserObserved ? browserVoiceDirs : voiceDirs;
+      const anchors = browserObserved && browserVoiceDirs.length === 0
+        ? []
+        : await retrieveAnchors(kb, postText, {
+            topK: 8,
+            ...(anchorDirs && anchorDirs.length ? { filterDirs: anchorDirs } : {}),
+            rerank: rerankGrounding,
+          }).catch((err) => {
+            log.warn({ err: (err as Error).message }, "knowledge base search failed; drafting with no anchors");
+            return [];
+          });
+
+      // Retrieval-score gate. LIGHT leads bypass it — a short congrats doesn't
+      // need a voice anchor. SUBSTANTIAL leads must clear the threshold (anchors
+      // are still fetched for voice grounding).
+      //
+      // NOTIFICATION leads bypass it entirely. The gate asks "do we have
+      // something relevant to say about this STRANGER's post?" — the right
+      // question for cold outbound, and the wrong one for somebody replying to
+      // US. Relevance to our vault does not decide whether a person already
+      // mid-conversation with us deserves an answer, and going quiet on them is
+      // the exact failure the notifications actor exists to fix. Same reasoning
+      // as migration 0091 exempting these leads from the cold-reply age ceiling:
+      // that ceiling is about not answering stale STRANGERS.
+      //
+      // Keyed on source, NOT on `lead.priority`, even though the X twin uses
+      // priority for its version of this bypass. The flag does not mean the same
+      // thing on the two platforms: on X it marks watchlist leads and most leads
+      // are priority=false, so it is a selective gate. On LinkedIn essentially
+      // EVERY lead is priority=true (profile_search, keyword and discovery all
+      // set it), so `!lead.priority` would silently switch the relevance gate
+      // off for the whole pipeline and flood the queue with low-relevance cold
+      // outbound. Measured before choosing this: 1,340 non-notification priority
+      // leads in the last 14 days versus 17 notification ones.
+      const isNotification = (payload as { source?: string }).source === "notification";
+      const replyRequest = substantialReplyRequest ?? readReplyRequest(payload as Record<string, unknown>);
