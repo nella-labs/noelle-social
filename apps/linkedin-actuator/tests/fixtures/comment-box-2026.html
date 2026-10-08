@@ -1,0 +1,48 @@
+<!--
+  A migrated (SDUI) post-permalink comment composer, faithful to the live
+  2026-07 DOM (captured from a real session). Obfuscated hash classes
+  everywhere. Two buttons read "Comment":
+    1. the ACTION-BAR TOGGLE (opens the composer) — carries the comment-bubble
+       sprite `svg#comment-small` and a count span; aria-label "Comment".
+    2. the COMPOSER SUBMIT (posts the comment) — rendered AFTER the TipTap
+       editor, next to Emoji/GIF/Photo, INSIDE a `componentkey*=commentButtonSection`
+       wrapper, type=button, its label the word "Comment" as text, NO sprite.
+  The real submit lives in `commentButtonSection`; treating that wrapper as a
+  toggle signal (as the locator once did) discarded it and caused the wf=0 wall.
+  A thread "Reply" inside a replaceableComment item is a further decoy.
+-->
+<main>
+  <div class="_7f3a2b1c">
+    <div class="_58c79b9a">
+      <a href="https://www.linkedin.com/in/janedoe/"><span>Jane Doe</span></a>
+      <p data-testid="expandable-text-box">A post worth replying to about developer tools.</p>
+    </div>
+    <div class="a838e221 e54d4b63">
+      <button type="button" class="_x9k2 _r5t7" aria-label="Reaction button state: no reaction"><span>24</span></button>
+      <button type="button" class="_x9k2" aria-label="Open reactions menu"></button>
+      <button type="button" class="_x9k2 _c3v8" componentkey="d22ff783-6d23-4275-9b8b-56878acd2446" aria-label="Comment">
+        <svg xmlns="http://www.w3.org/2000/svg" id="comment-small" viewBox="0 0 16 16"><path d="M5 8h5v1H5z"></path></svg>
+        <span>10</span>
+      </button>
+      <button type="button" class="_x9k2" aria-label="Repost"><span>3</span></button>
+    </div>
+    <div class="_2b19f98b c478988d" componentkey="commentBox-abc123">
+      <div data-testid="ui-core-tiptap-text-editor-wrapper" class="_5e4f3a2b">
+        <div class="tiptap ProseMirror _d5d492cc" role="textbox" contenteditable="true" aria-label="Text editor for creating comment"><p>great point!</p></div>
+      </div>
+      <div class="_1a2b3c4d">
+        <button type="button" class="_e5f6" aria-label="Show Emoji Picker"></button>
+        <button type="button" class="_e5f6" aria-label="Open GIF picker"></button>
+        <button type="button" class="_e5f6" aria-label="Share photo"></button>
+        <div class="_87ed9fa4" id="commentButtonSection-abc123" componentkey="commentButtonSection-abc123">
+          <button type="button" class="_8eef24a7 _9a0be13d" componentkey="commentButtonSection-abc123"><span class="_a78edf32"><span class="_206505cb">Comment</span></span></button>
+        </div>
+      </div>
+    </div>
+    <div componentkey="replaceableComment_1" class="_6d5c4b3a">
+      <a href="https://www.linkedin.com/in/someone/"><span>Someone Else</span></a>
+      <p>First!</p>
+      <button type="button" class="_e5f6" aria-label="Reply">Reply</button>
+    </div>
+  </div>
+</main>
