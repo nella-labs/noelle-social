@@ -398,3 +398,19 @@ export function locateLoadMoreComments(root: ParentNode): LocateResult {
  * "See 33 more comments".
  *
  * The param needs the TUPLE form — `urn:li:comment:(<post>,<id>)` — while the
+ * sweep stores the flat `urn:li:comment:<id>`, so it is rebuilt from the post
+ * urn we already have. Returns the plain url unchanged when either half is
+ * missing: a deep link we cannot build is not a reason to skip the reply.
+ */
+export function commentDeepLink(
+  postUrl: string,
+  activityUrn: string | null | undefined,
+  commentUrn: string | null | undefined,
+): string {
+  const id = commentIdOf(commentUrn);
+  const post = (activityUrn ?? "").trim();
+  if (!id || !post) return postUrl;
+  const tuple = `urn:li:comment:(${post},${id})`;
+  const sep = postUrl.includes("?") ? "&" : "?";
+  return `${postUrl}${sep}commentUrn=${encodeURIComponent(tuple)}`;
+}
