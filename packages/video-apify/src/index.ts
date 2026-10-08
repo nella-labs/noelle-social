@@ -598,3 +598,45 @@ export function createApifyVideoClient(opts: CreateApifyVideoClientOpts): ApifyV
         }
       }
 
+      // 3. Belt-and-suspenders: if profile discovery found nothing, fall back to
+      //    the hashtag lane so a niche never silently goes empty.
+      if (out.length === 0) {
+        return fetchHashtagReels({ platform, query, maxItems, ...(sinceISO ? { sinceISO } : {}) });
+      }
+      return out.slice(0, maxItems);
+    },
+
+    async accountSnapshot({ platform, handle, recentLimit = 12 }) {
+      transport.beginOperation();
+      if (!handle) throw new ApifyError("accountSnapshot requires a handle", 0);
+      const clean = handle.replace(/^@/, "");
+      const input =
+        platform === "tiktok"
+          ? { profiles: [clean], resultsPerPage: recentLimit, shouldDownloadVideos: false, shouldDownloadCovers: false }
+          : { directUrls: [igProfileUrl(clean)], resultsType: "details", resultsLimit: recentLimit, addParentData: false };
+      const snapshotActorId = platform === "tiktok" ? tiktokActorId : igDetailsActorId;
+      const items = await runActorSync(snapshotActorId, input, recentLimit);
+      const recent = normalizeAll(platform, items, recentLimit);
+      // The follower count + profile fields live either on a details item or on
+      // the first post's author block — read defensively from the first item.
+      const head = (items[0] ?? {}) as Record<string, unknown>;
+      const author = (head.authorMeta ?? head.owner ?? head.author ?? {}) as Record<string, unknown>;
+      return {
+        handle: clean.toLowerCase(),
+        platform,
+        followerCount: readSourceCount(
+          head.followersCount,
+          author.fans,
+          author.followerCount,
+          recent[0]?.authorFollowerCount,
+        ),
+        followingCount: readSourceCount(head.followsCount, head.followingCount, author.following),
+        postCount: readSourceCount(head.postsCount, head.videosCount, author.video),
+        fullName: firstStr(head.fullName, author.nickName, head.name) || null,
+        bio: firstStr(head.biography, head.signature, author.signature) || null,
+        recent,
+        raw: head,
+      };
+    },
+  };
+}
