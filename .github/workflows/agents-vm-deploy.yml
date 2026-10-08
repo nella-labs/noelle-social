@@ -1,0 +1,97 @@
+name: agents-vm-deploy
+
+# Deploy the legacy GCP API, X and Reddit worker pool through OS Login.
+# Workload Identity uses GCP_WIF_PROVIDER and GCP_DEPLOY_SA repository variables.
+# The existing deploy script owns dependency builds, units and internal health.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # api-vm + the X-intern worker pool both deploy from this VM, so a change
+      # to EITHER (or any workspace package they import at runtime, or any of
+      # their systemd units) must trigger a redeploy. Omitting apps/x-intern/**
+      # + the worker packages meant watchlist/per-worker-toggle/backfill changes
+      # silently never deployed.
+      - "apps/api-vm/**"
+      - "apps/x-intern/**"
+      - "apps/reddit-intern/**"
+      - "packages/contracts/**"
+      - "packages/types/**"
+      - "packages/runtime/**"
+      - "packages/agents/**"
+      - "packages/secrets/**"
+      - "packages/process/**"
+      - "packages/worker-runtime/**"
+      - "packages/x-apify/**"
+      - "packages/reddit-apify/**"
+      - "packages/x-client/**"
+      - "infra/systemd/**"
+      - "infra/agents-vm/**"
+      - ".github/workflows/agents-vm-deploy.yml"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy (default: remote HEAD)"
+        required: false
+        default: "HEAD"
+
+concurrency:
+  # Don't run two VM deploys in parallel — the second would interrupt the
+  # first's systemctl restart and could leave the unit failed.
+  group: agents-vm-deploy
+  cancel-in-progress: false
+
+# Federate to GCP via Workload Identity (no static SSH key / SA key on disk).
+# `id-token: write` lets the runner mint the OIDC token google-github-actions/auth
+# exchanges for short-lived credentials of the deploy service account.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: deploy + health-check
+    if: vars.NOELLE_ENABLE_LEGACY_VM_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      # WIF: exchange the runner's OIDC token for the deploy SA's credentials.
+      # vars.GCP_WIF_PROVIDER = projects/<num>/locations/global/workloadIdentityPools/github-pool/providers/github
+      # vars.GCP_DEPLOY_SA    = noelle-gh-deployer@noelle-agents.iam.gserviceaccount.com
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Run deploy.sh on noelle-vm-0 (gcloud SSH over OS Login)
+        env:
+          REF: ${{ inputs.ref || github.sha }}
+        run: |
+          # The SA has roles/compute.osAdminLogin → an OS Login account WITH
+          # passwordless sudo, so deploy.sh's internal `sudo`/`sudo -u noelle-api`
+          # steps work. The repo on the VM lives at /opt/noelle/repo.
+          gcloud compute ssh noelle-vm-0 --quiet \
+            --zone us-east1-c --project noelle-agents --no-tunnel-through-iap \
+            --command "bash /opt/noelle/repo/infra/agents-vm/deploy.sh '$REF'"
+
+      - name: Public /health (informational)
+        env:
+          HEALTH_URL: https://api.trynoelle.com/health
+        run: |
+          # Authoritative health gates live in deploy.sh (internal /health +
+          # worker-pool active) — by the time we get here the deploy already
+          # succeeded. This public probe is INFORMATIONAL ONLY and never fails the
+          # job: Cloudflare's WAF returns 403 to GitHub-runner (datacenter) IPs,
+          # so a non-200 here means "CI IP is challenged", not "service is down".
+          for i in {1..20}; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$HEALTH_URL" || echo 000)
+            if [ "$code" = "200" ]; then echo "Public /health OK ($i)"; exit 0; fi
+            sleep 3
+          done
+          echo "Public /health probe non-200 (likely Cloudflare 403 on the CI IP) — deploy already verified by deploy.sh; not failing."
+          exit 0
