@@ -398,3 +398,203 @@ describe("runDrafterTick (reddit quality pipeline)", () => {
       }),
       { json: (x: unknown) => x },
     );
+    const n = await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      dailySubstantialCap: 30,
+      dailyLightCap: 20,
+      draftedTodayByKind: async (kind) => (kind === "substantial" ? 30 : 0),
+      sql: sql as never,
+    });
+
+    expect(n).toBe(0);
+    expect(runner.draft).not.toHaveBeenCalled();
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(sqlCalls.flat()).toContain("L");
+  });
+
+  it("enforces the daily LIGHT cap independently of the substantial cap", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    const sql = Object.assign(vi.fn(async () => []), { json: (x: unknown) => x });
+    const n = await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      dailySubstantialCap: 30,
+      dailyLightCap: 20,
+      draftedTodayByKind: async (kind) => (kind === "light" ? 20 : 0),
+      sql: sql as never,
+    });
+
+    expect(n).toBe(0);
+    expect(runner.draft).not.toHaveBeenCalled();
+  });
+
+  it("draws down the daily budget within a tick: 2nd substantial lead is deferred when cap=1", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const sql = Object.assign(vi.fn(async () => []), { json: (x: unknown) => x });
+    const n = await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ id: "L1", external_id: "1", tier: "T3", classifier_score: 77 }),
+        lead({ id: "L2", external_id: "2", tier: "T3", classifier_score: 77 }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      dailySubstantialCap: 1,
+      dailyLightCap: 20,
+      draftedTodayByKind: async () => 0,
+      sql: sql as never,
+    });
+
+    expect(n).toBe(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats cap=0 as UNLIMITED, not as 'draft nothing'", async () => {
+    // Regression guard. The defaults are 0 (= no daily cap). The destructuring
+    // default in runDrafterTick only fires for `undefined`, so a raw 0 arriving
+    // here must be normalized to unlimited — otherwise "remove the cap" would
+    // invert into "defer every lead", silently starving the approval queue.
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const sql = Object.assign(vi.fn(async () => []), { json: (x: unknown) => x });
+    const n = await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ id: "L1", external_id: "1", tier: "T3", classifier_score: 77 }),
+        lead({ id: "L2", external_id: "2", tier: "T3", classifier_score: 77 }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      dailySubstantialCap: 0,
+      dailyLightCap: 0,
+      // A big prior-day count must ALSO not re-impose a ceiling when uncapped.
+      draftedTodayByKind: async () => 500,
+      sql: sql as never,
+    });
+
+    expect(n).toBe(2);
+    expect(postOutbound).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips leads with empty post text", async () => {
+    const { postOutbound, markStatus } = deps();
+    const runner = { draft: vi.fn() };
+    const kb = { search: vi.fn().mockResolvedValue([]) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ payload: { title: "", text: "" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith({ leadId: "L", status: "skipped", meta: { skip_reason: "empty post text" } });
+  });
+
+  it("marks lead errored when drafter output schema fails", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: "not valid json", engine: "bedrock", model: "m" }) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith({ leadId: "L", status: "errored", meta: { error: "schema" } });
+  });
+
+  it("marks the lead errored with reason='budget_exceeded' when the runner throws BudgetExceededError", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = {
+      draft: vi.fn(async () => {
+        throw new BudgetExceededError({ layer: "instance", spent_cents: 9999, cap_cents: 10000, estimated_cents: 200 });
+      }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leadId: "L",
+        status: "errored",
+        meta: expect.objectContaining({ error: "budget_exceeded", layer: "instance" }),
+      }),
+    );
+  });
+
+  it("uses the reddit comments URL fallback when payload has no url", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { title: "hi", text: "" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.originalPostUrl).toContain("reddit.com/comments/");
+  });
+});
+
+describe("decideOpus (score-based tiering rule)", () => {
+  const th = { scoreThreshold: 500, commentsThreshold: 100 };
+
+  it("uses Opus when score > threshold", () => {
+    expect(decideOpus({ score: 800, comments: 2, ...th }).useOpus).toBe(true);
+  });
+
+  it("uses Opus when comments > threshold", () => {
+    expect(decideOpus({ score: 5, comments: 150, ...th }).useOpus).toBe(true);
+  });
+
+  it("does NOT use Opus for a normal low-engagement post", () => {
+    expect(decideOpus({ score: 10, comments: 3, ...th }).useOpus).toBe(false);
+  });
+
+  it("uses strict > (equal to threshold does not trip Opus)", () => {
+    expect(decideOpus({ score: 500, comments: 100, ...th }).useOpus).toBe(false);
+  });
+
+  it("keeps unknown engagement nullable without selecting a costly model", () => {
+    expect(decideOpus({ score: null, comments: undefined, ...th })).toEqual({ useOpus: false, score: null, comments: null });
+    expect(decideOpus({ score: -2, comments: 0, ...th })).toEqual({ useOpus: false, score: -2, comments: 0 });
+    expect(decideOpus({ score: 800.5, comments: 150.5, ...th })).toEqual({ useOpus: false, score: null, comments: null });
+  });
