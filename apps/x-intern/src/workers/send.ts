@@ -398,3 +398,203 @@ async function main() {
                     decided_at = coalesce(decided_at, now()),
                     skip_reason = ${`send-failed: ${reason.slice(0, 480)}`}
                 where draft_id = ${draftId}
+                  and org_id = ${inst.org_id}
+                  and status = 'sent'
+              `;
+            } catch (err) {
+              log.error(
+                { draftId, err: (err as Error).message },
+                "markErrored: approval flip failed",
+              );
+            }
+          },
+        });
+
+        const uncertain = outcomes.find((outcome) => outcome.status === "uncertain");
+        if (uncertain) {
+          const halted = await haltXSend(sql, { orgId: inst.org_id, instanceId: inst.id }).catch(() => {
+            log.error({ instanceId: inst.id }, "failed to pause sends; uncertain target claim remains reserved");
+            return false;
+          });
+          await alerts.notify({
+            instanceId: inst.id,
+            kind: "write-reconciliation",
+            orgId: inst.org_id,
+            title: halted ? "X reply requires reconciliation — sends paused" : "X reply requires reconciliation — halt unconfirmed",
+            message: `Draft ${uncertain.draftId} has an unconfirmed dispatch or an unpersisted receipt. Its target reservation and write budget remain held.${halted ? "" : " The send halt was not confirmed in storage; other sends may still be enabled."} Check the account's recent replies and record the actual outcome before resuming sends.`,
+          });
+        }
+
+        // CIRCUIT-BREAKER: an account lock / automation flag / human challenge.
+        // Disable Send for this instance so NO further writes fire until a human
+        // clears it + re-enables. Never auto-retry a lock — that's the documented
+        // fastest path to permanent suspension.
+        const stop = outcomes.find((o) => o.status === "locked" || o.status === "challenged");
+        if (stop) {
+          const halted = await haltXSend(sql, { orgId: inst.org_id, instanceId: inst.id }).catch(() => {
+            log.error({ instanceId: inst.id }, "failed to disable send on lock");
+            return false;
+          });
+          readyCache.reset(inst.org_id, "x-cookies");
+          await alerts.notify({
+            instanceId: inst.id,
+            kind: "lock",
+            orgId: inst.org_id,
+            title: halted ? "🚨 X account locked — auto-send DISABLED" : "X account locked — halt unconfirmed",
+            message:
+              `X flagged the account (${stop.status}): ${(stop.reason ?? "").slice(0, 200)}.\n` +
+              `${halted ? "Auto-send is now OFF for this agent." : "The send halt was not confirmed in storage; sends may still be enabled."} Clear the challenge on X (and re-grab cookies if asked), then re-enable Send in the dashboard. Do NOT mass-delete posts.`,
+          });
+        }
+
+        // Reply-restriction 403s ("not been mentioned or otherwise engaged"):
+        // ONE is a per-conversation condition — that row already errored inside
+        // the tick. A consecutive run (REPLY_FORBIDDEN_TRIP) is systemic — the
+        // account/app cannot reply at all right now — so hold all sends for
+        // POLICY_403_COOLDOWN_MS, hand unattempted auto-claims back to the
+        // review inbox, and page. This is the guard the 2026-07-11 storm was
+        // missing (65 identical 403s terminally errored 118 approvals).
+        const forbidden = outcomes.filter((o) => o.status === "reply_forbidden");
+        // Systemic = runSendTick actually broke on a CONSECUTIVE streak (the
+        // row it broke on carries systemic:true). NOT a total count of
+        // reply_forbidden rows — two unrelated per-conversation 403s with a
+        // successful send between them must NOT trip the account-wide halt.
+        const systemicForbidden = forbidden.some((o) => o.systemic === true);
+        if (forbidden.length > 0) {
+          let released = 0;
+          if (systemicForbidden) {
+            const until = Date.now() + POLICY_403_COOLDOWN_MS;
+            sendCooldownUntilMs.set(inst.id, until);
+            if (env.X_PERSIST_SEND_COOLDOWN) {
+              await sql`update noelle.agent_instances set send_cooldown_until = ${new Date(until)} where id = ${inst.id}`.catch(
+                (e) => log.error({ err: (e as Error).message }, "persist policy-403 cooldown failed"),
+              );
+            }
+            const unattempted = toSend.slice(outcomes.length);
+            if (unattempted.length > 0) {
+              released = unattempted.length;
+              await releaseAutoSendRowsForReview(sql, { draftIds: unattempted.map((d) => d.draft_id) }).catch(
+                (e) => log.error({ err: (e as Error).message }, "failed to release unattempted rows after policy 403"),
+              );
+            }
+            log.error(
+              { org_id: inst.org_id, forbidden: forbidden.length, released, cooldownMin: POLICY_403_COOLDOWN_MS / 60_000 },
+              "systemic reply-restriction 403 — all sends cooled down",
+            );
+          }
+          await alerts.notify({
+            instanceId: inst.id,
+            kind: "reply-forbidden",
+            orgId: inst.org_id,
+            title:
+              systemicForbidden
+                ? "🚫 X refuses ALL replies (403) — sends paused"
+                : "X refused a reply (403 restriction)",
+            message:
+              systemicForbidden
+                ? `${forbidden.length} consecutive "reply not allowed" 403s — the account/app has likely lost reply permission (API tier, scope, or account restriction). Sends are paused ${POLICY_403_COOLDOWN_MS / 3_600_000}h; ${released} unattempted repl${released === 1 ? "y was" : "ies were"} returned to the inbox. Verify with ONE manual reply to a fresh tweet before re-enabling.`
+                : `X refused one reply with a who-can-reply restriction: ${(forbidden[0]?.reason ?? "").slice(0, 180)}. The row was errored; nothing else was touched.`,
+          });
+        }
+
+        const authFailed = outcomes.some((o) => o.status === "auth_failed");
+        if (authFailed) {
+          // Wipe the ready-cache so the next tick re-pulls creds, and alert the
+          // operator to reconnect. The fix instruction depends on WHICH auth path
+          // failed: the OAuth 2.0 token (reconnect under Connections), OAuth 1.0a
+          // API keys, or the cookie fallback (re-grab ct0 + auth_token). `write`
+          // is non-null only when the official X API path ran.
+          readyCache.reset(inst.org_id, "x-cookies");
+          const apiAuthKind = write ? tokens?.authKind : undefined;
+          const alert =
+            apiAuthKind === "oauth2"
+              ? {
+                  title: "X API token expired — reconnect",
+                  message:
+                    "Auto-send hit an auth failure on the X API OAuth 2.0 token (the refresh chain broke). Reconnect the X account under Connections to mint a fresh token. Sends pause until valid.",
+                }
+              : apiAuthKind === "oauth1a"
+                ? {
+                    title: "X API keys invalid — reconnect",
+                    message:
+                      "Auto-send hit an auth failure on the X API keys (OAuth 1.0a). Check / re-enter the X API keys under Connections. Sends pause until valid.",
+                  }
+                : {
+                    title: "X cookies invalid — reconnect",
+                    message:
+                      "Auto-send hit an auth failure (cookies dead/stale). Re-grab ct0 + auth_token. Sends pause until valid.",
+                  };
+          await alerts.notify({ instanceId: inst.id, kind: "auth", orgId: inst.org_id, ...alert });
+        }
+
+        // Escalating backoff on 429: 15 → 30 → 60 → cap 120 min (pure escalateBackoff).
+        // A clean tick (something actually sent) resets the streak + cooldown. When
+        // X_PERSIST_SEND_COOLDOWN is on we also persist the new cooldown+streak so a
+        // deploy-restart can't resume posting into a throttled account, and clear
+        // them on success — but ONLY when state actually existed (no per-post churn).
+        const rateLimited = outcomes.some((o) => o.status === "rate_limited");
+        const sentSomething = outcomes.some((o) => o.status === "sent");
+        if (rateLimited) {
+          const b = escalateBackoff(rateLimitStreak.get(inst.id) ?? 0, Date.now());
+          rateLimitStreak.set(inst.id, b.streak);
+          sendCooldownUntilMs.set(inst.id, b.cooldownUntilMs);
+          if (env.X_PERSIST_SEND_COOLDOWN) {
+            await sql`update noelle.agent_instances set send_cooldown_until = ${new Date(b.cooldownUntilMs)}, rate_limit_streak = ${b.streak} where id = ${inst.id}`
+              .catch((e) => log.error({ err: (e as Error).message }, "persist send cooldown failed"));
+          }
+          log.warn({ org_id: inst.org_id, cooldownMin: b.mins, streak: b.streak }, "send rate-limited; backing off");
+          await alerts.notify({
+            instanceId: inst.id,
+            kind: "ratelimit",
+            orgId: inst.org_id,
+            title: "X rate-limited auto-send",
+            message: `Backing off ${b.mins} min (streak ${b.streak}).`,
+            throttleMs: 60 * 60_000,
+          });
+        } else if (shouldClearSendBackoff({ sent: sentSomething, rateLimited, systemicForbidden })) {
+          // A clean send clears the 429 backoff — but NOT when a systemic
+          // reply-restriction 403 set the policy cooldown earlier THIS tick
+          // (1 send + 2 forbidden can co-occur before the batch breaks). The
+          // policy cooldown is a different axis and must survive; otherwise we
+          // resume posting straight into the account/app reply block.
+          const had = rateLimitStreak.has(inst.id) || sendCooldownUntilMs.has(inst.id) || persistedCooldownUntil != null;
+          rateLimitStreak.delete(inst.id);
+          sendCooldownUntilMs.delete(inst.id);
+          if (env.X_PERSIST_SEND_COOLDOWN && had) {
+            await sql`update noelle.agent_instances set send_cooldown_until = null, rate_limit_streak = 0 where id = ${inst.id}`
+              .catch((e) => log.error({ err: (e as Error).message }, "clear send cooldown failed"));
+          }
+        }
+
+        const sent = outcomes.filter((o) => o.status === "sent");
+        for (const o of sent) {
+          await bus.emit({
+            topic: "draft.sent",
+            worker: "send",
+            summary: "sent reply to X",
+            payload: { lead_id: o.leadId, draft_id: o.draftId, external_id: o.sentExternalId, url: o.sentUrl },
+            // correlation_id chains a lead's journey across workers — use the lead
+            // id (like every other event), not the draft id.
+            correlationId: o.leadId ?? o.draftId,
+          });
+        }
+        // Stamp the inter-send floor off the last successful post; next tick waits a
+        // fresh jittered gap. No-op when the flag is off (map stays empty).
+        if (floorEnabled && outcomes.some((o) => o.status === "sent")) {
+          nextSendAllowedAtMs.set(
+            inst.id,
+            nextSendAllowedAt({
+              nowMs: Date.now(),
+              minMs: env.AUTOSEND_INTERSEND_MIN_MS,
+              maxMs: env.AUTOSEND_INTERSEND_MAX_MS,
+              rand: Math.random(),
+            }),
+          );
+        }
+        const preparationFailure = outcomes.find((outcome) => outcome.status === "preparation_failed" || outcome.status === "claim_unavailable" || outcome.status === "uncertain");
+        await run.finish(preparationFailure
+          ? { status: "error", rowsProcessed: sent.length, errorMessage: preparationFailure.reason ?? "reply preparation unavailable" }
+          : { status: "ok", rowsProcessed: sent.length });
+      } catch (err) {
+        readyCache.reset(inst.org_id, "x-cookies");
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
