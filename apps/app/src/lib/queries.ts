@@ -3198,3 +3198,203 @@ export interface PipelineWorkerSnapshot {
   state: VegaWorkerState;
   lifetime: number;
   today: number;
+  sinceStart: number;
+  lastFinishedAt: string | null;
+  runningSince: string | null;
+  /**
+   * The reason a worker last failed (worker_runs.error), surfaced so the UI shows
+   * "errored: Apify tokens exhausted" instead of a silent "stalled". Null when the
+   * last run was clean.
+   */
+  lastError: string | null;
+}
+
+export interface PipelineSnapshot {
+  status: string;
+  pipelineStartedAt: string | null;
+  /**
+   * Distinct leads with at least one pending approval — i.e. leads waiting for
+   * you to review/reply, NOT the raw approval-row count (a lead has a reply +
+   * DM draft, so rows ≈ 4×). This is the human-facing "N leads ready" number.
+   */
+  leadsReady: number;
+  /**
+   * Distinct pending leads produced since the most recent goal-run started
+   * (`goal_started_at`). Scopes the "Leads ready" card to the LAST run so a
+   * small experiment isn't buried under leads piled up from earlier runs.
+   * Null when this instance has never had a goal-run (no run boundary to
+   * scope by — callers fall back to `leadsReady`).
+   */
+  leadsReadyLastRun: number | null;
+  /** Start of the most recent goal-run, or null if there's never been one. */
+  lastRunStartedAt: string | null;
+  goal: {
+    target: number | null;
+    startedAt: string | null;
+    produced: number;
+    ready: number;
+  };
+  /**
+   * The saved discovery default (agent_instances.discovery_config) used to
+   * prefill the "Tailor this run" form. null when the intern doesn't support
+   * run tailoring (e.g. the LinkedIn intern, which doesn't use Bird operators).
+   */
+  discoveryConfig: DiscoveryConfig | null;
+  /**
+   * The recurring scheduled run (0085_run_schedule.sql), or null when none is
+   * armed. `nextAt` is the next fire time the api-vm scheduler triggers on
+   * (null when disabled). Drives the Pipeline panel's Schedule block.
+   */
+  schedule: PipelineScheduleSnapshot | null;
+  workers: PipelineWorkerSnapshot[];
+}
+
+export interface PipelineScheduleSnapshot {
+  enabled: boolean;
+  mode: "interval" | "daily";
+  intervalHours: number | null;
+  dailyTime: string | null;
+  timezone: string;
+  goal: number;
+  nextAt: string | null;
+}
+
+/** Validate a raw discovery_config jsonb blob, defaulting bad/empty to {}. */
+function parseDiscoveryConfig(raw: unknown): DiscoveryConfig {
+  if (raw == null || typeof raw !== "object") return {};
+  const res = DiscoveryConfigSchema.safeParse(raw);
+  return res.success ? res.data : {};
+}
+
+/** Shape the saved run_schedule (+ next_at) for the panel. null = no schedule. */
+function pipelineSchedule(inst: NoelleAgentInstance): PipelineScheduleSnapshot | null {
+  const s = parseRunSchedule(inst.run_schedule);
+  if (!s) return null;
+  return {
+    enabled: s.enabled,
+    mode: s.mode,
+    intervalHours: s.intervalHours ?? null,
+    dailyTime: s.dailyTime ?? null,
+    timezone: s.timezone,
+    goal: s.goal,
+    nextAt: inst.run_schedule_next_at,
+  };
+}
+
+/**
+ * One read powering the live Pipeline panel: instance status + goal-run state,
+ * per-worker run state (worker_runs) and three count windows (lifetime / today /
+ * since pipeline_started_at), plus the goal "ready/produced" numbers. Tenancy via
+ * getAgentInstance (assertOrgMember).
+ */
+export async function getPipelineSnapshot(instanceId: string): Promise<PipelineSnapshot | null> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return null;
+  const since = inst.pipeline_started_at ?? "1970-01-01T00:00:00Z";
+  const goalStart = inst.goal_started_at ?? "1970-01-01T00:00:00Z";
+
+  const [leads] = await readSql<
+    Array<{ disc_life: number; disc_today: number; disc_since: number; cls_life: number; cls_today: number; cls_since: number }>
+  >`
+    select
+      count(*)::int as disc_life,
+      count(*) filter (where created_at >= date_trunc('day', now()))::int as disc_today,
+      count(*) filter (where created_at >= ${since})::int as disc_since,
+      count(*) filter (where classifier_label is not null)::int as cls_life,
+      count(*) filter (where classifier_label is not null and created_at >= date_trunc('day', now()))::int as cls_today,
+      count(*) filter (where classifier_label is not null and created_at >= ${since})::int as cls_since
+    from noelle.leads where agent_instance_id = ${inst.id}
+      and coalesce(nullif(payload->>'post_kind', ''), payload->>'postKind', '') not in ('intro_dm', 'relationship_dm')
+      and external_id not like '%:intro%'
+  `;
+  const [drafts] = await readSql<Array<{ life: number; today: number; since: number }>>`
+    select
+      count(distinct l.id)::int as life,
+      count(distinct l.id) filter (where d.synced_at >= date_trunc('day', now()))::int as today,
+      count(distinct l.id) filter (where d.synced_at >= ${since})::int as since
+    from noelle.drafts d join noelle.leads l on l.id = d.lead_id
+    where l.agent_instance_id = ${inst.id}
+      and coalesce(d.payload->>'kind', 'reply') = 'reply'
+      and coalesce(nullif(l.payload->>'post_kind', ''), l.payload->>'postKind', '') not in ('intro_dm', 'relationship_dm')
+      and l.external_id not like '%:intro%'
+  `;
+  const [appr] = await readSql<
+    Array<{
+      sent_life: number;
+      sent_today: number;
+      sent_since: number;
+      leads_ready: number;
+      leads_ready_run: number;
+      produced: number;
+    }>
+  >`
+    select
+      count(distinct a.lead_id) filter (where a.status = 'sent')::int as sent_life,
+      count(distinct a.lead_id) filter (where a.status = 'sent' and a.decided_at >= date_trunc('day', now()))::int as sent_today,
+      count(distinct a.lead_id) filter (where a.status = 'sent' and a.decided_at >= ${since})::int as sent_since,
+      count(distinct a.lead_id) filter (where a.status = 'pending')::int as leads_ready,
+      count(distinct a.lead_id) filter (where a.status = 'pending' and a.created_at >= ${goalStart})::int as leads_ready_run,
+      count(distinct a.lead_id) filter (where a.created_at >= ${goalStart})::int as produced
+    from noelle.approvals a
+    join noelle.drafts d on d.id = a.draft_id and d.lead_id = a.lead_id
+    join noelle.leads l on l.id = a.lead_id
+    where a.agent_instance_id = ${inst.id}
+      and coalesce(d.payload->>'kind', 'reply') = 'reply'
+      and coalesce(nullif(l.payload->>'post_kind', ''), l.payload->>'postKind', '') not in ('intro_dm', 'relationship_dm')
+      and l.external_id not like '%:intro%'
+  `;
+  const [profiles] = await readSql<Array<{ life: number; today: number; since: number }>>`
+    select
+      count(*) filter (where summary is not null)::int as life,
+      count(*) filter (where summary is not null and generated_at >= date_trunc('day', now()))::int as today,
+      count(*) filter (where summary is not null and generated_at >= ${since})::int as since
+    from noelle.x_watchlist_profiles where agent_instance_id = ${inst.id}
+  `;
+  // Watchlist lane "produced" count = distinct watched-people posts that got a
+  // reply draft (one per person), not raw angle rows.
+  const [wdrafts] = await readSql<Array<{ life: number; today: number; since: number }>>`
+    select
+      count(distinct l.id)::int as life,
+      count(distinct l.id) filter (where d.synced_at >= date_trunc('day', now()))::int as today,
+      count(distinct l.id) filter (where d.synced_at >= ${since})::int as since
+    from noelle.drafts d join noelle.leads l on l.id = d.lead_id
+    where l.agent_instance_id = ${inst.id} and l.priority = true
+      and coalesce(d.payload->>'kind','reply') = 'reply'
+      and coalesce(nullif(l.payload->>'post_kind', ''), l.payload->>'postKind', '') not in ('intro_dm', 'relationship_dm')
+      and l.external_id not like '%:intro%'
+  `;
+
+  const states = await listVegaWorkerStatus({
+    discovery: inst.discovery_enabled,
+    classifier: inst.classifier_enabled,
+    drafter: inst.drafter_enabled,
+    send: inst.send_enabled,
+    profiler: inst.profiler_enabled,
+  });
+  const stateByKind = new Map(states.map((s) => [s.kind, s] as const));
+
+  const counts: Record<VegaWorkerKind, { lifetime: number; today: number; sinceStart: number }> = {
+    discovery: { lifetime: leads?.disc_life ?? 0, today: leads?.disc_today ?? 0, sinceStart: leads?.disc_since ?? 0 },
+    classifier: { lifetime: leads?.cls_life ?? 0, today: leads?.cls_today ?? 0, sinceStart: leads?.cls_since ?? 0 },
+    drafter: { lifetime: drafts?.life ?? 0, today: drafts?.today ?? 0, sinceStart: drafts?.since ?? 0 },
+    send: { lifetime: appr?.sent_life ?? 0, today: appr?.sent_today ?? 0, sinceStart: appr?.sent_since ?? 0 },
+    profiler: { lifetime: profiles?.life ?? 0, today: profiles?.today ?? 0, sinceStart: profiles?.since ?? 0 },
+    watchlist: { lifetime: wdrafts?.life ?? 0, today: wdrafts?.today ?? 0, sinceStart: wdrafts?.since ?? 0 },
+  };
+  const enabledByKind: Record<VegaWorkerKind, boolean> = {
+    discovery: inst.discovery_enabled,
+    classifier: inst.classifier_enabled,
+    drafter: inst.drafter_enabled,
+    send: inst.send_enabled,
+    profiler: inst.profiler_enabled,
+    watchlist: inst.watchlist_enabled ?? true,
+  };
+
+  const workers: PipelineWorkerSnapshot[] = VEGA_WORKERS.map((kind) => {
+    const s = stateByKind.get(kind);
+    return {
+      kind,
+      enabled: enabledByKind[kind],
+      toggleable: true,
+      runsWhilePaused: kind === "profiler",
+      state: s?.state ?? "idle",
