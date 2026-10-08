@@ -1,0 +1,30 @@
+{
+  "name": "@noelle/contracts",
+  "version": "0.0.3-alpha.2",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "description": "Zod schemas for every HTTP body exchanged between Noelle services.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "echo \"lint placeholder\"",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  }
+}
