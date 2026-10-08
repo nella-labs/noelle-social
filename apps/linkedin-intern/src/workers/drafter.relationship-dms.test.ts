@@ -198,3 +198,94 @@ describe("LinkedIn drafter relationship-DM lane", () => {
     vi.doMock("@noelle/runtime/prior-replies", () => ({ getVoiceExemplars }));
 
     await import("./drafter.js");
+    await tickDone;
+
+    expect(loadActivePatternRules).toHaveBeenCalledWith(expect.any(Function), {
+      orgId: "org-1",
+      agentInstanceId: "inst-li",
+      role: "linkedin_intern",
+    });
+    expect(tickErrors).toEqual(state === "held" || state === "recovery" ? [held] : []);
+    if (tickErrors.length)
+      expect(finish).toHaveBeenCalledWith(expect.objectContaining({ status: "error" }));
+    if (state === "held") {
+      for (const effect of [
+        resolveApify,
+        runRelationshipDmsForInstance,
+        claimDmRequestLeads,
+        claimReplyRequestLeads,
+        runDmRequestTick,
+        runDrafterTick,
+        runnerDraft,
+        claimWatchlistLeadsForDrafting,
+        claimLeadsForDrafting,
+      ])
+        expect(effect).not.toHaveBeenCalled();
+      return;
+    }
+    expect(loadActivePatternRules.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      claimDmRequestLeads.mock.invocationCallOrder[0]!,
+    );
+    expect(resolveApify).toHaveBeenCalledTimes(commentState === "off" ? 0 : 1);
+    expect(runDrafterTick).toHaveBeenCalledWith(expect.objectContaining({
+      fetchPostComments: commentState === "ready" ? expect.any(Function) : undefined,
+    }));
+    if (commentState === "unavailable") {
+      expect(warn).toHaveBeenCalledWith(
+        { org_id: "org-1" },
+        "apify credential lookup failed; drafting without comment context",
+      );
+    }
+
+    expect(getVoiceExemplars).toHaveBeenCalledWith(expect.any(Function), expect.objectContaining({
+      agentInstanceId: "inst-li", humanOnly: true,
+    }));
+
+    expect(runRelationshipDmsForInstance).toHaveBeenCalledTimes(1);
+    expect(runRelationshipDmsForInstance).toHaveBeenCalledWith(expect.objectContaining({
+      instance: expect.objectContaining({ status: "paused", goal_target: 40 }),
+    }));
+    expect(claimDmRequestLeads).toHaveBeenCalledWith(expect.any(Function), {
+      agentInstanceId: "inst-li",
+      cap: 5,
+    });
+    expect(runDmRequestTick).toHaveBeenCalledTimes(1);
+    expect(claimReplyRequestLeads).toHaveBeenCalledWith(expect.any(Function), {
+      agentInstanceId: "inst-li",
+      cap: 5,
+    });
+    expect(runDrafterTick).toHaveBeenCalledWith(expect.objectContaining({
+      claimedLeads: [{ id: "reply-lead" }],
+      patternRules: [],
+      verify: expect.objectContaining({ enabled: true }),
+    }));
+    const tickArgs = (runDrafterTick.mock.calls as unknown as Array<[{
+      verify: {
+        makeCalls: (
+          priority: boolean,
+          options?: { directRouting?: boolean },
+        ) => Array<(system: string, prompt: string) => Promise<string>>;
+      };
+    }]>)[0]![0];
+    const verify = tickArgs.verify as {
+      makeCalls: (
+        priority: boolean,
+        options?: { directRouting?: boolean },
+      ) => Array<(system: string, prompt: string) => Promise<string>>;
+    };
+    await verify.makeCalls(false, { directRouting: true })[0]!("system", "prompt");
+    await verify.makeCalls(false)[0]!("system", "prompt");
+    expect(runnerDraft.mock.calls[0]![0]).toMatchObject({ directRouting: true });
+    expect(runnerDraft.mock.calls[1]![0]).not.toHaveProperty("directRouting");
+    expect(finish).toHaveBeenCalledWith({ status: "ok", rowsProcessed: 6 });
+    expect(enforceGoal).not.toHaveBeenCalled();
+    expect(countPendingApprovalsForInstance).not.toHaveBeenCalled();
+    expect(claimWatchlistLeadsForDrafting).not.toHaveBeenCalled();
+    expect(claimLeadsForDrafting).not.toHaveBeenCalled();
+  }
+
+  it.each(["off", "unavailable", "ready", "held", "recovery"] as const)(
+    "admits standing rules before requested work: %s",
+    checkRuleAdmission,
+  );
+});
