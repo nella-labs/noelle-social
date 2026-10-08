@@ -798,3 +798,203 @@ export async function getCapStatusForXIntern(
     }>
   >`
     select
+      ai.pending_drafts_cap,
+      ai.lead_backlog_cap,
+      (
+        select count(*)
+        from noelle.approvals a
+        where a.agent_instance_id = ai.id and a.status = 'pending'
+      )::text as pending_drafts,
+      (
+        select count(*)
+        from noelle.leads l
+        where l.agent_instance_id = ai.id
+          and l.status in ('new', 'classifying', 'classified', 'drafting')
+      )::text as lead_backlog
+    from noelle.agent_instances ai
+    where ai.org_id = ${orgId}
+      and ai.role = 'x_intern'
+    limit 1
+  `;
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    pendingDraftsCap: row.pending_drafts_cap,
+    pendingDrafts: Number(row.pending_drafts),
+    leadBacklogCap: row.lead_backlog_cap,
+    leadBacklog: Number(row.lead_backlog),
+  };
+}
+
+export async function getApprovalDetail(
+  approvalId: string,
+): Promise<ApprovalDetail | null> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+
+  // We need the approval row first to know which org to guard against; do
+  // it as the same single join so we only round-trip once.
+  const rows = await readSql<JoinedRowRaw[]>`
+    select
+      a.id              as a_id,
+      a.org_id          as a_org_id,
+      a.agent_instance_id as a_agent_instance_id,
+      a.draft_id        as a_draft_id,
+      a.lead_id         as a_lead_id,
+      a.status          as a_status,
+      a.decided_at      as a_decided_at,
+      a.decided_by      as a_decided_by,
+      a.skip_reason     as a_skip_reason,
+      a.auto_send_target_at as a_auto_send_target_at,
+      a.created_at      as a_created_at,
+      a.updated_at      as a_updated_at,
+      d.id              as d_id,
+      d.lead_id         as d_lead_id,
+      d.org_id          as d_org_id,
+      d.payload         as d_payload,
+      d.synced_at       as d_synced_at,
+      l.id              as l_id,
+      l.external_id     as l_external_id,
+      l.org_id          as l_org_id,
+      l.payload         as l_payload,
+      l.synced_at       as l_synced_at,
+      l.tier            as l_tier,
+      l.classifier_label as l_classifier_label,
+      l.classifier_score as l_classifier_score,
+      l.priority        as l_priority,
+      l.platform        as l_platform,
+      l.vip_signal      as l_vip_signal
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    where a.id = ${approvalId}
+    limit 1
+  `;
+
+  const row = rows[0];
+  if (!row) return null;
+  // Phase 2 guard: gate access on caller membership of the approval's org.
+  await assertMember(row.a_org_id, userId);
+  const unpacked = unpackJoined(row);
+  // Same defensive filter as listPendingApprovalsForOrg — old SKIP-shaped
+  // approval rows shouldn't be reachable via direct URL either.
+  if (
+    unpacked.approval.status === "pending" &&
+    isAllSkipDraft(draftPayload(unpacked.draft))
+  ) {
+    return null;
+  }
+
+  // Load every sibling approval for the same lead so the detail page can show
+  // all 3 reply angles + the DM on one page (each is a separate approval row).
+  // Falls back to just the primary row when the approval has no lead.
+  let siblings: PendingApprovalRow[] = [unpacked];
+  const leadId = unpacked.approval.lead_id ?? unpacked.draft?.lead_id ?? null;
+  if (leadId) {
+    const sibRows = await readSql<JoinedRowRaw[]>`
+      select
+        a.id              as a_id,
+        a.org_id          as a_org_id,
+        a.agent_instance_id as a_agent_instance_id,
+        a.draft_id        as a_draft_id,
+        a.lead_id         as a_lead_id,
+        a.status          as a_status,
+        a.decided_at      as a_decided_at,
+        a.decided_by      as a_decided_by,
+        a.skip_reason     as a_skip_reason,
+        a.auto_send_target_at as a_auto_send_target_at,
+        a.created_at      as a_created_at,
+        a.updated_at      as a_updated_at,
+        d.id              as d_id,
+        d.lead_id         as d_lead_id,
+        d.org_id          as d_org_id,
+        d.payload         as d_payload,
+        d.synced_at       as d_synced_at,
+        l.id              as l_id,
+        l.external_id     as l_external_id,
+        l.org_id          as l_org_id,
+        l.payload         as l_payload,
+        l.synced_at       as l_synced_at,
+        l.tier            as l_tier,
+        l.classifier_label as l_classifier_label,
+        l.classifier_score as l_classifier_score,
+        l.priority        as l_priority,
+        l.platform        as l_platform,
+        l.vip_signal      as l_vip_signal
+      from noelle.approvals a
+      left join noelle.drafts d on d.id = a.draft_id
+      left join noelle.leads  l on l.id = d.lead_id
+      where a.org_id = ${unpacked.approval.org_id}
+        and a.lead_id = ${leadId}
+      order by a.created_at asc
+    `;
+    const unpackedSibs = sibRows
+      .map(unpackJoined)
+      .filter((s) => !isAllSkipDraft(draftPayload(s.draft)));
+    if (unpackedSibs.length > 0) siblings = unpackedSibs;
+  }
+
+  return { ...unpacked, siblings };
+}
+
+interface JoinedRowRaw {
+  a_id: string;
+  a_org_id: string;
+  a_agent_instance_id: string;
+  a_draft_id: string;
+  a_lead_id: string;
+  a_status: string;
+  a_decided_at: string | null;
+  a_decided_by: string | null;
+  a_skip_reason: string | null;
+  a_auto_send_target_at: string | null;
+  a_created_at: string;
+  a_updated_at: string;
+  d_id: string | null;
+  d_lead_id: string | null;
+  d_org_id: string | null;
+  d_payload: unknown;
+  d_synced_at: string | null;
+  l_id: string | null;
+  l_external_id: string | null;
+  l_org_id: string | null;
+  l_payload: unknown;
+  l_synced_at: string | null;
+  // Classifier columns from cloudsql/0005. postgres-js returns `numeric`
+  // as a JS string, so we coerce on unpack.
+  l_tier: string | null;
+  l_classifier_label: string | null;
+  l_classifier_score: string | number | null;
+  // 0005_leads_full_schema §platform. Defaults to 'x' when the column is
+  // somehow null (pre-0005 rows that never got backfilled).
+  l_platform?: string | null;
+  // Watchlist flag — true when the lead's author is a watched person. Optional
+  // because the detail-sibling selects don't always project it; coalesced to
+  // null on unpack.
+  l_priority?: boolean | null;
+  // Relationship-scout verdict jsonb (noelle.leads.vip_signal). Optional because
+  // not every select projects it; parsed + coalesced to null on unpack.
+  l_vip_signal?: unknown;
+}
+
+function unpackJoined(r: JoinedRowRaw): PendingApprovalRow {
+  const approval: NoelleApproval = {
+    id: r.a_id,
+    org_id: r.a_org_id,
+    agent_instance_id: r.a_agent_instance_id,
+    draft_id: r.a_draft_id,
+    lead_id: r.a_lead_id,
+    status: r.a_status,
+    decided_at: r.a_decided_at,
+    decided_by: r.a_decided_by,
+    skip_reason: r.a_skip_reason,
+    auto_send_target_at: r.a_auto_send_target_at,
+    created_at: r.a_created_at,
+    updated_at: r.a_updated_at,
+  } as NoelleApproval;
+
+  const draft: NoelleDraft | null = r.d_id
+    ? ({
+        id: r.d_id,
+        lead_id: r.d_lead_id!,
+        org_id: r.d_org_id!,
