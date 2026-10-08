@@ -398,3 +398,19 @@ function extractJson(text: string): unknown {
     .replace(/\s*```$/i, "")
     .trim();
   for (const candidate of [unfenced, sliceBraces(unfenced)]) {
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+function sliceBraces(s: string): string | null {
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  return s.slice(start, end + 1);
+}

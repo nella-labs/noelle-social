@@ -398,3 +398,23 @@ function oneLine(s: string | null, max: number): string {
 /** Tolerant JSON parse (raw / fenced / first-brace-to-last). */
 export function safeJsonParse(s: string): unknown {
   try {
+    return JSON.parse(s);
+  } catch {
+    /* fall through */
+  }
+  try {
+    return JSON.parse(s.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, ""));
+  } catch {
+    /* fall through */
+  }
+  const a = s.indexOf("{");
+  const b = s.lastIndexOf("}");
+  if (a >= 0 && b > a) {
+    try {
+      return JSON.parse(s.slice(a, b + 1));
+    } catch {
+      /* fall through */
+    }
+  }
+  return null;
+}
