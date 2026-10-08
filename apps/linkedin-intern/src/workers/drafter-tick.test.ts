@@ -2398,3 +2398,203 @@ describe("runDrafterTick — verifier (grounded-drafting)", () => {
     vi.stubEnv("TYPESAFE_API_KEY", "");
     vi.stubEnv("AI_GATEWAY_API_KEY", "");
     const { postOutbound, runner, kb, markStatus } = deps();
+    runner.draft.mockResolvedValue({ text: JSON.stringify(browserDraft), engine: "bedrock", model: "m" });
+    const judge = failure === "rejected"
+      ? vi.fn().mockResolvedValue(verdict(false))
+      : vi.fn().mockRejectedValue(new Error("judge unavailable"));
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o", dm_autodraft_enabled: true } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { ...leadPayload, source: "extension_observed" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+
+    const outbound = postOutbound.mock.calls[0]![0];
+    expect(outbound.drafts).toEqual([
+      expect.objectContaining({ kind: "reply", angle: "empathetic", body: browserDraft.drafts[0]!.body }),
+    ]);
+    expect(outbound.verifierMeta.pass && outbound.verifierMeta.judgeOk).toBe(false);
+    if (failure === "rejected") expect(outbound.verifierMeta.pass).toBe(false);
+    else expect(outbound.verifierMeta.judgeOk).toBe(false);
+  });
+});
+
+describe("runDrafterTick voice variety (NOELLE_DRAFTER_VARIETY)", () => {
+  // A SUBSTANTIAL lead is register 'neutral', so it takes the SHAPE lane, not the
+  // register lane (celebrations are tone-first — see the light-path test below).
+  it("substantial path: injects the assigned SHAPE block when ON", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      variety: { enabled: true, rng: () => 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("THIS REPLY'S ASSIGNED SHAPE");
+    expect(prompt).not.toContain("ASSIGNED REGISTER FOR THIS REPLY");
+  });
+
+  // The regression this whole lane exists for: the closing line of the user
+  // prompt is the LAST thing the model reads, so a fixed "~90-180 chars" band
+  // there silently outranks the shape above it. That is what pinned Lyra's feed
+  // at 181 +/- 44 chars while Vega's spread 131 +/- 58.
+  it("drops the fixed 90-180 char band from the closing line when a shape is assigned", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      variety: { enabled: true, rng: () => 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("aim ~90-180 chars");
+    expect(prompt).toContain("REPLACES the default ~90-180 target");
+  });
+
+  it("keeps the fixed band when variety is OFF (no shape, no register)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      variety: { enabled: false, rng: () => 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("aim ~90-180 chars");
+  });
+
+  it("offers a gen-z marker under the rate, and only PLAIN ones on LinkedIn", async () => {
+    const promptFor = async (rate: number, r: number) => {
+      const runner = {
+        draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "claude-sonnet-4-6" }),
+      };
+      await runDrafterTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [lead({ classifier_label: "light", tier: "T3" })] as never,
+        runner: runner as never,
+        kb: { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) } as never,
+        postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+        markStatus: vi.fn().mockResolvedValue(undefined),
+        variety: { enabled: true, rng: () => r, genzMarkerRate: rate },
+      });
+      return runner.draft.mock.calls[0]![0].prompt as string;
+    };
+    expect(await promptFor(0.9, 0.1)).toContain("SPOKEN REGISTER FOR THIS REPLY");
+    expect(await promptFor(0.9, 0.95)).not.toContain("SPOKEN REGISTER FOR THIS REPLY");
+    expect(await promptFor(0, 0)).not.toContain("SPOKEN REGISTER FOR THIS REPLY");
+
+    // The LOUD tier is a Vega/Orion thing. On a professional network "deadass"
+    // and "cooked" cost more than they buy, so Lyra's rotation is plainOnly.
+    //
+    // Asserted against the DIRECTIVES themselves, not against a hand-written
+    // prefix. The first version of this checked `once: "${marker}` for a list
+    // of literal words, and two of the five could never match: the NOT_ME and
+    // THE_WAY directives open `the "not me …ing"`, so the quote is in a
+    // different place and those guards were silently vacuous.
+    const loudDirectives = GENZ_MARKERS.filter((m) => m.tier === "loud").map((m) => m.directive);
+    expect(loudDirectives.length).toBeGreaterThan(0);
+    const plainDirectives = GENZ_MARKERS.filter((m) => m.tier === "plain").map((m) => m.directive);
+    let sawPlain = false;
+    for (const r of [0.05, 0.15, 0.3, 0.45, 0.6, 0.8, 0.95]) {
+      const prompt = await promptFor(1, r);
+      for (const d of loudDirectives) expect(prompt).not.toContain(d);
+      if (plainDirectives.some((d) => prompt.includes(d))) sawPlain = true;
+    }
+    // …and the lane is actually firing, so "no loud markers" is not passing
+    // just because no marker rendered at all.
+    expect(sawPlain).toBe(true);
+  });
+
+  it("normal light drafting carries one forced conversational move", async () => {
+    const marker = GENZ_MARKERS.find((candidate) => candidate.id === "CONTEXT_SUPPORTED_ADDRESS");
+    expect(marker).toBeDefined();
+
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "claude-sonnet-4-6" }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: "T3" })] as never,
+      runner: runner as never,
+      kb: { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) } as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      batch: { enabled: false },
+      variety: {
+        enabled: true,
+        rng: () => 0,
+        genzMarkerRate: 1,
+        genzMarkerRotation: { next: () => marker ?? null },
+      },
+    });
+
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt.match(/SPOKEN REGISTER FOR THIS REPLY/g)).toHaveLength(1);
+    expect(prompt).toContain(marker?.directive);
+    expect(prompt).toContain("public reply only, never a DM");
+  });
+
+  it("light path: SHAPED half of the tone-first split gets a celebration-safe shape", async () => {
+    // A celebration used to mean "register, no shape", so every win in the feed
+    // came out in one length band. Half now take a shape drawn only from the
+    // shapes that can carry a congrats.
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "claude-sonnet-4-6" }),
+    };
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: "T3" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      // r=0.25 is below TONE_FIRST_SHAPE_SHARE → the shaped half.
+      variety: { enabled: true, rng: () => 0.25, genzMarkerRate: 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("THIS REPLY'S ASSIGNED SHAPE");
+    expect(prompt).not.toContain("ASSIGNED REGISTER FOR THIS REPLY");
+    // QUESTION_ONLY is already off-register on a win via the LIGHT lane, and
+    // DETAIL_ZOOM grades their material instead of congratulating them.
+    expect(prompt).not.toContain("The whole reply is ONE genuine, specific question");
+    expect(prompt).not.toContain("Zoom in on ONE small, specific detail");
+  });
+
+  it("light path: injects the assigned-register block when ON (rng → HYPE)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "claude-sonnet-4-6" }),
+    };
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: "T3" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      // r=0.75 is above TONE_FIRST_SHAPE_SHARE → the REGISTER half of the
