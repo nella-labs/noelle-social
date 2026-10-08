@@ -398,3 +398,113 @@ export function planScrollGestures(
 
   // Per-plan mixture weights (drawn once so each scroll has its OWN gesture-type
   // balance instead of the identical 0.45/0.40/0.10/0.05 split every time — a
+  // fixed mixture is a session-level fingerprint). Back-scroll stays tightly
+  // bounded, and (being self-compensating below) can't starve forward progress.
+  const wFlick = clamp(rng.normal(0.45, 0.08), 0.3, 0.6);
+  const wDrag = clamp(rng.normal(0.4, 0.08), 0.25, 0.55);
+  const wNudge = clamp(rng.normal(0.1, 0.04), 0.03, 0.2);
+  const wBack = clamp(rng.normal(0.05, 0.02), 0.02, 0.1);
+
+  while (scrolled < totalPx && guard++ < maxGestures) {
+    const remaining = totalPx - scrolled;
+    const typeIdx = rng.pickWeighted([wFlick, wDrag, wNudge, wBack]);
+
+    const deltas: number[] = [];
+    const interDeltaMs: number[] = [];
+    let kind: ScrollGesture["kind"];
+
+    if (typeIdx === 3) {
+      // BACK-SCROLL — a negative delta (re-reading / thumbing back up). It now
+      // DECREMENTS `scrolled`, so the loop scrolls forward again to re-cover that
+      // ground: net displacement still lands on totalPx (fixes a latent
+      // under-scroll) and keeps the total-scroll budget robust even as the
+      // magnitude below is widened for variance.
+      kind = "back-scroll";
+      const raw = -clamp(rng.normal(190, 85), 60, 420);
+      const d = jittered(raw, undefined);
+      deltas.push(d);
+      interDeltaMs.push(clamp(rng.logNormal(Math.log(150), 0.55), 60, 650));
+      scrolled += d;
+    } else if (typeIdx === 2) {
+      // MICRO-NUDGE — 1–3 small notches
+      kind = "micro-nudge";
+      const notches = rng.int(1, 3);
+      let prev: number | undefined;
+      for (let i = 0; i < notches; i++) {
+        const raw = clamp(rng.normal(50, 18), 20, 100);
+        const d = jittered(raw, prev);
+        deltas.push(d);
+        prev = d;
+        interDeltaMs.push(clamp(rng.logNormal(Math.log(140), 0.5), 60, 550));
+        scrolled += d;
+        if (scrolled >= totalPx) break; // stop once the destination is reached
+      }
+    } else if (typeIdx === 1) {
+      // SLOW-DRAG — reading scroll
+      kind = "slow-drag";
+      const notches = rng.int(3, 9);
+      let prev: number | undefined;
+      for (let i = 0; i < notches; i++) {
+        const raw = clamp(rng.normal(90, 30), 40, 150);
+        const d = jittered(raw, prev);
+        deltas.push(d);
+        prev = d;
+        // reading-scroll pacing: σ_log widened and the ceiling raised so an
+        // occasional long "stopped to read" pause sits between notches.
+        interDeltaMs.push(clamp(rng.logNormal(Math.log(140), 0.62), 60, 700));
+        scrolled += d;
+        if (scrolled >= totalPx) break; // stop once the destination is reached
+      }
+    } else {
+      // FLICK — momentum with exponential decay
+      kind = "flick";
+      const v0 = clamp(rng.logNormal(Math.log(1800), 0.5), 800, 3600); // px/s
+      // gesture target, but never carry the page far past where it's headed:
+      // a human stops the flick once they've reached their destination.
+      // (min with `remaining` still caps total scroll, so the ±budget holds.)
+      const targetDist = Math.min(
+        clamp(rng.logNormal(Math.log(650), 0.6), 200, 1800),
+        remaining,
+      );
+      const dt = 1 / 60; // ~16.7 ms frame budget
+      let v = v0;
+      let gestureScrolled = 0;
+      let prev: number | undefined;
+      let frames = 0;
+      while (frames++ < 240) {
+        const rawDelta = v * dt; // px this frame
+        if (rawDelta < 2) break;
+        const d = jittered(rawDelta, prev);
+        deltas.push(d);
+        prev = d;
+        // ~60fps frame budget. Real rAF-driven wheel momentum never runs FASTER
+        // than the vsync cap, so the jitter is upward-only (0–3 ms slower, never
+        // below the 16.7 ms budget — the low bound is NOT lowered vs baseline)
+        // plus an occasional dropped frame (~2× budget). This widens inter-delta
+        // spread while keeping every frame ≥ the baseline minimum.
+        let frameMs = 16.7 + rng.next() * 3;
+        if (rng.next() < 0.05) frameMs += 16.7;
+        interDeltaMs.push(frameMs);
+        gestureScrolled += d;
+        scrolled += d;
+        if (gestureScrolled >= targetDist) break;
+        v *= 0.95; // momentum decay per frame
+      }
+      // guarantee at least one delta even for a degenerate draw
+      if (deltas.length === 0) {
+        const d = jittered(clamp(v0 * dt, 2, 40), undefined);
+        deltas.push(d);
+        interDeltaMs.push(16.7);
+        scrolled += d;
+      }
+    }
+
+    // inter-gesture transit dwell as the previous gesture's postDwell — θ nudged
+    // up (mean 800→920 ms, slightly slower, never faster) and the ceiling raised
+    // 4000→6000 so a real "got distracted mid-scroll" pause occasionally lands.
+    const postDwellMs = clamp(rng.gamma(2, 460), 80, 6000);
+    gestures.push({ kind, deltas, interDeltaMs, postDwellMs });
+  }
+
+  return gestures;
+}
