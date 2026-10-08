@@ -198,3 +198,31 @@ export function ContactWatchlistCard({
             flexWrap: "wrap",
             gap: 8,
             alignItems: "center",
+            marginTop: 14,
+            paddingTop: 12,
+            borderTop: "1px solid var(--rule-soft)",
+          }}
+        >
+          <span className="eyebrow" style={{ flex: "1 1 100%" }}>
+            Add to a watchlist
+          </span>
+          <select
+            name="instanceId"
+            className="input"
+            style={{ flex: "1 1 140px", fontSize: 12 }}
+            aria-label="Agent to add this contact to"
+            required
+          >
+            {addableAgents.map((a) => (
+              <option key={a.instanceId} value={a.instanceId}>
+                {a.name}
+              </option>
+            ))}
+          </select>
+          <ObjectiveSelect name="objectiveKind" defaultValue="relationship" />
+          <SubmitButton className="btn btn-sm btn-accent">Add</SubmitButton>
+        </ReloadForm>
+      ) : null}
+    </section>
+  );
+}
