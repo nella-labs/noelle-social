@@ -1398,3 +1398,203 @@ const actionableX: Handler<{ Variables: { actuator: ActuatorContext } }> = async
     : await readXBrowserReplyUsage(sql, orgId);
   const remaining = Math.max(0, dailyCap - used);
   if (served.replies.length > remaining) {
+    const replies = served.replies.slice(0, remaining);
+    console.warn("[actuator] x daily write-cap trim", {
+      org_id: orgId, cap: dailyCap, used,
+      served: replies.length,
+      withheld: served.replies.length - replies.length,
+    });
+    return c.json(ActionableXResponseSchema.parse({ replies }));
+  }
+  return c.json(ActionableXResponseSchema.parse(served));
+};
+actuator.get("/api/actionable-x", actionableX);
+actuator.get("/api/actionable-x/priority-ready", actionableX);
+
+// Reserve the target tweet immediately before browser submit. A lost response
+// stays claimed: retrying an ambiguous public send risks a duplicate reply.
+actuator.use("/api/x-actuator/claim-reply/:id", requireActuatorToken);
+actuator.post("/api/x-actuator/claim-reply/:id", async (c) => {
+  const { orgId } = c.get("actuator");
+  const approvalId = c.req.param("id");
+  if (!/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(approvalId)) return c.json({ claimed: false, reason: "invalid-id" }, 400);
+  const sql = noelleDb();
+  try {
+    const rows = await sql<Array<XJoinedRow & {
+      status: string; reply_send_enabled: boolean; auto_send_enabled: boolean;
+      actuator_daily_reply_cap: number | null; cap_instance_id: string;
+    }>>`
+      select a.id as approval_id, a.status, a.auto_send_target_at,
+             d.id as draft_id, d.payload as draft_payload,
+             l.id as lead_id, l.payload as lead_payload,
+             l.external_id, l.author_handle,
+             ai.reply_send_enabled, ai.auto_send_enabled, ai.actuator_daily_reply_cap,
+             ai.id as cap_instance_id
+      from noelle.approvals a
+      join noelle.agent_instances ai on ai.id = a.agent_instance_id
+      join noelle.drafts d on d.id = a.draft_id
+      join noelle.leads l on l.id = d.lead_id and l.id = a.lead_id
+      where a.id = ${approvalId} and a.org_id = ${orgId}
+        and ai.org_id = ${orgId} and ai.role = 'x_intern'
+        and d.org_id = ${orgId} and l.org_id = ${orgId} and l.platform = 'x'
+      limit 1
+    `;
+    const row = rows[0];
+    if (!row || row.status !== "pending" ||
+        (row.reply_send_enabled !== true && row.auto_send_enabled !== true)) {
+      return c.json({ claimed: false, reason: "not-eligible" }, 409);
+    }
+    const eligible = buildActionableX([row], undefined, {
+      blockExternalLinks: (process.env.NOELLE_X_ACTUATOR_BLOCK_EXTERNAL_LINKS ?? "1") !== "0",
+    }).replies[0];
+    const tweetId = eligible?.target.tweet_id;
+    if (!tweetId || !/^\d{1,25}$/.test(tweetId)) return c.json({ claimed: false, reason: "not-eligible" }, 409);
+
+    const maxAgeHours = resolveXReplyMaxAgeHours(process.env.X_REPLY_MAX_AGE_HOURS);
+    const postedAt = readXSourceTimestamp(row.lead_payload?.posted_at);
+    const postedMs = postedAt ? Date.parse(postedAt) : NaN;
+    const observedJev = row.lead_payload?.source === "extension_observed" &&
+      row.lead_payload.classifier?.judge === "jev";
+    if (!observedJev && maxAgeHours > 0 && Number.isFinite(postedMs) && Date.now() - postedMs > maxAgeHours * 3600_000) {
+      return c.json({ claimed: false, reason: "stale" }, 409);
+    }
+    const repliedIds = await fetchXRepliedTweetIds(sql, orgId, [tweetId]);
+    if (repliedIds.has(tweetId)) return c.json({ claimed: false, reason: "already-replied" }, 409);
+    const perAuthorRaw = process.env.NOELLE_X_ACTUATOR_PER_AUTHOR_DAILY_CAP;
+    const parsedAuthorCap = Number(perAuthorRaw);
+    const perAuthorCap = perAuthorRaw?.trim()
+      ? Number.isFinite(parsedAuthorCap) && parsedAuthorCap >= 1 ? Math.floor(parsedAuthorCap) : 1
+      : null;
+    const outcome = await reserveXBrowserReply(sql, {
+      orgId, instanceId: row.cap_instance_id, approvalId, draftId: row.draft_id,
+      tweetId, body: eligible.body, maxAgeHours, perAuthorCap,
+      blockExternalLinks: (process.env.NOELLE_X_ACTUATOR_BLOCK_EXTERNAL_LINKS ?? "1") !== "0",
+      haltOnChallenge: ["1", "true"].includes(process.env.NOELLE_X_ACTUATOR_HALT_ON_CHALLENGE ?? ""),
+    });
+    if (outcome !== "claimed") return c.json({ claimed: false, reason: outcome }, 409);
+    return c.json({ claimed: true, tweetId });
+  } catch (err) {
+    console.error("[actuator] X reply claim failed; withholding send", err);
+    return c.json({ claimed: false, reason: "claim-unavailable" }, 503);
+  }
+});
+
+actuator.use("/api/x-activity", requireActuatorToken);
+
+actuator.post("/api/x-activity", async (c) => {
+  const { orgId } = c.get("actuator");
+  const body = XActivityInSchema.parse(await c.req.json());
+  const sql = noelleDb();
+  const values = body.events.map((e) => ({
+    org_id: orgId,
+    session_id: body.session_id,
+    type: e.type,
+    approval_id: e.approval_id ?? null,
+    tweet_id: e.tweet_id ?? null,
+    author_handle: e.author_handle ?? null,
+    reason: e.reason ?? null,
+    // e.engagement (like / bookmark / repost — the specific engagement delivered
+    // on a like) is accepted by the schema and surfaced in the extension panel,
+    // but intentionally NOT persisted here — no column for it yet. Add one + map
+    // it if engagement-mix analytics are wanted.
+  }));
+  await sql`insert into noelle.x_activity ${sql(values)}`;
+  return c.json({ inserted: values.length });
+});
+
+// GET /api/actuator/x-extension-build: the X twin of /api/actuator/extension-build
+// — the on-disk build stamp of the unpacked X actuator (`wxt build` writes
+// build-stamp.json next to the manifest; `noelle sync` refreshes it on every
+// merge-driven deploy). The running extension polls this on its 5-minute alarm
+// and chrome.runtime.reload()s itself when the stamp differs from the one
+// compiled into its bundle. Fail-soft: a missing/unreadable stamp file serves
+// { stamp: null } and the extension does nothing. pm2 starts api-vm via
+// `pnpm --filter @noelle/api-vm start`, so cwd is apps/api-vm; the repo-root
+// candidate covers a bare `node dist` start.
+actuator.use("/api/actuator/x-extension-build", requireActuatorToken);
+
+actuator.get("/api/actuator/x-extension-build", async (c) => {
+  const candidates = process.env.NOELLE_X_EXT_STAMP_PATH
+    ? [process.env.NOELLE_X_EXT_STAMP_PATH]
+    : [
+        join(process.cwd(), "../x-actuator/.output/chrome-mv3/build-stamp.json"),
+        join(process.cwd(), "apps/x-actuator/.output/chrome-mv3/build-stamp.json"),
+      ];
+  for (const p of candidates) {
+    try {
+      const raw = JSON.parse(await readFile(p, "utf8")) as { stamp?: unknown };
+      return c.json({ stamp: typeof raw.stamp === "string" ? raw.stamp : null });
+    } catch {
+      // try the next candidate; fall through to stamp:null when none is readable
+    }
+  }
+  return c.json({ stamp: null });
+});
+
+// GET /api/actuator/x-health: the X twin of /api/actuator/health, aggregating
+// noelle.x_activity instead of linkedin_activity. status: halt = a challenge in
+// the last hour (stop and back off), warn = a challenge in the last 24h,
+// ok = clean. writes = replies (the only server-served write kind on X).
+actuator.use("/api/actuator/x-health", requireActuatorToken);
+
+actuator.get("/api/actuator/x-health", async (c) => {
+  const { orgId } = c.get("actuator");
+  const sql = noelleDb();
+  const instanceId = c.req.query("instanceId");
+  let writeCap = resolveBrowserReplyCap("x", null);
+  if (instanceId) {
+    const policy = await readXBrowserReplyCap(sql, { orgId, instanceId });
+    if (!policy) return c.json({ error: "instance_not_in_org" }, 403);
+    writeCap = policy.cap;
+  }
+  const rows = await sql<Array<{
+    likes_today: number; replies_today: number;
+    skips_24h: number; challenges_24h: number; last_challenge_at: string | null;
+  }>>`
+    select
+      (count(*) filter (where type = 'like'  and created_at >= date_trunc('day', now())))::int as likes_today,
+      (count(*) filter (where type = 'reply' and created_at >= date_trunc('day', now())))::int as replies_today,
+      (count(*) filter (where type = 'skip'  and created_at >= now() - interval '24 hours'))::int as skips_24h,
+      (count(*) filter (where reason = 'challenge' and created_at >= now() - interval '24 hours'))::int as challenges_24h,
+      max(created_at) filter (where reason = 'challenge') as last_challenge_at
+    from noelle.x_activity
+    where org_id = ${orgId}
+  `;
+  const r = rows[0] ?? {
+    likes_today: 0, replies_today: 0,
+    skips_24h: 0, challenges_24h: 0, last_challenge_at: null,
+  };
+  const lastChallengeMs = r.last_challenge_at ? Date.parse(r.last_challenge_at) : 0;
+  const challengeWithinHour = lastChallengeMs > 0 && Date.now() - lastChallengeMs < 3600_000;
+  const status = challengeWithinHour ? "halt" : r.challenges_24h > 0 ? "warn" : "ok";
+  // Same resolver as the serve path, so telemetry can never claim a cap the
+  // queue doesn't enforce (the pre-fix Number(env ?? 40) diverged on garbage
+  // input). Infinity isn't JSON — report the unlimited sentinel as null.
+  return c.json({
+    status,
+    today: {
+      likes: r.likes_today, replies: r.replies_today,
+      writes: r.replies_today,
+      writeCap,
+    },
+    last24h: { skips: r.skips_24h, challenges: r.challenges_24h },
+    lastChallengeAt: r.last_challenge_at,
+  });
+});
+
+actuator.use("/api/reddit-reply-claim", requireActuatorToken,
+  bodyLimit({ maxSize: 131072, onError: c => c.json({ error: "claim_request_too_large" }, 413) }));
+actuator.post("/api/reddit-reply-claim", async c => {
+  let input: unknown;
+  try { input = await c.req.json(); }
+  catch { return c.json({ error: "invalid_claim_request" }, 400); }
+  const request = RedditReplyClaimInSchema.safeParse(input);
+  if (!request.success) return c.json({ error: "invalid_claim_request" }, 400);
+  const { orgId } = c.get("actuator");
+  try {
+    const result = await reserveRedditBrowserReply(noelleDb(), orgId, request.data, {
+      blockExternalLinks: (process.env.NOELLE_REDDIT_ACTUATOR_BLOCK_EXTERNAL_LINKS ?? "1") !== "0",
+      haltOnChallenge: ["1", "true"].includes(process.env.NOELLE_REDDIT_ACTUATOR_HALT_ON_CHALLENGE ?? ""),
+      dailyCapRaw: process.env.NOELLE_REDDIT_ACTUATOR_DAILY_WRITE_CAP,
+    });
+    return result === "claimed" ? c.json({ claimed: true }) : c.json({ error: result }, 409);
