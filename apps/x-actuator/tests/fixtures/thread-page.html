@@ -1,0 +1,50 @@
+<!-- A conversation (permalink) page opened on SOMEONE ELSE'S REPLY TO US — the
+     page the notifications sweep lands on for every item it ingests.
+
+     Captured shape, same rule as status-page.html: the FOCAL tweet (the one the
+     URL points at) renders its <time> WITHOUT a self-permalink anchor, because
+     you are already on its page. Every ancestor above it and every reply below
+     it keeps its permalink. That absence is how the focal tweet is located —
+     matching on its id cannot work, because its id is exactly what is missing.
+
+     Layout: root post (theirs) -> our reply -> THEIR reply (focal) -> a later reply. -->
+<div aria-label="Timeline: Conversation">
+  <article data-testid="tweet">
+    <div data-testid="User-Name"><span>Carol Dev</span> <span>@carol</span></div>
+    <a href="/carol/status/1900000000000000001"><time datetime="2026-07-26T09:00:00.000Z">9:00 AM</time></a>
+    <div data-testid="tweetText" lang="en">shipping daily is overrated, most teams cannot sustain it</div>
+    <div role="group">
+      <button data-testid="reply" aria-label="Reply"></button>
+      <button data-testid="like" aria-label="Like"></button>
+    </div>
+  </article>
+  <article data-testid="tweet">
+    <div data-testid="User-Name"><span>Alex</span> <span>@demooperator</span></div>
+    <a href="/demooperator/status/1900000000000000002"><time datetime="2026-07-26T09:12:00.000Z">9:12 AM</time></a>
+    <div data-testid="tweetText" lang="en">it is only unsustainable when every ship needs a meeting first</div>
+    <div role="group">
+      <button data-testid="reply" aria-label="Reply"></button>
+      <button data-testid="like" aria-label="Like"></button>
+    </div>
+  </article>
+  <!-- FOCAL: their reply to us. No self-permalink anchor on the <time>. -->
+  <article data-testid="tweet">
+    <div data-testid="User-Name"><span>Carol Dev</span> <span>@carol</span></div>
+    <div><div>Replying to <a href="/demooperator">@demooperator</a></div></div>
+    <div data-testid="tweetText" lang="en">fair, but the meeting is usually the review that catches the bug</div>
+    <time datetime="2026-07-26T09:20:00.000Z">9:20 AM · Jul 26, 2026</time>
+    <div role="group">
+      <button data-testid="reply" aria-label="Reply"></button>
+      <button data-testid="like" aria-label="Like"></button>
+    </div>
+  </article>
+  <article data-testid="tweet">
+    <div data-testid="User-Name"><span>Dave</span> <span>@dave</span></div>
+    <a href="/dave/status/1900000000000000004"><time datetime="2026-07-26T09:31:00.000Z">9:31 AM</time></a>
+    <div data-testid="tweetText" lang="en">both of you are describing the same team</div>
+    <div role="group">
+      <button data-testid="reply" aria-label="Reply"></button>
+      <button data-testid="like" aria-label="Like"></button>
+    </div>
+  </article>
+</div>
