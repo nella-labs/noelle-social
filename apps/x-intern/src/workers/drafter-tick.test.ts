@@ -598,3 +598,203 @@ describe("runDrafterTick", () => {
         .mockResolvedValueOnce({
           text: output([{ angle: "technical", body: "baseline reply" }]),
           engine: "codex",
+          model: "gpt-5",
+        })
+        .mockResolvedValueOnce({
+          text: output([
+            { angle: "empathetic", body: "unreviewed candidate" },
+            { angle: "empathetic", body: "weak voice candidate" },
+            { angle: "technical", body: "strong passing candidate" },
+            { angle: "contrarian", body: "overflow candidate must not be judged" },
+          ]),
+          engine: "codex",
+          model: "gpt-5",
+        }),
+    };
+    const judge = vi.fn().mockImplementation(async (_system: string, prompt: string) => {
+      if (prompt.includes("unreviewed candidate")) return "not a verdict";
+      if (prompt.includes("strong passing candidate") && !prompt.includes("weak voice candidate")) {
+        return JSON.stringify({ voice: 0.82, grounding: 0.84, relevance: 0.86, reasons: [], fix: null });
+      }
+      if (prompt.includes("weak voice candidate")) {
+        return JSON.stringify({ voice: 0.4, grounding: 0.84, relevance: 0.86, reasons: ["off voice"], fix: "fix voice" });
+      }
+      return JSON.stringify({ voice: 0.5, grounding: 0.8, relevance: 0.8, reasons: ["off voice"], fix: "fix voice" });
+    });
+
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [{
+        ...mkLead(),
+        payload: { ...mkLead().payload, source: "extension_observed" },
+      }],
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 1, makeCalls: () => [judge] },
+    });
+
+    expect(runner.draft).toHaveBeenCalledTimes(2);
+    expect(runner.draft.mock.calls[1]![0].prompt).toContain("exactly THREE distinct reply candidates");
+    expect(judge.mock.calls.some(([, prompt]) => prompt.includes("overflow candidate"))).toBe(false);
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.drafts).toHaveLength(1);
+    expect(body.drafts[0]).toMatchObject({
+      body: "strong passing candidate",
+      verifierMeta: expect.objectContaining({ pass: true }),
+    });
+  });
+
+  it("verifier grades voice against the same real sent replies as the drafter", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    const vaultSnippets = Array.from({ length: 8 }, (_, index) => `vault voice anchor ${index + 1}`);
+    const kb = {
+      search: vi.fn().mockResolvedValue(vaultSnippets.map((snippet, index) => ({
+        snippet,
+        score: 8 - index / 10,
+        filePath: `voice-${index + 1}.md`,
+        startLine: 1,
+        endLine: 1,
+        highlights: [],
+      }))),
+    };
+    const shortExamples = Array.from({ length: 6 }, (_, index) => `short sent reply ${index + 1}`);
+    const pairedExamples = Array.from({ length: 6 }, (_, index) => ({
+      post: `older source post ${index + 1}`,
+      reply: `paired sent reply ${index + 1}`,
+    }));
+
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [mkLead()],
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      examples: shortExamples,
+      voiceExemplars: pairedExamples,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+
+    const judgePrompt = judge.mock.calls[0]![1] as string;
+    expect(judgePrompt).toContain(shortExamples[0]);
+    expect(judgePrompt).toContain(pairedExamples[0]?.reply);
+    for (const snippet of vaultSnippets) expect(judgePrompt).toContain(snippet);
+    for (const example of pairedExamples) expect(judgePrompt).not.toContain(example.post);
+  });
+
+  it("excludes generated and template artifacts from writer and verifier voice evidence", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    const kb = {
+      search: vi.fn().mockResolvedValue([
+        {
+          snippet: "## Do {{#voiceDos}} - {{.}} {{/voiceDos}}",
+          score: 10,
+          source: { filePath: "Voice/voice-and-style.md", startLine: 29, endLine: 36 },
+        },
+        {
+          snippet: "Direct. Specific. Human. Honest uncertainty without guru energy.",
+          score: 9.5,
+          source: { filePath: "02-brand/voice-and-style.md", startLine: 8, endLine: 14 },
+        },
+        {
+          snippet: "Grow a physics and engineering student audience while building a startup",
+          score: 9,
+          source: { filePath: "Voice/personal-brand-state.md", startLine: 13, endLine: 21 },
+        },
+        {
+          snippet: "<!-- One or two lines. e.g. Solo founder building Noelle. -->",
+          score: 8,
+          source: { filePath: "Voice/voice-spec.md", startLine: 19, endLine: 22 },
+        },
+        {
+          snippet: "First person, lowercase-leaning, blunt, founder-to-peer.",
+          score: 7,
+          source: { filePath: "Voice/voice-spec.md", startLine: 23, endLine: 28 },
+        },
+      ]),
+    };
+
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [mkLead()],
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+
+    const writerPrompt = runner.draft.mock.calls[0]![0].prompt as string;
+    const judgePrompt = judge.mock.calls[0]![1] as string;
+    for (const prompt of [writerPrompt, judgePrompt]) {
+      expect(prompt).toContain("First person, lowercase-leaning, blunt, founder-to-peer.");
+      expect(prompt).toContain("Direct. Specific. Human. Honest uncertainty without guru energy.");
+      expect(prompt).not.toContain("{{#voiceDos}}");
+      expect(prompt).not.toContain("physics and engineering student audience");
+      expect(prompt).not.toContain("<!-- One or two lines");
+    }
+  });
+
+  it("uses Codex only for every browser draft and high reasoning for the final repair", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    const judge = vi.fn().mockResolvedValue(verdict(false));
+    const makeCalls = vi.fn(() => [judge]);
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const sourcePost = "If someone sees seven posts, they may warm up; separately, one prospect viewed my profile.";
+
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [{
+        ...mkLead(),
+        payload: {
+          ...mkLead().payload,
+          source: "extension_observed",
+          text: sourcePost,
+        },
+      }],
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, voiceFloor: 0.8, makeCalls },
+    });
+
+    expect(makeCalls).toHaveBeenCalledWith(false, {
+      codexSubscriptionOnly: true,
+      codexReasoningEffort: "high",
+    });
+    expect(runner.draft.mock.calls.map((call) => call[0].routing.primary.model))
+      .toEqual(["claude-sonnet-4-6", "claude-sonnet-4-6", "claude-sonnet-4-6"]);
+    expect(runner.draft.mock.calls[0]![0]).toMatchObject({ codexSubscriptionOnly: true });
+    expect(runner.draft.mock.calls[1]![0]).toMatchObject({ codexSubscriptionOnly: true });
+    expect(runner.draft.mock.calls[2]![0]).toMatchObject({
+      codexSubscriptionOnly: true,
+      codexReasoningEffort: "high",
+    });
+    const firstRepair = runner.draft.mock.calls[1]![0] as { prompt: string };
+    const finalRepair = runner.draft.mock.calls[2]![0] as { prompt: string };
+    expect(firstRepair.prompt).not.toContain("FINAL BROWSER REPAIR");
+    expect(finalRepair.prompt).toContain("FINAL BROWSER REPAIR");
+    expect(finalRepair.prompt).toContain(sourcePost);
+    expect(finalRepair.prompt).toContain("REVIEW FEEDBACK");
+    expect(finalRepair.prompt).toMatch(/one compact reply.*natural.*rhythm/i);
+    expect(finalRepair.prompt).toMatch(/source.*specific/i);
+    expect(finalRepair.prompt).toMatch(/learned.*pattern rules.*still apply/i);
+    expect(finalRepair.prompt).toContain("NO FULL STOPS");
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({
+      status: "skipped",
+      meta: expect.objectContaining({ skip_reason: "low-voice" }),
