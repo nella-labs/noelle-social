@@ -198,3 +198,25 @@ async function main() {
           });
           return;
         }
+
+        await run.finish({ status: "ok", rowsProcessed: result.corpusRows });
+      } catch (err) {
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      } finally {
+        // Clear the pending flag no matter what — last_run >= requested means the
+        // selector won't re-pick this instance. A crash must never strand a run as
+        // "pending" (which would re-pull + re-bill every tick).
+        await markFeederRunComplete(sql, inst.id).catch((err) =>
+          log.error({ instance: inst.id, err: (err as Error).message }, "markFeederRunComplete failed"),
+        );
+      }
+    },
+    shouldStop,
+  });
+}
+
+main().catch((err) => {
+  console.error("account-feeder fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});

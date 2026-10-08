@@ -798,3 +798,181 @@ The very first character of your response MUST be \`{\` and the last \`}\`. Outp
  * the model can reference something specific and ask a grounded question about
  * their current project. Mirrors how buildPersonDirective threads the profile.
  */
+export function renderIntroDmPrompt(person: {
+  name: string | null;
+  publicId: string | null;
+  headline: string | null;
+  objective: string | null;
+  summary: string;
+  topics: string[];
+  tone: string | null;
+  engagementNotes: string | null;
+}): string {
+  const who = person.name ?? (person.publicId ? `@${person.publicId}` : "this person");
+  const firstName = person.name ? person.name.trim().split(/\s+/)[0] : null;
+  const lines: string[] = [
+    `Write the operator's one-time intro DM to ${who} on LinkedIn.`,
+    "",
+    "WHO THEY ARE (ground the reference + the question in this — do not quote it back at them):",
+  ];
+  if (firstName) lines.push(`First name (use it in the greeting): ${firstName}`);
+  if (person.headline) lines.push(`Headline: ${person.headline}`);
+  if (person.summary) lines.push(`Who they are: ${person.summary}`);
+  if (person.topics.length) lines.push(`What they post / work on: ${person.topics.join(", ")}`);
+  if (person.tone) lines.push(`How they write: ${person.tone}`);
+  if (person.engagementNotes) lines.push(`How to engage them so it lands: ${person.engagementNotes}`);
+  if (person.objective) lines.push(`Operator's goal for this person: ${person.objective}`);
+  lines.push(
+    "",
+    "Reference something specific from the above, then ASK what they're building / working on right now. NO pitch, no product, no link. Warm, curious, peer-to-peer.",
+    "",
+    "OUTPUT FORMAT — STRICT JSON, NO PREAMBLE, NO MARKDOWN FENCES:",
+    "The very first character of your response MUST be `{` and the last `}`.",
+    '  {"body":"…","char_count":N}',
+    "Fragmented into 3-5 short chunks with literal \\n between them. Aim 300-550 chars, 700 hard max. No drafts array, no skip.",
+  );
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Progressive DM ladder (lib/dm-ladder.ts). An on-demand DM the operator asked
+// for on a specific post. Unlike the one-time intro DM, this is grounded in the
+// post AND aware of WHERE in the relationship it is: the rung (Open → Deepen →
+// Bridge → Invite) sets what the DM does and whether it may propose a call. Same
+// anti-slop voice; draft-only.
+// ---------------------------------------------------------------------------
+
+/** System prompt for a ladder DM at a given rung. The rung's directive is the
+ *  DM's job; the call policy is derived from `rung.proposesCall` so only the top
+ *  rung may suggest talking live. */
+export function buildLadderDmSystem(rung: DmRung): string {
+  const callPolicy = rung.proposesCall
+    ? "CALL POLICY: Prior outbound DMs do not prove a response or relationship. You MAY propose ONE low-pressure, easy-to-decline quick call (around 15 minutes, no agenda) at this rung. Exactly one gentle invite, framed as genuine curiosity, never pushy. Never imply prior exchange or interest without recorded received evidence."
+    : "CALL POLICY (HARD RULE): Do NOT propose a call, a meeting, a chat, a time to talk, or 'hopping on' anything. Not in this message. It is too early. Suggesting a call now would break the trust you're building.";
+  return `You are writing ONE LinkedIn DM for the operator to a person he's connected with. This is part of a GRADUAL relationship, not a cold pitch, and it is draft-only (the operator reviews and sends it himself).
+
+${WRITING_STRUCTURE_GUIDANCE}
+
+THIS DM'S JOB (rung ${rung.index} of 4 — "${rung.label}")
+${rung.directive}
+
+${callPolicy}
+
+NO PITCH — HARD RULE
+Do NOT mention any product, any link, any install line, or any CTA. Not even softly. This exists only to move a real relationship forward.
+
+VOICE (the thing everyone gets wrong)
+Direct. Specific. Human. Warm but never corporate. It should read like the operator actually typed it to this one person. English only. Honest and a little informal beats polished. First person. Glue clauses with commas and connectors (and, but, so, because) so it reads like one person talking.
+
+${EMOJI_RULE}
+
+${NO_COMMITMENTS_RULE}
+
+${ANTI_AI_RULES}
+
+NEVER DO
+- Em dashes (—, –, ―, --). Use commas, parentheses, or periods.
+- Any pitch, product mention, link, install line, or CTA (see NO PITCH above).
+- Reframe / negative parallelism (HARD BAN): no "not X, it's Y", "isn't just X, it's Y", "the real X is Y", or a rhetorical-question pivot.
+- "As a fellow founder…", "fellow builder", or any "as a X myself" framing. Just talk to them.
+- Corporate verbs: unlock, empower, leverage, streamline, delight, supercharge, revolutionize, seamless, synergy, cutting-edge.
+- "honestly" / "to be honest" as a filler crutch.
+- Hollow flattery ("huge fan", "love your work", "your content is fire"). Be specific or say nothing.
+- Any emoji outside 💀 😭 😛, and even those sparingly.
+- Non-English text.
+
+SHAPE
+- Warm and human: 2 to 5 short chunks separated by blank lines (literal \\n between chunks inside the JSON string). Never one block of prose.
+- Length: aim 250 to 550 characters, hard max 700. This is a message, not an essay. Earlier rungs can be shorter.
+
+OUTPUT FORMAT — STRICT JSON, NO MARKDOWN FENCES, NO PREAMBLE
+The very first character of your response MUST be \`{\` and the last \`}\`. Output exactly:
+
+  {"body":"…","char_count":N}
+
+\`char_count\` must equal the actual length of \`body\`. Output nothing else — no drafts array, no dm wrapper, no skip.`;
+}
+
+/**
+ * Render the user prompt for a ladder DM: grounds it in the person + the post the
+ * operator clicked, tells the model which rung it is, and passes the DMs already
+ * sent to this person so the next rung doesn't repeat an earlier opener/take.
+ */
+export function renderLadderDmPrompt(args: {
+  rung: DmRung;
+  postText: string;
+  person: { name: string | null; publicId: string | null; headline: string | null };
+  priorDmBodies: string[];
+}): string {
+  const { rung, postText, person, priorDmBodies } = args;
+  const who = person.name ?? (person.publicId ? `@${person.publicId}` : "this person");
+  const firstName = person.name ? person.name.trim().split(/\s+/)[0] : null;
+  const lines: string[] = [
+    `Write the operator's DM to ${who} on LinkedIn. This is rung ${rung.index} of 4 ("${rung.label}") in a gradual relationship.`,
+    "",
+    "WHO THEY ARE / WHAT THEY POSTED (ground the DM in this; do not quote it back at them):",
+  ];
+  if (firstName) lines.push(`First name (use it in a light greeting): ${firstName}`);
+  if (person.headline) lines.push(`Headline: ${person.headline}`);
+  if (postText.trim()) {
+    lines.push("Their recent post:", postText.replace(/\s+/g, " ").trim());
+  }
+  if (priorDmBodies.length > 0) {
+    lines.push(
+      "",
+      "DMs the operator has ALREADY sent this person (do NOT repeat these openers, takes, or questions — move the relationship forward):",
+      ...priorDmBodies.map((b, i) => `[${i + 1}] ${b.replace(/\s+/g, " ").trim()}`),
+    );
+  }
+  lines.push(
+    "",
+    `What THIS DM should do: ${rung.directive}`,
+    "",
+    "OUTPUT FORMAT — STRICT JSON, NO PREAMBLE, NO MARKDOWN FENCES:",
+    "The very first character MUST be `{` and the last `}`.",
+    '  {"body":"…","char_count":N}',
+    "Warm, human, 2-5 short chunks with literal \\n between them. Aim 250-550 chars, 700 hard max. No drafts array, no skip.",
+  );
+  return lines.join("\n");
+}
+
+const SYSTEM_PROFILER = [
+  "You build a concise profile of one LinkedIn person for an operator's social growth profile.",
+  "You are given a sample of the person's recent posts. Read them and infer who this person is and how to engage them authentically — NOT to flatter, but so comments land as a knowledgeable peer.",
+  "Be specific and grounded ONLY in the posts provided. Do not invent facts, employers, or beliefs you can't see. If the sample is thin, say so briefly rather than guessing.",
+  "Output STRICT JSON, no preamble, no markdown fences. The first character MUST be `{` and the last `}`:",
+  '  {"summary":"2-4 sentence who-they-are + what they care about","topics":["theme1","theme2"],"tone":"how they write (e.g. dry, earnest, technical, motivational)","engagement_notes":"how to comment so it lands — angles that resonate, things to avoid"}',
+  "`topics` is at most 6 short lowercase themes. Keep every field tight; this is a quick brief, not an essay.",
+].join(" ");
+
+/**
+ * System prompt for the LinkedIn profiler worker. Appends the operator mission so
+ * the "how to engage" notes are framed by what this agent is actually for.
+ */
+export function buildProfilerSystem(objective?: string | null): string {
+  const mission = objective?.trim();
+  if (!mission) return SYSTEM_PROFILER;
+  return [
+    SYSTEM_PROFILER,
+    "",
+    `OPERATOR MISSION: the founder framed this agent's job as: "${mission}". Frame the engagement notes toward that mission where the person genuinely overlaps with it — but never fabricate overlap, and keep the strict JSON shape.`,
+  ].join("\n");
+}
+
+// ---- Account Feeder: style extractor --------------------------------------
+// The Account Feeder distils ONE admired source account's writing STYLE (not who
+// they are — that's the profiler) so another writer can imitate it: voice, tone,
+// structural patterns, hook patterns, signature phrases, top topics. Input is a
+// sample of that account's own posts + authored comments (their real outbound
+// voice). Output is the "ultra profile" jsonb shape (UltraProfileOutput in
+// account-feeder-tick.ts). Mirrors SYSTEM_PROFILER: grounded-only, no fabrication,
+// strict JSON. Runs on Vertex Gemini Flash (createVertexBackend), like the
+// classifier — parse with the extractJson→Zod fence-stripping pattern.
+export const SYSTEM_STYLE_EXTRACTOR = [
+  "You analyze the posts and comments from ONE LinkedIn account and extract that account's writing STYLE so another writer can imitate it.",
+  "You are NOT summarizing what the account is about and you are NOT profiling who they are — you are reverse-engineering HOW they write: their voice, tone, the structural patterns of their posts, the hook patterns they open with, the signature phrases/words they reuse, and the topics they write about.",
+  "Ground EVERYTHING ONLY in the provided text. DO NOT invent, fabricate, or guess voice traits, phrases, hooks, or topics that are not clearly present in the samples. If the sample is thin or one-note, return fewer items rather than padding — an empty list is better than a made-up one. Never attribute a phrase the account did not actually use.",
+  "Output STRICT JSON, no preamble, no markdown fences. The first character MUST be `{` and the last `}`:",
+  '  {"voice_summary":"2-4 sentences on how this account writes (register, posture, what makes the voice recognizable)","tone":"a few adjectives for the tone (e.g. dry, punchy, earnest, contrarian, technical)","structure_notes":"how their posts/comments are structured — length, line breaks, lists vs prose, openers, closers, cadence","hook_patterns":["recurring ways they open a post / grab attention, quoted or paraphrased from the samples"],"signature_phrases":["distinctive words or phrasings they actually reuse"],"top_topics":["the themes they write about, lowercase"]}',
+  "Each list holds at most 8 short, concrete items drawn from the samples. Keep `voice_summary`/`tone`/`structure_notes` tight — this is an imitation cheat-sheet, not an essay.",
+].join(" ");
