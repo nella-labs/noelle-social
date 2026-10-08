@@ -198,3 +198,180 @@ export function InvitationsManager({ invitations, canManage, listmonkConfigured 
           <span>Created · redeemed</span>
           <span style={{ textAlign: "right" }}>{canManage ? "Action" : ""}</span>
         </div>
+
+        {invitations.length === 0 ? (
+          <div style={{ padding: "18px", fontSize: 13, color: "var(--ink-muted)" }}>
+            No invitations yet.
+          </div>
+        ) : (
+          invitations.map((inv, i) => (
+            <div
+              key={inv.id}
+              className="stack-phone"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "160px 1fr 90px 110px 1fr 90px",
+                gap: 14,
+                alignItems: "center",
+                padding: "12px 18px",
+                borderTop: i === 0 ? 0 : "1px solid var(--rule-soft)",
+              }}
+            >
+              <CopyChip code={inv.code} />
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {inv.email ?? <span style={{ color: "var(--ink-muted)" }}>—</span>}
+                </div>
+                {inv.note ? (
+                  <div style={{ fontSize: 11, color: "var(--ink-muted)" }}>{inv.note}</div>
+                ) : null}
+              </div>
+              <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--ink-muted)" }}>
+                {inv.kind}
+              </span>
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontFamily: "var(--mono)",
+                  fontSize: 10.5,
+                  color: STATUS_TONE[inv.status],
+                }}
+              >
+                <span style={{ width: 6, height: 6, borderRadius: "50%", background: STATUS_TONE[inv.status] }} />
+                {inv.status}
+              </span>
+              <span className="mono" style={{ fontSize: 11, color: "var(--ink-muted)" }}>
+                {fmtDate(inv.created_at)}
+                {inv.redeemed_at ? ` · ${fmtDate(inv.redeemed_at)}` : ""}
+              </span>
+              <span style={{ textAlign: "right" }}>
+                {canManage && inv.status === "pending" ? (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    disabled={pending}
+                    onClick={() => revoke(inv.id)}
+                  >
+                    Revoke
+                  </button>
+                ) : null}
+              </span>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function fmtDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  // Pin locale + timezone so the server (UTC) and client render identically —
+  // a locale/timezone-dependent date in render otherwise aborts hydration.
+  return d.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
+}
+
+function CopyChip({ code }: { code: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        navigator.clipboard?.writeText(code).then(
+          () => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1200);
+          },
+          () => {},
+        );
+      }}
+      title="Copy code"
+      style={{
+        fontFamily: "var(--mono)",
+        fontSize: 11.5,
+        color: copied ? "var(--ok)" : "var(--ink-2)",
+        background: "var(--paper-2)",
+        border: 0,
+        boxShadow: "0 0 0 0.5px var(--rule)",
+        borderRadius: 6,
+        padding: "4px 8px",
+        cursor: "pointer",
+        maxWidth: "100%",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {copied ? "copied!" : code}
+    </button>
+  );
+}
+
+function Field({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <span
+        style={{
+          fontFamily: "var(--mono)",
+          fontSize: 10.5,
+          letterSpacing: "0.1em",
+          textTransform: "uppercase",
+          color: "var(--ink-muted)",
+        }}
+      >
+        {label}
+      </span>
+      {children}
+      {hint ? <span style={{ fontSize: 11.5, color: "var(--ink-soft)" }}>{hint}</span> : null}
+    </label>
+  );
+}
+
+function TextInput({
+  value,
+  onChange,
+  placeholder,
+  type = "text",
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  type?: string;
+}) {
+  return (
+    <input
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      type={type}
+      style={{
+        height: 36,
+        padding: "0 12px",
+        borderRadius: 8,
+        border: 0,
+        boxShadow: "0 0 0 0.5px var(--rule)",
+        background: "var(--paper-2)",
+        color: "var(--ink)",
+        fontFamily: "var(--body)",
+        fontSize: 13,
+        outline: "none",
+        width: "100%",
+      }}
+    />
+  );
+}
