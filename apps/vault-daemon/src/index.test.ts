@@ -198,3 +198,24 @@ test("repeated shutdown signals share one drain and one successful exit", async 
   await first;
   expect(f.close).toHaveBeenCalledTimes(1);
   expect(process.exit).toHaveBeenCalledExactlyOnceWith(0);
+});
+test("queue saturation exits unsuccessfully only after accepted writes settle", async () => {
+  f.write.mockImplementation(() =>
+    f.write.mock.calls.length === 1
+      ? new Promise<void>((resolve) => {
+          release = resolve;
+        })
+      : Promise.resolve(),
+  );
+  await entry();
+  f.handlers.get("change")?.(`${root}/a.md`);
+  await vi.advanceTimersByTimeAsync(50);
+  for (let i = 0; i < 257; i++) f.handlers.get("change")?.(`${root}/queued-${i}.md`);
+  expect(f.close).toHaveBeenCalledTimes(1);
+  expect(process.exit).not.toHaveBeenCalled();
+  release?.();
+  await vi.runAllTimersAsync();
+  for (let i = 0; i < 40; i++) await Promise.resolve();
+  expect(f.write).toHaveBeenCalledTimes(257);
+  expect(process.exit).toHaveBeenCalledExactlyOnceWith(1);
+});
