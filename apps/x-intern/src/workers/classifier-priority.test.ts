@@ -598,3 +598,112 @@ describe("classifyOneLead", () => {
     });
     expect(values).toContain("skipped");
   });
+
+  it("RESCUES a slop post when the author has > 1500 followers", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue({ ...meteredOnBrand });
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: false, payload: { text: slopText, author_followers: 2000 } },
+      log: { warn: vi.fn() },
+    });
+    // slop, but rescued → kept (status 'classified'), not 'skipped'.
+    expect(values).toContain("classified");
+    expect(values).not.toContain("skipped");
+  });
+
+  it("drops a sub-100-follower author even when on-brand and not slop", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue({ ...meteredOnBrand });
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: false, payload: { text: "any tips for postgres migrations?", author_followers: 42 } },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("skipped");
+  });
+
+  it("keeps a clean, high-follower on-brand lead", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue({ ...meteredOnBrand });
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: false, payload: { text: "any tips for postgres migrations?", author_followers: 8000 } },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("classified");
+  });
+
+});
+
+describe("classifierBudgetBlock", () => {
+  const adapters = (
+    spend: { bucket: number; org: number; instance: number },
+    cap: { bucket: number; org: number; instance: number },
+  ): CapAdapters => ({
+    fetchSpend: async () => spend,
+    fetchCaps: async () => cap,
+  });
+
+  it("returns the BudgetExceededError when the classifier bucket is at cap", async () => {
+    const blocked = await classifierBudgetBlock(
+      adapters({ bucket: 100, org: 100, instance: 100 }, { bucket: 50, org: 9_999_999, instance: 9_999_999 }),
+      { orgId: "o", instanceId: "i" },
+    );
+    expect(blocked).not.toBeNull();
+    expect(blocked?.layer).toBe("bucket");
+  });
+
+  it("returns null when under every cap layer", async () => {
+    const blocked = await classifierBudgetBlock(
+      adapters({ bucket: 0, org: 0, instance: 0 }, { bucket: 1000, org: 1000, instance: 1000 }),
+      { orgId: "o", instanceId: "i" },
+    );
+    expect(blocked).toBeNull();
+  });
+
+  it("blocks claude-cli over cap too — a subscription is spent, not free", async () => {
+    // This used to return null on the premise that claude-cli is flat-rate and
+    // records cents=0. Both halves stopped being true: it records the CLI's own
+    // total_cost_usd, and what it spends is a weekly allowance. The matching
+    // exemption in callAgentModel is already gone; this was the last copy, and
+    // it let the classifier claim a batch and then fail call-by-call instead of
+    // skipping the tick cleanly.
+    const blocked = await classifierBudgetBlock(
+      adapters({ bucket: 100, org: 100, instance: 100 }, { bucket: 50, org: 50, instance: 50 }),
+      { orgId: "o", instanceId: "i", engine: "claude-cli" },
+    );
+    expect(blocked).not.toBeNull();
+  });
+
+  it("still blocks the paid engines when over cap", async () => {
+    for (const engine of ["vertex", "bedrock"] as const) {
+      const blocked = await classifierBudgetBlock(
+        adapters({ bucket: 100, org: 100, instance: 100 }, { bucket: 50, org: 50, instance: 50 }),
+        { orgId: "o", instanceId: "i", engine },
+      );
+      expect(blocked).not.toBeNull();
+    }
+  });
+
+  it("propagates non-budget errors (does not silently skip the tick)", async () => {
+    const broken: CapAdapters = {
+      fetchSpend: async () => {
+        throw new Error("db down");
+      },
+      fetchCaps: async () => ({ bucket: 1, org: 1, instance: 1 }),
+    };
+    await expect(
+      classifierBudgetBlock(broken, { orgId: "o", instanceId: "i" }),
+    ).rejects.toThrow("db down");
+  });
+});

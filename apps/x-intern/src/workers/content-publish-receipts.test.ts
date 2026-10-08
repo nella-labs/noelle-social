@@ -198,3 +198,79 @@ describe("content publish uncertain receipts", () => {
       const { state, args } = fixture({ draftFailure: true, restoreFailure });
       expect(await runContentPublishTick(args)).toEqual([
         {
+          slotId: "slot",
+          status: "failed",
+          failurePhase: "draft_load",
+          claimRetained: restoreFailure,
+          budgetReservationUncertain: false,
+        },
+      ]);
+      expect(state).toMatchObject({
+        status: restoreFailure ? "publishing" : "ready",
+        used: 0,
+        attempts: 0,
+      });
+    },
+  );
+
+  it.each([false, true])(
+    "recovers a lost reservation response without undercounting and reports restoration failure=%s",
+    async (restoreFailure) => {
+      const { state, args } = fixture({ budgetFailure: true, restoreFailure });
+      expect(await runContentPublishTick(args)).toEqual([
+        {
+          slotId: "slot",
+          status: "failed",
+          failurePhase: "budget_reservation",
+          claimRetained: restoreFailure,
+          budgetReservationUncertain: true,
+        },
+      ]);
+      expect(state).toMatchObject({
+        status: restoreFailure ? "publishing" : "ready",
+        used: 1,
+        attempts: 0,
+      });
+    },
+  );
+
+  it.each([
+    [new XAuthError(), "failed"],
+    [new XLockError(), "locked"],
+    [new XChallengeError(), "challenged"],
+    [new XRateLimitError(), "rate_limited"],
+  ])(
+    "releases known rejection %s without changing the account stop outcome",
+    async (writeFailure, status) => {
+      const { state, args } = fixture({ writeFailure: writeFailure as Error });
+      expect((await runContentPublishTick(args))[0]?.status).toBe(status);
+      expect(state).toMatchObject({ status: "ready", used: 0 });
+    },
+  );
+
+  it("keeps a pre-dispatch media failure retryable", async () => {
+    const { state, args } = fixture({ mediaFailure: true });
+    expect((await runContentPublishTick(args))[0]?.status).toBe("failed");
+    expect(state).toMatchObject({ status: "ready", used: 0, attempts: 0 });
+  });
+  it.each([false, true])(
+    "does not claim publication when the receipt update touches no row; quarantine absent=%s",
+    async (quarantineRowMissing) => {
+      const { state, args } = fixture({ receiptRowMissing: true, quarantineRowMissing });
+      expect(await runContentPublishTick(args)).toEqual([
+        {
+          slotId: "slot",
+          status: "uncertain",
+          receipt,
+          reconciliationPersisted: !quarantineRowMissing,
+        },
+      ]);
+      expect(state).toMatchObject({
+        status: quarantineRowMissing ? "publishing" : "failed",
+        used: 1,
+        attempts: 1,
+      });
+      expect(await runContentPublishTick(args)).toEqual([]);
+    },
+  );
+});

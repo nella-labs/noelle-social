@@ -198,3 +198,18 @@ describe("assembleIdeas", () => {
   it("honors an explicit fan-out scope (e.g. a cross-platform request)", () => {
     const ideas = assembleIdeas(parsed, sources, { ...opts, targetPlatforms: ["x", "linkedin"] });
     expect(ideas[0]!.targetPlatforms).toEqual(["x", "linkedin"]);
+  });
+
+  it("assigns Mon..Sun days for a weekly batch", () => {
+    const ideas = assembleIdeas(parsed, sources, { ...opts, weekStart: "2026-06-29" });
+    expect(ideas[0]!.suggestedDay).toBe("2026-06-29");
+    expect(ideas[1]!.suggestedDay).toBe("2026-06-30");
+  });
+});
+
+describe("addDays", () => {
+  it("adds UTC days without a clock", () => {
+    expect(addDays("2026-06-29", 0)).toBe("2026-06-29");
+    expect(addDays("2026-06-29", 6)).toBe("2026-07-05");
+  });
+});
