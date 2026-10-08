@@ -398,3 +398,203 @@ export const scheduleAutoSend = withRateLimit(
       throw e;
     }
   },
+);
+
+const MarkSentInput = z.object({
+  orgSlug: z.string().min(1),
+  approvalId: z.string().uuid(),
+  // Optional: the link to the reply you posted on X by hand. When present, the
+  // API extracts the tweet id so the dashboard can show a live "view reply".
+  tweetUrl: z.string().url().optional(),
+});
+
+export type MarkSentManualInput = z.infer<typeof MarkSentInput>;
+
+export type MarkSentManualResult =
+  | {
+      ok: true;
+      sentAt: string;
+      draftId: string;
+      /** How many sibling angles were auto-skipped (one lead, one reply). */
+      siblingSkipped: number;
+    }
+  | {
+      ok: false;
+      error: {
+        code: string;
+        message: string;
+        status: number;
+        retry_after_ms?: number;
+      };
+    };
+
+/**
+ * Manual mark-sent: the reviewer already posted the reply on X by hand (the
+ * Speedrun copy → paste flow, or a lead with no valid in_reply_to anchor).
+ * POSTs to api.trynoelle.com `/api/drafts/:id/mark-sent`, which flips the
+ * approval to 'sent' and skips siblings WITHOUT re-posting to X. We then
+ * revalidate the inbox + detail routes so the row leaves the pending queue.
+ *
+ * Shares the 'approvals.send' rate-limit bucket — same "approvals work" cap.
+ */
+export const markSentManual = withRateLimit(
+  "approvals.send",
+  { capacity: 60, refillPerSecond: 1, cost: 2 },
+  async (input: MarkSentManualInput): Promise<MarkSentManualResult> => {
+    const parsed = MarkSentInput.parse(input);
+
+    try {
+      const res = await noelleFetch<DraftMarkSentOut>(
+        `/api/drafts/${encodeURIComponent(parsed.approvalId)}/mark-sent`,
+        { method: "POST", body: parsed.tweetUrl ? { tweet_url: parsed.tweetUrl } : {} },
+      );
+      DraftMarkSentOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals`);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals/${parsed.approvalId}`);
+      return {
+        ok: true,
+        sentAt: res.sent_at,
+        draftId: res.draft_id,
+        siblingSkipped: res.sibling_skipped ?? 0,
+      };
+    } catch (e) {
+      if (e instanceof NoelleApiError) {
+        return {
+          ok: false,
+          error: {
+            code: e.code,
+            message: e.message,
+            status: e.status,
+            retry_after_ms: e.retryAfterMs,
+          },
+        };
+      }
+      throw e;
+    }
+  },
+);
+
+const UnmarkSentInput = z.object({
+  orgSlug: z.string().min(1),
+  approvalId: z.string().uuid(),
+});
+
+export type UnmarkSentManualInput = z.infer<typeof UnmarkSentInput>;
+
+export type UnmarkSentManualResult =
+  | { ok: true; status: string; restored: number }
+  | { ok: false; error: { code: string; message: string; status: number; retry_after_ms?: number } };
+
+/**
+ * Undo a manual mark-sent — the transient "Undo" affordance in the inbox. POSTs
+ * to `/api/drafts/:id/unmark-sent`, which reverses the send (approval back to
+ * 'pending', draft un-locked, sibling angles + auto-deferred DM restored) for a
+ * MANUAL send only. We then revalidate the inbox + detail routes so the row
+ * returns to the actionable queue. Shares the 'approvals.send' rate bucket.
+ */
+export const unmarkSentManual = withRateLimit(
+  "approvals.send",
+  { capacity: 60, refillPerSecond: 1, cost: 2 },
+  async (input: UnmarkSentManualInput): Promise<UnmarkSentManualResult> => {
+    const parsed = UnmarkSentInput.parse(input);
+
+    try {
+      const res = await noelleFetch<DraftUnmarkSentOut>(
+        `/api/drafts/${encodeURIComponent(parsed.approvalId)}/unmark-sent`,
+        { method: "POST", body: {} },
+      );
+      DraftUnmarkSentOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals`);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals/${parsed.approvalId}`);
+      return { ok: true, status: res.status, restored: res.restored };
+    } catch (e) {
+      if (e instanceof NoelleApiError) {
+        return {
+          ok: false,
+          error: {
+            code: e.code,
+            message: e.message,
+            status: e.status,
+            retry_after_ms: e.retryAfterMs,
+          },
+        };
+      }
+      throw e;
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Pattern Breaker — the approvals-page popup's Revert / Refine / Acknowledge.
+// All three POST to api.trynoelle.com (org-membership checked there) and
+// revalidate the inbox. Refine ENQUEUES an AI rewrite (status→refining); the
+// pattern-breaker worker drains it, so the next poll shows the refined rule.
+// ---------------------------------------------------------------------------
+
+const PatternAlertActionInput = z.object({
+  orgSlug: z.string().min(1),
+  alertId: z.string().uuid(),
+});
+export type PatternAlertActionInput = z.infer<typeof PatternAlertActionInput>;
+
+const PatternRefineActionInput = PatternAlertActionInput.merge(PatternRefineInputSchema);
+export type PatternRefineActionInput = z.infer<typeof PatternRefineActionInput>;
+
+export type PatternAlertActionResult =
+  | { ok: true; status: string; refineRequestId?: string | null }
+  | { ok: false; error: { code: string; message: string; status: number; retry_after_ms?: number } };
+
+function patternError(e: unknown): PatternAlertActionResult {
+  if (e instanceof NoelleApiError) {
+    return { ok: false, error: { code: e.code, message: e.message, status: e.status, retry_after_ms: e.retryAfterMs } };
+  }
+  throw e;
+}
+
+export const revertPatternAlert = withRateLimit(
+  "approvals.send",
+  { capacity: 60, refillPerSecond: 1, cost: 1 },
+  async (input: PatternAlertActionInput): Promise<PatternAlertActionResult> => {
+    const parsed = PatternAlertActionInput.parse(input);
+    try {
+      const res = await noelleFetch<{ status: string }>(
+        `/api/pattern-alerts/${encodeURIComponent(parsed.alertId)}/revert`,
+        { method: "POST", body: {} },
+      );
+      revalidatePath(`/app/${parsed.orgSlug}/approvals`);
+      return { ok: true, status: res.status };
+    } catch (e) {
+      return patternError(e);
+    }
+  },
+);
+
+export const refinePatternAlert = withRateLimit(
+  "approvals.send",
+  { capacity: 60, refillPerSecond: 1, cost: 1 },
+  async (input: PatternRefineActionInput): Promise<PatternAlertActionResult> => {
+    const parsed = PatternRefineActionInput.parse(input);
+    try {
+      const res = await noelleFetch<{ status: string; refineRequestId: string | null }>(
+        `/api/pattern-alerts/${encodeURIComponent(parsed.alertId)}/refine`,
+        {
+          method: "POST",
+          body: {
+            ...(parsed.note !== undefined ? { note: parsed.note } : {}),
+            ...(parsed.expectedRequestId ? { expectedRequestId: parsed.expectedRequestId } : {}),
+          },
+        },
+      );
+      revalidatePath(`/app/${parsed.orgSlug}/approvals`);
+      return { ok: true, status: res.status, refineRequestId: res.refineRequestId };
+    } catch (e) {
+      return patternError(e);
+    }
+  },
+);
+
+export const acknowledgePatternAlert = withRateLimit(
+  "approvals.send",
+  { capacity: 60, refillPerSecond: 1, cost: 1 },
+  async (input: PatternAlertActionInput): Promise<PatternAlertActionResult> => {
+    const parsed = PatternAlertActionInput.parse(input);
