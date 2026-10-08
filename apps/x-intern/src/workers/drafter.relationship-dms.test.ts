@@ -198,3 +198,37 @@ describe("X drafter relationship-DM lane", () => {
       return;
     }
     expect(loadActivePatternRules.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      claimDmRequestLeads.mock.invocationCallOrder[0]!,
+    );
+    expect(runRelationshipDmsForInstance).toHaveBeenCalledWith(expect.objectContaining({
+      instance: expect.objectContaining({ status: "paused", goal_target: 15 }),
+    }));
+    expect(claimDmRequestLeads).toHaveBeenCalledWith(expect.any(Function), {
+      agentInstanceId: "inst-x",
+      cap: 5,
+    });
+    expect(runDmRequestTick).toHaveBeenCalledTimes(1);
+    expect(claimReplyRequestLeads).toHaveBeenCalledWith(expect.any(Function), {
+      agentInstanceId: "inst-x",
+      cap: 5,
+    });
+    expect(runDrafterTick).toHaveBeenCalledWith(expect.objectContaining({
+      claimedLeads: [{ id: "reply-lead" }],
+      patternRules: [],
+      verify: expect.objectContaining({ enabled: true, voiceFloor: 0.65 }),
+    }));
+    expect(finish).toHaveBeenCalledWith({ status: "ok", rowsProcessed: 7 });
+    expect(enforceGoal).not.toHaveBeenCalled();
+    expect(countPendingApprovalsForInstance).not.toHaveBeenCalled();
+    expect(claimWatchlistLeadsForDrafting).not.toHaveBeenCalled();
+    expect(claimLeadsForDrafting).not.toHaveBeenCalled();
+    expect(expireStaleClassifiedLeads).not.toHaveBeenCalled();
+    expect(expireStaleApprovals).not.toHaveBeenCalled();
+    expect(createNellaClient).toHaveBeenCalledTimes(1);
+  }
+
+  it.each(["empty", "held", "recovery"] as const)(
+    "admits standing rules before requested work: %s",
+    checkRuleAdmission,
+  );
+});
