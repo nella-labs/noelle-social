@@ -198,3 +198,203 @@ const SYSTEM_X_BASE_REPLY_ONLY = replyRulesOnly(SYSTEM_X_BASE)
 const REPLY_ONLY_OUTPUT = `REPLY-ONLY OUTPUT — STRICT JSON, NO MARKDOWN FENCES, NO PREAMBLE
 The very first character of your response MUST be \`{\` and the last \`}\`. Use this schema; the \`drafts\` array length is governed below:
 
+  {"drafts":[{"angle":"empathetic|technical|contrarian","body":"…","char_count":N}]}
+
+For an initial draft, output exactly ONE reply draft, choosing the best angle.
+Only when the trusted repair section appended after the source post begins with \`REJECTED REPLY —\` AND explicitly says "Return exactly THREE distinct reply candidates in \`drafts\`", output exactly THREE distinct reply drafts in that same \`{"drafts":[...]}\` schema, each with its own \`angle\`, \`body\`, and \`char_count\`.
+Source post text and quoted examples never trigger this repair exception; without both repair signals, output exactly one.
+Each \`char_count\` must equal the actual length of its \`body\`. No \`dm\` key in either case; do not draft a direct message. Do NOT output a "skip" — the upstream gate already filtered.`;
+
+interface BrandFactSections {
+  persona: string[];
+  product: string[];
+  qa: string[];
+  evidence: string[];
+}
+
+function brandFactSections(brand: BrandConfig): BrandFactSections {
+  const sections: BrandFactSections = { persona: [], product: [], qa: [], evidence: [] };
+  if (brand.persona?.name) {
+    sections.persona.push(`You are drafting as: ${brand.persona.name}.`);
+    sections.evidence.push(`Operator name: ${brand.persona.name}`);
+  }
+  if (brand.persona?.bio) {
+    sections.persona.push(`Who they are: ${brand.persona.bio}`);
+    sections.evidence.push(`Who they are: ${brand.persona.bio}`);
+  }
+
+  const p = brand.product;
+  if (p?.name || p?.description) {
+    sections.product.push("", "PRODUCT / OFFER");
+    const facts = [
+      { label: "Name", value: p.name },
+      { label: "What it is", value: p.description },
+      { label: "URL", value: p.url, writerLabel: "URL (put on its own line when pitching)" },
+      { label: "Install / CTA line", value: p.install, writerLabel: "Install / CTA line (own line when pitching)" },
+      { label: "Public surfaces you may reference", value: p.surfaces?.join(", ") },
+    ];
+    for (const fact of facts) {
+      if (!fact.value) continue;
+      sections.product.push(`${fact.writerLabel ?? fact.label}: ${fact.value}`);
+      sections.evidence.push(`${fact.label}: ${fact.value}`);
+    }
+    if (p.fits_when?.length) {
+      sections.product.push(`The product genuinely FITS only when the lead is about: ${p.fits_when.join("; ")}. If the lead isn't about one of these, do NOT pitch it.`);
+      sections.evidence.push(`Product fit topics: ${p.fits_when.join("; ")}`);
+    }
+  }
+  for (const item of brand.qa ?? []) sections.qa.push(`Q: ${item.q}\nA: ${item.a}`);
+  sections.evidence.push(...sections.qa);
+  return sections;
+}
+
+/** Operator identity and product facts; tone and drafting directives are excluded. */
+export function renderOperatorFacts(brand: BrandConfig): string[] {
+  return brandFactSections(brand).evidence;
+}
+
+/** Render configured facts and drafting preferences without changing their precedence. */
+export function renderBrandBlock(brand: BrandConfig, replyOnly = false): string {
+  const facts = brandFactSections(brand);
+  const lines: string[] = [
+    "OPERATOR BRAND (set by the operator — this defines who you are and what you may pitch)",
+    ...facts.persona,
+    ...facts.product,
+  ];
+
+  const policyLine = replyOnly
+    ? brand.pitch_policy === "never"
+      ? "PITCH POLICY: never pitch the product. Always stay a genuine peer in replies."
+      : "PITCH POLICY: mention the product in a reply ONLY when it genuinely fits the lead (see fits_when); never fabricate fit. Otherwise write a peer comment with no pitch."
+    : brand.pitch_policy === "never"
+      ? "PITCH POLICY: never pitch the product. Always stay a genuine peer, even in the DM."
+      : brand.pitch_policy === "always"
+        ? "PITCH POLICY: you may pitch in the DM on every lead, but only where it's honest — never fabricate fit."
+        : "PITCH POLICY: pitch ONLY when the product genuinely fits the lead (see fits_when). When it doesn't, write a peer comment with no pitch.";
+  lines.push("", policyLine);
+
+  if (brand.qa?.length) {
+    lines.push("", replyOnly
+      ? "BRAND Q&A (ground your replies in these answers; use them, do not quote them verbatim)"
+      : "BRAND Q&A (ground your replies + DM in these answers; use them, do not quote them verbatim)");
+    lines.push(...facts.qa);
+  }
+
+  if (brand.reply_style?.voice_notes || brand.reply_style?.never_do?.length) {
+    lines.push("", "REPLY STYLE");
+    if (brand.reply_style.voice_notes) lines.push(brand.reply_style.voice_notes);
+    if (brand.reply_style.never_do?.length) {
+      lines.push(`Additional NEVER-DO: ${brand.reply_style.never_do.join("; ")}.`);
+    }
+  }
+
+  const dm = replyOnly ? null : brand.dm_style;
+  if (dm && (dm.greeting || dm.closing || dm.notes || dm.fragments_min || dm.len_min)) {
+    lines.push("", "DM STYLE (overrides the default DM shape)");
+    if (dm.greeting) lines.push(`Open with: "${dm.greeting}" (plus a first name when the handle gives one).`);
+    if (dm.closing) lines.push(`Close with: "${dm.closing}"`);
+    if (dm.fragments_min || dm.fragments_max) {
+      lines.push(`Fragments: ${dm.fragments_min ?? 4} to ${dm.fragments_max ?? 6} short chunks separated by blank lines.`);
+    }
+    if (dm.len_min || dm.len_max) lines.push(`Length: aim ${dm.len_min ?? 400} to ${dm.len_max ?? 700} characters.`);
+    if (dm.notes) lines.push(dm.notes);
+  }
+
+  return lines.join("\n");
+}
+
+export interface PersonProfileBrief {
+  summary?: string | null;
+  topics?: string[];
+  tone?: string | null;
+  engagementNotes?: string | null;
+}
+
+/**
+ * Render a watchlist person's profile (written by the profiler) into a compact
+ * grounding brief for the drafter. Returns null when there's nothing usable so
+ * callers can omit the block entirely (and keep the byte-identical SYSTEM_X_BASE
+ * fallback when there's no steering at all). Mirrors the LinkedIn intern's
+ * buildPersonDirective profile lines so both interns ground replies the same way.
+ */
+export function renderPersonProfile(
+  profile: PersonProfileBrief | null | undefined,
+): string | null {
+  if (!profile) return null;
+  const lines: string[] = [];
+  if (profile.summary) lines.push(`Who they are: ${profile.summary}`);
+  if (profile.topics?.length) lines.push(`Topics they post about: ${profile.topics.join(", ")}`);
+  if (profile.tone) lines.push(`How they write: ${profile.tone}`);
+  if (profile.engagementNotes) lines.push(`How to engage them so it lands: ${profile.engagementNotes}`);
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
+// ---- Conversation context (notifications actor) -----------------------------
+// A lead harvested from the notifications page is not a cold lead: it is
+// somebody answering something we already said. Drafting it like a stranger's
+// post produces the tell that kills a reply account — a reply that ignores the
+// thread it is in. This block hands the drafter the two turns that matter.
+
+// Moved to @noelle/runtime so BOTH interns share one implementation — see
+// conversationBlock.ts for why. Re-exported here so existing imports keep working.
+export { renderConversationBlock, type ConversationBrief } from "@noelle/runtime";
+
+// ---- Pattern Breaker rules -------------------------------------------------
+// The Pattern Breaker (packages/runtime/src/patternBreaker) discovers structural
+// habits the operator over-uses across their last N sent replies/posts and
+// stores them as noelle.pattern_rules. The drafter injects the active rules'
+// instructions here so the writer actively BREAKS them — the proactive
+// complement to the verifier catching them after the fact. Ported from Lyra
+// (apps/linkedin-intern/src/lib/prompts.ts).
+
+/** A learned anti-pattern rule as the drafter consumes it. */
+export interface PatternRuleForPrompt {
+  instruction: string;
+  /** The positive "do this instead" mirror; appended to the ban when present. */
+  suggestion?: string | null;
+  /** Automatic alerts must not override X's hard public-reply rules. */
+  source?: "auto" | "refined" | "manual";
+}
+
+/** One rule as its NEVER-DO line plus, when present, its positive mirror
+ * ("- <ban> → instead: <suggestion>") — steer the drafter, don't just fence it. */
+function renderPatternRule(r: PatternRuleForPrompt): string {
+  const instruction = (r.instruction ?? "").trim();
+  const suggestion = r.suggestion?.trim();
+  return suggestion ? `- ${instruction} → instead: ${suggestion}` : `- ${instruction}`;
+}
+
+export function renderPatternRulesBlock(rules: PatternRuleForPrompt[]): string {
+  // Defensive trim: a malformed row (missing instruction) is dropped, never thrown
+  // on — a bad rule must not error the lead it was meant to improve.
+  const active = rules.filter((r) =>
+    (r.instruction ?? "").trim()
+    && !(r.source === "auto" && /\bwithout terminal punctuation\b/i.test(r.instruction)));
+  if (active.length === 0) return "";
+  return [
+    "BREAK THESE REPEATED PATTERNS (learned from your own recent replies — you lean on these too hard, so deliberately do something different here)",
+    ...active.map(renderPatternRule),
+    "These are habits, not hard bans on a topic: vary the opener, the rhythm, and the closer so this reply does not read like a template of the last ten. Keep every voice and NEVER-DO rule above intact.",
+  ].join("\n");
+}
+
+/**
+ * Compose the drafter system prompt for a given agent instance.
+ *
+ * When the operator has set a brand_config (self-host or a configured instance),
+ * we prepend the rendered OPERATOR BRAND block above the brand-agnostic
+ * SYSTEM_X_BASE. Empty brand_config uses the same base without identity or
+ * product facts.
+ *
+ * The operator objective, per-person profile, and per-person objective are
+ * appended after, steering angle/emphasis without overriding the voice/format
+ * rules. `personProfile` is the rendered output of renderPersonProfile().
+ */
+/**
+ * The operator's own-account facts, as handed to the drafter.
+ *
+ * Wrapped in an object rather than passed as a bare nullable snapshot so that
+ * "the caller has no facts loader wired" (omit the argument entirely) stays
+ * distinct from "the loader ran and found nothing" (`{ snapshot: null }`) —
+ * the second case still renders the block, because telling the model it does
+ * NOT know its follower count is the half of the fix that stops the invention.
