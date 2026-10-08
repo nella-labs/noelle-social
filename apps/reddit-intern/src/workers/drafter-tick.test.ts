@@ -998,3 +998,203 @@ describe("runDrafterTick — verifier (grounded-drafting)", () => {
         .mockResolvedValueOnce({ text: JSON.stringify(passingRetry), engine: "bedrock", model: "m" }),
     };
     const judge = vi
+      .fn()
+      .mockResolvedValueOnce(
+        JSON.stringify({ voice: 1, grounding: 1, relevance: 1, novelty: 0.1, reasons: ["repeats prior"], fix: "take a new angle" }),
+      )
+      .mockResolvedValueOnce(
+        JSON.stringify({ voice: 0.71, grounding: 0.71, relevance: 0.71, novelty: 0.71, reasons: [], fix: null }),
+      );
+    const { postOutbound, kb, markStatus } = deps({ runner });
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead(leadOverrides as Record<string, unknown>)] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      getPriorReplies: vi.fn().mockResolvedValue(["same point before"]),
+      verify: { enabled: true, retries: 1, makeCalls: () => [judge] },
+    });
+
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.drafts[0].body).toBe(passingRetry.drafts[0]!.body);
+    expect(body.verifierMeta.pass).toBe(true);
+    expect(body.verifierMeta.scores.voice).toBe(0.71);
+    expect(body.verifierMeta.scores.novelty).toBe(0.71);
+  });
+
+  it("keeps the highest-total failing draft when no retry passes", async () => {
+    const improvedButFailing = { drafts: [{ angle: "empathetic", body: "clearer but still below the bar", char_count: 31 }] };
+    const runner = {
+      draft: vi
+        .fn()
+        .mockResolvedValueOnce({ text: JSON.stringify({ drafts: [{ angle: "empathetic", body: "weak first attempt", char_count: 18 }] }), engine: "bedrock", model: "m" })
+        .mockResolvedValueOnce({ text: JSON.stringify(improvedButFailing), engine: "bedrock", model: "m" }),
+    };
+    const judge = vi
+      .fn()
+      .mockResolvedValueOnce(
+        JSON.stringify({ voice: 0.2, grounding: 0.2, relevance: 0.2, novelty: 0.2, reasons: ["weak"], fix: "improve it" }),
+      )
+      .mockResolvedValueOnce(
+        JSON.stringify({ voice: 0.6, grounding: 0.6, relevance: 0.6, novelty: 0.6, reasons: ["still thin"], fix: "ground it" }),
+      );
+    const { postOutbound, kb, markStatus } = deps({ runner });
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      getPriorReplies: vi.fn().mockResolvedValue(["previous reply"]),
+      verify: { enabled: true, retries: 1, makeCalls: () => [judge] },
+    });
+
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.drafts[0].body).toBe("clearer but still below the bar");
+    expect(body.verifierMeta.pass).toBe(false);
+    expect(body.verifierMeta.scores.voice).toBe(0.6);
+  });
+});
+
+describe("runDrafterTick voice variety (NOELLE_DRAFTER_VARIETY)", () => {
+  it("substantial path: an ordinary lead now gets a SHAPE, not a register", async () => {
+    // Orion had no shape lane at all: every comment was drafted in the same
+    // 1-4 sentence band with only the register varying, which made his the most
+    // uniform of the three feeds. He now runs Vega's machinery, so an ordinary
+    // (non tone-first) lead takes a shape and the register steps aside.
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      variety: { enabled: true, rng: () => 0, genzMarkerRate: 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("THIS REPLY'S ASSIGNED SHAPE");
+    expect(prompt).not.toContain("ASSIGNED REGISTER FOR THIS REPLY");
+  });
+
+  it("substantial path: a tone-first lead can still take the REGISTER half", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ tier: "T1", classifier_label: "light", payload: { text: "we just shipped it, so happy to announce this today" } }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      energy: { enabled: true },
+      // r=0.9 is above TONE_FIRST_SHAPE_SHARE → the register half.
+      variety: { enabled: true, rng: () => 0.9, genzMarkerRate: 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("ASSIGNED REGISTER FOR THIS REPLY");
+    expect(prompt).not.toContain("THIS REPLY'S ASSIGNED SHAPE");
+  });
+
+  it("drops the fixed sentence-count line when a shape is assigned", async () => {
+    // The closing line is the LAST thing in the user message, BELOW the shape
+    // block, so the shape's "overrides the rules above" cannot reach it. Left
+    // fixed, "1-4 sentences" silently beats every shape outside that band —
+    // MICRO asks for one to eight WORDS — and the whole lane collapses back
+    // into the default band with every other test still green.
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      variety: { enabled: true, rng: () => 0, genzMarkerRate: 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("THIS REPLY'S ASSIGNED SHAPE");
+    expect(prompt).not.toContain("1-4 sentences, conversational and human");
+    expect(prompt).toContain("REPLACES the default 1-4 sentences");
+  });
+
+  it("keeps the fixed sentence-count line when NO shape is assigned", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      variety: { enabled: false, rng: () => 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("THIS REPLY'S ASSIGNED SHAPE");
+    expect(prompt).toContain("1-4 sentences, conversational and human");
+  });
+
+  it("rotates the shape across consecutive leads instead of one fixed band", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ tier: "T1", id: "l1", external_id: "r1" }),
+        lead({ tier: "T1", id: "l2", external_id: "r2" }),
+        lead({ tier: "T1", id: "l3", external_id: "r3" }),
+        lead({ tier: "T1", id: "l4", external_id: "r4" }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      variety: { enabled: true, rng: makeLcg(5), genzMarkerRate: 0 },
+    });
+    const shapes = runner.draft.mock.calls.map((c: unknown[]) => {
+      const p = (c[0] as { prompt: string }).prompt;
+      const i = p.indexOf("THIS REPLY'S ASSIGNED SHAPE");
+      return i >= 0 ? p.slice(i, i + 220) : "";
+    });
+    expect(shapes.every((s: string) => s.length > 0)).toBe(true);
+    expect(new Set(shapes).size).toBe(shapes.length);
+  });
+
+  it("offers a gen-z marker under the rate, and reaches the LOUD tier on Reddit", async () => {
+    const promptFor = async (rate: number, r: number, energyOn = false) => {
+      const { postOutbound, runner, kb, markStatus } = deps();
+      await runDrafterTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [lead({ tier: "T1" })] as never,
+        runner: runner as never,
+        kb: kb as never,
+        postOutbound,
+        markStatus,
+        ...(energyOn ? { energy: { enabled: true } } : {}),
+        variety: { enabled: true, rng: () => r, genzMarkerRate: rate },
+      });
+      return runner.draft.mock.calls[0]![0].prompt as string;
+    };
+    expect(await promptFor(0.9, 0.1)).toContain("SPOKEN REGISTER FOR THIS REPLY");
+    expect(await promptFor(0.9, 0.95)).not.toContain("SPOKEN REGISTER FOR THIS REPLY");
+    expect(await promptFor(0, 0)).not.toContain("SPOKEN REGISTER FOR THIS REPLY");
+
+    const loudDirectives = GENZ_MARKERS.filter((m) => m.tier === "loud").map((m) => m.directive);
+
+    // With energy detection OFF — which is the DEFAULT and the state of the
+    // live ecosystem config — the post's energy is null, so the loud tier is
+    // unreachable everywhere. Without a signal we cannot know we are not under
+    // someone's vent, and a Reddit reply is auto-sent.
