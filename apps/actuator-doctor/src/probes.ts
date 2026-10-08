@@ -198,3 +198,203 @@ export async function probeHeartbeat(env: Env, at: string, sinceBootMs: number):
     // the chrome_reachable probe already owns, so there we only emit the lanes
     // ok=true to keep the report complete and avoid a double-fault.
     if (r.status === 401 || r.status === 403) {
+      out.push(mk("bridge", "heartbeat", false, "heartbeats-unauthorized", { http_status: r.status }, at));
+    }
+    for (const source of sourceSlugs) {
+      out.push(
+        mk(HEARTBEAT_SOURCE_TO_TARGET[source]!, "heartbeat", true, undefined, {
+          note: "heartbeats-unavailable",
+          http_status: r.status ?? -1,
+        }, at),
+      );
+    }
+    return out;
+  }
+
+  const sources = ((r.json as { sources?: HeartbeatStatus[] }).sources ?? []) as HeartbeatStatus[];
+  const bySource = new Map(sources.map((s) => [s.source, s]));
+  for (const source of sourceSlugs) {
+    const target = HEARTBEAT_SOURCE_TO_TARGET[source]!;
+    const hb = bySource.get(source);
+    if (!hb) {
+      // Never heartbeated. During the warmup grace this is expected (ext not yet
+      // self-reloaded onto the sink build), so keep it ok=true; past the grace an
+      // armed lane that still has NO heartbeat is a genuine "never came online"
+      // fault worth paging.
+      out.push(
+        inWarmup
+          ? mk(target, "heartbeat", true, undefined, { present: false, note: "heartbeat-warmup" }, at)
+          : mk(target, "heartbeat", false, "heartbeat-absent", { present: false }, at),
+      );
+    } else {
+      const ok = !hb.stale;
+      out.push(
+        mk(target, "heartbeat", ok, ok ? undefined : "heartbeat-stale", {
+          present: true,
+          age_ms: hb.age_ms,
+          stale: hb.stale,
+          state: hb.state,
+        }, at),
+      );
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// api_freshness (+ pipeline lane_freshness from worker_runs).
+// ---------------------------------------------------------------------------
+
+// Reuses apps/api-vm/src/routes/system.ts thresholds.
+const WORKER_STALE_MS: Record<string, number> = {
+  discovery: 15 * 60_000,
+  classifier: 5 * 60_000,
+  drafter: 5 * 60_000,
+  send: 10 * 60_000,
+};
+
+interface WorkerFreshness {
+  kind: string;
+  lastSuccessAt: string | null;
+  stale: boolean;
+  staleMinutes: number | null;
+}
+
+async function readWorkerFreshness(sql: Sql, now: number): Promise<WorkerFreshness[]> {
+  try {
+    const rows = await sql<Array<{ worker: string; last_success_at: Date | null }>>`
+      select worker, max(finished_at) filter (where error is null) as last_success_at
+      from noelle.worker_runs
+      group by worker
+    `;
+    const byKind = new Map(rows.map((r) => [r.worker, r.last_success_at]));
+    return Object.keys(WORKER_STALE_MS).map((kind) => {
+      const last = byKind.get(kind) ?? null;
+      const lastMs = last ? new Date(last).getTime() : null;
+      const ageMs = lastMs == null ? null : now - lastMs;
+      // Never-ran => NOT stale (observe-only; avoids a false "stale" on a box
+      // where that worker isn't deployed).
+      const stale = lastMs != null && now - lastMs > (WORKER_STALE_MS[kind] ?? Infinity);
+      return {
+        kind,
+        lastSuccessAt: lastMs == null ? null : new Date(lastMs).toISOString(),
+        stale,
+        staleMinutes: ageMs == null ? null : Math.round(ageMs / 60_000),
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+export async function probeApiFreshness(
+  env: Env,
+  sql: Sql,
+  at: string,
+  now: number,
+): Promise<ProbeResult[]> {
+  const out: ProbeResult[] = [];
+
+  // Reachability. /api/system/status is JWT-gated; use it only when an operator
+  // JWT is configured (to detect a `degraded` body), and ALWAYS fall back to the
+  // unauth /health so we can tell "api-vm down" (no response) from "unauthorized".
+  let reachable = false;
+  let detail: string | undefined;
+
+  if (env.NOELLE_LOCAL_OPERATOR_JWT) {
+    const s = await httpGet(`${env.NOELLE_API_URL}/api/system/status`, {
+      timeoutMs: env.NOELLE_DOCTOR_HTTP_TIMEOUT_MS,
+      token: env.NOELLE_LOCAL_OPERATOR_JWT,
+    });
+    if (s.status !== null && s.status !== 401 && s.status !== 403) {
+      reachable = true;
+      if (s.status !== 200) detail = `status-${s.status}`;
+      else if ((s.json as { ok?: unknown } | null)?.ok !== true) detail = "status-degraded";
+    }
+  }
+  if (!reachable) {
+    const h = await httpGet(`${env.NOELLE_API_URL}/health`, {
+      timeoutMs: env.NOELLE_DOCTOR_HTTP_TIMEOUT_MS,
+    });
+    if (h.status !== null) {
+      reachable = true;
+      if (h.status !== 200) detail = `health-${h.status}`;
+      else if ((h.json as { ok?: unknown } | null)?.ok !== true) detail = "health-degraded";
+    } else {
+      detail = "unreachable";
+    }
+  }
+  const apiOk = reachable && detail === undefined;
+  out.push(
+    mk("api-vm", "api_freshness", apiOk, apiOk ? undefined : detail ?? "unreachable", {
+      reachable,
+      detail: detail ?? null,
+    }, at),
+  );
+
+  // Pipeline freshness. worker_runs.worker is NOT lane-namespaced (all interns
+  // write "discovery"/"classifier"/"drafter"), so this is a GLOBAL pipeline
+  // signal — tagged api-vm + observe-only (no seed remediates it).
+  for (const wr of await readWorkerFreshness(sql, now)) {
+    out.push(
+      mk("api-vm", "lane_freshness", !wr.stale, wr.stale ? "worker-stale" : undefined, {
+        worker: wr.kind,
+        stale_minutes: wr.staleMinutes,
+        last_success_at: wr.lastSuccessAt,
+      }, at),
+    );
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// stuck_queue — approvals pending past their auto-send target, OR simply pending
+// far too long with no target stamped.
+//
+// The second arm exists because the target-based rule alone was dead: the X
+// intern no longer stamps auto_send_target_at, so every pending approval in the
+// system is unstamped and `auto_send_target_at is not null` matched NOTHING on
+// every lane. Vega sat idle for days behind a 40/day write cap with 33 approvals
+// pending and the doctor never faulted. Unstamped rows therefore get their own
+// (longer) age threshold so a normal short-lived queue stays quiet.
+// ---------------------------------------------------------------------------
+
+export async function probeStuckQueue(env: Env, sql: Sql, at: string): Promise<ProbeResult[]> {
+  const depths = new Map<DoctorTarget, number>();
+  let dbErr = false;
+  try {
+    const rows = await sql<Array<{ role: string; depth: number }>>`
+      select ai.role, count(*)::int as depth
+      from noelle.approvals a
+      join noelle.agent_instances ai on ai.id = a.agent_instance_id
+      where a.status = 'pending'
+        and (
+          (a.auto_send_target_at is not null
+            and a.auto_send_target_at < now() - make_interval(mins => ${env.NOELLE_DOCTOR_STUCK_QUEUE_MIN}))
+          or
+          (a.auto_send_target_at is null
+            and a.created_at < now() - make_interval(mins => ${env.NOELLE_DOCTOR_STUCK_QUEUE_AGE_MIN}))
+        )
+      group by ai.role
+    `;
+    for (const r of rows) {
+      const t = ROLE_TO_TARGET[r.role];
+      if (t) depths.set(t, Number(r.depth));
+    }
+  } catch {
+    dbErr = true;
+  }
+
+  const out: ProbeResult[] = [];
+  for (const target of LANE_TARGETS) {
+    if (dbErr) {
+      // fail-open: an unreadable DB must never look like a stuck queue.
+      out.push(mk(target, "stuck_queue", true, undefined, { note: "db-error" }, at));
+      continue;
+    }
+    const depth = depths.get(target) ?? 0;
+    const ok = depth < env.NOELLE_DOCTOR_STUCK_QUEUE_DEPTH;
+    out.push(mk(target, "stuck_queue", ok, ok ? undefined : "queue-stuck", { depth }, at));
+  }
+  return out;
+}
