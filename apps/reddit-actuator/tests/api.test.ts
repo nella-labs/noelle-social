@@ -198,3 +198,116 @@ describe("ActuatorApi (Reddit)", () => {
 
 
 describe("Reddit claim transport", () => {
+  const scoped = { ...config, instanceId: "77777777-7777-4777-8777-777777777777" };
+  it("sends the unchanged captured reply exactly once", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => jsonResponse({ claimed: true }));
+    await new ActuatorApi(scoped, fetchImpl).claimReply(postReply);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetchImpl.mock.calls[0]![1]!.body as string)).toEqual({ instance_id: scoped.instanceId, reply: postReply });
+  });
+  it.each([409, 503])("does not retry an admission failure %s", async status => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => jsonResponse({ error: "unavailable" }, status));
+    await expect(new ActuatorApi(scoped, fetchImpl).claimReply(postReply)).rejects.toThrow();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+  it("rejects a malformed or oversized admission response", async () => {
+    for (const response of [jsonResponse({ claimed: false }), new Response("x".repeat(16385))]) {
+      const fetchImpl = vi.fn<typeof fetch>(async () => response);
+      await expect(new ActuatorApi(scoped, fetchImpl).claimReply(postReply)).rejects.toThrow();
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    }
+  });
+  it("rejects an oversized original body before any transport", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    await expect(new ActuatorApi(scoped, fetchImpl).claimReply({ ...postReply, body: "測".repeat(22000) })).rejects.toThrow();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+  it("withholds a legacy or changed pool capture", () => {
+    const item = { approvalId: postReply.approval_id, draftId: postReply.draft_id, body: postReply.body,
+      url: postReply.target.url, targetType: "post" as const, capturedReply: postReply };
+    expect(readCapturedReply(item)).toEqual(postReply);
+    expect(readCapturedReply({ ...item, body: "changed" })).toBeNull();
+    const legacy = { ...item, capturedReply: undefined };
+    expect(readCapturedReply(legacy)).toBeNull();
+  });
+});
+
+async function observeNative(promise: Promise<void>): Promise<void> {
+  const controller = new AbortController();
+  const watchdog = nativeDelay(2000, undefined, { signal: controller.signal }).then(() => {
+    throw new Error("Native HTTP observation did not arrive");
+  }).catch((error: unknown) => {
+    if (!controller.signal.aborted) throw error;
+  });
+  try { await Promise.race([promise, watchdog]); }
+  finally { controller.abort(); await watchdog; }
+}
+
+describe("native Reddit claim transport lifecycle", () => {
+  it.each(["headers", "body"])("closes an admitted held %s request at the original deadline without retry", async mode => {
+    let admitted!: () => void;
+    let closed!: () => void;
+    const admission = new Promise<void>(resolve => { admitted = resolve; });
+    const socketClosed = new Promise<void>(resolve => { closed = resolve; });
+    let requests = 0;
+    const server = createServer((request, response) => {
+      requests++;
+      request.resume();
+      if (requests === 1) {
+        request.socket.once("close", closed);
+        if (mode === "body") {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.write('{"claimed":');
+        }
+        admitted();
+      } else response.end('{"claimed":true}');
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Native test port missing");
+    const api = new ActuatorApi({ ...config, instanceId: "77777777-7777-4777-8777-777777777777",
+      apiBaseUrl: `http://127.0.0.1:${address.port}` });
+    let pending: Promise<{ ok: boolean; error?: unknown }> | undefined;
+    try {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      pending = api.claimReply(postReply).then(() => ({ ok: true }), error => ({ ok: false, error }));
+      await observeNative(admission);
+      expect(requests).toBe(1);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(await pending).toMatchObject({ ok: false, error: { code: "timeout" } });
+      await observeNative(socketClosed);
+      expect(requests).toBe(1);
+      vi.useRealTimers();
+      await api.claimReply(postReply);
+      expect(requests).toBe(2);
+    } finally {
+      if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(5000);
+      vi.useRealTimers();
+      await pending;
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+  it("bounds actual multibyte response bytes and allows the next healthy request", async () => {
+    let requests = 0;
+    const server = createServer((request, response) => {
+      request.resume();
+      requests++;
+      response.end(requests === 1 ? "😀".repeat(4097) : '{"claimed":true}');
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Native test port missing");
+    const api = new ActuatorApi({ ...config, instanceId: "77777777-7777-4777-8777-777777777777",
+      apiBaseUrl: `http://127.0.0.1:${address.port}` });
+    try {
+      await expect(api.claimReply(postReply)).rejects.toMatchObject({ code: "body_too_large" });
+      expect(requests).toBe(1);
+      await api.claimReply(postReply);
+      expect(requests).toBe(2);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+});
