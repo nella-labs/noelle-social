@@ -1,0 +1,34 @@
+{
+  "name": "@noelle/api-vm",
+  "version": "0.0.1-alpha.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node --import tsx src/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@google-cloud/storage": "^7.19.0",
+    "@hono/node-server": "^1.13.5",
+    "@noelle/contracts": "workspace:*",
+    "@noelle/runtime": "workspace:*",
+    "@noelle/secrets": "workspace:*",
+    "@noelle/types": "workspace:*",
+    "@noelle/x-client": "workspace:*",
+    "ai": "^7.0.107",
+    "hono": "^4.6.10",
+    "jose": "^5.9.6",
+    "postgres": "^3.4.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  }
+}

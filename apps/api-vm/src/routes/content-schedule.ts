@@ -198,3 +198,20 @@ contentSchedule.post("/api/content/slots/bulk", async (c) => {
       const materializeAfter = new Date(new Date(slotAt).getTime() - JIT_MS).toISOString();
       await tx`
         insert into noelle.content_schedule_slots
+          (org_id, agent_instance_id, platform, slot_at, status, idea_id, auto_publish,
+           window_source, batch_id, materialize_after, target_kind)
+        values
+          (${inst.org_id}, ${payload.instanceId}, ${payload.platform}, ${slotAt}, 'empty',
+           ${idea!.id}, ${payload.autoPublish}, 'batch', ${job!.id}, ${materializeAfter}, 'post_idea')
+      `;
+    }
+    return job!.id;
+    });
+  } catch (err) {
+    const failure = scheduleWriteFailure(err);
+    if (failure) return c.json({ error: failure.error }, failure.status);
+    throw err;
+  }
+
+  return c.json({ job_id: jobId, items_total: slotTimes.length }, 201);
+});
