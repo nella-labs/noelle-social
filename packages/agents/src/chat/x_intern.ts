@@ -198,3 +198,8 @@ function renderApprovalRow(row: ChatApprovalSummary, ordinal: number): string {
   const out = [
     `  ${ordinal}. ${handle} · tier=${tier} · velocity=${score} · selected_angle=${angle}`,
     `     post: ${post}`,
+    `     your_draft: ${draft}`,
+  ];
+  if (row.replyUrl) out.push(`     reply_link: ${row.replyUrl}`);
+  return out.join("\n");
+}
