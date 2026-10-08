@@ -198,3 +198,203 @@ export interface RunState {
  *                         treat as prior=true — never disarm what might be
  *                         standing consent. (Fail direction stays closed for
  *                         posting: nothing is ever POSTED without the flag; the
+ *                         only cost is an old server keeping the switch ON at
+ *                         rest, the pre-`prior` behavior.)
+ */
+export function armedByManualEnable(prior: boolean | undefined): boolean {
+  return prior === false;
+}
+
+// One store owns this service worker's compound epoch and state operations.
+// Session storage retains the run generation across worker restarts.
+const sessionState = createSessionRunStateStore<RunState>(() => chrome.storage.session);
+export async function saveState(s: RunState): Promise<void> { await sessionState.saveState(s); }
+export async function loadState(): Promise<RunState | null> { return sessionState.loadState(); }
+export async function clearState(): Promise<void> { await sessionState.clearState(); }
+export async function currentEpoch(): Promise<number> { return sessionState.currentEpoch(); }
+export async function bumpEpoch(): Promise<number> { return sessionState.bumpEpoch(); }
+
+/**
+ * Pure guard: should endRun turn the master reply switch (reply_send_enabled)
+ * back OFF? Only when BOTH hold:
+ *   1. THIS run armed it (`armedSend` — a manual Run/Drain whose enable POST
+ *      succeeded). Autonomous runs (checkAutonomy) deliberately never arm, and
+ *      Reddit's actionable route has NO auto_send_enabled fallback, so an
+ *      unconditional disable would overwrite the operator's standing dashboard
+ *      toggle and silently starve every later lights-out run ("upvotes only,
+ *      zero replies" with nothing surfaced).
+ *   2. The ending run's epoch (`termEpoch`, stamped by endRun's own bump) is
+ *      still current. A fresh Run/Drain that superseded this end has bumped
+ *      past it and re-enabled sending for ITS run; disabling here would race
+ *      that enable back OFF and empty the new run's queue (the "0/0 despite
+ *      pending drafts" bug). Callers must run the check-then-disable inside the
+ *      withSendSwitch serial queue so it can't interleave with an enable.
+ */
+export function shouldDisableSendOnRunEnd(opts: {
+  armedSend: boolean | undefined;
+  termEpoch: number;
+  curEpoch: number;
+}): boolean {
+  return opts.armedSend === true && tickIsCurrent(opts.termEpoch, opts.curEpoch);
+}
+
+/** Save only if the state's epoch is still the current one. Returns whether it saved. */
+export async function saveIfCurrent(s: RunState): Promise<boolean> {
+  return sessionState.saveIfCurrent(s);
+}
+
+// ── Pending-arm marker (send-switch leak guard) ─────────────────────────────
+// A manual Run/Drain arms the master reply switch (reply_send_enabled) BEFORE it
+// fetches the queue and persists RunState. If anything between the landed arm
+// and saveState throws (e.g. a transient api-vm 5xx on fetchQueue), no RunState
+// carries armedSend, endRun never sees it, and autonomous runs never disarm by
+// design — so the switch would stay ON indefinitely and the next lights-out run
+// would post replies under a consent flag the operator never chose to leave
+// standing. To make the arm fail-closed AT REST, the marker below is written to
+// chrome.storage.local (survives SW + browser restarts) the moment an arm
+// LANDS, and cleared only once the arm is accounted for: RunState persisted
+// (endRun now owns the disarm) or the arm rolled back OFF after a failed start.
+// While an UNACCOUNTED marker stands, checkAutonomy refuses to lights-out
+// start and instead retries the disarm (see classifyPendingArm).
+
+export interface PendingArm {
+  /** The run epoch that armed the switch (bumped before the arm POST). */
+  epoch: number;
+  /** When the arm landed — distinguishes an in-flight start from a stale leak. */
+  atMs: number;
+}
+
+const ARM_PENDING_KEY = "actuator.armPending";
+/** A start (arm → fetch → plan → saveState) takes seconds; a marker older than
+ * this can only be a leak from a failed start, never a start still in flight. */
+export const ARM_PENDING_GRACE_MS = 2 * 60_000;
+
+export async function setPendingArm(epoch: number, atMs: number): Promise<void> {
+  await chrome.storage.local.set({ [ARM_PENDING_KEY]: { epoch, atMs } satisfies PendingArm });
+}
+
+export async function getPendingArm(): Promise<PendingArm | null> {
+  const r = await chrome.storage.local.get(ARM_PENDING_KEY);
+  const v = r[ARM_PENDING_KEY] as PendingArm | undefined;
+  return v && typeof v.epoch === "number" && typeof v.atMs === "number" ? v : null;
+}
+
+/** Clear the marker ONLY if it still belongs to `epoch` — a newer manual start
+ * may have overwritten it with ITS arm, which is not ours to erase. */
+export async function clearPendingArm(epoch: number): Promise<void> {
+  const cur = await getPendingArm();
+  if (cur && cur.epoch === epoch) await chrome.storage.local.remove(ARM_PENDING_KEY);
+}
+
+/**
+ * Pure classifier: what must checkAutonomy do about the pending-arm marker
+ * before a lights-out start?
+ *   "none"   → no marker; the switch state is fully accounted for — proceed.
+ *   "wait"   → a FRESH marker (within the grace window): a manual start is
+ *              likely still in flight between its arm and its saveState. Do NOT
+ *              disarm under it (that would empty the manual run's queue — the
+ *              "0/0 despite pending drafts" class) and do NOT lights-out start;
+ *              re-evaluate next tick.
+ *   "disarm" → a STALE marker: the arm leaked from a failed start. Best-effort
+ *              disarm (then clear the marker); until the disarm SUCCEEDS the
+ *              caller must keep refusing to auto-start — fail-closed.
+ */
+export function classifyPendingArm(
+  arm: PendingArm | null,
+  nowMs: number,
+  graceMs: number = ARM_PENDING_GRACE_MS,
+): "none" | "wait" | "disarm" {
+  if (!arm) return "none";
+  return nowMs - arm.atMs > graceMs ? "disarm" : "wait";
+}
+
+/**
+ * Pure guard: must a manual Run/Drain INHERIT send-switch ownership from the
+ * run it is superseding? Transition-aware arming (armedByManualEnable) alone
+ * orphans the disarm on the double-press/restart path: standing toggle OFF →
+ * Run A arms (prior=false, armedSend=true) → the operator presses Run/Drain
+ * again mid-run. Run B's enable now sees prior=true (A already flipped the flag
+ * ON), so B would not arm — and B's saveState overwrites A's RunState, the only
+ * record that armedSend was true. Nobody disarms at run end and
+ * reply_send_enabled stays ON at rest under a flag the operator never chose as
+ * standing consent. So when the run being superseded is a LIVE run that armed
+ * the switch itself (`status === "running"` with armedSend === true), or an
+ * unaccounted pending-arm marker still stands (a manual start armed the switch
+ * but its arm was never accounted for — mid-flight or leaked), the superseding
+ * manual run inherits ownership: it sets its own armedSend=true (and stamps the
+ * pending-arm marker for its epoch) even though its enable saw prior=true, so
+ * its endRun (or the failed-start rollback) owns the disarm.
+ *
+ * Standing-consent protection is unaffected: with NO live armed run and no
+ * pending marker, prior=true still means the operator's dashboard toggle — a
+ * terminal superseded state (status !== "running", e.g. an ended run that
+ * already disarmed or never armed) and a live UNARMED run (an autonomous run,
+ * or a manual run started under the standing toggle: armedSend false/undefined)
+ * never confer ownership, so that toggle is never disarmed.
+ */
+export function inheritsArmOnSupersede(opts: {
+  supersededStatus: RunState["status"] | undefined;
+  supersededArmedSend: boolean | undefined;
+  pendingArm: PendingArm | null;
+}): boolean {
+  return (
+    (opts.supersededStatus === "running" && opts.supersededArmedSend === true) ||
+    opts.pendingArm != null
+  );
+}
+
+// ── Reply hygiene ────────────────────────────────────────────────────────────
+
+/** Reddit's per-comment character ceiling; replies are capped here before typing. */
+export const MAX_REPLY_LEN = 10_000;
+
+/**
+ * Sanitize an approved reply for VERBATIM typing. The body is DATA — it is typed
+ * literally, character for character, and never interpreted — so this only:
+ *   1. normalizes CR / CRLF to LF,
+ *   2. strips non-printable control characters (C0 except tab/newline, DEL, C1),
+ *   3. caps the length at Reddit's comment limit.
+ * It never rewrites wording. Legitimate literal whitespace (\n, \t) is preserved
+ * so multi-paragraph drafts type as authored (CDP commits \n via Input.insertText,
+ * which inserts a newline rather than firing an Enter key, so it can't submit).
+ */
+export function sanitizeReplyBody(raw: string): string {
+  const lf = raw.replace(/\r\n?/g, "\n");
+  // eslint-disable-next-line no-control-regex
+  const printable = lf.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "");
+  return printable.slice(0, MAX_REPLY_LEN);
+}
+
+/**
+ * Pure guard for the Reddit min-reply-spacing hard floor (default 240s / 4 min).
+ * Returns true if a reply may fire now: either none has fired yet this session, or
+ * at least `minSpacingMs` has elapsed since the last one. The caller defers (never
+ * drops) when false.
+ */
+export function replySpacingOk(lastReplyMs: number | undefined, nowMs: number, minSpacingMs: number): boolean {
+  if (lastReplyMs == null) return true;
+  return nowMs - lastReplyMs >= minSpacingMs;
+}
+
+// ── Idle-upvote rate limiting ────────────────────────────────────────────────
+
+/**
+ * Count upvotes recorded within the rolling window ending at `now` (timestamps
+ * strictly newer than `now - windowMs`). Pure — drives the ≤10/15-min hard cap.
+ */
+export function upvotesInWindow(upvoteAtMs: number[] | undefined, now: number, windowMs: number): number {
+  if (!upvoteAtMs || upvoteAtMs.length === 0) return 0;
+  const cutoff = now - windowMs;
+  let n = 0;
+  for (const t of upvoteAtMs) if (t > cutoff) n++;
+  return n;
+}
+
+/**
+ * Pure gate: may an idle-UPVOTE fire now? Mirrors the LinkedIn shouldIdleLike
+ * shape but caps on a ROLLING WINDOW instead of a daily budget. Gated five ways
+ * (in the order the code checks them):
+ *  - quiet gap: never while `inQuietGap` — a drain gap the plan deliberately left
+ *    long (a cooldown-band or long-break gap; scheduler.inQuietDrainGap). Firing an
+ *    idle-upvote through it would erase the very "stepped away" pause the timing
+ *    archetype drew; the ambient browse alone keeps the session looking alive.
