@@ -198,3 +198,70 @@ describe("makeNavigateTab", () => {
       })(7, "u");
       expect(updateTab).not.toHaveBeenCalled();
     });
+
+    it("clears and navigates as usual while the condition holds", async () => {
+      const order: string[] = [];
+      await makeNavigateTab({
+        clearComposer: async () => { order.push("clear"); },
+        updateTab: async () => { order.push("navigate"); },
+        shouldProceed: async () => true,
+      })(7, "u");
+      expect(order).toEqual(["clear", "navigate"]);
+    });
+  });
+});
+
+// Gate on the DM send confirmation. Its whole job is to keep a DELIVERED
+// message from being re-queued and sent a second time to a real person, so the
+// only answer that may be "yes, this is still our un-sent draft" is one where
+// the text genuinely is ours.
+describe("sameDraft (DM send confirmation)", () => {
+  const BODY = "Hey Dana, saw your post about migrating the billing service — how did the cutover go?";
+
+  it("matches our own draft still sitting in the box", () => {
+    expect(sameDraft(BODY, BODY)).toBe(true);
+  });
+
+  it("matches through the editor's whitespace reflow", () => {
+    expect(sameDraft(`  Hey   Dana,\n saw your post about migrating\nthe billing service — how did the cutover go?  `, BODY)).toBe(true);
+  });
+
+  // THE regression. typeText sends "\n" via Input.insertText and a
+  // contenteditable turns it into a block boundary contributing NO character to
+  // textContent, so the newline simply VANISHES from the read-back. 98 of the
+  // 113 DM drafts in the live DB carry one inside the first 40 chars, so a
+  // whitespace-collapsing compare (which normalises the two sides in opposite
+  // directions) missed on essentially every real DM — leaving both the miss
+  // detection and the unwind's ownership check permanently inert.
+  it("matches a body whose newline the contenteditable dropped entirely", () => {
+    const multiline = "hellooo jessika\nday 44 of building in public and the demo finally works";
+    const asRead = "hellooo jessikaday 44 of building in public and the demo finally works";
+    expect(sameDraft(asRead, multiline)).toBe(true);
+  });
+
+  it("still tells two different multi-line drafts apart", () => {
+    const ours = "hellooo jessika\nday 44 of building in public";
+    const theirs = "hey marcus\nquick question about your pricing page";
+    expect(sameDraft(theirs.replace("\n", ""), ours)).toBe(false);
+  });
+
+  // THE case. findMessageCompose returns the first `.msg-form` editable, and the
+  // messaging rail can hold several open bubbles — so a sent DM can still find a
+  // non-empty box belonging to a conversation the operator is typing in. Calling
+  // that a miss re-sends the DM.
+  it("does NOT match a different conversation's draft", () => {
+    expect(sameDraft("no worries, talk monday", BODY)).toBe(false);
+  });
+
+  it("does not match an empty box, or treat an empty body as a match for anything", () => {
+    expect(sameDraft("", BODY)).toBe(false);
+    expect(sameDraft("someone else's text", "")).toBe(false);
+  });
+
+  // A body too short to make a distinctive prefix must be fully contained
+  // rather than matching on a few incidental characters.
+  it("requires full containment for a very short body", () => {
+    expect(sameDraft("ok then", "ok")).toBe(true);
+    expect(sameDraft("nope", "ok")).toBe(false);
+  });
+});
