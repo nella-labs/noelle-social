@@ -198,3 +198,44 @@ function renderCurrentDraft(d: ChatVideoDraft): string {
     });
   }
   if (d.visuals.length) {
+    out.push(`   on-screen visuals: ${d.visuals.join("; ")}.`);
+  }
+  if (d.script && d.beats.length === 0) {
+    // No structured beats — fall back to the raw script so Nova still has the words.
+    out.push(`   script: ${truncate(d.script, 800)}`);
+  }
+
+  // The exemplar reels this draft was scripted from, with their teardowns — the
+  // same grounding the scripter had. Lets the refiner justify changes from the
+  // real reels ("@raycfu's winner opens on a cut, yours buries it").
+  const insp = d.inspirations && d.inspirations.length ? d.inspirations : null;
+  if (insp) {
+    out.push("   modeled on these reels (your teardowns — ground changes in them):");
+    for (const c of insp.slice(0, 4)) {
+      const reach = c.reachMultiple !== null ? `, ${c.reachMultiple.toFixed(1)}× views/followers` : "";
+      const hook = c.hook ? ` hook: "${truncate(c.hook, 120)}";` : "";
+      const why = c.whyItWorked ? ` why it worked: ${truncate(c.whyItWorked, 240)}` : "";
+      out.push(`     – @${c.handle} (${formatViewCount(c.views)} views${reach});${hook}${why}`);
+    }
+  } else if (d.inspiredBy.length) {
+    out.push(`   modeled on: ${d.inspiredBy.map((h) => `@${h}`).join(", ")}.`);
+  }
+
+  if (d.voice) {
+    out.push(`   the operator's own voice (match this substance + tone): ${truncate(d.voice, 400)}`);
+  }
+  return out.join("\n");
+}
+
+/** Trim long text for the prompt without cutting mid-escape. */
+function truncate(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** Compact view count for the snapshot — 1.2M / 48K / 920. */
+function formatViewCount(n: number | null): string {
+  if (n === null) return "unknown";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}K`;
+  return String(n);
+}

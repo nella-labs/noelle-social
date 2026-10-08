@@ -1,0 +1,36 @@
+id: x_intern
+display_name: "X Growth Intern"
+short_description: "Drafts on-brand X replies to monitored leads. You approve each one."
+icon: "bird"
+default_model:
+  primary:
+    engine: bedrock
+    model: claude-sonnet-4-6
+  fallback:
+    engine: vertex
+    model: claude-sonnet-4-6
+  escalation:
+    engine: bedrock
+    model: claude-opus-4-6
+    when:
+      kind: velocity_score_gte
+      threshold: 80
+default_bucket: drafter
+default_budget_cap_cents: 10000
+tools:
+  - nella.search
+  - leads.claim
+  - drafts.post
+hireable: true
+single_instance_per_org: false
+# Skill-to-agent routing facet (docs/agent-model.md § "Capability routing").
+# Optional + dormant: no consumer is on by default. Vega owns X replies.
+capability:
+  handles:
+    - engagement.reply.x
+  surfaces:
+    - agent_chat
+  intent_examples:
+    - "draft a reply to this tweet"
+    - "respond to an X post from a lead"
+    - "write an on-brand X reply"

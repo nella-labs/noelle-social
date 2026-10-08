@@ -1,0 +1,30 @@
+id: linkedin_intern
+display_name: "LinkedIn Growth Intern"
+short_description: "Drafts replies + DMs to your LinkedIn connections' posts. You send each one by hand."
+icon: "linkedin"
+default_model:
+  primary:
+    engine: vertex
+    model: claude-sonnet-4-6
+  fallback:
+    engine: bedrock
+    model: claude-sonnet-4-6
+default_bucket: drafter
+default_budget_cap_cents: 10000
+tools:
+  - nella.search
+  - leads.claim
+  - drafts.post
+hireable: true
+single_instance_per_org: false
+# Skill-to-agent routing facet (docs/agent-model.md § "Capability routing").
+# Optional + dormant: no consumer is on by default. Lyra owns LinkedIn replies/DMs.
+capability:
+  handles:
+    - engagement.reply.linkedin
+  surfaces:
+    - agent_chat
+  intent_examples:
+    - "draft a reply to this LinkedIn post"
+    - "write a comment on a connection's LinkedIn update"
+    - "draft a LinkedIn DM to a lead"
