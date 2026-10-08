@@ -398,3 +398,19 @@ describe("buildGuidedPlan — status line", () => {
     expect(plan.currentId).toBeNull();
     expect(plan.status).toMatch(/discovering|poll cycle/i);
   });
+
+  test("congratulates a finished org", () => {
+    const s: GuidedSignals = {
+      vaultStage: "rich",
+      hasApifyToken: true,
+      discoveredAny: false,
+      agents: [withVega({ status: "active", hasTargeting: true })],
+      draftedAny: true,
+      pendingApprovals: 0,
+      actionedAny: true,
+      xPostingReady: false,
+    };
+    expect(buildGuidedPlan(s, ORG).complete).toBe(true);
+    expect(buildGuidedPlan(s, ORG).status).toBeTruthy();
+  });
+});
