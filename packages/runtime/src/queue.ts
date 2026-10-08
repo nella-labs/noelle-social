@@ -198,3 +198,191 @@ export class PgWorkQueue<T> implements WorkQueue<T> {
     this.queue = opts.queue;
     this.claimTtlSeconds = opts.claimTtlSeconds ?? 300;
     this.maxAttempts = opts.maxAttempts ?? 5;
+  }
+
+  /**
+   * The claimable predicate: not dead, attempts left, available, and not
+   * under a live claim. An expired `claimed_until` fails no condition —
+   * that IS the orphan-reclaim path.
+   */
+  private static readonly CLAIMABLE =
+    `queue = $1 and dead_at is null and attempts < $2 ` +
+    `and available_at <= now() and (claimed_until is null or claimed_until <= now())`;
+
+  async enqueue(job: T, opts?: EnqueueOptions): Promise<void> {
+    // The payload travels as TEXT and the server parses it: the double cast
+    // `($2::text)::jsonb` defeats driver param-type inference. With a bare
+    // `$2::jsonb`, postgres.js pre-types the param as jsonb and JSON-encodes
+    // the JS value itself — our pre-stringified payload would land as a jsonb
+    // STRING (the double-encode trap), and jobs would come back as text.
+    await this.executor(
+      `insert into noelle.work_queue (queue, job, key, available_at)
+       values ($1, ($2::text)::jsonb, $3, now() + make_interval(secs => ($4)::float8))
+       on conflict (queue, key) where key is not null do nothing`,
+      [this.queue, JSON.stringify(job), opts?.key ?? null, opts?.delaySeconds ?? 0],
+    );
+  }
+
+  async claim(opts: ClaimOptions): Promise<Claimed<T>[]> {
+    // Lazily promote exhausted orphans to dead. nack stamps dead_at itself,
+    // but a worker that dies on the FINAL attempt never nacks — the claim
+    // expires with attempts == maxAttempts and dead_at still null. Without
+    // this, such rows are invisible to any dashboard keyed on dead_at.
+    // Live claims are excluded: an in-flight final attempt may still ack.
+    await this.executor(
+      `update noelle.work_queue
+       set dead_at = now(), claim_id = null, claimed_until = null
+       where queue = $1 and dead_at is null and attempts >= $2
+         and (claimed_until is null or claimed_until <= now())`,
+      [this.queue, this.maxAttempts],
+    );
+
+    const params: unknown[] = [this.queue, this.maxAttempts, opts.batchSize, this.claimTtlSeconds];
+
+    const perKey = Object.entries(opts.perKeyMax ?? {});
+    let candidateSql: string;
+    if (perKey.length === 0) {
+      candidateSql = `
+        select id from noelle.work_queue
+        where ${PgWorkQueue.CLAIMABLE}
+        order by available_at, seq
+        limit $3
+        for update skip locked`;
+    } else {
+      // Rank claimable rows per payload key, cap each key's share of the
+      // batch, then lock the survivors. The rank snapshot can go stale
+      // between the CTE and the lock (another worker claims a row first) —
+      // that's why CLAIMABLE is REPEATED in the locking query below, not
+      // just in the CTE: SKIP LOCKED only skips rows whose lock is still
+      // held, so a row claimed-and-committed by a concurrent worker after
+      // our snapshot would otherwise pass the lock and be double-claimed.
+      // With the predicate on the locking level, the locked-row recheck
+      // (EvalPlanQual) re-evaluates claimability against the committed
+      // version and excludes it — same protection the non-perKey branch
+      // gets for free. Worst case is an under-filled batch, never a
+      // double-claim.
+      const rankCols = perKey.map(([field], i) => {
+        params.push(field);
+        return `row_number() over (partition by job->>$${params.length} order by available_at, seq) as rn_${i}`;
+      });
+      const rankConds = perKey.map(([, max], i) => {
+        params.push(max);
+        return `r.rn_${i} <= $${params.length}`;
+      });
+      candidateSql = `
+        with ranked as (
+          select id, ${rankCols.join(", ")}
+          from noelle.work_queue
+          where ${PgWorkQueue.CLAIMABLE}
+        )
+        select q.id from noelle.work_queue q
+        join ranked r on r.id = q.id
+        where ${rankConds.join(" and ")} and ${PgWorkQueue.CLAIMABLE}
+        order by q.available_at, q.seq
+        limit $3
+        for update skip locked`;
+    }
+
+    const rows = await this.executor(
+      `with candidate as (${candidateSql})
+       update noelle.work_queue q
+       set claim_id = gen_random_uuid(),
+           claimed_until = now() + make_interval(secs => ($4)::float8),
+           attempts = q.attempts + 1
+       from candidate c
+       where q.id = c.id
+       returning q.claim_id as claim_id, q.job::text as job, q.attempts as attempts`,
+      params,
+    );
+
+    // job is selected as ::text and parsed here, deterministically: whether a
+    // driver auto-parses jsonb varies (postgres.js sql.unsafe skips jsonb
+    // parsing when params are present), and for scalar-string payloads the
+    // two behaviors are indistinguishable after the fact.
+    return rows.map((r) => ({
+      claimId: String(r.claim_id),
+      job: JSON.parse(String(r.job)) as T,
+      attempt: Number(r.attempts) - 1,
+    }));
+  }
+
+  async ack(claimId: string): Promise<void> {
+    await this.executor(`delete from noelle.work_queue where claim_id = $1`, [claimId]);
+  }
+
+  async nack(claimId: string, opts?: NackOptions): Promise<void> {
+    await this.executor(
+      `update noelle.work_queue
+       set claim_id = null,
+           claimed_until = null,
+           available_at = now() + make_interval(secs => ($2)::float8),
+           dead_at = case when attempts >= $3 then now() else dead_at end
+       where claim_id = $1`,
+      [claimId, opts?.requeueDelaySeconds ?? 0, this.maxAttempts],
+    );
+  }
+
+  async depth(): Promise<number> {
+    const rows = await this.executor(
+      `select count(*)::int as depth from noelle.work_queue where ${PgWorkQueue.CLAIMABLE}`,
+      [this.queue, this.maxAttempts],
+    );
+    return Number(rows[0]?.depth ?? 0);
+  }
+
+  /**
+   * Count of dead-lettered rows (attempts exhausted). Not part of the
+   * WorkQueue interface — an observability extra for dashboards/alerts.
+   * An in-flight FINAL attempt (attempts == maxAttempts under a live
+   * claim) is not counted — it may still ack successfully.
+   */
+  async deadDepth(): Promise<number> {
+    const rows = await this.executor(
+      `select count(*)::int as dead from noelle.work_queue
+       where queue = $1
+         and (dead_at is not null
+              or (attempts >= $2 and (claimed_until is null or claimed_until <= now())))`,
+      [this.queue, this.maxAttempts],
+    );
+    return Number(rows[0]?.dead ?? 0);
+  }
+}
+
+// -- factory ---------------------------------------------------------------
+
+export type WorkQueueDriver = "memory" | "pg";
+
+export interface GetWorkQueueOptions {
+  driver?: WorkQueueDriver;
+  /** Required when driver=pg. */
+  executor?: QueryExecutor;
+  /** Required when driver=pg. */
+  queue?: string;
+  claimTtlSeconds?: number;
+  maxAttempts?: number;
+}
+
+export function getWorkQueue<T>(opts: GetWorkQueueOptions = {}): WorkQueue<T> {
+  const driver = opts.driver ?? (process.env.NOELLE_QUEUE_DRIVER as WorkQueueDriver | undefined) ?? "memory";
+  switch (driver) {
+    case "memory":
+      // Honor the same tuning options as pg (TTL in seconds → ms).
+      return new MemoryWorkQueue<T>(
+        opts.claimTtlSeconds !== undefined ? opts.claimTtlSeconds * 1000 : undefined,
+        opts.maxAttempts,
+      );
+    case "pg": {
+      if (!opts.executor || !opts.queue) {
+        throw new Error("getWorkQueue(pg): executor and queue are required");
+      }
+      const pgOpts: PgWorkQueueOptions = { queue: opts.queue };
+      if (opts.claimTtlSeconds !== undefined) pgOpts.claimTtlSeconds = opts.claimTtlSeconds;
+      if (opts.maxAttempts !== undefined) pgOpts.maxAttempts = opts.maxAttempts;
+      return new PgWorkQueue<T>(opts.executor, pgOpts);
+    }
+    default: {
+      const exhaustive: never = driver;
+      throw new Error(`Unknown NOELLE_QUEUE_DRIVER: ${String(exhaustive)}`);
+    }
+  }
+}

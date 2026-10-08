@@ -198,3 +198,15 @@ export function createBedrockBackend(opts?: CreateBedrockBackendOptions): Bedroc
       }
 
       // The Anthropic Bedrock SDK returns the same shape as the direct API:
+      // an array of content blocks, the first of which is usually `text`.
+      const textBlock = res.content.find((b) => b.type === "text");
+      const text = textBlock && "text" in textBlock ? textBlock.text : "";
+
+      // Fold any cache-read/creation tokens back into the full-price input
+      // count so spend is never under-counted when served from cache.
+      const usage = reportedAnthropicUsage(res.usage);
+
+      return { text, usage };
+    },
+  };
+}
