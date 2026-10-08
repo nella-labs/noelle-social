@@ -198,3 +198,203 @@ export default async function AgentConfigPage({
   const dmAutodraftEnabled = instance?.dm_autodraft_enabled ?? false;
   // 0039_linkedin_intro_dm_enabled — Lyra's one-time intro-DM lane. Off by
   // default; LinkedIn (Lyra) only.
+  const introDmEnabled = instance?.linkedin_intro_dm_enabled ?? false;
+
+  // 0015_auto_send defaults: off + (120s, 660s) + 6/hr.
+  const autoSendEnabled = instance?.auto_send_enabled ?? false;
+  const autoSendMinDelay = instance?.auto_send_min_delay_sec ?? 120;
+  const autoSendMaxDelay = instance?.auto_send_max_delay_sec ?? 660;
+  const autoSendMaxPerHour = instance?.auto_send_max_per_hour ?? 6;
+
+  // Backpressure caps: NULL on the DB row means "no cap" — render as an
+  // empty input so the founder sees a blank field, not a 0 they'd have to
+  // delete. The form action treats "" as null again on save.
+  const pendingDraftsCap = instance?.pending_drafts_cap ?? null;
+  const leadBacklogCap = instance?.lead_backlog_cap ?? null;
+  // 0042 — per-instance classifier q-score threshold (0-100). NULL = env default.
+  const classifierThreshold = instance?.classifier_threshold ?? null;
+
+  // Discovery defaults (0032). Bird-operator tailoring is X-only, so the section
+  // is gated to x_intern. Bad/empty jsonb degrades to {} (worker defaults).
+  const isXIntern = (instance?.role ?? "") === "x_intern";
+  const isLinkedinIntern = (instance?.role ?? "") === "linkedin_intern";
+  const isRedditIntern = (instance?.role ?? "") === "reddit_intern";
+  const discParsed = DiscoveryConfigSchema.safeParse(
+    (instance as { discovery_config?: unknown } | null)?.discovery_config ?? {},
+  );
+  const disc = discParsed.success ? discParsed.data : {};
+
+  // Whether Pushover is actually wired — env keys (self-host) or Secret
+  // Manager (hosted). When it isn't, the alert toggles below silently no-op,
+  // so availability is shown beside the alert settings.
+  const pushover = await getPushoverConnection(org.id);
+  const connectionsHref = `/app/${orgSlug}/connections`;
+
+  const saveHelpCopy = !isAdmin
+    ? "Only workspace admins can change channel preferences."
+    : "Changes apply to the next run.";
+
+  return (
+    <>
+      <SavedToast token={savedToken} />
+      <PageHeader
+        eyebrow={`${title} · configure`}
+        title={
+          <>
+            <em>{displayName}</em> · settings
+          </>
+        }
+        sub="Pick a model for each worker. Discovery and Send don't call LLMs; Classifier and Drafter run through the model you choose, billed against the catalog price."
+        right={
+          <Link
+            href={instance ? agentHref(orgSlug, instance) : `/app/${orgSlug}/agents/${instanceId}`}
+            className="btn btn-sm btn-ghost"
+          >
+            ← Back to agent
+          </Link>
+        }
+      />
+
+      <form
+        action={updateAgentConfig}
+        className="stack-phone"
+        style={{ display: "grid", gridTemplateColumns: "240px 1fr", gap: 24, alignItems: "start" }}
+      >
+        {/* The save action writes by instance UUID — never the URL slug. */}
+        <input type="hidden" name="instanceId" value={instance?.id ?? instanceId} />
+        <input type="hidden" name="orgSlug" value={orgSlug} />
+
+        <aside className="hide-phone" style={{ position: "sticky", top: 16, alignSelf: "start" }}>
+          <div className="card" style={{ padding: 18 }}>
+            <div className="eyebrow" style={{ marginBottom: 12 }}>
+              Configure
+            </div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                marginBottom: 14,
+              }}
+            >
+              <Avatar role={designRole} size={32} />
+              <div>
+                <div style={{ fontFamily: "var(--display)", fontSize: 17, lineHeight: 1 }}>
+                  {displayName}
+                </div>
+                <div
+                  style={{
+                    fontFamily: "var(--mono)",
+                    fontSize: 10,
+                    color: "var(--ink-muted)",
+                    marginTop: 3,
+                    letterSpacing: "0.12em",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  {title}
+                </div>
+              </div>
+            </div>
+            <hr className="rule-soft" style={{ margin: "0 0 10px" }} />
+            <ConfigSideNav
+              items={[
+                { id: "routing", label: "Worker routing" },
+                { id: "byo-keys", label: "Bring your own key" },
+                { id: "budget", label: "Budget cap" },
+                { id: "auto-send", label: "Auto-send" },
+                { id: "dms", label: "Direct messages" },
+                ...(isXIntern || isLinkedinIntern || isRedditIntern ? [{ id: "classifier", label: "Classifier filter" }] : []),
+                ...(isXIntern || isLinkedinIntern || isRedditIntern ? [{ id: "discovery", label: "Discovery" }] : []),
+                { id: "backpressure", label: "Pipeline caps" },
+                { id: "alerts", label: "Alerts" },
+                { id: "escalation", label: "Escalation rules" },
+              ]}
+            />
+          </div>
+        </aside>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+          <CfgSection
+            id="routing"
+            title="Worker routing"
+            sub="Each agent runs as a small pipeline. Pick the model each step calls through. Preview-tagged models are saved as your intent but currently run on our default managed model until that option ships."
+          >
+            <WorkerCard
+              label="Discovery"
+              role="No LLM — polls X public-search APIs for new leads."
+              stage="0.0.1"
+            />
+
+            <WorkerCard
+              label="Classifier"
+              role="Decides whether a lead is on-brand and assigns a quality score that feeds the inbox filter."
+              stage="0.0.1"
+            >
+              <CfgRow
+                label="Primary"
+                hint="What the classifier runs on every new lead. Default is Haiku 4.5 — cheap and quick."
+              >
+                <ModelPills
+                  name="classifierPrimary"
+                  defaultValue={currentClassifierPrimary}
+                  options={classifierPrimaryOpts}
+                  disabled={!canEdit}
+                />
+              </CfgRow>
+              <CfgRow
+                label="Fallback"
+                hint="Used automatically on rate-limit or 5xx. None means the classifier passes the lead through unscored."
+              >
+                <ModelPills
+                  name="classifierFallback"
+                  defaultValue={currentClassifierFallback}
+                  options={classifierFallbackOpts}
+                  disabled={!canEdit}
+                />
+              </CfgRow>
+              <PriceLine
+                handle={currentClassifierPrimary}
+                fallback={currentClassifierFallback}
+              />
+            </WorkerCard>
+
+            <WorkerCard
+              label="Drafter"
+              role="Writes the three angles per classified lead. Drives draft cost more than any other step."
+              stage="0.0.1"
+            >
+              <CfgRow
+                label="Primary"
+                hint="What the drafter calls per lead. Sonnet 4.6 is the cheapest model that ships on-brand drafts at scale."
+              >
+                <ModelPills
+                  name="drafterPrimary"
+                  defaultValue={currentDrafterPrimary}
+                  options={drafterPrimaryOpts}
+                  disabled={!canEdit}
+                />
+              </CfgRow>
+              <CfgRow
+                label="Fallback"
+                hint="Used on rate-limit or 5xx. Opus is ~5× the cost — keep as the escalation, not the default."
+              >
+                <ModelPills
+                  name="drafterFallback"
+                  defaultValue={currentDrafterFallback}
+                  options={drafterFallbackOpts}
+                  disabled={!canEdit}
+                />
+              </CfgRow>
+              <PriceLine
+                handle={currentDrafterPrimary}
+                fallback={currentDrafterFallback}
+              />
+            </WorkerCard>
+
+            <WorkerCard
+              label="Send"
+              role="No LLM — posts the approved draft through the operator's X OAuth token."
+              stage="0.0.1"
+            />
+          </CfgSection>
