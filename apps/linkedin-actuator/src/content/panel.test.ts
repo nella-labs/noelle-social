@@ -198,3 +198,152 @@ describe("browser discovery actor control", () => {
     await vi.waitFor(() => expect(set).toHaveBeenCalledWith({
       "noelle.discoverySchedule.v1": { enabled: true, start: "03:00", end: "08:15" },
     }));
+
+    panel.querySelector<HTMLButtonElement>("#na-discover")!.click();
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ cmd: "startBrowserDiscovery" }));
+    expect(set.mock.invocationCallOrder.at(-1)).toBeLessThan(sendMessage.mock.invocationCallOrder.at(-1)!);
+  });
+
+  it("waits for the saved schedule before accepting edits or a discovery start", async () => {
+    vi.spyOn(Element.prototype, "attachShadow").mockImplementation(function (this: Element, init) {
+      return originalAttachShadow.call(this, { ...init, mode: "open" });
+    });
+    let resolveGet!: (value: Record<string, unknown>) => void;
+    const get = vi.fn(() => new Promise<Record<string, unknown>>((resolve) => { resolveGet = resolve; }));
+    const set = vi.fn(async () => {});
+    const sendMessage = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal("chrome", { runtime: { sendMessage }, storage: { local: { get, set } } });
+
+    mountPanel();
+    const panel = document.body.firstElementChild!.shadowRoot!;
+    const button = panel.querySelector<HTMLButtonElement>("#na-discover")!;
+    const quiet = panel.querySelector<HTMLInputElement>("#na-discovery-quiet")!;
+    const start = panel.querySelector<HTMLInputElement>("#na-discovery-start")!;
+    const end = panel.querySelector<HTMLInputElement>("#na-discovery-end")!;
+    expect(button.disabled).toBe(true);
+    expect(quiet.disabled).toBe(true);
+    expect(start.disabled).toBe(true);
+    expect(end.disabled).toBe(true);
+    button.click();
+    expect(set).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalledWith({ cmd: "startBrowserDiscovery" });
+
+    resolveGet({ "noelle.discoverySchedule.v1": { enabled: true, start: "02:30", end: "08:15" } });
+    await vi.waitFor(() => expect(button.disabled).toBe(false));
+    expect(quiet.checked).toBe(true);
+    expect(start.value).toBe("02:30");
+    expect(end.value).toBe("08:15");
+    start.value = "03:00";
+    start.dispatchEvent(new Event("change", { bubbles: true }));
+    button.click();
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ cmd: "startBrowserDiscovery" }));
+    expect(set).toHaveBeenLastCalledWith({
+      "noelle.discoverySchedule.v1": { enabled: true, start: "03:00", end: "08:15" },
+    });
+  });
+
+  it("does not overwrite a saved quiet window if reading storage fails", async () => {
+    vi.spyOn(Element.prototype, "attachShadow").mockImplementation(function (this: Element, init) {
+      return originalAttachShadow.call(this, { ...init, mode: "open" });
+    });
+    const sendMessage = vi.fn(async () => ({ ok: true }));
+    const set = vi.fn(async () => {});
+    vi.stubGlobal("chrome", { runtime: { sendMessage }, storage: { local: {
+      get: vi.fn(async () => { throw new Error("storage down"); }), set,
+    } } });
+    mountPanel();
+    const panel = document.body.firstElementChild!.shadowRoot!;
+    panel.querySelector<HTMLButtonElement>("#na-discover")!.click();
+    await vi.waitFor(() => expect(panel.textContent).toContain("Could not load discovery schedule"));
+    expect(set).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalledWith({ cmd: "startBrowserDiscovery" });
+  });
+
+  it("shows ready replies and errors without an activity console", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Element.prototype, "attachShadow").mockImplementation(function (this: Element, init) {
+      return originalAttachShadow.call(this, { ...init, mode: "open" });
+    });
+    vi.stubGlobal("chrome", { runtime: { sendMessage: vi.fn(async ({ cmd }: { cmd: string }) => cmd === "getState"
+      ? { ok: true, browserDiscoveryActive: true, state: {
+          status: "running", commentPool: [{}, {}, {}], actions: [], lastEvent: "comment failed: composer unavailable",
+        } }
+      : { ok: true }) }, storage: { local: {
+      get: vi.fn(async () => ({})), set: vi.fn(async () => {}),
+    } } });
+
+    mountPanel();
+    const panel = document.body.firstElementChild!.shadowRoot!;
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(panel.querySelector("#na-leads")?.textContent).toContain("3");
+    expect(panel.querySelector("#na-error")?.textContent).toContain("comment failed");
+    expect(panel.querySelector("#na-error")?.getAttribute("role")).toBe("alert");
+    expect(panel.querySelector("pre")).toBeNull();
+    expect(panel.querySelector("#na-advanced")?.hasAttribute("open")).toBe(false);
+    expect(panel.querySelector("#na-schedule")?.hasAttribute("open")).toBe(false);
+  });
+
+  it("shows the server's active lead occupancy with the five-slot limit", async () => {
+    vi.spyOn(Element.prototype, "attachShadow").mockImplementation(function (this: Element, init) {
+      return originalAttachShadow.call(this, { ...init, mode: "open" });
+    });
+    const sendMessage = vi.fn(async ({ cmd }: { cmd: string }) => cmd === "getDiscoveryCapacity"
+      ? { ok: true, capacity: { occupied: 4, available: 1, limit: 5 } }
+      : { ok: true });
+    vi.stubGlobal("chrome", { runtime: { sendMessage }, storage: { local: {
+      get: vi.fn(async () => ({})), set: vi.fn(async () => {}),
+    } } });
+
+    mountPanel();
+    const panel = document.body.firstElementChild!.shadowRoot!;
+    await vi.waitFor(() => expect(panel.querySelector("#na-leads")?.textContent).toBe("4/5"));
+    expect(panel.querySelector(".pool")?.textContent).toContain("Active reply leads");
+  });
+
+  it("shows a background skip: err event as an error alert", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Element.prototype, "attachShadow").mockImplementation(function (this: Element, init) {
+      return originalAttachShadow.call(this, { ...init, mode: "open" });
+    });
+    vi.stubGlobal("chrome", { runtime: { sendMessage: vi.fn(async ({ cmd }: { cmd: string }) => cmd === "getState"
+      ? { ok: true, browserDiscoveryActive: true, state: {
+          status: "running", commentPool: [], lastEvent: "skip: err: composer detached",
+        } }
+      : { ok: true, capacity: { occupied: 0, limit: 5 } }) }, storage: { local: {
+      get: vi.fn(async () => ({})), set: vi.fn(async () => {}),
+    } } });
+
+    mountPanel();
+    const panel = document.body.firstElementChild!.shadowRoot!;
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(panel.querySelector("#na-error")?.textContent).toContain("skip: err: composer detached");
+    expect(panel.querySelector<HTMLElement>("#na-error")?.hidden).toBe(false);
+  });
+
+  it("clears a saved schedule error after a successful retry", async () => {
+    vi.spyOn(Element.prototype, "attachShadow").mockImplementation(function (this: Element, init) {
+      return originalAttachShadow.call(this, { ...init, mode: "open" });
+    });
+    const set = vi.fn()
+      .mockRejectedValueOnce(new Error("storage failed"))
+      .mockResolvedValueOnce(undefined);
+    vi.stubGlobal("chrome", { runtime: { sendMessage: vi.fn(async () => ({
+      ok: true, capacity: { occupied: 0, limit: 5 },
+    })) }, storage: { local: {
+      get: vi.fn(async () => ({})), set,
+    } } });
+
+    mountPanel();
+    const panel = document.body.firstElementChild!.shadowRoot!;
+    const start = panel.querySelector<HTMLInputElement>("#na-discovery-start")!;
+    await vi.waitFor(() => expect(start.disabled).toBe(false));
+    start.value = "02:00";
+    start.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => expect(panel.querySelector("#na-error")?.textContent).toContain("storage failed"));
+
+    start.value = "03:00";
+    start.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => expect(set).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(panel.querySelector<HTMLElement>("#na-error")?.hidden).toBe(true));
+  });
+});

@@ -598,3 +598,54 @@ describe("registered threaded locator ownership", () => {
   });
 
   it("reads a mention-only target as measured empty body", () => {
+    document.body.innerHTML = anchor(box(true));
+    document.querySelector('[data-x="10"]')!.innerHTML =
+      '<span data-type="mention">Ann Smith</span>\u200B\uFEFF';
+    expect(command("readReplyComposer")).toMatchObject({
+      ok: true,
+      observed: { present: true, empty: true, text: "" },
+    });
+  });
+  it("reads only the target body while another post editor is dirty", () => {
+    document.body.innerHTML = box(true, "Other") + anchor(box(true));
+    expect(command("readReplyComposer")).toMatchObject({
+      ok: true,
+      observed: { present: true, empty: false, text: "approved body" },
+    });
+  });
+  it("accepts readable absence only under a still-mounted named anchor", () => {
+    document.body.innerHTML = anchor();
+    expect(command("readReplyComposer")).toMatchObject({
+      ok: true,
+      observed: { present: false, empty: true, text: "" },
+    });
+  });
+  it("keeps a missing named anchor unknown", () => {
+    document.body.innerHTML = box(true);
+    expect(command("readReplyComposer")).toMatchObject({
+      ok: false,
+      skipReason: "reply-composer:comment-not-found",
+    });
+  });
+  it("keeps a foreign-only following composer unknown", () => {
+    document.body.innerHTML = anchor() + foreign();
+    expect(command("readReplyComposer")).toMatchObject({
+      ok: false,
+      skipReason: "reply-composer:not-this-comments-box",
+    });
+  });
+  it("keeps a nested foreign-only composer unknown", () => {
+    document.body.innerHTML = anchor(foreign());
+    expect(command("readReplyComposer")).toMatchObject({
+      ok: false,
+      skipReason: "reply-composer:not-this-comments-box",
+    });
+  });
+  it("keeps a mounted box without its editor unknown", () => {
+    document.body.innerHTML = anchor('<div componentkey="commentBox-target"></div>');
+    expect(command("readReplyComposer")).toMatchObject({
+      ok: false,
+      skipReason: "reply-composer:no-editor",
+    });
+  });
+});
