@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Noelle Reddit Actuator Options</title></head>
+<body style="font:14px system-ui;max-width:520px;margin:24px auto">
+  <h1>Noelle Reddit Actuator</h1>
+  <p style="color:#555">Orion's hands — posts <b>human-approved</b> Reddit replies (to a post or a top-upvoted comment) from your own logged-in tab. It may also <b>upvote</b> posts while idle (upvote-only, capped, never downvotes) when the option below is on.</p>
+  <form id="f">
+    <p><label>API base URL<br><input id="apiBaseUrl" style="width:100%" placeholder="http://127.0.0.1:18791"></label></p>
+    <p><label>Bearer token<br><input id="token" style="width:100%"></label></p>
+    <p><label>Reddit (Orion) instance id<br><input id="instanceId" style="width:100%"></label></p>
+    <p><label>Daily reply cap <input id="capComments" type="number" min="0" value="8"></label> <small>Reddit-safe; warm-up ramps this up over ~4 weeks. Reddit is reply-only — never votes.</small></p>
+    <p><label><input id="preferOldReddit" type="checkbox"> Post via old.reddit.com</label> <small>Only if you actually browse old Reddit. It's easier to automate but a more distinct write surface; the default posts via new Reddit to match your normal interface.</small></p>
+    <!-- Deep-night taper checkbox removed: the taper is an inert stub (scheduler
+         densityWeight is hardcoded to full density per operator directive
+         e660bccd — post any hour), so a live-looking control here only misled. -->
+    <p><label><input id="ambientReadActions" type="checkbox" checked> Ambient read-actions (expand “…more” / open threads to read — read-only, non-counted)</label></p>
+    <p><label><input id="upvotesEnabled" type="checkbox" checked> Upvote posts you reply to (max 10 / 15 min)</label> <small>Upvote-only — never downvotes. Fires while idle between replies, hard-capped per rolling 15 min. Automated voting is a Reddit-ToS gray area you are accepting.</small></p>
+    <p><label>Upvote cap (per 15 min) <input id="upvotesPer15Min" type="number" min="0" max="10" value="10"></label></p>
+    <p><label><input id="autonomous" type="checkbox"> Autonomous (lights-out): auto-start a daily run</label></p>
+    <p><label><input id="autoDrain" type="checkbox"> Auto-drain: whenever approved replies are waiting (and nothing is running), start a drain inside the window, so newly approved replies go out without a manual “Drain all approvals” click</label> <small>Requires Autonomous, plus the dashboard's standing send consent (auto_send_enabled) — without it the server serves an empty queue and nothing starts.</small></p>
+    <p><label>Auto window: start <input id="autoStartHour" type="number" min="0" max="23" value="9"> end <input id="autoEndHour" type="number" min="0" max="23" value="21"> run hours <input id="autoWindowHours" type="number" min="1" max="16" value="8"></label></p>
+    <p><label>Auto daily target: replies <input id="autoTargetComments" type="number" min="0" value="8"></label></p>
+    <p><label>Challenge cooldown (days) <input id="challengeCooldownDays" type="number" min="0" max="14" value="3"></label></p>
+    <p><label>Extra challenge backoff (days, 0=off) <input id="autoChallengeBackoffDays" type="number" min="0" max="14" value="0"></label></p>
+    <p><label><input id="healthGate" type="checkbox" checked> Health-gate auto-start (require server status = ok)</label></p>
+    <button>Save</button> <span id="msg"></span>
+  </form>
+  <script type="module" src="../../src/options/options.ts"></script>
+</body></html>
