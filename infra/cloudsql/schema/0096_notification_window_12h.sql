@@ -198,3 +198,18 @@ begin
          updated_at = now()
     from cand
    where l.id = cand.id
+  returning
+    l.id,
+    l.external_id,
+    l.payload,
+    l.author_handle,
+    l.author_id,
+    l.status,
+    l.tier,
+    l.classifier_label,
+    l.classifier_score,
+    l.priority;
+end;
+$$;
+
+grant execute on function noelle.claim_notification_leads_for_drafting(uuid, integer) to noelle_app;
