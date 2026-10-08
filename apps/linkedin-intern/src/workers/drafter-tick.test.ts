@@ -3198,3 +3198,203 @@ describe("runDrafterTick — F6b tiered reply batching (NOELLE_DRAFTER_BATCH)", 
         engine: "bedrock",
         model: "m",
       }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) } as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      batch: { enabled: true, batchLightLeads: true },
+      variety: { enabled: true, rng: () => 0.1, genzMarkerRate: 1 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("SPOKEN REGISTER FOR THIS REPLY");
+    // One per lead, since both rolled under a rate of 1.
+    expect(prompt.match(/SPOKEN REGISTER FOR THIS REPLY/g)).toHaveLength(2);
+  });
+
+  it("BATCH ON: each light post keeps its forced conversational move local", async () => {
+    const marker = GENZ_MARKERS.find((candidate) => candidate.id === "RELATIONAL_TAG");
+    expect(marker).toBeDefined();
+
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: batchOk([{ id: "L1" }, { id: "L2" }]),
+        engine: "bedrock",
+        model: "m",
+      }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) } as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      batch: { enabled: true, batchLightLeads: true },
+      variety: {
+        enabled: true,
+        rng: () => 0,
+        genzMarkerRate: 1,
+        genzMarkerRotation: { next: () => marker ?? null },
+      },
+    });
+
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt.match(/SPOKEN REGISTER FOR THIS REPLY/g)).toHaveLength(2);
+    expect(prompt.match(new RegExp(marker?.directive.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") ?? "", "g"))).toHaveLength(2);
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    expect(system).toContain("SPOKEN REGISTER are PER-POST");
+  });
+
+  it("BATCH ON: the batched suffix declares the marker as PER-POST", async () => {
+    // The production case is MIXED, not all-or-nothing: at the shipped 22% rate
+    // a 5-lead batch carries the block on about one post. If the suffix does not
+    // name it as per-post, the model can apply that one marker to all five
+    // replies — which is the repetition the lane exists to prevent. The two
+    // other batched tests only pin rate 1 and rate 0, so neither sees this.
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: batchOk([{ id: "L1" }, { id: "L2" }]),
+        engine: "bedrock",
+        model: "m",
+      }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) } as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      batch: { enabled: true, batchLightLeads: true },
+      variety: { enabled: true, rng: () => 0.1, genzMarkerRate: 1 },
+    });
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    expect(system).toContain("spoken register:");
+    expect(system).toContain("SPOKEN REGISTER are PER-POST");
+    expect(system).toContain("never licenses that marker, or any marker, in the replies to the OTHER posts");
+  });
+
+  it("BATCH ON: no marker block in the batched prompt when the lane is off", async () => {
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: batchOk([{ id: "L1" }, { id: "L2" }]),
+        engine: "bedrock",
+        model: "m",
+      }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) } as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      batch: { enabled: true, batchLightLeads: true },
+      variety: { enabled: true, rng: () => 0.1, genzMarkerRate: 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("SPOKEN REGISTER FOR THIS REPLY");
+  });
+
+  it("BATCH ON: drafts N light leads in ONE call (user prompt enumerates all leads)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const L1 = lightLead("L1", "1");
+    const L2 = lightLead("L2", "2");
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: batchOk([{ id: "L1" }, { id: "L2" }]),
+        engine: "bedrock",
+        model: "m",
+      }),
+    };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [L1, L2] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+    });
+    // One batch call for both leads
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    // Both leads drafted
+    expect(n).toBe(2);
+    expect(postOutbound).toHaveBeenCalledTimes(2);
+    // The single call's prompt mentions both lead ids
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("L1");
+    expect(prompt).toContain("L2");
+    // System uses BATCHED_LIGHT_SYSTEM_SUFFIX marker
+    expect(runner.draft.mock.calls[0]![0].system as string).toContain("BATCHED MODE");
+  });
+
+  it("BATCH ON: a budget-blocked batch defers every lead without retrying per-lead", async () => {
+    // The batch call proves the org cap is spent, so the per-lead fallback must
+    // not re-attempt a call we already know throws. Exactly ONE call total.
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const runner = {
+      draft: vi.fn(async () => {
+        throw new BudgetExceededError({ layer: "org", spent_cents: 9999, cap_cents: 10000, estimated_cents: 200 });
+      }),
+    };
+    const sqlValues: unknown[] = [];
+    const sql = Object.assign(
+      vi.fn(async (_s: unknown, ...vals: unknown[]) => {
+        sqlValues.push(...vals);
+        return [];
+      }),
+      { json: (x: unknown) => x },
+    );
+    await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+      sql: sql as never,
+    });
+
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).not.toHaveBeenCalledWith(expect.objectContaining({ status: "errored" }));
+    expect(sqlValues).toContainEqual({ budget_deferred: "light" });
+  });
+
+  it("BATCH ON: each lead's OWN postText is in the user prompt (not shared context)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const L1 = lightLead("L1", "1", { payload: { text: "post A by alice", authorName: "Alice" } });
+    const L2 = lightLead("L2", "2", { payload: { text: "post B by bob", authorName: "Bob" } });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: batchOk([{ id: "L1" }, { id: "L2" }]),
+        engine: "bedrock",
+        model: "m",
+      }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [L1, L2] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
