@@ -1198,3 +1198,203 @@ describe("source-ring rotation under the tick budget (sourceCursor)", () => {
       watchlist: { handles: ["a", "b", "c"], keywords: [] },
       watchlistPeople: [],
       xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      sourceCursor: cursor,
+    });
+    const polled = xClient.userTweets.mock.calls.map((c) => (c[0] as { handle: string }).handle);
+    expect(polled).toEqual(["b", "c", "a"]); // 7 % 3 = 1 ⇒ starts at b
+    expect(cursor.get()).toBe(1); // full pass wraps back to the normalized offset
+  });
+
+  it("per-mode cursors: a watchlist-only tick doesn't clamp full-mode rotation (keyword lane still reached)", async () => {
+    // The worker keys cursors by (instance, mode) via createSourceCursorRegistry:
+    // watchlist-only ticks iterate a people-only ring and re-mod the stored value
+    // by THEIR length, so sharing one cursor across modes would clamp full-mode
+    // rotation to the head and starve the keyword lane all over again.
+    const reg = createSourceCursorRegistry();
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: false });
+    const xClient = emptyClient();
+    const people = [{ handle: "p1", addedAt: "2026-01-01T00:00:00.000Z" }];
+    const wl = { handles: ["h1", "h2"], keywords: ["k1"] };
+    const fullTick = () =>
+      runDiscoveryTick({
+        log: log(),
+        instance: { id: "i", org_id: "o" } as never,
+        watchlist: wl,
+        watchlistPeople: people,
+        xClient: xClient as never,
+        upsertLead: upsert,
+        rateBucket: { tryTake: () => true },
+        budgetMs: 100,
+        clockNow: clockFor(2),
+        sourceCursor: reg.for("i", "full"),
+      });
+    // full ring [h1, h2, p1, k1]; capacity 2 ⇒ tick 1 polls h1,h2
+    await fullTick();
+    // a watchlist-only tick in between (paused / caps tripped) — its own 1-source ring
+    await runDiscoveryTick({
+      log: log(),
+      instance: { id: "i", org_id: "o" } as never,
+      watchlist: wl,
+      watchlistPeople: people,
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      watchlistOnly: true,
+      sourceCursor: reg.for("i", "watchlist"),
+    });
+    // the next full tick must resume at p1,k1 — the keyword lane is reached
+    await fullTick();
+    expect(xClient.searchTimeline).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("person-first lane (candidate retention + polling)", () => {
+  const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+  const icpGate = { headlineKeywords: ["founder", "devtools"], headlineExcludeKeywords: ["crypto"] };
+
+  const authored = (handle: string, bio: string | null, id = "1") =>
+    res([
+      {
+        id,
+        text: "a post",
+        created_at: "2026-05-18T00:00:00.000Z",
+        author: { handle, id: `${handle}-id`, followers: 5000, ...(bio ? { bio } : {}) },
+        url: `https://x.com/${handle}/status/${id}`,
+      },
+    ]);
+
+  it("retains an author whose BIO matches the ICP", async () => {
+    const recordDiscoveredPerson = vi.fn().mockResolvedValue(undefined);
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: ["agents"] },
+      watchlistPeople: [],
+      xClient: {
+        userTweets: vi.fn().mockResolvedValue(res([])),
+        searchTimeline: vi.fn().mockResolvedValue(authored("someone", "founder, building devtools")),
+      } as never,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+      rateBucket: { tryTake: () => true },
+      icpGate,
+      recordDiscoveredPerson,
+    });
+    expect(recordDiscoveredPerson).toHaveBeenCalledWith(
+      expect.objectContaining({ handle: "someone", bio: "founder, building devtools" }),
+    );
+  });
+
+  it("does NOT retain an off-ICP author", async () => {
+    const recordDiscoveredPerson = vi.fn().mockResolvedValue(undefined);
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: ["agents"] },
+      watchlistPeople: [],
+      xClient: {
+        userTweets: vi.fn().mockResolvedValue(res([])),
+        searchTimeline: vi.fn().mockResolvedValue(authored("degen", "crypto trader, NFTs")),
+      } as never,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+      rateBucket: { tryTake: () => true },
+      icpGate,
+      recordDiscoveredPerson,
+    });
+    expect(recordDiscoveredPerson).not.toHaveBeenCalled();
+  });
+
+  it("does NOT retain on an UNKNOWN bio — retention fails CLOSED", async () => {
+    // The classifier's gate fails open on a missing bio (the actor often omits
+    // it) because dropping the lane would be worse. Retention is the opposite
+    // trade: a speculative prospect list filled with unvetted handles would
+    // spend Apify budget polling strangers.
+    const recordDiscoveredPerson = vi.fn().mockResolvedValue(undefined);
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: ["agents"] },
+      watchlistPeople: [],
+      xClient: {
+        userTweets: vi.fn().mockResolvedValue(res([])),
+        searchTimeline: vi.fn().mockResolvedValue(authored("nobio", null)),
+      } as never,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+      rateBucket: { tryTake: () => true },
+      icpGate,
+      recordDiscoveredPerson,
+    });
+    expect(recordDiscoveredPerson).not.toHaveBeenCalled();
+  });
+
+  it("never retains a WATCHLIST person (the watchlist already holds them)", async () => {
+    const recordDiscoveredPerson = vi.fn().mockResolvedValue(undefined);
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: ["agents"] },
+      watchlistPeople: [{ handle: "someone", addedAt: "2020-01-01T00:00:00.000Z" }],
+      xClient: {
+        userTweets: vi.fn().mockResolvedValue(res([])),
+        searchTimeline: vi.fn().mockResolvedValue(authored("someone", "founder, building devtools")),
+      } as never,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+      rateBucket: { tryTake: () => true },
+      icpGate,
+      recordDiscoveredPerson,
+    });
+    expect(recordDiscoveredPerson).not.toHaveBeenCalled();
+  });
+
+  it("polls retained candidates and their posts become NON-priority leads", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const userTweets = vi.fn().mockResolvedValue(authored("candidate", "founder", "9"));
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: [] },
+      watchlistPeople: [],
+      xClient: { userTweets, searchTimeline: vi.fn().mockResolvedValue(res([])) } as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      discoveredHandles: ["candidate"],
+    });
+    expect(userTweets).toHaveBeenCalledWith(expect.objectContaining({ handle: "candidate" }));
+    // A candidate is NOT hand-picked, so their post is an ordinary lead.
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ priority: false }));
+  });
+
+  it("stamps a candidate as polled even when their fetch FAILS (no starvation)", async () => {
+    // Otherwise a person whose timeline errors stays at the front of the
+    // never-polled queue and is retried every tick forever.
+    const onPersonPolled = vi.fn().mockResolvedValue(undefined);
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: [] },
+      watchlistPeople: [],
+      xClient: {
+        userTweets: vi.fn().mockRejectedValue(new Error("actor 500")),
+        searchTimeline: vi.fn().mockResolvedValue(res([])),
+      } as never,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+      rateBucket: { tryTake: () => true },
+      discoveredHandles: ["candidate"],
+      onPersonPolled,
+    });
+    expect(onPersonPolled).toHaveBeenCalledWith("candidate");
+  });
+
+  it("does not double-poll someone who is BOTH a candidate and a watch person", async () => {
+    const userTweets = vi.fn().mockResolvedValue(res([]));
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["dup"], keywords: [] },
+      watchlistPeople: [],
+      xClient: { userTweets, searchTimeline: vi.fn().mockResolvedValue(res([])) } as never,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+      rateBucket: { tryTake: () => true },
+      discoveredHandles: ["dup"],
+    });
