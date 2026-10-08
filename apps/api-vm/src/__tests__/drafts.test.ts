@@ -398,3 +398,203 @@ describe("POST /api/drafts/:id/send", () => {
       body: JSON.stringify({ body: "hi", edited: false }),
     });
     expect(res.status).toBe(503);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toBe("x_auth_failed");
+  });
+
+  it("returns 503 x_rate_limited when X says slow down", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-A",
+        org_id: "org-1",
+        draft_id: "draft-A",
+        lead_id: "lead-1",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: "1234567890",
+      },
+      siblingIds: [],
+    });
+    const xClient = makeXClientStub({ throws: new XRateLimitError() });
+    const app = await buildApp({ sql: fakeSql, xClient });
+
+    const res = await app.request("/api/drafts/appr-A/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hi", edited: false }),
+    });
+    expect(res.status).toBe(503);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toBe("x_rate_limited");
+  });
+
+  it("returns 502 x_post_failed on permanent X error", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-A",
+        org_id: "org-1",
+        draft_id: "draft-A",
+        lead_id: "lead-1",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: "1234567890",
+      },
+      siblingIds: [],
+    });
+    const xClient = makeXClientStub({ throws: new XError("404 deleted", 404) });
+    const app = await buildApp({ sql: fakeSql, xClient });
+
+    const res = await app.request("/api/drafts/appr-A/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hi", edited: false }),
+    });
+    expect(res.status).toBe(502);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toBe("x_post_failed");
+  });
+
+  it("returns 409 x_cookies_missing when Secret Manager NOT_FOUND", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-A",
+        org_id: "org-1",
+        draft_id: "draft-A",
+        lead_id: "lead-1",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: "1234567890",
+      },
+      siblingIds: [],
+    });
+    const secrets = makeSecretsStub({ notFound: true });
+    const app = await buildApp({ sql: fakeSql, secrets });
+
+    const res = await app.request("/api/drafts/appr-A/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hi", edited: false }),
+    });
+    expect(res.status).toBe(409);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toBe("x_cookies_missing");
+  });
+
+  it("returns 422 missing_in_reply_to when lead has no external_id", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-A",
+        org_id: "org-1",
+        draft_id: "draft-A",
+        lead_id: "lead-1",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: null,
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-A/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hi", edited: false }),
+    });
+    expect(res.status).toBe(422);
+  });
+
+  it("returns sibling_skipped=0 when the lead has only one approval", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-solo",
+        org_id: "org-1",
+        draft_id: "draft-solo",
+        lead_id: "lead-solo",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: "111",
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-solo/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hi", edited: false }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { sibling_skipped: number };
+    expect(json.sibling_skipped).toBe(0);
+  });
+
+  it("returns 404 when the approval id is unknown", async () => {
+    const fakeSql = makeFakeSql({
+      approval: null,
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/unknown/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hi", edited: false }),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("returns the existing sent_at when called against an already-sent approval", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-already",
+        org_id: "org-1",
+        draft_id: "draft-already",
+        lead_id: "lead-already",
+        status: "sent",
+        decided_at: "2026-01-15T10:30:00.000Z",
+        lead_external_id: "111",
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-already/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hi", edited: false }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { sent_at: string };
+    expect(json.sent_at).toBe("2026-01-15T10:30:00.000Z");
+  });
+
+  it("returns 500 db_write_failed_after_post when DB writes throw after a successful X post", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-A",
+        org_id: "org-1",
+        draft_id: "draft-A",
+        lead_id: "lead-1",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: "1234567890",
+      },
+      siblingIds: [],
+      txError: "connection reset",
+    });
+    const xClient = makeXClientStub({
+      reply: async () => ({ id: "999", url: "https://x.com/me/status/999" }),
+    });
+    const app = await buildApp({ sql: fakeSql, xClient });
+
+    const res = await app.request("/api/drafts/appr-A/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hi", edited: false }),
+    });
+    expect(res.status).toBe(500);
+    const json = (await res.json()) as {
+      error: string;
+      sent_external_id: string;
+      sent_url: string;
+    };
