@@ -2198,3 +2198,203 @@ function toPersonInteraction(r: {
     approvalId: r.approval_id,
     status: r.status,
     decidedAt: r.decided_at,
+    kind: draft.kind ?? "reply",
+    bodyPreview: body ? truncate(body, 200) : null,
+    body: body ?? null,
+    recipientId: r.lead_author_id ?? lead.author_id ?? null,
+    sourcePostUrl,
+    postUrl,
+  };
+}
+
+interface PersonInteractionRaw {
+  approval_id: string;
+  status: string;
+  decided_at: string | null;
+  created_at: string;
+  sent_external_id: string | null;
+  lead_id: string | null;
+  lead_external_id: string | null;
+  lead_author_handle: string | null;
+  lead_author_id: string | null;
+  lead_payload: unknown;
+  draft_payload: unknown;
+}
+
+// ── Contacts CRM (org-scoped persons) ───────────────────────────────────────
+
+export interface PersonSocialAccountView {
+  platform: SocialPlatform;
+  handle: string | null;
+  url: string | null;
+}
+
+export interface PersonListItem {
+  id: string;
+  displayName: string;
+  xHandle: string | null;
+  /** LinkedIn public_id (vanity slug), when the contact has a LinkedIn account. */
+  linkedinHandle: string | null;
+  platforms: SocialPlatform[];
+  repliesSent: number;
+  pendingReplies: number;
+  lastInteractionAt: string | null;
+  /**
+   * Display names of the agents that watch this contact — across BOTH the X
+   * (x_watchlist_people) and LinkedIn (linkedin_watchlist_people) watchlists.
+   * Empty = not on any watchlist. Drives the "Watched" badge + filter so
+   * Contacts is the single combined view of persons + watchlist.
+   */
+  watchedBy: string[];
+}
+
+export interface PersonDetail {
+  id: string;
+  displayName: string;
+  notes: string | null;
+  accounts: PersonSocialAccountView[];
+  xHandle: string | null;
+  /** LinkedIn public_id (vanity slug), when the contact has a LinkedIn account. */
+  linkedinHandle: string | null;
+}
+
+/** display_name, else the X handle, else a stable fallback. */
+function personDisplayName(displayName: string | null, xHandle: string | null): string {
+  return displayName?.trim() || (xHandle ? `@${xHandle}` : "Unknown contact");
+}
+
+/**
+ * Per-handle interaction rollup for an org, keyed by lowercased X handle. One
+ * query feeds both the contacts list (join in JS) and is cheap because
+ * approvals is indexed on org_id. NULL author handles are skipped.
+ */
+async function orgHandleStats(orgId: string): Promise<
+  Map<string, { repliesSent: number; pendingReplies: number; lastInteractionAt: string | null }>
+> {
+  const rows = await readSql<
+    Array<{
+      handle: string;
+      replies_sent: number;
+      pending_replies: number;
+      last_interaction: string | null;
+    }>
+  >`
+    select
+      lower(l.author_handle) as handle,
+      count(*) filter (where a.status = 'sent')::int    as replies_sent,
+      count(*) filter (where a.status = 'pending')::int as pending_replies,
+      max(a.decided_at) filter (where a.status = 'sent') as last_interaction
+    from noelle.approvals a
+    join noelle.leads l on l.id = a.lead_id
+    where a.org_id = ${orgId} and l.author_handle is not null
+    group by lower(l.author_handle)
+  `;
+  const m = new Map<string, { repliesSent: number; pendingReplies: number; lastInteractionAt: string | null }>();
+  for (const r of rows) {
+    m.set(r.handle, {
+      repliesSent: r.replies_sent,
+      pendingReplies: r.pending_replies,
+      lastInteractionAt: r.last_interaction,
+    });
+  }
+  return m;
+}
+
+/**
+ * For each watched handle in an org, the display names of the agents that watch
+ * it — unioning the X watchlist (keyed by handle) and the LinkedIn watchlist
+ * (keyed by public_id). A CRM person's 'x' account handle matches the former and
+ * its 'linkedin' account handle (= public_id) the latter, so the contacts list
+ * can flag who is watched on either platform without per-person round-trips.
+ */
+async function orgWatchersByHandle(orgId: string): Promise<Map<string, string[]>> {
+  const rows = await readSql<Array<{ handle: string; agent_name: string | null }>>`
+    select lower(wp.handle) as handle, ai.display_name as agent_name
+    from noelle.x_watchlist_people wp
+    join noelle.agent_instances ai on ai.id = wp.agent_instance_id
+    where wp.org_id = ${orgId}
+    union all
+    select lower(lp.public_id) as handle, ai.display_name as agent_name
+    from noelle.linkedin_watchlist_people lp
+    join noelle.agent_instances ai on ai.id = lp.agent_instance_id
+    where lp.org_id = ${orgId} and lp.public_id is not null
+  `;
+  const m = new Map<string, string[]>();
+  for (const r of rows) {
+    const name = r.agent_name?.trim() || "Agent";
+    const list = m.get(r.handle);
+    if (!list) m.set(r.handle, [name]);
+    else if (!list.includes(name)) list.push(name);
+  }
+  return m;
+}
+
+/**
+ * Self-heal the Contacts CRM: ensure every person an agent watches or has
+ * actually replied to exists as a `noelle.persons` row. The Contacts page
+ * lists `persons`, so anything that never got a person row is invisible there.
+ *
+ * Sources (idempotent — only handles without an account row are materialized):
+ *   1. X watchlist people            → an 'x' account
+ *   2. LinkedIn watchlist people     → a 'linkedin' account
+ *   3. authors we SENT a reply to    → an account on the lead's platform
+ *
+ * "Engaged" deliberately means a SENT reply only — pending/skipped drafts don't
+ * make someone a contact. This is the reconcile path the live `ensurePerson*`
+ * write-hooks lean on: watchlists seeded straight into the DB (bypassing those
+ * hooks) are healed here on the next contacts load, so the page can't drift.
+ * Best-effort: a failure here must never blank the page, so callers swallow.
+ */
+export async function reconcileContactsForOrg(orgId: string): Promise<void> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+
+  // One idempotent pass: collect candidate (platform, handle, name, url) tuples
+  // from every source, dedupe, drop any that already have an account, mint a
+  // person + account for the rest. The person id is generated in-CTE so the
+  // account insert can reference it without a second round-trip.
+  await sql`
+    with candidates as (
+      select org_id, 'x'::text as platform, lower(handle) as handle,
+             lower(handle) as display_name, null::text as url
+      from noelle.x_watchlist_people
+      where org_id = ${orgId} and handle is not null
+      union all
+      select l.org_id, 'x', lower(l.author_handle), lower(l.author_handle), null
+      from noelle.approvals ap join noelle.leads l on l.id = ap.lead_id
+      where ap.org_id = ${orgId} and ap.status = 'sent'
+        and l.platform = 'x' and l.author_handle is not null
+      union all
+      select org_id, 'linkedin', lower(public_id),
+             coalesce(nullif(name, ''), public_id),
+             'https://www.linkedin.com/in/' || lower(public_id)
+      from noelle.linkedin_watchlist_people
+      where org_id = ${orgId} and public_id is not null
+      union all
+      select l.org_id, 'linkedin', lower(l.author_handle),
+             coalesce(nullif(l.payload->>'authorName', ''), l.author_handle),
+             'https://www.linkedin.com/in/' || lower(l.author_handle)
+      from noelle.approvals ap join noelle.leads l on l.id = ap.lead_id
+      where ap.org_id = ${orgId} and ap.status = 'sent'
+        and l.platform = 'linkedin' and l.author_handle is not null
+      union all
+      -- 4. Account-Feeder STYLE SOURCES → a contact on the source's platform, so
+      --    every account Lyra learns its writing style from shows up in Contacts
+      --    (and the style-source card can link back to the Styles page).
+      select s.org_id, s.platform, lower(s.handle),
+             coalesce(nullif(s.display_name, ''), s.handle),
+             case when s.platform = 'linkedin'
+                  then 'https://www.linkedin.com/in/' || lower(s.handle)
+                  else null end
+      from noelle.account_feeder_sources s
+      where s.org_id = ${orgId} and s.handle is not null
+    ),
+    -- LinkedIn vanity slugs often carry a trailing -<hex id> (e.g.
+    -- kaia-tham-7bb065343) when the person has no custom vanity URL. The same
+    -- human can be added once with the raw slug (a feeder source) and once with
+    -- the clean vanity (kaia-tham, a watchlist contact) — two handles, one
+    -- person. We dedupe/match LinkedIn on the SUFFIX-STRIPPED handle so they
+    -- collapse to a single contact. X / Reddit have no such suffix and match
+    -- exactly. Mirrors prettyHandle() in StyleSourceBadge.tsx.
+    normed as (
