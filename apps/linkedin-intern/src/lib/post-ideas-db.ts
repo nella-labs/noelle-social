@@ -198,3 +198,11 @@ export async function getStandingRules(
  * role='operator'), oldest first — the framing/anecdote/avoid notes for this post.
  */
 export async function getIdeaChatGuidance(sql: Sql, ideaId: string): Promise<string[]> {
+  const rows = await sql<{ body: string }[]>`
+    select body from noelle.drafter_notes
+    where idea_id = ${ideaId} and scope = 'post' and role = 'operator'
+    order by created_at asc
+    limit 30
+  `;
+  return rows.map((r) => r.body);
+}

@@ -198,3 +198,195 @@ export function createClassifier(opts: {
    * and pre-drafts an intro DM, in the same call. The worker passes this from
    * NOELLE_VIP_SCOUT. Off → classifier behaves exactly as before (no vip field).
    */
+  vipScout?: boolean;
+  /** Injected only by tests; production uses the shared Gateway evaluator. */
+  evaluateChoice?: typeof evaluateJevChoice;
+  /** Injected only by tests; production uses the shared Gateway evaluator. */
+  evaluateBoolean?: typeof evaluateJevBoolean;
+}): Classifier {
+  const backend = opts.backend;
+  const model = opts.model ?? DEFAULT_CLASSIFIER_MODEL;
+  const qThreshold = opts.qThreshold ?? 75;
+  const system = buildClassifierSystem(opts.objective, qThreshold, opts.vipScout ?? false);
+  const evaluateChoice = opts.evaluateChoice ?? evaluateJevChoice;
+  const evaluateBoolean = opts.evaluateBoolean ?? evaluateJevBoolean;
+  const jevClassify = async (input: ClassifyInput, strict: boolean): Promise<ClassifyOutput | null> => {
+    try {
+      const result = await evaluateChoice({
+        state: JSON.stringify(input),
+        instructions: [
+          "Classify whether this LinkedIn post deserves a real value-adding founder reply, a short warm supportive reply, or no reply.",
+          opts.objective ? `Founder's mission: ${opts.objective}` : "",
+          "Judge the post itself; an author's watchlist status cannot override post quality.",
+        ].filter(Boolean).join(" "),
+        criteria: {
+          substantial: "Specific founder, builder, or operator insight, pain, opinion, or genuine question that merits a thoughtful peer reply.",
+          light: "A genuine personal win, launch, or milestone that merits a short supportive comment but no substantial reply.",
+          skip: "Promo, repost, hiring, news, politics, generic motivation, comment bait, or nothing specific to add.",
+        },
+      });
+      if (result.kind !== "choice") return null;
+      const selected = result.choice;
+      if (selected !== "substantial" && selected !== "light" && selected !== "skip") return null;
+      const probability = result.probabilities[selected];
+      if (typeof probability !== "number" || !Number.isFinite(probability)) return null;
+      if (!strict && probability < 0.8) return null;
+      const q = Math.round((selected === "skip" ? 1 - probability : probability) * 100);
+      const belowThreshold = selected !== "skip" && probability * 100 < qThreshold &&
+        (strict || selected === "substantial");
+      const replyKind = probability < 0.8 || belowThreshold ? "skip" : selected;
+      let vip: VipSignal | null = null;
+      let usage = { inputTokens: 0, outputTokens: 0 };
+      let vipScoutProvider: "jev" | "legacy" | "none" = "none";
+      if (opts.vipScout && (!strict || replyKind !== "skip")) {
+        let vipDecision: Awaited<ReturnType<typeof evaluateJevBoolean>> = { kind: "unavailable", provider: "jev" };
+        try {
+          vipDecision = await evaluateBoolean({
+            state: JSON.stringify(input),
+            instructions: [
+              "Is this LinkedIn post's author a high-leverage relationship for the founder? Judge from the author headline and post, not follower count alone.",
+              opts.objective ? `Founder's mission: ${opts.objective}` : "",
+            ].filter(Boolean).join(" "),
+            criteria: {
+              true: "Founder, investor, notable builder, or operator whose connection would be unusually valuable for the founder's mission.",
+              false: "No concrete evidence of unusually valuable relationship potential, or only generic creator status.",
+            },
+          });
+        } catch { /* A VIP scout outage must not invalidate Jev's reply verdict. */ }
+        vipScoutProvider = vipDecision.kind === "confident" ? "jev" : "none";
+        if (vipDecision.kind !== "confident" || vipDecision.pass) {
+          try {
+            const scout = await backend.call({
+              system: RELATIONSHIP_SCOUT_ONLY_SYSTEM,
+              prompt: JSON.stringify(input),
+              model,
+            });
+            usage = { inputTokens: scout.usage.input_tokens, outputTokens: scout.usage.output_tokens };
+            const parsed = z.object({ relationship: VipSignalSchema }).safeParse(extractJson(scout.text));
+            if (parsed.success) {
+              vip = parsed.data.relationship;
+              vipScoutProvider = "legacy";
+            }
+          } catch (error) {
+            if (isBudgetAdmissionError(error)) throw error;
+            // Other scout outages leave the independent qualification intact.
+          }
+        }
+      }
+      return {
+        provider: "jev",
+        q,
+        reply_kind: replyKind,
+        tier: replyKind === "substantial" ? tierForQ(q) : null,
+        reason: probability < 0.8 ? "Jev category below confidence floor" :
+          belowThreshold ? "Below instance classifier threshold" :
+          `Jev selected ${selected}`,
+        comment_bait: false,
+        vip,
+        usage,
+        raw: { provider: "jev", choice: selected, probability, probabilities: result.probabilities, vip_scout_provider: vipScoutProvider },
+      };
+    } catch (error) {
+      if (isBudgetAdmissionError(error)) throw error;
+      return null;
+    }
+  };
+  return {
+    classifyObserved: (input) => jevClassify(input, true),
+    async classify(input) {
+      const jev = await jevClassify(input, false);
+      if (jev) return jev;
+      try {
+        const { text, usage } = await backend.call({
+          system,
+          prompt: JSON.stringify(input),
+          model,
+        });
+        const callUsage = {
+          inputTokens: usage.input_tokens,
+          outputTokens: usage.output_tokens,
+        };
+        // unparseable / schema-miss still consumed tokens (the call succeeded),
+        // so carry the real usage through — only a thrown call records nothing.
+        const obj = extractJson(text);
+        if (obj == null) return failOpen("unparseable", callUsage);
+        const parsed = ClassifierOutput.safeParse(obj);
+        if (!parsed.success) return failOpen("schema", callUsage);
+        // Normalise the tier to the kind: only 'substantial' leads carry a tier,
+        // and we recompute it from q so the band is authoritative even if the
+        // model put a tier on a light/skip lead or picked the wrong band.
+        const replyKind = parsed.data.reply_kind;
+        const tier = replyKind === "substantial" ? tierForQ(parsed.data.q) : null;
+        return {
+          provider: "legacy",
+          q: parsed.data.q,
+          reply_kind: replyKind,
+          tier,
+          reason: parsed.data.reason,
+          comment_bait: parsed.data.comment_bait,
+          vip: parsed.data.relationship ?? null,
+          usage: callUsage,
+          raw: parsed.data,
+        };
+      } catch (err) {
+        if (isBudgetAdmissionError(err)) throw err;
+        return failOpen((err as Error).message);
+      }
+    },
+  };
+}
+
+/**
+ * Parse the model's text into a JSON object. Vertex Gemini, called without a
+ * forced JSON mime-type, sometimes wraps the object in a ```json fence or
+ * surrounds it with prose, so we strip fences and fall back to the first
+ * `{...}` span before giving up. Returns null when nothing parses.
+ */
+function extractJson(text: string): unknown {
+  const trimmed = text.trim();
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  for (const candidate of [unfenced, sliceBraces(unfenced)]) {
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+function sliceBraces(s: string): string | null {
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  return s.slice(start, end + 1);
+}
+
+/**
+ * Fail-open verdict: when the backend errors or returns garbage, let the lead
+ * through as a SUBSTANTIAL T3 (so nothing high-signal is silently lost) but with
+ * a NULL score so it's distinguishable from a real zero downstream.
+ */
+function failOpen(
+  reason: string,
+  usage: { inputTokens: number; outputTokens: number } = { inputTokens: 0, outputTokens: 0 },
+): ClassifyOutput {
+  return {
+    provider: "legacy-fail-open",
+    q: null,
+    reply_kind: "substantial",
+    tier: "T3",
+    reason: `fail-open: ${reason}`,
+    // Treat an unscored lead as genuine discussion: never demote a real
+    // high-engagement post's comment count off a scoring failure.
+    comment_bait: false,
+    // No scout verdict on a fail-open — the call gave us nothing to trust.
+    vip: null,
+    usage,
+    raw: { fail_open: reason },
+  };
+}
