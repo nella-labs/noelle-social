@@ -198,3 +198,155 @@ describe("shouldDisableSendOnRunEnd", () => {
 // standing dashboard toggle is ON must NOT disarm that toggle at run end —
 // doing so silently revokes the documented lights-out consent and every later
 // autonomous run serves an empty queue (upvotes/ambient only, zero replies).
+// armedByManualEnable maps the server-reported `prior` value onto that intent.
+describe("armedByManualEnable (transition-aware arming)", () => {
+  it("standing consent ON (prior=true) + manual run → NOT armed → run end does NOT disarm", () => {
+    // The enable was a no-op against the operator's standing toggle: the switch
+    // is not this run's to flip OFF. This is the reviewer's clobber scenario.
+    expect(armedByManualEnable(true)).toBe(false);
+    expect(
+      shouldDisableSendOnRunEnd({ armedSend: armedByManualEnable(true), termEpoch: 5, curEpoch: 5 }),
+    ).toBe(false);
+  });
+
+  it("switch OFF (prior=false) + manual run arms → run end disarms (fail-closed at rest)", () => {
+    // This run turned the flag ON itself, so endRun owns turning it back OFF.
+    expect(armedByManualEnable(false)).toBe(true);
+    expect(
+      shouldDisableSendOnRunEnd({ armedSend: armedByManualEnable(false), termEpoch: 5, curEpoch: 5 }),
+    ).toBe(true);
+  });
+
+  it("old server (prior missing) → NEVER disarms — fail-safe toward standing consent", () => {
+    // An older api-vm doesn't report prior; the flag MIGHT be the operator's
+    // standing consent, so it is never ours to flip OFF. (Posting stays
+    // fail-closed either way — this only governs the end-of-run disarm.)
+    expect(armedByManualEnable(undefined)).toBe(false);
+    expect(
+      shouldDisableSendOnRunEnd({ armedSend: armedByManualEnable(undefined), termEpoch: 5, curEpoch: 5 }),
+    ).toBe(false);
+  });
+});
+
+// The failed-start ARM LEAK (round-3 review): a manual Run/Drain arms
+// reply_send_enabled, then fetchQueue throws (transient api-vm 5xx) before any
+// RunState is persisted. No RunState → endRun never sees armedSend, and
+// autonomous runs never disarm by design — so without the pending-arm marker
+// the switch would stay ON indefinitely and the next 9–21 checkAutonomy window
+// would post replies lights-out under a consent flag the operator never chose
+// to leave standing. classifyPendingArm is what checkAutonomy consults before
+// ANY lights-out start.
+describe("classifyPendingArm (failed-start send-switch leak guard)", () => {
+  const now = 10_000_000;
+
+  it("no marker → 'none' (every arm is accounted for; lights-out start may proceed)", () => {
+    expect(classifyPendingArm(null, now)).toBe("none");
+  });
+
+  it("FRESH marker → 'wait': a manual start is in flight between its arm and its saveState — never disarm under it, never auto-start over it", () => {
+    // Disarming here would empty the manual run's queue (the "0/0 despite
+    // pending drafts" class); starting here would double-run. Both must wait.
+    expect(classifyPendingArm({ epoch: 7, atMs: now - 5_000 }, now)).toBe("wait");
+    // Boundary: exactly at the grace edge is still "wait" (fail toward caution).
+    expect(classifyPendingArm({ epoch: 7, atMs: now - ARM_PENDING_GRACE_MS }, now)).toBe("wait");
+  });
+
+  it("STALE marker → 'disarm': the exact reviewer race — arm landed, fetchQueue 5xx'd, no RunState persisted", () => {
+    // A start takes seconds; a marker older than the grace window can only be a
+    // leak. checkAutonomy must retry the disarm and keep refusing to auto-start
+    // until the switch is confirmed OFF (fail-closed at rest).
+    expect(classifyPendingArm({ epoch: 7, atMs: now - ARM_PENDING_GRACE_MS - 1 }, now)).toBe("disarm");
+    expect(classifyPendingArm({ epoch: 7, atMs: now - 3600_000 }, now)).toBe("disarm");
+  });
+
+  it("honors a custom grace window", () => {
+    expect(classifyPendingArm({ epoch: 1, atMs: now - 2_000 }, now, 1_000)).toBe("disarm");
+    expect(classifyPendingArm({ epoch: 1, atMs: now - 500 }, now, 1_000)).toBe("wait");
+  });
+});
+
+// The SUPERSESSION ORPHANED-ARM leak (round-5 review): transition-aware arming
+// (armedByManualEnable) breaks the disarm hand-off when a manual Run/Drain
+// supersedes a LIVE manual-armed run. Standing toggle OFF → Run A arms
+// (prior=false, armedSend=true) → the operator presses Run/Drain again mid-run
+// (the double-press/restart path startRun explicitly supports). Run B's enable
+// sees prior=true (A's own flip, NOT standing consent) so B would not arm, B's
+// saveState overwrites A's RunState (the only record armedSend was true), B's
+// endRun sees armedSend=false → nobody disarms → reply_send_enabled stays ON
+// at rest and the next lights-out run posts replies under a flag the operator
+// never chose as standing consent. inheritsArmOnSupersede is the hand-off: the
+// superseding manual run inherits the arm from a live armed predecessor (or an
+// unaccounted pending-arm marker) so its endRun / failed-start rollback owns
+// the disarm — while a manual run with NO live armed predecessor still treats
+// prior=true as the operator's standing dashboard toggle and never disarms it.
+describe("inheritsArmOnSupersede (double-press/restart disarm hand-off)", () => {
+  it("REGRESSION (a): OFF → Run A arms → Run/Drain B supersedes mid-run → B inherits the arm → B's endRun disarms (switch OFF at rest)", () => {
+    // B's own enable saw prior=true (A flipped it), so transition-aware arming
+    // alone says NOT armed …
+    expect(armedByManualEnable(true)).toBe(false);
+    // … but A is a live run that armed the switch itself, so B inherits.
+    const armedSend =
+      armedByManualEnable(true) ||
+      inheritsArmOnSupersede({ supersededStatus: "running", supersededArmedSend: true, pendingArm: null });
+    expect(armedSend).toBe(true);
+    // B's endRun (still current) therefore owns and performs the disarm.
+    expect(shouldDisableSendOnRunEnd({ armedSend, termEpoch: 6, curEpoch: 6 })).toBe(true);
+  });
+
+  it("REGRESSION (b): standing-toggle-ON manual run with NO live armed predecessor never arms → never disarms the operator's toggle", () => {
+    // No prior state at all (first run of the session) …
+    expect(
+      inheritsArmOnSupersede({ supersededStatus: undefined, supersededArmedSend: undefined, pendingArm: null }),
+    ).toBe(false);
+    // … or a terminal predecessor (already ended; its arm, if any, was already
+    // disarmed by its own endRun) …
+    expect(
+      inheritsArmOnSupersede({ supersededStatus: "stopped", supersededArmedSend: true, pendingArm: null }),
+    ).toBe(false);
+    expect(
+      inheritsArmOnSupersede({ supersededStatus: "idle", supersededArmedSend: true, pendingArm: null }),
+    ).toBe(false);
+    // … or a LIVE but UNARMED predecessor (an autonomous run, or a manual run
+    // started under the standing toggle) — none confer ownership:
+    expect(
+      inheritsArmOnSupersede({ supersededStatus: "running", supersededArmedSend: false, pendingArm: null }),
+    ).toBe(false);
+    expect(
+      inheritsArmOnSupersede({ supersededStatus: "running", supersededArmedSend: undefined, pendingArm: null }),
+    ).toBe(false);
+    // So the run's armedSend stays false (prior=true = standing consent) and
+    // run end leaves the dashboard toggle alone.
+    const armedSend = armedByManualEnable(true) || false;
+    expect(shouldDisableSendOnRunEnd({ armedSend, termEpoch: 6, curEpoch: 6 })).toBe(false);
+  });
+
+  it("inherits from an unaccounted pending-arm marker (predecessor armed but its arm was never accounted for)", () => {
+    // A manual start armed the switch, stamped the marker, and its RunState is
+    // not (or no longer) the record of that arm — the superseding run takes the
+    // arm over regardless of what loadState returned.
+    expect(
+      inheritsArmOnSupersede({ supersededStatus: undefined, supersededArmedSend: undefined, pendingArm: { epoch: 4, atMs: 1_000 } }),
+    ).toBe(true);
+    expect(
+      inheritsArmOnSupersede({ supersededStatus: "stopped", supersededArmedSend: undefined, pendingArm: { epoch: 4, atMs: 1_000 } }),
+    ).toBe(true);
+  });
+
+  it("REGRESSION (failed-second-start variant): an INHERITED arm is a real arm — the failed-start rollback must not no-op on it", () => {
+    // Run B inherited A's arm, then B's fetchQueue threw before saveState.
+    // rollbackArmAfterFailedStart early-returns on armedSend=false (index.ts) —
+    // the inherited arm must present as armedSend=true so the rollback's disarm
+    // actually runs (while B's epoch is still current), instead of leaving the
+    // switch ON with no RunState accounting for it.
+    const armedSend =
+      armedByManualEnable(true) ||
+      inheritsArmOnSupersede({ supersededStatus: "running", supersededArmedSend: true, pendingArm: null });
+    expect(armedSend).toBe(true); // !armedSend guard does NOT short-circuit
+    expect(tickIsCurrent(7, 7)).toBe(true); // not superseded → rollback owns the disarm
+    // And because the inheriting run stamps setPendingArm for ITS epoch, a
+    // rollback whose disarm POST also fails leaves the marker standing —
+    // checkAutonomy stays fail-closed (classifyPendingArm → wait/disarm, never
+    // "none") until the switch is confirmed OFF.
+    expect(classifyPendingArm({ epoch: 7, atMs: 0 }, ARM_PENDING_GRACE_MS + 1)).toBe("disarm");
+  });
+});
