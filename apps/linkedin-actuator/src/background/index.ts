@@ -1998,3 +1998,203 @@ async function doDmInner(tabId: number, item: PoolItem, rng: ReturnType<typeof m
   // Known gap, stated: a click that DISMISSED the overlay instead of sending
   // also leaves no text, and still reads as sent. Closing that needs positive
   // evidence of delivery (the message appearing in the thread), which this
+  // locator set cannot give — and it is no worse than the unconditional ok this
+  // replaces. Poll rather than read once: the composer is React-controlled and
+  // the send lands a frame or two later.
+  // ~12s, matching submitComment's window rather than the 3.2s this started at.
+  // Same latency class, and here the cost of giving up early is strictly worse:
+  // a slow-but-successful send would read as our own text still sitting there —
+  // exactly the "positive evidence" this check trusts — and a failed DM is
+  // re-queued, so the operator's contact receives the message twice.
+  const DM_CONFIRM_POLLS = 30;
+  let missed = false;
+  for (let i = 0; i < DM_CONFIRM_POLLS; i++) {
+    await sleep(400);
+    if (await messageComposeEmpty(tabId)) break;
+    if (i === DM_CONFIRM_POLLS - 1) missed = await messageComposeStillHasText(tabId, item.body);
+  }
+  if (missed) return { kind: "failed", detail: "dm-not-cleared" };
+  // A DM always lands on a /in/ profile; return to the feed so the following idle
+  // likes + ambient browse run on the feed instead of lingering on the profile
+  // (mirrors drain-mode's post-comment return). The ambient/like feed guards
+  // would recover it next tick anyway, but doing it here avoids a visible stall.
+  // Skip on STOP so a stopped run doesn't autonomously move the operator's tab
+  // (moveAndClick fast-forwards rather than throwing when aborted mid-motion).
+  if (stopped()) return { kind: "ok" };
+  await navigateTab(tabId, "https://www.linkedin.com/feed/", rng, undefined, item.body).catch(() => {});
+  await waitTabComplete(tabId);
+  return { kind: "ok" };
+}
+
+// ── Lights-out autonomy ────────────────────────────────────────────────────
+// A persistent alarm (survives service-worker suspend) checks a few times an
+// hour whether to auto-start the daily run, no manual Run click. Once started,
+// the content-script tick loop drives it as usual; a persisted day key enforces
+// one auto-start per day. Requires a logged-in linkedin.com tab open (startRun
+// attaches to it); with none open the run pauses until a tab appears.
+const AUTO_START_DAY_KEY = "actuator.lastAutoStartDay";
+// Day key of the most recent challenge halt (stamped in endRun). Drives the
+// post-challenge cooldown/backoff + health safety gate below. Distinct from
+// AUTO_START_DAY_KEY so a suppressed tick never masks the once-per-day guard.
+const CHALLENGE_DAY_KEY = "actuator.lastChallengeDay";
+// Day key of the last manual STOP. A STOP must silence BOTH autonomy paths for
+// the rest of the day (the daily auto-start already stamps AUTO_START_DAY_KEY;
+// auto-drain has no daily guard, so it reads this instead).
+const STOP_DAY_KEY = "actuator.lastManualStopDay";
+// ms stamp of the last auto-drain start + the re-arm cooldown between starts.
+// The cooldown bounds the pathological loop of a drain that keeps dying with
+// items still queued (no tab, comment-fail give-ups) — without it the 5-min
+// alarm would relaunch a doomed drain forever.
+const AUTO_DRAIN_MS_KEY = "actuator.lastAutoDrainMs";
+const AUTO_DRAIN_REARM_MIN = 30;
+// No-progress threshold that flags a running run as a stall CANDIDATE (while
+// drafts are loaded and comment slots are overdue). Only a candidate: recovery
+// additionally requires the stall to persist across two consecutive autonomy
+// ticks with no progress between them (confirmStall) — that is what actually
+// rules out a healthy run's large-but-legitimate gaps (scheduled-mode spacing
+// under maxWritesPerHour, or a post mid-flight while the slot still reads
+// overdue). This floor just avoids probing on short pacing gaps. Config override:
+// cfg.stallRecoverMinutes.
+const STALL_RECOVER_MIN = 20;
+// Two-tick confirmation probe: the last stall observation (session + progress
+// marker). Recovery only acts when a run looks stalled on two consecutive
+// autonomy ticks with no progress between them (see confirmStall).
+const STALL_PROBE_KEY = "actuator.stallProbe";
+// Last build stamp a self-reload was attempted for (one attempt per stamp).
+const RELOAD_STAMP_KEY = "actuator.lastReloadStamp";
+// Durable standing intent for BOTH drain buttons ("Drain all approvals" and
+// "Full automatic"). Set on the click, cleared ONLY by STOP — so the drain
+// resumes after anything that wipes the in-memory run (self-reload, SW death,
+// browser restart, closed tab). Value is `{ curfew: boolean }` — the one thing
+// that differs between the two buttons (Full auto = overnight curfew on). A legacy
+// bare `true` (an older Full-auto build) is read as `{ curfew: true }`. See
+// shouldResumeDrain. Storage string kept as "actuator.fullAuto" for back-compat.
+const DRAIN_INTENT_KEY = "actuator.fullAuto";
+type DrainIntent = { curfew: boolean; notifications: boolean };
+/** Parse the stored drain intent (handles the legacy bare-`true` Full-auto value). */
+function parseDrainIntent(raw: unknown): DrainIntent | null {
+  if (raw === true) return { curfew: true, notifications: false };
+  if (raw && typeof raw === "object") {
+    const o = raw as { curfew?: boolean; notifications?: boolean };
+    // `notifications` is carried through the standing intent so an Auto-
+    // notifications run that dies to a reload/SW-death resumes as a
+    // notifications run, not a plain drain — the sweep is the whole point.
+    return { curfew: o.curfew === true, notifications: o.notifications === true };
+  }
+  return null;
+}
+async function ensureAutonomyAlarm(): Promise<void> {
+  if (!(await chrome.alarms.get(AUTONOMY_ALARM))) {
+    await chrome.alarms.create(AUTONOMY_ALARM, { periodInMinutes: 5 });
+  }
+}
+async function checkAutonomy(): Promise<void> {
+  const expectedEpoch = await currentEpoch();
+  if (await remoteStopped()) return; // remote STOP is authoritative — hands stay down
+  const cfg = await getConfig();
+  if (!cfg?.autonomous) return;
+  const s = await loadState();
+  const now = new Date();
+  const store = await chrome.storage.local.get(AUTO_START_DAY_KEY);
+  // Read the challenge-day stamp fail-closed: if storage throws, skip this tick
+  // rather than risk auto-starting a freshly-challenged account.
+  let lastChallengeDay: string | null;
+  try {
+    const chStore = await chrome.storage.local.get(CHALLENGE_DAY_KEY);
+    lastChallengeDay = (chStore[CHALLENGE_DAY_KEY] as string | undefined) ?? null;
+  } catch {
+    console.warn("[autonomy] challenge-day read failed; skipping auto-start");
+    return;
+  }
+  const decide = shouldAutoStart({
+    autonomous: true,
+    runActive: s?.status === "running",
+    localHour: now.getHours(),
+    startHour: cfg.autoStartHour ?? 9,
+    endHour: cfg.autoEndHour ?? 21,
+    todayKey: localDayKey(now),
+    lastAutoStartDay: (store[AUTO_START_DAY_KEY] as string | undefined) ?? null,
+    // Post-challenge backoff (default OFF via undefined/0).
+    lastChallengeDay,
+    challengeBackoffDays: cfg.autoChallengeBackoffDays ?? 0,
+  });
+  if (!decide) {
+    // A run may be live but WEDGED (running, not posting). Recover it first —
+    // shouldAutoDrain's runActive gate can't, so a wedged run would otherwise pin
+    // the actor with approvals piling up. If nothing needed recovery, fall through
+    // to lights-out inbox clearing (approvals waiting while nothing runs).
+    const recovered = await maybeRecoverStalledRun(cfg, s ?? null, now, lastChallengeDay, expectedEpoch);
+    if (!recovered) await maybeAutoDrain(cfg, s ?? null, now, lastChallengeDay, expectedEpoch);
+    return;
+  }
+
+  // Secondary safety gate: post-challenge cooldown (default 3d) + server health.
+  // Any error/non-2xx/timeout from health() collapses to null → treated as
+  // not-ok when the gate is on (default) → skip. Manual operator Run (the
+  // 'startRun' message path) never runs this gate.
+  const api = new ActuatorApi(cfg);
+  const health = await api.health().catch(() => null); // fetch fail → null → fail-closed
+  const safe = passesAutoStartSafety({
+    healthGate: cfg.healthGate ?? true,
+    healthStatus: health?.status ?? null,
+    challengeCooldownDays: cfg.challengeCooldownDays ?? 3,
+    todayKey: localDayKey(now),
+    lastChallengeDay,
+  });
+  if (!safe) {
+    console.warn("[autonomy] auto-start suppressed by safety gate", { health: health?.status ?? "unknown" });
+    return; // do NOT stamp AUTO_START_DAY_KEY → re-evaluates next tick when health recovers
+  }
+
+  // Stamp the day BEFORE starting so a mid-start crash can't double-fire today.
+  if (!(await runIfCurrent(expectedEpoch, () => chrome.storage.local.set({ [AUTO_START_DAY_KEY]: localDayKey(now) })))) return;
+  await startRun({
+    windowHours: cfg.autoWindowHours ?? 8,
+    targetComments: cfg.autoTargetComments ?? 20,
+    targetLikes: cfg.autoTargetLikes ?? 40,
+  }, { curfew: true, expectedEpoch }).catch((e) => console.warn("[autonomy] auto-start failed:", e instanceof Error ? e.message : e)); // unattended → overnight posting-curfew on
+}
+
+/**
+ * Resume a standing drain whenever its durable intent is set and nothing is
+ * running. This is what makes BOTH drain buttons mean runs-until-STOP: each button
+ * persists DRAIN_INTENT_KEY (with its curfew choice), and every recovery point
+ * (both alarms, browser startup) calls this, so the drain comes back within
+ * seconds of any death — a self-reload onto a new build, a service-worker restart,
+ * a browser relaunch, a closed-then-reopened tab. Resumes with the SAME curfew the
+ * operator picked (Full auto → curfew on; Drain → off). Independent of the
+ * lights-out `autonomous` switch (a drain button is its own one-click consent),
+ * but it reuses the SAME post-challenge + health safety gate as auto-start, so a
+ * freshly-challenged account holds off and resumes only once clean — no re-click,
+ * no hammering. Cleared only by STOP.
+ */
+async function checkDrainResume(): Promise<void> {
+  const expectedEpoch = await currentEpoch();
+  if (await remoteStopped()) return; // remote STOP hard-gates the drain resume too
+  const cfg = await getConfig();
+  if (!cfg) return;
+  let intent: DrainIntent | null;
+  let lastChallengeDay: string | null;
+  try {
+    const store = await chrome.storage.local.get([DRAIN_INTENT_KEY, CHALLENGE_DAY_KEY]);
+    intent = parseDrainIntent(store[DRAIN_INTENT_KEY]);
+    lastChallengeDay = (store[CHALLENGE_DAY_KEY] as string | undefined) ?? null;
+  } catch {
+    return; // storage flaky → skip this tick, retry next
+  }
+  if (!intent) return;
+  const s = await loadState();
+  const runActive = s?.status === "running";
+  if (runActive) return; // already running — nothing to resume
+  const now = new Date();
+  const api = new ActuatorApi(cfg);
+  const health = await api.health().catch(() => null); // fetch fail → null → fail-closed
+  const safe = passesAutoStartSafety({
+    healthGate: cfg.healthGate ?? true,
+    healthStatus: health?.status ?? null,
+    challengeCooldownDays: cfg.challengeCooldownDays ?? 3,
+    todayKey: localDayKey(now),
+    lastChallengeDay,
+  });
+  if (!shouldResumeDrain({ intentSet: true, runActive, safe })) {
+    if (!safe) console.warn("[drain-resume] held by safety gate", { health: health?.status ?? "unknown" });
