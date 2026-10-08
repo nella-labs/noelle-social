@@ -198,3 +198,150 @@ function InboxRow({
       }}
     >
       ↩
+    </button>
+  ) : isPending ? (
+    <button
+      type="button"
+      onClick={onSkip}
+      disabled={busy}
+      title="Skip — remove this draft from the queue (reversible under Status → Skipped)"
+      className="inbox-rowbtn"
+      style={{
+        justifySelf: "center",
+        border: "none",
+        background: "transparent",
+        cursor: busy ? "default" : "pointer",
+        color: "var(--ink-muted)",
+        fontSize: 15,
+        lineHeight: 1,
+        padding: 4,
+      }}
+    >
+      ✕
+    </button>
+  ) : null;
+
+  // ─── Phone: one card per thread ────────────────────────────────────────────
+  if (mobile) {
+    return (
+      <div className={`row-card ${styles.mobileRow}`} style={{ gap: 8 }}>
+        <div className="row-card-head" style={{ alignItems: "flex-start" }}>
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggle}
+            disabled={!isPending}
+            title={isPending ? "Select to skip" : "Only pending drafts are selectable"}
+            style={{
+              width: 18,
+              height: 18,
+              marginTop: 2,
+              flexShrink: 0,
+              cursor: isPending ? "pointer" : "default",
+            }}
+          />
+          <Link
+            href={detailHref}
+            className="inbox-handle"
+            style={{
+              flex: 1,
+              minWidth: 0,
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              whiteSpace: "normal",
+              textDecoration: "none",
+              color: "inherit",
+            }}
+          >
+            {sub}
+          </Link>
+          {actionBtn}
+        </div>
+        <Link
+          href={detailHref}
+          className="inbox-preview"
+          style={{ textDecoration: "none", color: "var(--ink-muted)" }}
+        >
+          &ldquo;{preview}&rdquo;
+        </Link>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexWrap: "wrap",
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "var(--ink-soft)",
+          }}
+        >
+          <span title={ageTitle} style={stale ? { color: "var(--danger, #b4432f)" } : undefined}>
+            {ageLabel}
+            {stale ? " · stale" : ""}
+          </span>
+          {row.authorHandle ? <span>· u/{row.authorHandle}</span> : null}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`${styles.row} ${styles.simple}`}
+      data-selected={selected || undefined}
+    >
+      <input
+        type="checkbox"
+        checked={selected}
+        onChange={onToggle}
+        disabled={!isPending}
+        title={isPending ? "Select to skip" : "Only pending drafts are selectable"}
+        style={{
+          width: 16,
+          height: 16,
+          cursor: isPending ? "pointer" : "default",
+        }}
+      />
+      <Link
+        href={detailHref}
+        style={{ textDecoration: "none", color: "inherit", display: "block", minWidth: 0 }}
+      >
+        <div
+          className="inbox-handle"
+          style={{ display: "flex", alignItems: "center", gap: 6 }}
+        >
+          {sub}
+        </div>
+        <div
+          style={{
+            fontSize: 11,
+            color: "var(--ink-muted)",
+            marginTop: 2,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {row.authorHandle ? `u/${row.authorHandle}` : "—"}
+        </div>
+      </Link>
+      <Link
+        href={detailHref}
+        className="inbox-preview"
+        style={{ textDecoration: "none", color: "inherit" }}
+      >
+        &ldquo;{preview}&rdquo;
+      </Link>
+      <div
+        className="inbox-time"
+        title={ageTitle}
+        style={stale ? { color: "var(--danger, #b4432f)" } : undefined}
+      >
+        {ageLabel}
+        {stale ? <span style={{ display: "block", fontSize: 9, opacity: 0.8 }}>stale</span> : null}
+      </div>
+      {actionBtn ?? <span />}
+    </div>
+  );
+}
