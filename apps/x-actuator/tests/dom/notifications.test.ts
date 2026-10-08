@@ -198,3 +198,203 @@ describe("harvestThread", () => {
     expect(harvestThread(mount(thread), "300")).toEqual([
       { tweet_id: "100", handle: "carol", text: "shipping is hard" },
       { tweet_id: "200", handle: "demooperator", text: "only if you ship rarely" },
+    ]);
+  });
+
+  it("returns [] when the focused tweet is not on the page", () => {
+    expect(harvestThread(mount(thread), "999")).toEqual([]);
+  });
+
+  it("returns [] for a focused tweet with no ancestors", () => {
+    expect(harvestThread(mount(thread), "100")).toEqual([]);
+  });
+});
+
+describe("conversationFrom", () => {
+  const chain = [
+    { tweet_id: "100", handle: "carol", text: "shipping is hard" },
+    { tweet_id: "200", handle: "demooperator", text: "only if you ship rarely" },
+  ];
+
+  it("picks the root and our last turn", () => {
+    expect(conversationFrom(chain, "demooperator")).toEqual({
+      root_post_id: "100",
+      root_post_text: "shipping is hard",
+      our_reply_id: "200",
+      our_reply_text: "only if you ship rarely",
+    });
+  });
+
+  it("omits our reply when we authored the root itself", () => {
+    // Someone replying to our own post: the root already carries our words, so
+    // repeating it as "you then said" would double it in the prompt.
+    expect(conversationFrom([{ tweet_id: "100", handle: "demooperator", text: "we shipped" }], "demooperator")).toEqual({
+      root_post_id: "100",
+      root_post_text: "we shipped",
+    });
+  });
+
+  it("omits our reply when we never spoke in the chain", () => {
+    expect(conversationFrom([{ tweet_id: "100", handle: "carol", text: "hi" }], "demooperator")).toEqual({
+      root_post_id: "100",
+      root_post_text: "hi",
+    });
+  });
+
+  it("is empty for an empty chain", () => {
+    expect(conversationFrom([], "demooperator")).toEqual({});
+  });
+});
+
+describe("stripAt", () => {
+  it("normalizes handles", () => {
+    expect(stripAt("  @DemoOperator ")).toBe("demooperator");
+    expect(stripAt("demooperator")).toBe("demooperator");
+  });
+});
+
+// Against the REAL captured markup, not hand-shaped fixtures. This is the pair
+// that caught the bug the synthetic tests could not: on a permalink page X
+// renders the FOCAL tweet's timestamp with no self-permalink anchor, so its id
+// is unreadable — and harvestThread used to identify it by id match, so it
+// returned [] for every real conversation and the sweep ingested nothing.
+describe("harvestThread against real captured thread markup", () => {
+  const fx = (name: string) =>
+    readFileSync(join(here, "..", "fixtures", name), "utf8");
+
+  it("thread-page.html: returns the ancestors above the focal reply", () => {
+    document.body.innerHTML = fx("thread-page.html");
+    // The focal tweet's id is exactly what the page does NOT render, so the
+    // caller passes the id it navigated to and harvestThread must still work.
+    expect(harvestThread(document.body, "1900000000000000003")).toEqual([
+      {
+        tweet_id: "1900000000000000001",
+        handle: "carol",
+        text: "shipping daily is overrated, most teams cannot sustain it",
+      },
+      {
+        tweet_id: "1900000000000000002",
+        handle: "demooperator",
+        text: "it is only unsustainable when every ship needs a meeting first",
+      },
+    ]);
+  });
+
+  it("thread-page.html: the chain yields a usable conversation for the drafter", () => {
+    document.body.innerHTML = fx("thread-page.html");
+    const chain = harvestThread(document.body, "1900000000000000003");
+    expect(conversationFrom(chain, "demooperator")).toEqual({
+      root_post_id: "1900000000000000001",
+      root_post_text: "shipping daily is overrated, most teams cannot sustain it",
+      our_reply_id: "1900000000000000002",
+      our_reply_text: "it is only unsustainable when every ship needs a meeting first",
+    });
+  });
+
+  it("thread-page.html: the focal cell's reply context still names us", () => {
+    document.body.innerHTML = fx("thread-page.html");
+    const cells = Array.from(document.querySelectorAll("article[data-testid='tweet']"));
+    // third cell is the focal reply
+    expect(replyContextHandles(cells[2]!)).toEqual(["demooperator"]);
+  });
+
+  it("status-page.html: a focal tweet with no ancestors yields an empty chain", () => {
+    // The sweep DROPS empty chains, so this is the 'no usable context' path,
+    // not a crash — and it must not mis-report the reply below the focal one
+    // as an ancestor.
+    document.body.innerHTML = fx("status-page.html");
+    expect(harvestThread(document.body, "1802000000000000001")).toEqual([]);
+  });
+});
+
+// REAL markup captured from a logged-in x.com/notifications/mentions
+// (fixtures/notifications-mentions.html). This is the part that could not be
+// verified from repo evidence alone — the "Replying to" context line carries no
+// testid, so it is the one signal separating a reply to us from a bare mention.
+describe("harvestNotifications against real mentions markup", () => {
+  const fx = () => readFileSync(join(here, "..", "fixtures", "notifications-mentions.html"), "utf8");
+  // The fixture was captured on 2026-07-24; pin "now" just after its newest
+  // cell so the recency gate sees these as fresh rather than two days stale.
+  const NOW = Date.parse("2026-07-24T21:00:00.000Z");
+
+  it("harvests both real reply cells with every field correct", () => {
+    document.body.innerHTML = fx();
+    expect(harvestNotifications(document.body)).toEqual([
+      {
+        tweet_id: "2080744715796803921",
+        handle: "ada",
+        text: "It's an easy way to get a first push\n\nI see so many great builders post into a black hole\n\nZero likes and zero attention",
+        url: "https://x.com/ada/status/2080744715796803921",
+        posted_at: "2026-07-24T19:59:33.000Z",
+        replying_to: ["operator"],
+      },
+      {
+        tweet_id: "2080686254182556109",
+        handle: "bram",
+        text: "We have a yes from the operator!",
+        url: "https://x.com/bram/status/2080686254182556109",
+        posted_at: "2026-07-24T16:07:14.000Z",
+        replying_to: ["operator", "cleo"],
+      },
+    ]);
+  });
+
+  it("reads a MULTI-handle reply context ('Replying to @operator and @cleo')", () => {
+    document.body.innerHTML = fx();
+    const cells = Array.from(document.querySelectorAll("article[data-testid='tweet']"));
+    expect(replyContextHandles(cells[1]!)).toEqual(["operator", "cleo"]);
+  });
+
+  it("selects both as replies to the operator", () => {
+    document.body.innerHTML = fx();
+    const picked = selectRepliesToMe(harvestNotifications(document.body), {
+      selfHandle: "operator",
+      seen: [],
+      max: 3,
+      nowMs: NOW,
+    });
+    expect(picked.map((p) => p.handle)).toEqual(["ada", "bram"]);
+  });
+
+  it("selects NEITHER for a different operator — a reply to someone else is not ours", () => {
+    document.body.innerHTML = fx();
+    const picked = selectRepliesToMe(harvestNotifications(document.body), {
+      selfHandle: "cleo", // named in cell 2's context, but the reply is not TO cleo alone
+      seen: [],
+      max: 3,
+      nowMs: NOW,
+    });
+    // cleo IS named in the second cell's context, so that one legitimately counts.
+    expect(picked.map((p) => p.handle)).toEqual(["bram"]);
+  });
+});
+
+// REAL structure from the x.com/notifications "All" tab. The subtle fact worth
+// locking: likes/follows render as article[data-testid="notification"] while a
+// genuine reply renders as article[data-testid="tweet"]. findFeedTweets targets
+// "tweet", so the All tab filters itself — but only as long as nobody widens
+// that selector. A regression here would ingest every like as a conversation.
+describe("the All tab: notification cards are not replies", () => {
+  const fx = () => readFileSync(join(here, "..", "fixtures", "notifications-all-tab.html"), "utf8");
+  const NOW = Date.parse("2026-07-25T00:00:00.000Z"); // just after the fixture's newest cell
+
+  it("harvests ONLY the genuine reply, not the like or the follow", () => {
+    document.body.innerHTML = fx();
+    const items = harvestNotifications(document.body);
+    expect(items).toHaveLength(1);
+    expect(items[0]!.handle).toBe("ada");
+    expect(items[0]!.replying_to).toEqual(["operator"]);
+  });
+
+  it("a 'liked your reply' card is never selected, even though it quotes our text", () => {
+    // The like card contains a data-testid="tweetText" holding OUR OWN reply.
+    // Ingesting it would file our own words as somebody talking to us.
+    document.body.innerHTML = fx();
+    const picked = selectRepliesToMe(harvestNotifications(document.body), {
+      selfHandle: "operator",
+      seen: [],
+      max: 5,
+      nowMs: NOW,
+    });
+    expect(picked).toHaveLength(1);
+    expect(picked[0]!.text).not.toMatch(/buzz is the one/);
