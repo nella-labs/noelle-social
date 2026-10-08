@@ -1,0 +1,2 @@
+export const GCS_METADATA_PAGE_LIMIT = 100;
+export const GCS_METADATA_PAGE_TOKEN_LIMIT = 2048;

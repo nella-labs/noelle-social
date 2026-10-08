@@ -198,3 +198,27 @@ export function saveApprovalEdit(sql: Sql, scope: ApprovalMutationScope, body: s
 
 export async function bulkSkipApprovals(
   sql: Sql,
+  args: { orgId: string; approvalIds: string[]; operatorId: string; reason?: string },
+) {
+  return sql.begin(async (tx) => {
+    await setBounds(tx);
+    const selected = await tx<
+      Candidate[]
+    >`select distinct on (a.agent_instance_id,a.lead_id) a.id,a.draft_id,a.lead_id,a.agent_instance_id,
+      coalesce(d.payload->>'kind','reply') as kind from noelle.approvals a
+      join noelle.drafts d on d.id=a.draft_id left join noelle.leads l on l.id=a.lead_id
+      where a.org_id=${args.orgId} and a.id=any(${args.approvalIds}::uuid[]) and a.status='pending'
+        and coalesce(d.payload->>'kind','reply')='reply' and ${contextSql(tx)} order by a.agent_instance_id,a.lead_id,a.id`;
+    let approvals = 0;
+    let leads = 0;
+    for (const candidate of selected) {
+      const scope = { orgId: args.orgId, approvalId: candidate.id, operatorId: args.operatorId };
+      const row = await lockApproval(tx, scope);
+      if (!row || row.status !== "pending") continue;
+      const result = await skipLocked(tx, scope, row, args.reason ?? "bulk-skip");
+      approvals += result.count;
+      if (result.count) leads++;
+    }
+    return { approvals, leads };
+  });
+}
