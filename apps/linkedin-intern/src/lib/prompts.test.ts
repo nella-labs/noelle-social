@@ -198,3 +198,203 @@ describe("LinkedIn system prompts allow an ASSIGNED REGISTER override", () => {
 describe("LinkedIn reply prompts allow 'honestly' as texture but ban the reflexive tic", () => {
   it("every reply prompt permits a natural honestly/tbh yet forbids the hedge-opener/tic", () => {
     for (const p of REPLY_PROMPTS) {
+      const lower = p.toLowerCase();
+      // the rule still names honestly...
+      expect(lower).toContain('"honestly"');
+      // ...but now permits it as occasional natural texture (matching the X prompt),
+      // rather than banning the word outright — that hard ban was a driver of the
+      // stiff/corporate read the LinkedIn replies had.
+      expect(lower).toMatch(/single natural "honestly"|texture is fine/);
+      // ...while still forbidding the throat-clearing hedge-opener / verbal tic.
+      expect(lower).toMatch(/hedge-opener|verbal tic/);
+    }
+  });
+});
+
+describe("renderStyleBlock is post-register aware", () => {
+  it("celebration → instructs a warm/hyped BLEND, not a neutral form-match", () => {
+    const block = renderStyleBlock(sampleStyle, "celebration");
+    const lower = block.toLowerCase();
+    expect(lower).toContain("celebrating");
+    expect(lower).toMatch(/warm|hyped|excited/);
+    expect(lower).toContain("blend");
+    // FORM discipline survives: no fabrication, exemplars still rendered
+    expect(lower).toContain("fabricate");
+    expect(block).toContain("omg congrats this is amazing!!!");
+  });
+
+  it("neutral → forbids forced cheer, keeps the substantive voice", () => {
+    const block = renderStyleBlock(sampleStyle, "neutral");
+    const lower = block.toLowerCase();
+    expect(lower).toMatch(/analytical|not a celebration/);
+    expect(lower).toMatch(/reads fake|do not add cheering|forced excitement/);
+    // exemplars still rendered (form is still taught)
+    expect(block).toContain("omg congrats this is amazing!!!");
+  });
+
+  it("omitting the register → the legacy generic FORM block", () => {
+    const block = renderStyleBlock(sampleStyle);
+    expect(block).toContain("match the FORM, not the content");
+    expect(block.toLowerCase()).not.toContain("celebrating");
+  });
+
+  it("empty style → empty string (prompt stays unchanged)", () => {
+    expect(renderStyleBlock({ exemplars: [], styleNotes: "" }, "celebration")).toBe("");
+  });
+});
+
+describe("buildDrafterSystem threads the post register into the STYLE block", () => {
+  it("includes sent reply exemplars when they are the only optional context", () => {
+    const exemplars = [{ post: "The approval handoff takes a day", reply: "That handoff is where the queue piles up" }];
+    const system = buildDrafterSystem(null, null, null, null, undefined, null, false, exemplars);
+    expect(system).toContain(exemplars[0]!.post);
+    expect(system).toContain(exemplars[0]!.reply);
+    expect(system.slice(0, drafterSystemCachePrefixLen(null))).toBe(SYSTEM_LINKEDIN_BASE);
+    expect(buildDrafterSystem(null, null, null, null, undefined, null, false, [])).toBe(SYSTEM_LINKEDIN_BASE);
+  });
+
+  it("a celebration register reaches the rendered prompt", () => {
+    const sys = buildDrafterSystem("obj", "person", null, sampleStyle, "celebration");
+    expect(sys.toLowerCase()).toContain("celebrating");
+  });
+
+  it("a neutral register renders the no-forced-cheer guidance", () => {
+    const sys = buildDrafterSystem("obj", "person", null, sampleStyle, "neutral");
+    expect(sys.toLowerCase()).toMatch(/reads fake|not a celebration/);
+  });
+});
+
+describe("buildDrafterSystem injects Pattern Breaker rules", () => {
+  const rules = [
+    { instruction: "Do not end a substantive post with a bare 'congrats'; end on the actual point." },
+    { instruction: "Vary your opener; you keep leading with a one-line hook then a blank line." },
+  ];
+
+  it("renders the BREAK THESE REPEATED PATTERNS block with each instruction", () => {
+    const sys = buildDrafterSystem("obj", "person", null, null, undefined, rules);
+    expect(sys).toContain("BREAK THESE REPEATED PATTERNS");
+    expect(sys).toContain("bare 'congrats'");
+    expect(sys).toContain("Vary your opener");
+  });
+
+  it("omits the block entirely when there are no rules", () => {
+    const sys = buildDrafterSystem("obj", "person", null, null, undefined, []);
+    expect(sys).not.toContain("BREAK THESE REPEATED PATTERNS");
+  });
+
+  it("omits an auto terminal-punctuation rule that conflicts with public reply style", () => {
+    const instruction = "Do not habitually leave replies without terminal punctuation.";
+    const auto = buildDrafterSystem("obj", "person", null, null, undefined,
+      [{ instruction, source: "auto" }]);
+    expect(auto).not.toContain(instruction);
+    expect(auto).not.toContain("BREAK THESE REPEATED PATTERNS");
+    const confirmed = buildDrafterSystem("obj", "person", null, null, undefined,
+      [{ instruction, source: "manual" }]);
+    expect(confirmed).toContain(instruction);
+  });
+
+  it("appends the positive 'instead' mirror to a rule that has a suggestion", () => {
+    const sys = buildDrafterSystem("obj", "person", null, null, undefined, [
+      { instruction: "Do not open with a raw-detail fragment.", suggestion: "Open with your actual take or a question." },
+    ]);
+    expect(sys).toContain("→ instead: Open with your actual take or a question.");
+    // A rule without a suggestion stays a plain bullet (no trailing arrow).
+    const plain = buildDrafterSystem("obj", "person", null, null, undefined, [{ instruction: "Vary your opener." }]);
+    expect(plain).toContain("- Vary your opener.");
+    expect(plain).not.toContain("→ instead:");
+  });
+});
+
+describe("drafterSystemCachePrefixLen is a real prefix of buildDrafterSystem", () => {
+  it("no-brand: prefix len === SYSTEM_LINKEDIN_BASE.length and the output starts with it", () => {
+    const sys = buildDrafterSystem("mission x", "person y", null);
+    expect(sys.startsWith(SYSTEM_LINKEDIN_BASE)).toBe(true);
+    expect(drafterSystemCachePrefixLen(null)).toBe(SYSTEM_LINKEDIN_BASE.length);
+    // The computed prefix is a byte-exact prefix of the full system (the
+    // load-bearing invariant: a wrong len silently kills cache hits).
+    expect(sys.slice(0, drafterSystemCachePrefixLen(null))).toBe(SYSTEM_LINKEDIN_BASE);
+  });
+
+  it("brand: prefix is renderBrandBlock + blank + SYSTEM_LINKEDIN_BASE, a real prefix of the output", () => {
+    const brand: BrandConfig = {
+      persona: { name: "Ada", bio: "builder of things" },
+      product: { name: "Widget", description: "does widget stuff", surfaces: [], fits_when: [] },
+      pitch_policy: "when_relevant",
+      qa: [],
+    };
+    const sys2 = buildDrafterSystem("mission x", "person y", brand);
+    const expectedPrefix = [renderBrandBlock(brand), "", SYSTEM_LINKEDIN_BASE].join("\n");
+    expect(drafterSystemCachePrefixLen(brand)).toBe(expectedPrefix.length);
+    expect(sys2.slice(0, drafterSystemCachePrefixLen(brand))).toBe(expectedPrefix);
+    expect(sys2.startsWith(expectedPrefix)).toBe(true);
+  });
+
+  it("falls back to the no-brand prefix when brand_config has no content", () => {
+    expect(drafterSystemCachePrefixLen({} as BrandConfig)).toBe(SYSTEM_LINKEDIN_BASE.length);
+  });
+});
+
+// ---- anti-ai skill rules reach every Lyra prose surface --------------------
+// The deterministic half lives in scoreFormat (@noelle/runtime); this asserts the
+// proactive half is actually IN the prompts. A rule that exists only in the
+// verifier just burns regenerates.
+describe("anti-ai rules are injected into every Lyra system prompt", () => {
+  const SURFACES: Array<[string, string]> = [
+    ["SYSTEM_LINKEDIN_BASE", SYSTEM_LINKEDIN_BASE],
+    ["SYSTEM_LINKEDIN_BASE", SYSTEM_LINKEDIN_BASE],
+    ["SYSTEM_LINKEDIN_LIGHT", SYSTEM_LINKEDIN_LIGHT],
+  ];
+  for (const [name, prompt] of SURFACES) {
+    it(`${name} bans significance-marking meta commentary`, () => {
+      expect(prompt).toMatch(/NEVER MARK SIGNIFICANCE/);
+      expect(prompt).toContain("here's the thing");
+      expect(prompt).toContain("let that sink in");
+    });
+    it(`${name} names the reader-mode constructions`, () => {
+      expect(prompt).toMatch(/Rule of three/i);
+      expect(prompt).toMatch(/Copula dodge/i);
+      expect(prompt).toMatch(/Vague authority/i);
+      expect(prompt).toMatch(/Participial tails/i);
+    });
+    it(`${name} carries the tier-1 wordbank`, () => {
+      expect(prompt).toMatch(/TIER-1 VOCABULARY/);
+      for (const w of ["delve", "leverage", "tapestry", "seamless", "myriad"]) {
+        expect(prompt).toContain(w);
+      }
+    });
+    it(`${name} keeps the fixate-don't-cover + grounding rules`, () => {
+      expect(prompt).toMatch(/FIXATE, DON'T COVER/);
+      expect(prompt).toMatch(/GROUND IT IN THE REAL/);
+    });
+  }
+
+  // The anti-ai skill's DETECTOR mode needs invented names/prices/dialogue as
+  // scaffolding. Lyra auto-queues drafts with no swap-in step, so the
+  // no-fabrication ban must still win. If a future change adopts discourse
+  // fracture, this test should fail loudly and force the decision.
+  it("does not weaken the no-fabrication ban", () => {
+    expect(SYSTEM_LINKEDIN_BASE).toMatch(/Invent personal history \(HARD BAN/);
+    expect(SYSTEM_LINKEDIN_BASE).toMatch(/Invent personal history \(HARD BAN/);
+    expect(SYSTEM_LINKEDIN_LIGHT).toMatch(/Do NOT invent personal history/);
+  });
+
+  // Detector-mode's "no punchlines, flat complaints only" would kill the
+  // register-matching Lyra was explicitly tuned for. Assert it survived.
+  it("keeps register-matching (detector-mode flatness was NOT adopted)", () => {
+    expect(SYSTEM_LINKEDIN_BASE).toMatch(/MATCH THE ENERGY/);
+    expect(SYSTEM_LINKEDIN_BASE).toMatch(/dry humor when the line earns it/);
+  });
+});
+
+// The anti-ai rules share a prompt with the assigned FORM VARIANTS
+// (@noelle/runtime FORM_VARIANTS). Three variants steer toward moves the rules
+// appear to ban, so the reconciliations must stay in the prompt:
+//   THREE_BEAT   -> "reaction, concrete point, closing thought" vs rule-of-three
+//   QUESTION_ONLY-> "the whole reply is ONE question"           vs rhetorical Q&A
+//   DETAIL_ZOOM  -> "say why it stuck with you"                 vs significance markers
+describe("anti-ai rules do not contradict the assigned form variants", () => {
+  it("scopes rule-of-three to lists, not to sentence count (THREE_BEAT)", () => {
+    expect(SYSTEM_LINKEDIN_BASE).toMatch(/about LISTS, not about how many sentences/);
+  });
+  it("keeps genuinely asking a question allowed (QUESTION_ONLY)", () => {
+    expect(SYSTEM_LINKEDIN_BASE).toMatch(/Genuinely ASKING them something you actually want to know/);
