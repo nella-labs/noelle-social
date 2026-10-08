@@ -198,3 +198,8 @@ it("rejects contradictory metadata without returning a receipt", async () => {
   try {
     await expect(create(server.config).getSecret({ name })).rejects.toMatchObject({
       code: "invalid_response",
+    });
+  } finally {
+    await server.close();
+  }
+});
