@@ -1,0 +1,200 @@
+/**
+ * @noelle/ui — globals.css
+ *
+ * Imported once per app (apps/www, apps/app). Pairs with
+ * `@noelle/ui/tailwind-preset` and `@noelle/ui/fonts.css`.
+ *
+ * Fonts themselves are NOT @imported here — each app loads them via
+ * @fontsource/* packages (Next.js) or <link> (Astro). See ./fonts.css for the
+ * exact families this stylesheet expects to be available.
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Constellation CSS variables — exposed for shadcn/ui and any consumer
+     that prefers CSS-var theming over Tailwind color classes. Keep in sync
+     with tailwind-preset.cjs and src/tokens.ts. */
+  :root {
+    color-scheme: light;
+
+    /* Cream */
+    --color-cream-50: #f5efe6;
+    --color-cream-100: #f2ede0;
+    --color-cream-200: #efe7d2;
+    --color-cream-300: #e6decb;
+    --color-cream-400: #d9cdb1;
+    --color-cream-500: #c9b98f;
+    --color-cream-600: #a89868;
+    --color-cream-700: #7c6f4b;
+    --color-cream-800: #4f4632;
+    --color-cream-900: #2a2519;
+
+    /* Rust (clay accent) */
+    --color-rust-50: #fbf1eb;
+    --color-rust-100: #f4ddcb;
+    --color-rust-200: #e8b89a;
+    --color-rust-300: #dc9269;
+    --color-rust-400: #cc6e3e;
+    --color-rust-500: #bd5c30;
+    --color-rust-600: #b5532a;
+    --color-rust-700: #964322;
+    --color-rust-800: #71321a;
+    --color-rust-900: #4a2011;
+
+    /* Ink */
+    --color-ink-50: #f4f2ee;
+    --color-ink-100: #e0dcd3;
+    --color-ink-200: #bbb4a4;
+    --color-ink-300: #948b78;
+    --color-ink-400: #6e6552;
+    --color-ink-500: #4d4636;
+    --color-ink-600: #3a352b;
+    --color-ink-700: #272420;
+    --color-ink-800: #1a1816;
+    --color-ink-900: #13110c;
+
+    /* shadcn-style semantic aliases — apps can override these. */
+    --background: var(--color-cream-100);
+    --foreground: var(--color-ink-900);
+    --muted: var(--color-cream-300);
+    --muted-foreground: var(--color-ink-500);
+    --accent: var(--color-rust-600);
+    --accent-foreground: var(--color-cream-50);
+    --border: var(--color-cream-400);
+    --ring: var(--color-rust-600);
+
+    --radius: 0.5rem;
+  }
+
+  html {
+    background-color: var(--color-cream-100);
+  }
+
+  body {
+    color: var(--color-ink-900);
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    background-color: var(--color-cream-100);
+    background-image: radial-gradient(
+      at 50% 15%,
+      rgba(239, 216, 176, 0.2) 0%,
+      rgba(242, 237, 224, 0) 55%
+    );
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    background-color: var(--color-rust-600);
+    color: var(--color-cream-50);
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Faint clay-accent glow — small, low-opacity, sits behind hero/CTA
+     headlines to suggest a warm light source without ever looking like a
+     drop shadow. Combine with `shadow-glow-rust` for an interactive ring. */
+  .clay-glow {
+    background: radial-gradient(
+      ellipse 45% 35% at 50% 50%,
+      rgba(181, 83, 42, 0.12) 0%,
+      rgba(181, 83, 42, 0.05) 40%,
+      rgba(181, 83, 42, 0) 75%
+    );
+  }
+
+  /* Subtle film-grain texture via inline SVG fractalNoise. Tiny payload,
+     tiled. Sits at low opacity with multiply blend so it darkens evenly
+     across any cream background. Suppressed under prefers-contrast: more.
+     Pair with `.grain-overlay-fixed` (below) when you want a page-wide
+     overlay; the base class can be applied to any container. */
+  .grain-overlay {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.07 0 0 0 0 0.065 0 0 0 0 0.05 0 0 0 0.6 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 240px 240px;
+    mix-blend-mode: multiply;
+    opacity: 0.35;
+    pointer-events: none;
+    animation: grain-shift 8s steps(10) infinite;
+  }
+
+  /* Page-wide variant: drop into a layout root once. */
+  .grain-overlay-fixed {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+  }
+
+  @media (prefers-contrast: more) {
+    .grain-overlay,
+    .grain-overlay-fixed {
+      display: none;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .grain-overlay,
+    .grain-overlay-fixed {
+      animation: none;
+    }
+  }
+
+  /* CRT-style scanlines — pure repeating-linear-gradient, no images.
+     ~3px row (1px line + 2px gap) keeps it readable on Retina + low-DPI.
+     Multiply blend so it darkens cleanly without changing hue. */
+  .scanlines {
+    background-image: repeating-linear-gradient(
+      to bottom,
+      rgba(15, 11, 5, 0.05) 0px,
+      rgba(15, 11, 5, 0.05) 1px,
+      transparent 1px,
+      transparent 3px
+    );
+    mix-blend-mode: multiply;
+    pointer-events: none;
+  }
+  @media (prefers-contrast: more) {
+    .scanlines {
+      display: none;
+    }
+  }
+}
+
+/* Keyframes also live in tailwind-preset.cjs so JIT picks them up; we
+   redeclare here so the animation works even when consumers reference the
+   utility via inline style. */
+@keyframes grain-shift {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+  10% {
+    transform: translate(-2%, -3%);
+  }
+  20% {
+    transform: translate(-4%, 2%);
+  }
+  30% {
+    transform: translate(2%, -4%);
+  }
+  40% {
+    transform: translate(-2%, 5%);
+  }
+  50% {
+    transform: translate(-4%, 2%);
+  }
+  60% {
+    transform: translate(3%, 0%);
+  }
+  70% {
+    transform: translate(0%, 3%);
+  }
+  80% {
+    transform: translate(-3%, 1%);
+  }
+  90% {
