@@ -798,3 +798,57 @@ function TailorRun({
         type="button"
         onClick={onToggle}
         className="btn btn-xs btn-ghost"
+        aria-expanded={open}
+        style={{ fontFamily: "var(--mono)", fontSize: 11 }}
+      >
+        {open ? "▾" : "▸"} Tailor this run
+      </button>
+      {open ? (
+        <div
+          style={{
+            marginTop: 8,
+            padding: 12,
+            borderRadius: 8,
+            background: "var(--paper)",
+            boxShadow: "0 0 0 0.5px var(--rule-soft)",
+          }}
+        >
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 10 }}>
+            {ui.tailorFields.map((f) => num(f))}
+          </div>
+          {hasExtras ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 16, marginTop: 10, flexWrap: "wrap" }}>
+              {ui.tailorBooleans.map((b) => (
+                <label key={b.key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5 }}>
+                  <input
+                    type="checkbox"
+                    checked={bools[b.key] ?? false}
+                    onChange={(e) => setBool(b.key, e.target.checked)}
+                  />
+                  {b.label}
+                </label>
+              ))}
+              {ui.tailorLang ? (
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5 }} title="Two-letter language code, e.g. en. Keyword search only (X lang:).">
+                  Lang
+                  <input
+                    type="text"
+                    value={lang}
+                    placeholder="any"
+                    maxLength={2}
+                    onChange={(e) => setLang(e.target.value)}
+                    className="input"
+                    style={{ width: 56, padding: "4px 8px", textTransform: "lowercase" }}
+                  />
+                </label>
+              ) : null}
+            </div>
+          ) : null}
+          <div style={{ fontSize: 10.5, color: "var(--ink-soft)", marginTop: 8, lineHeight: 1.4 }}>
+            {ui.tailorFootnote}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
