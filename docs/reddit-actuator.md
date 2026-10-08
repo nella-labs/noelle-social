@@ -398,3 +398,82 @@ reason; it can never post.
   `0086_reddit_reply_dedup.sql`.
 - `POST /api/reddit-activity` — append-only `noelle.reddit_activity` log.
 - `GET /api/actuator/reddit-health` — today's volume + challenge signal.
+- Reuses the generic `POST /api/actuator/mark-sent/:id`, the generic
+  `POST /api/actuator/mark-skipped/:id` (dead-target skips above; only ever flips a
+  still-`pending` approval to `skipped`), and `requireActuatorToken`.
+
+Env: `NOELLE_REDDIT_ACTUATOR_DAILY_WRITE_CAP` (default 8; fail-SAFE parse —
+unset/garbage/negative ⇒ 8, `0` honored as serve-nothing; only the explicit
+sentinel `off`/`unlimited` lifts the cap, which skips the usage count and makes
+`reddit-health` report `writeCap: null`. Unlike LinkedIn's post-#426 cap, unset
+never means unlimited — Reddit shadowbans young accounts at far lower write
+velocity, and the client-side floors stay as the residual backstop),
+`NOELLE_REDDIT_ACTUATOR_HALT_ON_CHALLENGE` (default OFF), the shared
+`NOELLE_ACTUATOR_TOKEN` / `NOELLE_ACTUATOR_ORG_ID`. Migration:
+`infra/cloudsql/schema/00NN_reddit_activity.sql`.
+
+## Build + load + run
+
+1. **Build** (from the repo root):
+   ```bash
+   pnpm --filter @noelle/reddit-actuator build
+   ```
+   Output: `apps/reddit-actuator/.output/chrome-mv3/` (canonical) and a copy at
+   `apps/reddit-actuator/dist-unpacked/` (produced automatically by the build).
+2. **Load unpacked:** Chrome → `chrome://extensions` → enable **Developer mode** →
+   **Load unpacked** → select `apps/reddit-actuator/dist-unpacked/` (or
+   `.output/chrome-mv3/`).
+3. **Configure** on the extension **Options** page: API base URL
+   (`http://127.0.0.1:18791` for the native runtime), the actuator bearer token
+   (`NOELLE_ACTUATOR_TOKEN`), and Orion's **instance id** (the `reddit_intern` agent UUID
+   from the dashboard). Caps default Reddit-safe.
+4. **Run:** open a logged-in `reddit.com` tab, ensure Orion's `reply_send_enabled=true`
+   and at least one pending `platform='reddit'`, `kind='reply'` approval exists, then click
+   **Run** on the floating panel. Watch the shadow-root panel log. Keep DevTools closed
+   (it blocks `chrome.debugger`) and the tab foregrounded; `caffeinate -dimsu` keeps the
+   Mac awake for a long run.
+
+The extension is **never server-deployed** — it runs in the operator's browser. It is
+excluded from the fleet-wide `noelle deploy` build, but the deploy runs a separate
+NON-FATAL `pnpm --filter @noelle/reddit-actuator build` step (warn-only on failure) so
+every merge refreshes `dist-unpacked` + the build stamp that feeds the self-reload below;
+a wedged wxt toolchain degrades to a stale extension, never a blocked server deploy.
+
+### Self-reload on deploy (no chrome://extensions click)
+
+Chrome loads the unpacked extension from `apps/reddit-actuator/dist-unpacked` (untracked;
+ignored). The package `build` script stage-and-rename swaps that dir from
+`.output/chrome-mv3` atomically on every build, so fresh bits land at the load path
+without Chrome ever observing an empty/partial dir.
+
+`wxt build` embeds a build stamp in the bundle and writes the same stamp to
+`.output/chrome-mv3/build-stamp.json`. Token-authed `GET /api/actuator/reddit-extension-build`
+serves the on-disk stamp (fail-soft `null` when unreadable; path override
+`NOELLE_REDDIT_EXT_STAMP_PATH`). On the 5-minute alarm the extension compares stamps and
+calls `chrome.runtime.reload()` when a newer build landed, which re-reads the unpacked
+dir. Never during a run; one attempt per served stamp, so a machine whose unpacked copy
+is not synced to the served build (e.g. the laptop) tries once and stays quiet instead of
+looping. Works independently of the autonomy checkboxes, so every merge-driven deploy
+reaches the browser on its own.
+
+## Activation (Orion the intern)
+
+To have approved Reddit drafts to actuate, Orion must be running:
+- **Activate** (data plane): hire/confirm the `reddit_intern` instance active, enable the
+  `discovery/classifier/drafter` lanes, seed the subreddit **Watchlist**, and provide an
+  Apify token (Connections page or `NOELLE_SECRET_APIFY_TOKEN`).
+- **Run** (control plane): the `noelle-reddit-{discovery,classifier,drafter}` workers are
+  registered in the pm2 ecosystem generator (`apps/cli/src/lib/process-manager.ts`); they
+  come up on the next `noelle sync`. There is **no send worker** — the actuator is the only
+  thing that posts. A reply in the approvals queue is treated as approved, and the actuator
+  auto-sends it (Skip is the veto).
+
+## Limits / caveats
+
+- The reddit.com locators are grounded in real DOM but, like the X actuator, are best
+  proven against a live logged-in tab — do the first smoke run attended.
+- `debugger` permission shows Chrome's persistent "is debugging this browser" banner and
+  blocks a public Web-Store listing (same as the other actuators).
+- Reddit A/B-tests new-Reddit layout; selectors are pinned to stable hooks
+  (`shreddit-*[attr]`, `data-*`, `[slot]`, `[name]`), never Tailwind utility classes.
+  old Reddit remains available as a stable opt-in fallback via the Options toggle.
