@@ -598,3 +598,203 @@ describe("runDiscoveryTick", () => {
       watchlist: { handles: [], keywords: [] },
       watchlistPeople: [{ handle: "patio11", addedAt: "2026-05-29T00:00:00.000Z" }],
       xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    // only the authored post is upserted; the repost is dropped despite priority
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "own", priority: true }));
+  });
+
+  it("drops a reply (is_reply) by default — both lanes, including a watchlist person", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(
+        res([
+          // a watched person's REPLY to someone else → dropped (excludeReplies default ON)
+          { id: "r", text: "good point, though I'd add…", created_at: "2026-05-29T12:00:00.000Z", author: { handle: "patio11", id: "p", followers: 9 }, url: "u", is_repost: false, is_reply: true },
+          // their own top-level post on the same tick → ingested
+          { id: "own", text: "here's my own take", created_at: "2026-05-29T13:00:00.000Z", author: { handle: "patio11", id: "p", followers: 9 }, url: "u", is_repost: false, is_reply: false },
+        ]),
+      ),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: [] },
+      watchlistPeople: [{ handle: "patio11", addedAt: "2026-05-29T00:00:00.000Z" }],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "own" }));
+  });
+
+  it("keeps replies when excludeReplies is explicitly turned off", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(res([])),
+      searchTimeline: vi.fn().mockResolvedValue(
+        res([
+          { id: "r", text: "replying in a thread", created_at: "2026-05-29T12:00:00.000Z", author: { handle: "u", id: "uid", followers: 100 }, url: "u", is_repost: false, is_reply: true },
+        ]),
+      ),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o", run_config: { excludeReplies: false } },
+      watchlist: { handles: [], keywords: ["ai agents"] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "r" }));
+  });
+
+  it("threads tweet.images onto the lead payload when the tweet has media", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(
+        res([
+          {
+            id: "1",
+            text: "with a chart",
+            created_at: "2026-05-18T00:00:00.000Z",
+            author: { handle: "u", id: "uid", followers: 100 },
+            url: "https://x.com/u/status/1",
+            images: ["https://pbs.twimg.com/media/a.jpg", "https://pbs.twimg.com/media/b.jpg"],
+          },
+        ]),
+      ),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["u"], keywords: [] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          images: ["https://pbs.twimg.com/media/a.jpg", "https://pbs.twimg.com/media/b.jpg"],
+        }),
+      }),
+    );
+  });
+
+  it("omits the images key on a text-only tweet (no media)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      // The tweet has no images field at all.
+      userTweets: vi.fn().mockResolvedValue(
+        res([
+          { id: "1", text: "just words", created_at: "2026-05-18T00:00:00.000Z", author: { handle: "u", id: "uid", followers: 100 }, url: "https://x.com/u/status/1" },
+        ]),
+      ),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["u"], keywords: [] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    const payload = upsert.mock.calls[0]![0].payload;
+    expect("images" in payload).toBe(false);
+  });
+
+  describe("engagement floor (minFaves)", () => {
+    const tweet = (over: Record<string, unknown>) => ({
+      id: "1",
+      text: "hi",
+      created_at: "2026-05-18T00:00:00.000Z",
+      author: { handle: "u", id: "uid", followers: 100 },
+      url: "https://x.com/u/status/1",
+      ...over,
+    });
+
+    it("drops a post whose like count is below the floor", async () => {
+      const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+      const xClient = {
+        userTweets: vi.fn().mockResolvedValue(res([tweet({ likes: 12 })])),
+        searchTimeline: vi.fn().mockResolvedValue(res([])),
+      };
+      const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+      const inserted = await runDiscoveryTick({
+        log,
+        instance: { id: "i", org_id: "o", discovery_config: { minFaves: 50 } },
+        watchlist: { handles: ["u"], keywords: [] },
+        watchlistPeople: [],
+        xClient: xClient as never,
+        upsertLead: upsert,
+        rateBucket: { tryTake: () => true },
+      });
+      expect(upsert).not.toHaveBeenCalled();
+      expect(inserted).toBe(0);
+    });
+
+    it("keeps a post at or above the floor", async () => {
+      const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+      const xClient = {
+        userTweets: vi.fn().mockResolvedValue(res([tweet({ likes: 50 })])),
+        searchTimeline: vi.fn().mockResolvedValue(res([])),
+      };
+      const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+      await runDiscoveryTick({
+        log,
+        instance: { id: "i", org_id: "o", discovery_config: { minFaves: 50 } },
+        watchlist: { handles: ["u"], keywords: [] },
+        watchlistPeople: [],
+        xClient: xClient as never,
+        upsertLead: upsert,
+        rateBucket: { tryTake: () => true },
+      });
+      expect(upsert).toHaveBeenCalledTimes(1);
+    });
+
+    it("never punishes an unknown (null) like count — the server-side operator covers search", async () => {
+      const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+      const xClient = {
+        // no `likes` field at all → count is unknown
+        userTweets: vi.fn().mockResolvedValue(res([tweet({})])),
+        searchTimeline: vi.fn().mockResolvedValue(res([])),
+      };
+      const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+      await runDiscoveryTick({
+        log,
+        instance: { id: "i", org_id: "o", discovery_config: { minFaves: 50 } },
+        watchlist: { handles: ["u"], keywords: [] },
+        watchlistPeople: [],
+        xClient: xClient as never,
+        upsertLead: upsert,
+        rateBucket: { tryTake: () => true },
+      });
+      expect(upsert).toHaveBeenCalledTimes(1);
+    });
+
+    // CONTRACT CHANGE: the engagement floor is now a KEYWORD-lane heuristic only.
+    // "The person is the gate, not the post" (#185) — a hand-picked person's
+    // quiet post is exactly what Vega should answer, and quality is judged
+    // downstream by the classifier + the priority clamp's off-topic floor, not by
+    // a like count at ingest.
+    it("narrows a watch-lane fetch to added_at so Apify is not billed for discards", async () => {
+      // Apify bills per item and pre-added_at posts are dropped client-side, so
+      // the fetch must ask for max(window, added_at), not the raw window.
+      const userTweets = vi.fn().mockResolvedValue(res([]));
+      const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+      await runDiscoveryTick({
