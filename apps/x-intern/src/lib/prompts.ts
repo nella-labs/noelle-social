@@ -398,3 +398,149 @@ export function renderPatternRulesBlock(rules: PatternRuleForPrompt[]): string {
  * distinct from "the loader ran and found nothing" (`{ snapshot: null }`) —
  * the second case still renders the block, because telling the model it does
  * NOT know its follower count is the half of the fix that stops the invention.
+ */
+export interface OwnAccountFacts {
+  snapshot: OwnAccountSnapshot | null;
+  now: Date;
+}
+
+export function buildDrafterSystem(
+  objective?: string | null,
+  personDirective?: string | null,
+  brand?: BrandConfig | null,
+  personProfile?: string | null,
+  style?: StyleForPrompt | null,
+  postRegister?: PostRegister,
+  patternRules?: PatternRuleForPrompt[] | null,
+  ownAccount?: OwnAccountFacts | null,
+  /**
+   * Suppress the DM pitch for an EARLY ladder rung. The base DM section above
+   * declares the DM "is where the actual pitch lives" and mandates the site +
+   * install lines, which flatly contradicts rungs 1-3 ("ask for nothing, no
+   * pitch"). A per-lead rung directive in the USER prompt cannot reliably beat a
+   * SYSTEM-prompt mandate, so the override is appended here, LAST, where it wins.
+   */
+  dmNoPitch?: boolean,
+  /**
+   * The operator's own approved replies, paired with the posts they answered.
+   * Layered after the pattern rules so it is the last thing about VOICE the
+   * model reads — the frozen STYLE TARGETS teach shape, these teach the move.
+   * Empty ⇒ no push ⇒ byte-identical prompt, so an org with no sent history is
+   * unaffected.
+   */
+  voiceExemplars?: ReadonlyArray<{ post: string; reply: string }>,
+  /** An explicit account pin transfers the writer's voice, including its warmth. */
+  styleFaithful?: boolean,
+  /** Browser reply-only leads must not ask the model to draft a cold DM. */
+  replyOnly?: boolean,
+): string {
+  const mission = objective?.trim();
+  const person = personDirective?.trim();
+  const profile = personProfile?.trim();
+  // Brand-configured (self-host / tailored) → generic base + OPERATOR BRAND.
+  // Empty brand uses the same rules with no supplied product facts.
+  const useBrand = brand != null && brandConfigHasContent(brand);
+  const parts = useBrand
+    ? [renderBrandBlock(brand, replyOnly), "", replyOnly ? SYSTEM_X_BASE_REPLY_ONLY : SYSTEM_X_BASE]
+    : [replyOnly ? SYSTEM_X_BASE_REPLY_ONLY : SYSTEM_X_BASE];
+  const baseLen = parts.length;
+  // The operator's VOICE SPEC from their vault, when present. It describes ONE
+  // voice across every platform, so Vega reads the same file Lyra and the
+  // voice-post skill do — editing the vault steers all of them at once. Absent
+  // (no file) ⇒ "" and the prompt is byte-identical, so this ships dark and
+  // turns on the moment a voice-spec.md lands in the vault.
+  const specBlock = voiceSpecBlock(loadVoiceSpec());
+  if (specBlock) parts.push("", specBlock);
+  // Own-account ground truth goes FIRST among the appended blocks: it is a fact
+  // about the writer, so it should be in place before any block that shapes what
+  // the writer says. Rendered even when the snapshot is null/stale — that
+  // renders as an explicit "you do not know these numbers", which is the point.
+  if (ownAccount) parts.push("", renderOwnAccountBlock(ownAccount.snapshot, ownAccount.now));
+  if (mission) {
+    parts.push(
+      "",
+      "OPERATOR MISSION (set by the operator for this agent)",
+      `The operator framed this agent's job as: "${mission}"`,
+      "Let that mission steer which angle leads and what you emphasise. When a lead clearly relates to the mission, lean into it. It does NOT override anything above: keep the voice, the NEVER-DO list, and the strict JSON output shape exactly as specified. Never fabricate a connection to the mission — if a lead doesn't relate, write the best honest peer reply anyway.",
+    );
+  }
+  if (profile) {
+    // Per-watchlist-person PROFILE: who this account is, grounded in their
+    // recent posts by the profiler. Lets the reply land as a knowledgeable peer
+    // instead of a generic take. Grounding only — never a script.
+    parts.push(
+      "",
+      "WHO YOU'RE REPLYING TO (profile of this account, grounded in their recent posts)",
+      profile,
+      "Use this to make the reply land as a knowledgeable peer — match what they actually care about and how they write. It is grounding, not a script: never fabricate facts beyond it, and keep the voice, the NEVER-DO list, and the strict JSON output shape exactly as specified.",
+    );
+  }
+  if (person) {
+    // Per-watchlist-person objective: the operator set a specific goal for THIS
+    // person. It steers tone/intent for both the replies and the DM, layered
+    // under the operator mission; it never overrides the voice/format rules.
+    parts.push(
+      "",
+      "PER-PERSON OBJECTIVE (set by the operator for the specific account you're replying to)",
+      person,
+      replyOnly
+        ? "Apply this to the reply. It steers tone and intent only — keep the voice, the NEVER-DO list, and the strict JSON output shape exactly as specified."
+        : "Apply this to both the replies and the DM. It steers tone and intent only — keep the voice, the NEVER-DO list, and the strict JSON output shape exactly as specified.",
+    );
+  }
+  // Account Feeder STYLE block (FORM of admired X accounts, register-conditioned),
+  // layered LAST so it shapes rhythm/hooks without overriding voice/format rules.
+  // Absent style ⇒ no push ⇒ the byte-identical SYSTEM_X_BASE short-circuit below fires.
+  const styleBlock = style ? renderStyleBlock(style, postRegister, styleFaithful) : "";
+  if (styleBlock) parts.push("", styleBlock);
+  // Pattern-breaker rules sit LAST — the final constraint layered before the
+  // model writes, so "don't repeat yourself" is the freshest instruction.
+  // Absent/empty rules ⇒ no push ⇒ byte-identical prompt.
+  const patternBlock = patternRules?.length ? renderPatternRulesBlock(patternRules) : "";
+  if (patternBlock) parts.push("", patternBlock);
+  // The operator's real POST → REPLY pairs, last among the voice layers: the
+  // freshest thing the model reads before the pattern rules' "don't repeat
+  // yourself" is how it actually replies.
+  const exemplarBlock = voiceExemplars?.length ? renderVoiceExemplars(voiceExemplars) : "";
+  if (exemplarBlock) parts.push(exemplarBlock);
+  // No steering added and no brand returns the base prompt.
+  if (!useBrand && !replyOnly && parts.length === baseLen) return SYSTEM_X_BASE;
+  if (dmNoPitch && !replyOnly) {
+    parts.push(
+      "",
+      "DM PITCH OVERRIDE — HARD RULE, OVERRIDES THE DM SECTION ABOVE",
+      "This particular DM is an EARLY touch in a relationship, not the ask. It must contain NO pitch: do not name the product, do not include a product URL or install line, do not describe capabilities, and do not propose a call, a meeting, or 'hopping on' anything. The DM section above says the DM is where the pitch lives — for THIS DM that is suspended. Everything else about the DM voice (the casual greeting, the fragmented chunks, the soft sign-off, the length, the NEVER DO list) still applies. Follow the DM RELATIONSHIP STAGE block in the user message for what this DM should actually do.",
+    );
+  }
+
+  if (replyOnly) {
+    parts.push("", REPLY_ONLY_OUTPUT, useBrand
+      ? "Keep the 150-character reply ceiling unless an ASSIGNED SHAPE overrides it, as specified above."
+      : "Each reply `body` must be at most 250 characters.");
+  }
+
+  return parts.join("\n");
+}
+
+const SYSTEM_PROFILER = [
+  "You build a concise profile of one X (Twitter) account for an operator's social growth profile.",
+  "You are given a sample of the account's recent tweets. Read them and infer who this person is and how to engage them authentically — NOT to flatter, but so replies land as a knowledgeable peer.",
+  "Be specific and grounded ONLY in the tweets provided. Do not invent facts, employers, or beliefs you can't see. If the sample is thin, say so briefly rather than guessing.",
+  "Output STRICT JSON, no preamble, no markdown fences. The first character MUST be `{` and the last `}`:",
+  '  {"summary":"2-4 sentence who-they-are + what they care about","topics":["theme1","theme2"],"tone":"how they write (e.g. dry, earnest, technical, shitposty)","engagement_notes":"how to reply so it lands — angles that resonate, things to avoid"}',
+  "`topics` is at most 6 short lowercase themes. Keep every field tight; this is a quick brief, not an essay.",
+].join(" ");
+
+/**
+ * System prompt for the profiler worker. Appends the operator mission so the
+ * "how to engage" notes are framed by what this agent is actually for.
+ */
+export function buildProfilerSystem(objective?: string | null): string {
+  const mission = objective?.trim();
+  if (!mission) return SYSTEM_PROFILER;
+  return [
+    SYSTEM_PROFILER,
+    "",
+    `OPERATOR MISSION: the founder framed this agent's job as: "${mission}". Frame the engagement notes toward that mission where the account genuinely overlaps with it — but never fabricate overlap, and keep the strict JSON shape.`,
+  ].join("\n");
+}
