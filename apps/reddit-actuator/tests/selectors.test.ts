@@ -1198,3 +1198,61 @@ describe("isCommentsUnavailable (locked thread / archived post skip gate)", () =
   it("new Reddit: an archived banner wins the archived-specific reason", () => {
     const root = mount(
       `<shreddit-post id="t3_c"><h1 slot="title">t</h1></shreddit-post>
+       <faceplate-banner>This post is archived. New comments cannot be posted and votes cannot be cast.</faceplate-banner>`,
+    );
+    const r = isCommentsUnavailable(root, "new");
+    expect(r.blocked).toBe(true);
+    expect(r.reason).toBe("post-archived");
+  });
+
+  it("a healthy new-Reddit thread ⇒ NOT blocked", () => {
+    expect(isCommentsUnavailable(mount(NEW_POST + NEW_COMMENTS), "new").blocked).toBe(false);
+  });
+
+  it("FALSE-POSITIVE guard: a post BODY merely quoting the lock banner does NOT trip", () => {
+    const root = mount(
+      `<shreddit-post id="t3_q" permalink="/r/x/comments/q/y/">
+        <h1 slot="title">Mods locked my thread</h1>
+        <div slot="text-body"><div class="md">It just says "Comments are locked" and "This thread has been locked by the moderators". This post is archived nowhere, to be clear.</div></div>
+      </shreddit-post>` + NEW_COMMENTS,
+    );
+    expect(isCommentsUnavailable(root, "new").blocked).toBe(false);
+  });
+
+  it("FALSE-POSITIVE guard: a COMMENT quoting the banner phrases does NOT trip", () => {
+    const root = mount(
+      NEW_POST +
+        `<shreddit-comment thingid="t1_q" author="quoter">
+          <div slot="comment">The banner said "new comments cannot be posted" — you won't be able to vote or comment.</div>
+        </shreddit-comment>`,
+    );
+    expect(isCommentsUnavailable(root, "new").blocked).toBe(false);
+  });
+
+  it("old Reddit: the .thing.link.locked class ⇒ blocked (comments-locked)", () => {
+    const root = mount(`<div class="thing link locked" data-fullname="t3_ol"><a class="title">locked one</a></div>`);
+    const r = isCommentsUnavailable(root, "old");
+    expect(r.blocked).toBe(true);
+    expect(r.reason).toBe("comments-locked");
+  });
+
+  it("old Reddit: the .thing.link.archived class ⇒ blocked (post-archived)", () => {
+    const root = mount(`<div class="thing link archived" data-fullname="t3_oa"><a class="title">old one</a></div>`);
+    const r = isCommentsUnavailable(root, "old");
+    expect(r.blocked).toBe(true);
+    expect(r.reason).toBe("post-archived");
+  });
+
+  it("old Reddit: the archived .infobar phrase ⇒ blocked (post-archived)", () => {
+    const root = mount(
+      OLD_POST + `<div class="infobar">This is an archived post. You won't be able to vote or comment.</div>`,
+    );
+    const r = isCommentsUnavailable(root, "old");
+    expect(r.blocked).toBe(true);
+    expect(r.reason).toBe("post-archived");
+  });
+
+  it("old Reddit: a healthy post ⇒ NOT blocked", () => {
+    expect(isCommentsUnavailable(mount(OLD_POST + OLD_COMMENTS), "old").blocked).toBe(false);
+  });
+});
