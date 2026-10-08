@@ -398,3 +398,14 @@ export async function testAllApifyTokens(input: z.infer<typeof TestAllApifyInput
     async function worker() {
       while (true) {
         const i = next++;
+        if (i >= conns.length) return;
+        results[i] = await testOneApify(orgId, conns[i]!);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, conns.length) }, worker));
+    revalidatePath(`/app/${parsed.data.orgSlug}/connections`);
+    return { ok: true, results };
+  } catch (err) {
+    return { ok: false, error: { code: "check_failed", message: err instanceof Error ? err.message : String(err) } };
+  }
+}

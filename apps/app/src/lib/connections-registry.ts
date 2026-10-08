@@ -198,3 +198,14 @@ export const CONNECTIONS: ConnectionKindSpec[] = [
   },
   {
     id: "pushover_token",
+    secretFragment: "pushover-app-token",
+    name: "Pushover · app token",
+    icon: "🔔",
+    hint: "Application token for the Noelle app registered in Pushover.",
+    group: "notify",
+    input: "text",
+    inputHelp:
+      "Paste the 30-character Pushover API token for the Noelle application. Found in the app settings on pushover.net.",
+    validate: validatePushover30,
+  },
+];
