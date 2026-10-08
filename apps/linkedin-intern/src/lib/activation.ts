@@ -198,3 +198,73 @@ export async function listActiveLinkedinInternInstances(
 }
 
 // Discovery / classifier / drafter use this so the always-on WATCHLIST lane keeps
+// Lyra replying to watched connections for PAUSED instances too — not just active
+// ones. Each worker gates on (active OR watchlist_enabled): active runs the full
+// funnel under the goal + backpressure caps; paused runs the watchlist lane only
+// when watchlist_enabled (the goal auto-pause no longer applies, but the inbox
+// backpressure caps still do). The on-demand DM pass also runs while paused.
+// See 0034_watchlist_enabled.sql.
+export async function listActiveOrPausedLinkedinInternInstances(
+  sql: Sql,
+): Promise<ActiveInstance[]> {
+  return listLinkedinInternInstancesByStatus(sql, ["active", "paused"]);
+}
+
+// The profiler is decoupled from Start/Pause (0024): watchlist profiling is
+// passive enrichment, useful while the pipeline is paused. So it sees active
+// AND paused instances and gates only on profiler_enabled in its onTick.
+export async function listProfilerLinkedinInternInstances(
+  sql: Sql,
+): Promise<ActiveInstance[]> {
+  return listLinkedinInternInstancesByStatus(sql, ["active", "paused"]);
+}
+
+// The POST pipeline (ideation + post-drafter) spans both content interns: ideas
+// are owned by either the LinkedIn intern (Lyra) or the X intern (Vega). The
+// post-drafter runs in this process for BOTH so an X-owned approved idea is
+// drafted too — it already drafts platform='x' variants of LinkedIn-owned ideas
+// (the cross-platform fan-out), so the only thing missing was claiming X-owned
+// rows. Selects `role` so the worker attributes spend + picks routing per intern.
+// agent_instances is one shared table, so the LinkedIn-specific columns are
+// present (null/default) on x_intern rows — selecting them is harmless.
+export async function listActiveOrPausedPostPipelineInstances(
+  sql: Sql,
+): Promise<ActiveInstance[]> {
+  const rows = await sql<ActiveInstance[]>`
+    select
+      id,
+      org_id,
+      role,
+      status,
+      model_overrides,
+      budget_alert_pct,
+      escalate_on_cap,
+      pause_on_5xx,
+      notify_low_confidence,
+      pending_drafts_cap,
+      lead_backlog_cap,
+      objective,
+      classifier_threshold,
+      brand_config,
+      discovery_enabled,
+      classifier_enabled,
+      drafter_enabled,
+      notifications_enabled,
+      profiler_enabled,
+      watchlist_enabled,
+      dm_autodraft_enabled,
+      linkedin_intro_dm_enabled,
+      pipeline_started_at,
+      goal_target,
+      goal_started_at,
+      discovery_config,
+      run_config,
+      icp_config,
+      lane_config,
+      account_feeder_config
+    from noelle.agent_instances
+    where role in ('linkedin_intern', 'x_intern')
+      and status = any(${["active", "paused"] as string[]})
+  `;
+  return [...rows];
+}
