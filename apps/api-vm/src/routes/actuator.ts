@@ -1598,3 +1598,203 @@ actuator.post("/api/reddit-reply-claim", async c => {
       dailyCapRaw: process.env.NOELLE_REDDIT_ACTUATOR_DAILY_WRITE_CAP,
     });
     return result === "claimed" ? c.json({ claimed: true }) : c.json({ error: result }, 409);
+  } catch {
+    return c.json({ error: "reddit_claim_unavailable" }, 503);
+  }
+});
+
+// GET /api/actionable-reddit: the Reddit sibling of /api/actionable-x, reply-only.
+// The extension polls this, posts each reply from the operator's logged-in
+// reddit.com tab (under the source post OR a specific comment), then calls the
+// shared /api/actuator/mark-sent/:id. No votes — ever (see reddit-actuator.ts).
+//
+// Env knobs (read via process.env, matching the X actuator; not consumed via
+// loadEnv — see env.ts for the discoverability note):
+//   NOELLE_REDDIT_ACTUATOR_DAILY_WRITE_CAP        default 8   (server-side reply/day backstop)
+//   NOELLE_REDDIT_ACTUATOR_HALT_ON_CHALLENGE      default OFF (opt-in challenge/throttle circuit-breaker)
+//   NOELLE_REDDIT_ACTUATOR_BLOCK_EXTERNAL_LINKS   default ON  (withhold link-bearing replies; set "0" to allow)
+actuator.use("/api/actionable-reddit", requireActuatorToken);
+
+actuator.get("/api/actionable-reddit", async (c) => {
+  const { orgId } = c.get("actuator");
+  const instanceId = c.req.query("instanceId");
+  if (!instanceId) return c.json({ error: "missing_instance_id" }, 400);
+  const sql = noelleDb();
+
+  // Verify the instance belongs to the configured actuator org (tenancy).
+  const owns = await sql<Array<{ id: string; reply_send_enabled: boolean; auto_send_enabled: boolean }>>`
+    select id, reply_send_enabled, auto_send_enabled from noelle.agent_instances
+    where id = ${instanceId} and org_id = ${orgId} limit 1
+  `;
+  if (owns.length === 0) return c.json({ error: "instance_not_in_org" }, 403);
+  // Consent gate, two flags, both OFF by default (serve an empty queue — still
+  // 200 so the extension keeps polling), mirroring /api/actionable-linkedin:
+  //   - reply_send_enabled (0081): per-run consent for a manual Run/Drain.
+  //   - auto_send_enabled: STANDING lights-out consent, set from the dashboard
+  //     and never touched by the extension — this is what lets the extension's
+  //     unattended auto-drain path (which deliberately never arms
+  //     reply_send_enabled) serve a queue.
+  // pauseAllSending clears BOTH, so the panic stop stays a real org-wide kill.
+  // Every withhold gate below (challenge breaker, daily cap, link guard) applies
+  // to both consent paths unchanged.
+  if (owns[0]!.reply_send_enabled !== true && owns[0]!.auto_send_enabled !== true) {
+    return c.json(ActionableRedditResponseSchema.parse({ replies: [] }));
+  }
+
+  // Circuit-breaker: if the actuator recorded a Reddit challenge/throttle in the
+  // last hour, halt this org's send queue — replying into a live challenge or a
+  // rate-limit throttle is the fast path to a suspension and nobody is watching.
+  // Fail-CLOSED: a query error halts. Auto-recovers once the hour elapses clean.
+  // Flag defaults OFF (opt-in); enable with '1'/'true'.
+  const haltOnChallenge =
+    process.env.NOELLE_REDDIT_ACTUATOR_HALT_ON_CHALLENGE === "1" ||
+    process.env.NOELLE_REDDIT_ACTUATOR_HALT_ON_CHALLENGE === "true";
+  if (haltOnChallenge) {
+    let recentChallenges: number | null = null;
+    try {
+      const chal = await sql<Array<{ n: number }>>`
+        select count(*)::int as n from noelle.reddit_activity
+        where organization_id = ${orgId}
+          and reason in ('challenge', 'throttle')
+          and created_at >= now() - interval '1 hour'
+      `;
+      recentChallenges = chal[0]?.n ?? 0;
+    } catch (e) {
+      console.warn("[actuator] reddit challenge-halt check failed; failing closed",
+        (e as Error).message);
+      recentChallenges = null; // fail closed
+    }
+    if (shouldHaltForChallenge({ flagEnabled: true, recentChallengeCount: recentChallenges })) {
+      console.warn("[actuator] Reddit send HALTED: recent challenge/throttle",
+        { org_id: orgId, recentChallenges });
+      return c.json(ActionableRedditResponseSchema.parse({ replies: [] }));
+    }
+  }
+
+  // Newest-DRAFT-first: Reddit post ids are base36 (not time-ordered numerics
+  // like X snowflakes), so there is no reliable in-SQL "newest post" sort; order
+  // by approval recency, matching the LinkedIn queue.
+  const rows = await sql<RedditJoinedRow[]>`
+    select
+      a.id            as approval_id,
+      d.id            as draft_id,
+      l.id            as lead_id,
+      d.payload       as draft_payload,
+      l.payload       as lead_payload,
+      l.external_id   as lead_external_id,
+      l.author_handle as author_handle,
+      l.external_id   as external_id
+    from noelle.approvals a
+    join noelle.drafts d on d.id = a.draft_id
+    join noelle.leads  l on l.id = d.lead_id
+    where a.agent_instance_id = ${instanceId}
+      and a.org_id = ${orgId} and l.platform = 'reddit'
+      and ${replyApprovalContextSql(sql)}
+      and a.status = 'pending'
+      and l.platform = 'reddit'
+    order by a.created_at desc
+    limit 500 -- TODO: paginate if a pending queue ever exceeds this
+  `;
+  // External-link guard (default ON): withhold any reply whose body carries a
+  // non-reddit link — a top-tier spam signal. Reddit-internal links (reddit.com /
+  // redd.it) are allowed. Off via "0".
+  const blockExternalLinks = (process.env.NOELLE_REDDIT_ACTUATOR_BLOCK_EXTERNAL_LINKS ?? "1") !== "0";
+  const out = buildActionableReddit(
+    rows,
+    (reason, r) => console.warn("[actuator] reddit item omitted:", reason, { approval_id: r.approval_id, draft_id: r.draft_id }),
+    { blockExternalLinks },
+  );
+
+  // Persistent dedup-by-thread (always on; ports the LinkedIn dedup-by-link):
+  // never serve a reply for a thread already replied to — any session, any lead,
+  // any prior markSent outcome. Keyed on the bare t3 post id, built two ways and
+  // unioned:
+  //   Source B (authoritative, covers ALL history with no backfill): every reply
+  //     approval already marked 'sent' → its thread's id via the lead's
+  //     external_id. This is the record of "we sent a reply here".
+  //   Source A (safety net for the markSent-failed edge): reply rows the
+  //     extension stamped with the post id at post time — written independently
+  //     of markSent, so a thread that DID get a reply but whose approval is still
+  //     'pending' (markSent never confirmed) is still blocked.
+  // Fail CLOSED: a second comment in someone's thread is the exact spam we're
+  // preventing, so on a query error serve nothing (still 200 so the extension
+  // keeps polling).
+  let served: ActionableRedditResponse = out;
+  try {
+    const repliedRows = await sql<Array<{ post_id: string }>>`
+      select distinct post_id from (
+        select post_id
+          from noelle.reddit_activity
+          where organization_id = ${orgId} and type = 'reply' and post_id is not null
+        union
+        select le.external_id as post_id
+          from noelle.approvals a
+          join noelle.drafts d  on d.id = a.draft_id
+          join noelle.leads  le on le.id = a.lead_id
+          where a.org_id = ${orgId}
+            and a.status = 'sent'
+            and le.platform = 'reddit'
+            and le.external_id is not null
+            and coalesce(d.payload->>'kind', 'reply') = 'reply'
+      ) s
+    `;
+    // Ids are stored bare, but normalize defensively (a t3_-prefixed id from any
+    // source still matches target.post_id, which buildActionableReddit strips).
+    const repliedIds = new Set(repliedRows.map((r) => readRedditThingId(r.post_id, "post")).filter((x): x is string => !!x));
+    const claimedIds = await readClaimedRedditPosts(sql, orgId,
+      out.replies.flatMap(reply => reply.target.post_id ? [reply.target.post_id] : []));
+    for (const id of claimedIds) repliedIds.add(id);
+    served = dedupeAlreadyRepliedReddit(out, repliedIds);
+    const dropped = out.replies.length - served.replies.length;
+    if (dropped > 0) {
+      console.warn("[actuator] reddit dedup-by-thread: dropped already-replied threads", { org_id: orgId, dropped });
+    }
+  } catch (err) {
+    console.error("[actuator] reddit dedup-by-thread query failed; serving empty queue", err);
+    return c.json(ActionableRedditResponseSchema.parse({ replies: [] }));
+  }
+
+  // Server-side daily write-cap backstop. Client caps are advisory (a tampered or
+  // misconfigured extension can exceed them), so refuse to serve replies beyond
+  // the org's remaining daily write budget. Default 8 — Reddit tolerates far fewer
+  // comment writes/day than X before shadowbanning a young account. Unset stays
+  // capped; only NOELLE_REDDIT_ACTUATOR_DAILY_WRITE_CAP=off (or "unlimited")
+  // lifts it, and when unlimited the usage count is skipped entirely (nothing to
+  // compare against).
+  const dailyCap = resolveRedditDailyWriteCap(process.env.NOELLE_REDDIT_ACTUATOR_DAILY_WRITE_CAP);
+  const used = dailyCap === Number.POSITIVE_INFINITY ? 0 : await readRedditReplyUsage(sql, orgId);
+  const remaining = Math.max(0, dailyCap - used);
+  if (served.replies.length > remaining) {
+    const replies = served.replies.slice(0, remaining);
+    console.warn("[actuator] reddit daily write-cap trim", {
+      org_id: orgId, cap: dailyCap, used,
+      served: replies.length,
+      withheld: served.replies.length - replies.length,
+    });
+    return c.json(ActionableRedditResponseSchema.parse({ replies }));
+  }
+  return c.json(ActionableRedditResponseSchema.parse(served));
+});
+
+actuator.use("/api/reddit-activity", requireActuatorToken);
+
+actuator.post("/api/reddit-activity", async (c) => {
+  const { orgId } = c.get("actuator");
+  const body = RedditActivityInSchema.parse(await c.req.json());
+  const sql = noelleDb();
+  // org-scoped from the token; agent_instance_id is reserved (the wire contract
+  // carries no instance id) and stays null. `at` is the client event time, stored
+  // verbatim; all time-window filters use the server-trusted created_at default.
+  // The optional `engagement` discriminator (upvote|save on an "upvote" event) is
+  // ACCEPTED by the schema but deliberately NOT persisted — there is no
+  // reddit_activity.engagement column and this change adds no migration; the
+  // enumerated insert below simply omits it (a save still counts as an upvote row).
+  const values = body.events.map((e) => ({
+    organization_id: orgId,
+    session_id: body.session_id,
+    type: e.type,
+    approval_id: e.approval_id ?? null,
+    post_id: e.post_id ?? null,
+    comment_id: e.comment_id ?? null,
+    subreddit: e.subreddit ?? null,
+    reason: e.reason ?? null,
