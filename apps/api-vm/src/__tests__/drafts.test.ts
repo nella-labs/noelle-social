@@ -598,3 +598,203 @@ describe("POST /api/drafts/:id/send", () => {
       sent_external_id: string;
       sent_url: string;
     };
+    expect(json.error).toBe("db_write_failed_after_post");
+    expect(json.sent_external_id).toBe("999");
+  });
+});
+
+describe("POST /api/drafts/:id/mark-sent", () => {
+  it("flips to sent, writes a sentinel, skips siblings — and never posts to X", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-A",
+        org_id: "org-1",
+        draft_id: "draft-A",
+        lead_id: "lead-1",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: "synthetic-nella-fit-123",
+      },
+      siblingIds: ["appr-B", "appr-C"],
+    });
+    // An X client that throws on any post — if the route called X, the
+    // request would error. A 200 proves the manual path never touched X.
+    const xClient = makeXClientStub({ throws: new XError("must not be called", 500) });
+    const app = await buildApp({ sql: fakeSql, xClient });
+
+    const res = await app.request("/api/drafts/appr-A/mark-sent", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      approval_id: string;
+      draft_id: string;
+      status: string;
+      sent_via: string;
+      sibling_skipped: number;
+    };
+    expect(json.approval_id).toBe("appr-A");
+    expect(json.status).toBe("sent");
+    expect(json.sent_via).toBe("manual");
+    expect(json.sibling_skipped).toBe(2);
+
+    // makeFakeSql returns `as never`; reach the recorded calls via a cast.
+    const calls = (fakeSql as unknown as { __calls: SqlCall[] }).__calls;
+
+    // The send-worker-safety sentinel must be written into drafts.sent_external_id.
+    const wroteSentinel = calls.some(
+      (c) => /update noelle\.drafts/i.test(c.text) && /manual:/.test(c.text),
+    );
+    expect(wroteSentinel).toBe(true);
+
+    // ...and guarded by `sent_external_id is null` so a concurrent /send that
+    // already wrote a real tweet id is never clobbered with the sentinel.
+    const guardedDraftWrite = calls.some(
+      (c) =>
+        /update noelle\.drafts/i.test(c.text) &&
+        /sent_external_id is null/i.test(c.text),
+    );
+    expect(guardedDraftWrite).toBe(true);
+
+    // The approval was flipped to sent (not via the sibling-skip update).
+    const flippedSent = calls.some(
+      (c) =>
+        /update noelle\.approvals/i.test(c.text) &&
+        /status\s*=\s*'sent'/i.test(c.text),
+    );
+    expect(flippedSent).toBe(true);
+  });
+
+  it("returns sibling_skipped=0 when the lead has a single angle", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-solo",
+        org_id: "org-1",
+        draft_id: "draft-solo",
+        lead_id: "lead-solo",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: "111",
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-solo/mark-sent", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { sibling_skipped: number };
+    expect(json.sibling_skipped).toBe(0);
+  });
+
+  it("is idempotent: echoes the existing sent_at for an already-sent approval", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-already",
+        org_id: "org-1",
+        draft_id: "draft-already",
+        lead_id: "lead-already",
+        status: "sent",
+        decided_at: "2026-01-15T10:30:00.000Z",
+        lead_external_id: "111",
+      },
+      siblingIds: [],
+      manualReceipt: "manual:draft-already",
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-already/mark-sent", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { sent_at: string; sent_via: string };
+    expect(json.sent_at).toBe("2026-01-15T10:30:00.000Z");
+    expect(json.sent_via).toBe("manual");
+  });
+
+  it("returns 409 already_actioned when the approval was skipped", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-skipped",
+        org_id: "org-1",
+        draft_id: "draft-skipped",
+        lead_id: "lead-skipped",
+        status: "skipped",
+        decided_at: "2026-01-15T10:30:00.000Z",
+        lead_external_id: "111",
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-skipped/mark-sent", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(409);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toBe("already_actioned");
+  });
+
+  it("returns 404 when the approval id is unknown", async () => {
+    const fakeSql = makeFakeSql({ approval: null, siblingIds: [] });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/unknown/mark-sent", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /api/drafts/:id/save-edit", () => {
+  it("persists edited_body (+ edited=true) without touching approval status", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-edit",
+        org_id: "org-1",
+        draft_id: "draft-edit",
+        lead_id: "lead-edit",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: null,
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-edit/save-edit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "my edited reply" }),
+    });
+
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      approval_id: string;
+      draft_id: string;
+      saved: boolean;
+    };
+    expect(json.approval_id).toBe("appr-edit");
+    expect(json.draft_id).toBe("draft-edit");
+    expect(json.saved).toBe(true);
+
+    const calls = (fakeSql as unknown as { __calls: SqlCall[] }).__calls;
+    // It writes edited_body into the draft payload...
+    const wroteEdit = calls.some(
+      (c) =>
+        /update noelle\.drafts/i.test(c.text) &&
+        /edited_body/i.test(JSON.stringify(c.values)),
+    );
+    expect(wroteEdit).toBe(true);
