@@ -1398,3 +1398,203 @@ describe("runDrafterTick", () => {
     expect(n).toBe(0);
     expect(postOutbound).not.toHaveBeenCalled();
     // surfaced as errored (visible), NOT silently skipped
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "errored", meta: expect.objectContaining({ error: "priority_model_skip" }) }),
+    );
+    expect(markStatus).not.toHaveBeenCalledWith(expect.objectContaining({ status: "skipped" }));
+  });
+
+  it("treats prose 'no nella connection' reasoning as a skip", async () => {
+    const postOutbound = vi.fn();
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text:
+          "The lead post is just a joke meme. There is no mention of agents, hallucinated imports, codebase indexing, or any Nella surface area — no nella connection here, recommending skip.",
+        engine: "bedrock",
+        model: "claude-sonnet-4-6",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "Lprose", external_id: "xprose", payload: { text: "meme" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ status: "skipped" }));
+  });
+
+  it("still errors when output is unrelated prose with no skip intent", async () => {
+    const postOutbound = vi.fn();
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: "Let me think about this carefully and produce drafts in a moment...",
+        engine: "bedrock",
+        model: "claude-sonnet-4-6",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "Lerr", external_id: "xerr", payload: { text: "post" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ status: "errored" }));
+  });
+
+  it("skips lead without calling runner when top anchor score is below threshold", async () => {
+    const postOutbound = vi.fn();
+    const draft = vi.fn();
+    const runner = { draft };
+    // All anchors below the default threshold of 1.5.
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p1.md", snippet: "weak", score: 0.4, filePath: "p1.md", startLine: 1, endLine: 1, highlights: [] },
+        { path: "p2.md", snippet: "weaker", score: 0.2, filePath: "p2.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "Lbelow", external_id: "xbelow", payload: { text: "some post about unrelated topic" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+
+    expect(n).toBe(0);
+    expect(draft).not.toHaveBeenCalled();
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith({
+      leadId: "Lbelow",
+      status: "skipped",
+      meta: expect.objectContaining({
+        skip_reason: expect.stringContaining("below-relevance-threshold"),
+        top_anchor_score: 0.4,
+        relevance_threshold: 1.5,
+      }),
+    });
+  });
+
+  it("drafts lead when top anchor score meets the threshold", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "ok", approval_id: "ok" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e", char_count: 1 },
+            { angle: "technical", body: "t", char_count: 1 },
+            { angle: "contrarian", body: "c", char_count: 1 },
+          ],
+        }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    // Top anchor at 2.4 — comfortably above the 1.5 threshold.
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p1.md", snippet: "strong overlap", score: 2.4, filePath: "p1.md", startLine: 1, endLine: 1, highlights: [] },
+        { path: "p2.md", snippet: "weaker", score: 0.4, filePath: "p2.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "Labove", external_id: "xabove", payload: { text: "on-topic post about agents" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+
+    expect(n).toBe(1);
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ leadId: "Labove", status: "drafted" }),
+    );
+  });
+
+  it("skips a non-priority lead below the classifier quality threshold without searching the KB or drafting", async () => {
+    const postOutbound = vi.fn();
+    const draft = vi.fn();
+    const runner = { draft };
+    const search = vi.fn().mockResolvedValue([]);
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "Lq", external_id: "xq", payload: { text: "low quality post" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: "thought", classifier_score: 0.3, priority: false },
+      ],
+      runner: runner as never,
+      kb: { search } as never,
+      postOutbound,
+      markStatus,
+      qualityThreshold: 0.5,
+    });
+    expect(n).toBe(0);
+    expect(search).not.toHaveBeenCalled();
+    expect(draft).not.toHaveBeenCalled();
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leadId: "Lq",
+        status: "skipped",
+        meta: expect.objectContaining({ skip_reason: expect.stringContaining("below-quality-threshold") }),
+      }),
+    );
+  });
+
+  // CONTRACT CHANGE: this used to assert that an unscored lead is SKIPPED. That
+  // was fail-CLOSED — a classifier outage silently dropped every keyword lead —
+  // and it contradicted the fail-open contract Lyra and Orion implement. A null
+  // score means the scoring call failed, not that the lead is junk (over 90 days
+  // 399 `label=other` leads carry a score and 193 do not), so the lead now
+  // proceeds to drafting where the relevance gate and verifier still apply.
