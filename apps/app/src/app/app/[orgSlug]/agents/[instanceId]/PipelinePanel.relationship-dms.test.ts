@@ -198,3 +198,89 @@ describe("PipelinePanel relationship DMs", () => {
     let resolveSave!: (value: {
       ok: false;
       error: { code: string; message: string };
+    }) => void;
+    actions.setRelationshipDmsEnabled.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSave = resolve;
+      }),
+    );
+
+    await act(async () => {
+      root.render(
+        createElement(PipelinePanel, {
+          orgSlug: "operator",
+          instanceId: "22222222-2222-2222-2222-222222222222",
+          snapshot: snapshot("paused"),
+          agentRole: "linkedin_intern",
+          relationshipDms: {
+            platform: "linkedin",
+            enabled: false,
+            approvalsHref: "/app/operator/approvals?stream=linkedin-intern",
+          },
+        }),
+      );
+    });
+
+    const toggle = container.querySelector<HTMLInputElement>(
+      'input[aria-label="Friendly DMs"]',
+    )!;
+
+    await act(async () => {
+      toggle.click();
+    });
+    expect(toggle.checked).toBe(true);
+    expect(toggle.disabled).toBe(true);
+
+    await act(async () => {
+      resolveSave({
+        ok: false,
+        error: { code: "bad_save", message: "Could not save DMs" },
+      });
+    });
+
+    expect(toggle.checked).toBe(false);
+    expect(toggle.disabled).toBe(false);
+    expect(container.textContent).toContain("Could not save DMs");
+  });
+
+  it("renders the X cap and never renders Friendly DMs for Orion", async () => {
+    await act(async () => {
+      root.render(
+        createElement(PipelinePanel, {
+          orgSlug: "operator",
+          instanceId: "11111111-1111-1111-1111-111111111111",
+          snapshot: snapshot("active"),
+          agentRole: "x_intern",
+          relationshipDms: {
+            platform: "x",
+            enabled: true,
+            approvalsHref: "/app/operator/approvals?kind=dm_request&stream=x-intern",
+          },
+        }),
+      );
+    });
+
+    expect(container.textContent).toContain("Friendly DMs");
+    expect(container.textContent).toContain("15/day");
+
+    await act(async () => {
+      root.render(
+        createElement(PipelinePanel, {
+          orgSlug: "operator",
+          instanceId: "5a81bc63-4fad-42a1-a50c-e67ba1ae3a1d",
+          snapshot: {
+            ...snapshot("paused"),
+            workers: [
+              worker("discovery", { state: "disabled", runsWhilePaused: false }),
+              worker("classifier", { state: "disabled", runsWhilePaused: false }),
+              worker("drafter", { state: "disabled", runsWhilePaused: false }),
+            ],
+          },
+          agentRole: "reddit_intern",
+        }),
+      );
+    });
+
+    expect(container.textContent).not.toContain("Friendly DMs");
+  });
+});
