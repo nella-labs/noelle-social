@@ -198,3 +198,203 @@ async function boot(mode: Mode, options: { stopBeforeClaim?: boolean } = {}) {
     "fetch",
     vi.fn(() => {
       throw new Error("network forbidden");
+    }),
+  );
+  seams.moveAndClick.mockImplementation(async (_id: number, rect: { x: number }) => {
+    focusedX = rect.x;
+    if (rect.x === 10) {
+      document.querySelector("article")!.insertAdjacentHTML("beforeend", replyBox);
+      return;
+    }
+    if (rect.x === 30) {
+      clicked = true;
+      if (mode === "thread-clear") {
+        document.getElementById("body")!.textContent = "";
+      }
+      if (mode === "thread-gone") {
+        document.querySelector('[componentkey="commentBox-target"]')!.remove();
+      }
+      if (mode === "thread-anchor-missing") document.querySelector("article")!.remove();
+      if (mode === "post-click") {
+        document.getElementById("editor")!.textContent = "";
+      }
+    }
+  });
+  seams.typeText.mockImplementation(async (_id: number, text: string) => {
+    document.getElementById(thread ? "body" : "editor")!.textContent = text;
+    if (mode === "thread-unrelated")
+      document.body.insertAdjacentHTML(
+        "afterbegin",
+        '<div class="comments-comment-box"><div contenteditable="true" role="textbox" data-x="200" id="unrelated">unrelated comment draft</div></div><div class="msg-form"><div contenteditable="true" role="textbox" data-x="300">private operator draft</div></div>',
+      );
+    if (
+      ["post-meta", "post-ctrl", "post-lost-box", "post-meta-lost", "post-other-body"].includes(
+        mode,
+      )
+    )
+      document.querySelector('button[type="submit"]')!.remove();
+    if (mode === "post-other-body")
+      document.getElementById("editor")!.textContent = "An unrelated operator comment";
+  });
+  seams.pressSubmitChord.mockImplementation(async (_id: number, mod: number) => {
+    clicked = true;
+    if (mode === "post-meta-lost" && mod === 4)
+      document.body.innerHTML =
+        '<div class="msg-form"><div contenteditable="true" role="textbox">private operator draft</div></div>';
+    if ((mode === "post-meta" && mod === 4) || (mode === "post-ctrl" && mod === 2))
+      document.getElementById("editor")!.textContent = "";
+  });
+  seams.clearFocusedEditor.mockImplementation(async () => {
+    const editor = document.querySelector(`[contenteditable="true"][data-x="${focusedX}"]`);
+    const node = editor?.querySelector("#body") ?? editor;
+    if (node) node.textContent = "";
+  });
+  if (mode === "post-lost-box") {
+    const original = chrome.tabs.sendMessage;
+    chrome.tabs.sendMessage = vi.fn(async (id: number, msg: Parameters<Handler>[0]) => {
+      if (msg.cmd === "locateCommentSubmit" && !lost) {
+        lost = true;
+        document.body.innerHTML =
+          '<div class="msg-form"><div contenteditable="true" role="textbox" data-x="200">private operator draft</div></div>';
+      }
+      return original(id, msg);
+    });
+  }
+  vi.resetModules();
+  const content = await import("../src/content/index.js");
+  content.initContent();
+  await import("../src/background/index.js");
+  expect(listeners).toHaveLength(2);
+  const tick = () =>
+    new Promise<Response>((resolve) => {
+      expect(listeners[1]!({ cmd: "tick" }, {}, resolve)).toBe(true);
+    });
+  return {
+    tick,
+    contentCommand,
+    sessionValues,
+    chrome,
+    snapshot: () => structuredClone(sessionValues["actuator.runstate"]) as RunState,
+  };
+}
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-10-06T15:00:00Z"));
+  vi.clearAllMocks();
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: HTMLElement,
+  ) {
+    const x = Number(this.getAttribute("data-x") ?? 1);
+    return {
+      x,
+      y: 20,
+      width: 40,
+      height: 20,
+      top: 20,
+      left: x,
+      right: x + 40,
+      bottom: 40,
+      toJSON: () => ({}),
+    } as DOMRect;
+  });
+  seams.fetchQueue.mockResolvedValue({ comments: [{ approval_id: "approval" }], dms: [] });
+  seams.claimComment.mockResolvedValue({ claimed: true });
+  for (const name of [
+    "markSent",
+    "markSkipped",
+    "logActivity",
+    "enableSend",
+    "ackIntent",
+    "attach",
+    "detach",
+    "detachAll",
+    "wheel",
+  ] as const)
+    seams[name].mockResolvedValue(undefined);
+});
+afterEach(async () => {
+  for (let i = 0; i < 30; i++) await Promise.resolve();
+  vi.clearAllTimers();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  document.body.innerHTML = "";
+});
+function observation(mode: Mode, h: Awaited<ReturnType<typeof boot>>) {
+  const value = {
+    mode,
+    done: h.snapshot().done,
+    doneDraftIds: h.snapshot().doneDraftIds,
+    markSent: seams.markSent.mock.calls,
+    claim: seams.claimComment.mock.calls,
+    chords: seams.pressSubmitChord.mock.calls.map((args) => args[1]),
+    events: seams.logActivity.mock.calls,
+    visibleText: document.getElementById("editor")?.textContent ?? null,
+  };
+  return value;
+}
+describe("actual registered worker tick composed with current content handler", () => {
+  it.each(["thread-clear", "thread-gone"] as const)(
+    "healthy %s confirms one threaded reply",
+    async (mode) => {
+      const h = await boot(mode);
+      expect(await h.tick()).toEqual({ ok: true });
+      const seen = observation(mode, h);
+      expect(seen.markSent).toHaveLength(1);
+      expect(seen.done.comments).toBe(1);
+      expect(seen.claim).toHaveLength(1);
+      expect(seen.chords).toEqual([]);
+    },
+  );
+  it.each(["thread-still", "thread-read-error"] as const)(
+    "%s cannot falsely mark the unchanged or unreadable reply sent",
+    async (mode) => {
+      const h = await boot(mode);
+      expect(await h.tick()).toEqual({ ok: true });
+      const seen = observation(mode, h);
+      expect(seen.claim).toHaveLength(1);
+      expect(seen.markSent).toHaveLength(0);
+      expect(seen.done.comments).toBe(0);
+      expect(seen.doneDraftIds).toContain("draft");
+      expect(seen.chords).toEqual([]);
+    },
+  );
+  it.each([
+    ["post-click", []],
+    ["post-meta", [4]],
+    ["post-ctrl", [4, 2]],
+  ] as const)("healthy %s stops fallback after measured clearing", async (mode, chords) => {
+    const h = await boot(mode);
+    expect(await h.tick()).toEqual({ ok: true });
+    const seen = observation(mode, h);
+    expect(seen.done.comments).toBe(1);
+    expect(seen.markSent).toHaveLength(1);
+    expect(seen.claim).toHaveLength(1);
+    expect(seen.chords).toEqual(chords);
+  });
+  it("post-lost-box sends no Meta/CtrlEnter into a remaining private message editor", async () => {
+    const h = await boot("post-lost-box");
+    expect(await h.tick()).toEqual({ ok: true });
+    const seen = observation("post-lost-box", h);
+    expect(seen.chords).toEqual([]);
+    expect(seen.markSent).toHaveLength(0);
+    expect(document.querySelector(".msg-form")!.textContent).toBe("private operator draft");
+  });
+  it("post-read-error remains unconfirmed without false success", async () => {
+    const h = await boot("post-read-error");
+    expect(await h.tick()).toEqual({ ok: true });
+    const seen = observation("post-read-error", h);
+    expect(seen.markSent).toHaveLength(0);
+    expect(seen.done.comments).toBe(0);
+    expect(seen.doneDraftIds).toContain("draft");
+  });
+
+  it.each([
+    "thread-still",
+    "thread-read-error",
+    "thread-anchor-missing",
+    "thread-malformed-read",
+  ] as const)("%s retains the claim without a second tick dispatch", async (mode) => {
+    const h = await boot(mode);
+    expect(await h.tick()).toEqual({ ok: true });
+    expect(h.snapshot().done.comments).toBe(0);
