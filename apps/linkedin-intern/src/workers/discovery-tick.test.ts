@@ -398,3 +398,203 @@ describe("runDiscoveryTick — tailored run filters", () => {
         postsSource: { profilePosts },
         discoveryLimit: 5,
         dailyExtractCap: CAP,
+        alreadyExtractedToday: 0,
+        upsertLead: upsert,
+        filters: { timeWindowHours: 12, minReactions: null, minComments: null },
+      });
+
+      // sinceISO = later of (added_at, now − 12h) = the window bound.
+      expect(profilePosts).toHaveBeenCalledWith(
+        expect.objectContaining({ sinceISO: "2026-06-09T12:00:00.000Z" }),
+      );
+      // Client-side backstop: the 48h-old post is dropped, the 6h-old one kept.
+      expect(inserted).toBe(1);
+      expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "fresh" }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("without filters, sinceISO stays the person's added_at (no window narrowing)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const profilePosts = vi.fn().mockResolvedValue([]);
+
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      postsSource: { profilePosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+      filters: { timeWindowHours: null, minReactions: null, minComments: null },
+    });
+
+    expect(profilePosts).toHaveBeenCalledWith(
+      expect.objectContaining({ sinceISO: "2026-06-01T00:00:00.000Z" }),
+    );
+  });
+});
+
+describe("runDiscoveryTick — keyword (search) lane", () => {
+  // A search post carries its OWN (stranger) author + an author.type.
+  const searchPost = (id: string, opts: { reactions?: number; type?: string; publicId?: string | null } = {}) => ({
+    ...post(id),
+    reactions: opts.reactions ?? 50,
+    author: {
+      name: "Stranger Founder",
+      publicId: opts.publicId === undefined ? `stranger-${id}` : opts.publicId,
+      url: "https://www.linkedin.com/in/stranger",
+      headline: "Building in public",
+      type: opts.type ?? "member",
+    },
+  });
+
+  const kwConfig = { searchLimit: 15, minReactions: 10, postedLimit: "week" };
+
+  it("searches each keyword and upserts results as keyword-source leads (author_id null)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const searchPosts = vi
+      .fn()
+      .mockResolvedValueOnce([searchPost("s1"), searchPost("s2")])
+      .mockResolvedValueOnce([searchPost("s3"), searchPost("s4")]);
+    const profilePosts = vi.fn().mockResolvedValue([]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      keywords: ["ai agents", "yc"],
+      keywordConfig: kwConfig,
+      postsSource: { profilePosts, searchPosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(searchPosts).toHaveBeenCalledTimes(2); // one per keyword
+    expect(searchPosts).toHaveBeenCalledWith(
+      expect.objectContaining({ queries: ["ai agents"], maxPosts: 15, postedLimit: "week" }),
+    );
+    expect(inserted).toBe(4);
+    const call = upsert.mock.calls[0]![0];
+    expect(call.authorHandle).toBe("stranger-s1");
+    expect(call.authorId).toBeNull();
+    expect(call.payload.source).toBe("keyword");
+    expect(call.payload.keyword).toBe("ai agents");
+  });
+
+  it("threads post.images onto keyword-lane leads (parity with the watch lane)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const withImages = {
+      ...searchPost("s1"),
+      images: ["https://media.licdn.com/x.jpg", "https://media.licdn.com/y.jpg"],
+    };
+    const searchPosts = vi.fn().mockResolvedValueOnce([withImages]);
+
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      keywords: ["ai agents"],
+      keywordConfig: kwConfig,
+      postsSource: { profilePosts: vi.fn().mockResolvedValue([]), searchPosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(upsert.mock.calls[0]![0].payload.images).toEqual([
+      "https://media.licdn.com/x.jpg",
+      "https://media.licdn.com/y.jpg",
+    ]);
+  });
+
+  it("omits the images key on a text-only keyword-lane post", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const searchPosts = vi.fn().mockResolvedValueOnce([searchPost("s1")]);
+
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      keywords: ["ai agents"],
+      keywordConfig: kwConfig,
+      postsSource: { profilePosts: vi.fn().mockResolvedValue([]), searchPosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect("images" in upsert.mock.calls[0]![0].payload).toBe(false);
+  });
+
+  it("skips company-authored posts (objective targets people, not company promo)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const searchPosts = vi
+      .fn()
+      .mockResolvedValue([searchPost("co", { type: "company" }), searchPost("person", { type: "member" })]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      keywords: ["startup"],
+      keywordConfig: kwConfig,
+      postsSource: { profilePosts: vi.fn().mockResolvedValue([]), searchPosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "person" }));
+  });
+
+  it("drops posts below the keyword reaction floor (the lane's whole purpose)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const searchPosts = vi
+      .fn()
+      .mockResolvedValue([searchPost("lo", { reactions: 4 }), searchPost("hi", { reactions: 99 })]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      keywords: ["startup"],
+      keywordConfig: { ...kwConfig, minReactions: 10 },
+      postsSource: { profilePosts: vi.fn().mockResolvedValue([]), searchPosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "hi" }));
+  });
+
+  it("skips a search post with no resolvable author public id", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const searchPosts = vi.fn().mockResolvedValue([searchPost("x", { publicId: null })]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      keywords: ["startup"],
+      keywordConfig: kwConfig,
+      postsSource: { profilePosts: vi.fn().mockResolvedValue([]), searchPosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(0);
+    expect(upsert).not.toHaveBeenCalled();
