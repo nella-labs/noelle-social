@@ -198,3 +198,203 @@ export function ScheduleCalendar({
                 const isOver = dragOver === day;
                 return (
                   <div
+                    key={day}
+                    onDragOver={(e) => { e.preventDefault(); setDragOver(day); }}
+                    onDragLeave={() => setDragOver((d) => (d === day ? null : d))}
+                    onDrop={() => onDrop(day)}
+                    style={{
+                      minHeight: 104,
+                      padding: "5px 6px 7px",
+                      borderRight: dayIdx === 6 ? "none" : "1px solid var(--rule)",
+                      borderTop: "1px solid var(--rule)",
+                      background: isOver
+                        ? `color-mix(in oklch, ${laneColor} 10%, var(--paper-2))`
+                        : isToday
+                          ? "color-mix(in oklch, var(--accent) 5%, var(--paper-2))"
+                          : "var(--paper-2)",
+                      opacity: inMonth ? 1 : 0.42,
+                      transition: "background .12s",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                      <span style={{ fontSize: 12, fontWeight: isToday ? 700 : 500, color: isToday ? "var(--accent)" : "var(--ink-2)" }}>
+                        {dayOfMonth(day)}
+                      </span>
+                      {items.length > 0 ? (
+                        <span style={{ fontFamily: "var(--mono)", fontSize: 8.5, color: "var(--ink-soft)" }}>{items.length}</span>
+                      ) : null}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                      {items.slice(0, 3).map((s) => (
+                        <MiniChip
+                          key={s.id}
+                          slot={s}
+                          laneColor={laneColor}
+                          canAutoPost={canAutoPost}
+                          mutable={canMutateCalendarSlot(s, pending)}
+                          onDragStart={() => { if (canMutateCalendarSlot(s, pending)) dragId.current = s.id; }}
+                        />
+                      ))}
+                      {items.length > 3 ? (
+                        <span style={{ fontFamily: "var(--mono)", fontSize: 8.5, color: "var(--ink-soft)", paddingLeft: 2 }}>
+                          +{items.length - 3} more
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!visibleHasSlots && loaded && !fetching && !readError ? (
+        <div style={{ padding: "26px 18px", textAlign: "center", color: "var(--ink-muted)", fontSize: 13, borderTop: "1px solid var(--rule)" }}>
+          {emptyHint.replace("this week", `this ${view}`)}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function CalendarFeedback({ fetching, readError, mutationError, retry }: {
+  fetching: boolean; readError: boolean; mutationError: boolean; retry: () => void;
+}) {
+  if (!readError && !mutationError) return null;
+  return (
+    <div role="alert" style={{ padding: "10px 16px", borderBottom: "1px solid var(--rule)", color: "var(--danger)", fontSize: 12 }}>
+      {mutationError ? "Could not confirm the schedule change. Check the current calendar before trying again." : "Could not load this date range."}
+      {readError && <button type="button" className="btn btn-sm btn-ghost" disabled={fetching} onClick={retry} style={{ marginLeft: 8 }}>Retry load</button>}
+    </div>
+  );
+}
+
+function ViewToggle({ view, onChange }: { view: "week" | "month"; onChange: (value: "week" | "month") => void }) {
+  return (
+    <div className={styles.calendarToggle}>
+      {(["week", "month"] as const).map((value) => (
+        <button key={value} type="button" onClick={() => onChange(value)} aria-pressed={view === value}
+          className={view === value ? styles.calendarToggleActive : undefined}>{value}</button>
+      ))}
+    </div>
+  );
+}
+
+function NavBtn({ dir, onClick, disabled }: { dir: "prev" | "next"; onClick: () => void; disabled?: boolean }) {
+  return <button type="button" className={styles.calendarNav} onClick={onClick} disabled={disabled}
+    aria-label={dir === "prev" ? "Previous" : "Next"}>{dir === "prev" ? "‹" : "›"}</button>;
+}
+
+function MiniChip({
+  slot,
+  laneColor,
+  canAutoPost,
+  mutable,
+  onDragStart,
+}: {
+  slot: CalendarSlot;
+  laneColor: string;
+  canAutoPost: boolean;
+  mutable: boolean;
+  onDragStart: () => void;
+}) {
+  const meta = statusMeta(slot.status);
+  const text = (slot.hook ?? slot.preview ?? "Reserved").replace(/\s+/g, " ").trim();
+  const isAuto = canAutoPost && slot.autoPublish;
+  return (
+    <div
+      draggable={mutable}
+      onDragStart={onDragStart}
+      title={text}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+        padding: "2px 5px",
+        borderRadius: 5,
+        background: "var(--paper)",
+        boxShadow: "0 0 0 0.5px var(--rule)",
+        borderLeft: `2px solid ${isAuto ? laneColor : meta.color}`,
+        cursor: mutable ? "grab" : "default",
+      }}
+    >
+      <span style={{ flex: "0 0 auto", width: 4, height: 4, borderRadius: "50%", background: meta.color }} />
+      <span style={{ fontSize: 10, lineHeight: 1.3, color: "var(--ink-2)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+        {text}
+      </span>
+    </div>
+  );
+}
+
+function SlotChip({
+  slot,
+  time,
+  laneColor,
+  canAutoPost,
+  mutable,
+  onDragStart,
+  onSkip,
+}: {
+  slot: CalendarSlot;
+  time: string;
+  laneColor: string;
+  canAutoPost: boolean;
+  mutable: boolean;
+  onDragStart: () => void;
+  onSkip: () => void;
+}) {
+  const meta = statusMeta(slot.status);
+  const text = (slot.preview ?? slot.hook ?? "Reserved slot").replace(/\s+/g, " ").trim();
+  const isAuto = canAutoPost && slot.autoPublish;
+  return (
+    <div
+      draggable={mutable}
+      onDragStart={onDragStart}
+      title={text}
+      style={{
+        position: "relative",
+        background: "var(--paper)",
+        borderRadius: 12,
+        padding: "12px 11px",
+        boxShadow: "0 0 0 1px var(--rule)",
+        borderLeft: `2.5px solid ${meta.color}`,
+        cursor: mutable ? "grab" : "default",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, marginBottom: 3 }}>
+        <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--ink-muted)" }}>{time || "·"}</span>
+        {isAuto ? (
+          <span
+            className="tag"
+            style={{ fontSize: 8.5, height: 14, color: laneColor, background: `color-mix(in oklch, ${laneColor} 12%, var(--paper))`, boxShadow: `0 0 0 0.5px color-mix(in oklch, ${laneColor} 35%, var(--rule))` }}
+          >
+            auto
+          </span>
+        ) : (
+          <span style={{ fontFamily: "var(--mono)", fontSize: 8.5, color: meta.color, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+            {meta.label}
+          </span>
+        )}
+      </div>
+      <div
+        style={{
+          fontSize: 12,
+          lineHeight: 1.35,
+          color: "var(--ink-2)",
+          display: "-webkit-box",
+          WebkitLineClamp: 3,
+          WebkitBoxOrient: "vertical",
+          overflow: "hidden",
+        }}
+      >
+        {text}
+      </div>
+      {mutable && <button
+        type="button"
+        onClick={onSkip}
+        aria-label="Remove from schedule"
+        style={{
+          position: "absolute",
+          top: 4,
+          right: 4,
