@@ -398,3 +398,203 @@ export function buildActionableX(
         author_handle: handle,
         author_name: typeof lp.authorName === "string" ? lp.authorName.trim() || null : null,
       },
+    });
+  }
+  return { replies };
+}
+
+// Persistent dedup-by-link: drop any reply whose tweet was already replied to.
+// Keyed on the tweet's numeric status id carried on each item's target
+// (tweet_id = leads.external_id). Unlike the extension's in-memory per-run
+// guard (RunState.actionedUrls), this blocks a re-reply across browser
+// restarts, across a failed markSent, and across two leads that resolve to the
+// same tweet — a double reply on one tweet is a prime X spam signal. Items with
+// no tweet_id are left as-is (buildActionableX already omits them). Mirrors
+// dedupeAlreadyCommented (LinkedIn) but X-native. Pure/testable.
+export function dedupeAlreadyRepliedX(
+  built: ActionableXResponse,
+  repliedTweetIds: ReadonlySet<string>,
+): ActionableXResponse {
+  if (repliedTweetIds.size === 0) return built;
+  const replies = built.replies.filter(
+    (r) => !(r.target.tweet_id && repliedTweetIds.has(r.target.tweet_id)),
+  );
+  return { replies };
+}
+
+// Trim the served X reply queue to at most `cap` replies per author_handle/day
+// including confirmed replies earlier today. Rows MUST be newest-first; only
+// items that survived buildActionableX are counted. Mirrors capActionablePerAuthor
+// (LinkedIn) but X has no author_id and no dms, so it keys on author_handle only.
+export function capActionableXPerAuthor(
+  built: ActionableXResponse,
+  rows: XJoinedRow[],
+  args: { cap: number; writtenCounts: ReadonlyMap<string, number> },
+): ActionableXResponse {
+  const cap = Number.isFinite(args.cap) && args.cap >= 1 ? Math.floor(args.cap) : 1; // fail-safe → 1
+  const live = new Set(built.replies.map((i) => i.approval_id));
+  const counts = new Map<string, number>();
+  const keep = new Set<string>();
+  for (const r of rows) {
+    if (!live.has(r.approval_id)) continue; // only count actually-served items
+    const handle = r.author_handle?.trim().toLowerCase() || null;
+    const key = handle ?? `lead:${r.lead_id}`; // unknown-author rows never merge
+    const used = (args.writtenCounts.get(key) ?? 0) + (counts.get(key) ?? 0);
+    if (used >= cap) continue;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    keep.add(r.approval_id);
+  }
+  return { replies: built.replies.filter((i) => keep.has(i.approval_id)) };
+}
+
+// Resolve an actuator daily write-cap env var, fail-SAFE. Two deliberate choices
+// (deviating from the LinkedIn cap, which PR #426 flipped to unset ⇒ unlimited):
+// - unset/blank stays CAPPED at the platform default — X and Reddit ban at far
+//   lower write velocity than LinkedIn, so lifting this backstop must be an
+//   EXPLICIT opt-in: the sentinel "off"/"unlimited" ⇒ Infinity (callers then
+//   skip the usage count entirely — nothing to compare against).
+// - a non-numeric or negative value collapses to the default, never NaN —
+//   because `served.length > NaN` is always false, a NaN cap would silently
+//   NEVER trim the queue (fail-OPEN on a ban backstop).
+// Pure/testable; 0 is honored (serve nothing — the safe direction).
+// X's resolver is shared with the live actor cap endpoint.
+
+// ---------------------------------------------------------------------------
+// Reddit actuator (apps/reddit-actuator): the browser sibling of the X +
+// LinkedIn actuators for reddit.com. Reply-first — Orion (the Reddit intern) is
+// draft-only and there is no server-side Reddit credential, so the operator's own
+// logged-in reddit.com tab posts. The extension additionally performs operator-
+// opt-in UPVOTES (UPVOTE-ONLY, client-side hard-capped ≤10 per rolling 15 min,
+// idle-only — never a downvote; see packages/contracts/src/reddit-actuator.ts).
+// The extension polls GET /api/actionable-reddit, posts each reply, calls the
+// shared mark-sent, and logs {reply,skip,upvote} events to /api/reddit-activity.
+//
+// Reddit-specific vs. X: a reply target can be the source POST or a specific
+// COMMENT in the thread. The intern signals this on the draft payload's
+// `reply_target` (persisted by outbound.ts from OutboundDraftIn.replyTarget):
+// kind='comment' → reply under that comment (permalink + comment_id); otherwise
+// reply to the source post (its comments-page permalink). The post's identity
+// (id/subreddit/author/url) comes from the joined reddit lead.
+// ---------------------------------------------------------------------------
+
+export { buildActionableReddit, bodyHasExternalRedditLink, dedupeAlreadyRepliedReddit,
+  resolveRedditDailyWriteCap, type RedditJoinedRow } from "../lib/reddit-reply-policy.js";
+
+export const actuator = new Hono<{ Variables: { actuator: ActuatorContext } }>();
+
+actuator.use("/api/actionable-linkedin", requireActuatorToken);
+actuator.use("/api/actuator/priority-ready", requireActuatorToken);
+
+const actionableLinkedIn: Handler<{ Variables: { actuator: ActuatorContext } }> = async (c) => {
+  const { orgId } = c.get("actuator");
+  const priorityOnly = c.req.path === "/api/actuator/priority-ready";
+  const instanceId = c.req.query("instanceId");
+  if (!instanceId) return c.json({ error: "missing_instance_id" }, 400);
+  const sql = noelleDb();
+
+  // Verify the instance belongs to the configured actuator org (tenancy).
+  const owns = await sql<Array<{ id: string; reply_send_enabled: boolean; auto_send_enabled: boolean; actuator_daily_reply_cap: number | null }>>`
+    select id, reply_send_enabled, auto_send_enabled, actuator_daily_reply_cap from noelle.agent_instances
+    where id = ${instanceId} and org_id = ${orgId} limit 1
+  `;
+  if (owns.length === 0) return c.json({ error: "instance_not_in_org" }, 403);
+  // Consent gate, two flags, both OFF by default (serve an empty queue — still
+  // 200 so the extension keeps polling):
+  //   - reply_send_enabled (0081): per-run consent. The extension arms it on a
+  //     manual Run/Drain and disarms it at run end (fail-closed at rest).
+  //   - auto_send_enabled: STANDING lights-out consent, set from the dashboard
+  //     and never touched by the extension — this is what lets the extension's
+  //     unattended auto-start/auto-drain paths (which deliberately never arm
+  //     reply_send_enabled) serve a queue.
+  // pauseAllSending clears BOTH, so the panic stop stays a real org-wide kill.
+  // Every withhold gate below (challenge breaker, working hours, caps) applies
+  // to both consent paths unchanged.
+  if (owns[0]!.reply_send_enabled !== true && owns[0]!.auto_send_enabled !== true) {
+    return c.json(ActionableLinkedInResponseSchema.parse({ comments: [], dms: [] }));
+  }
+
+  if (priorityOnly) {
+    const since = Number(c.req.query("since") ?? "0");
+    const wait = Math.min(25_000, Math.max(0, Number(c.req.query("waitMs") ?? "0") || 0));
+    const deadline = Date.now() + wait;
+    let advanced = false;
+    for (;;) {
+      const latest = await sql<Array<{ at_ms: string | null }>>`
+        select (extract(epoch from max(a.created_at)) * 1000)::bigint::text as at_ms
+        from noelle.approvals a
+        join noelle.leads l on l.id = a.lead_id
+        join noelle.drafts d on d.id = a.draft_id
+        where a.agent_instance_id = ${instanceId} and a.org_id = ${orgId}
+          and a.status = 'pending' and l.platform = 'linkedin'
+          and ${replyApprovalContextSql(sql)}
+          and l.payload->>'source' = 'extension_observed'
+          and l.payload->'classifier'->>'provider' = 'jev'
+          and d.payload->'verifier_meta'->>'judgeOk' = 'true'
+          and d.payload->'verifier_meta'->>'pass' = 'true'
+      `;
+      advanced = Number(latest[0]?.at_ms ?? 0) > (Number.isFinite(since) ? since : 0);
+      if (advanced || Date.now() >= deadline) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+    }
+    if (!advanced) return c.json(ActionableLinkedInResponseSchema.parse({ comments: [], dms: [] }));
+  }
+
+  // Circuit-breaker (P5): if the actuator recorded a LinkedIn bot-challenge in the
+  // last hour, halt this org's send queue — commenting/DMing into a live challenge
+  // is the documented fast path to a restriction and nobody is watching. Reuses the
+  // /health handler's 1-hour challenge window and the X send circuit-breaker pattern.
+  // Fail-CLOSED: a query error halts. Auto-recovers once the hour elapses with no new
+  // challenge. Flag defaults OFF (opt-in); enable with '1'/'true'.
+  const haltOnChallenge =
+    process.env.NOELLE_LINKEDIN_HALT_ON_CHALLENGE === "1" ||
+    process.env.NOELLE_LINKEDIN_HALT_ON_CHALLENGE === "true";
+  if (haltOnChallenge) {
+    let recentChallenges: number | null = null;
+    try {
+      const chal = await sql<Array<{ n: number }>>`
+        select count(*)::int as n from noelle.linkedin_activity
+        where org_id = ${orgId}
+          and reason = 'challenge'
+          and created_at >= now() - interval '1 hour'
+      `;
+      recentChallenges = chal[0]?.n ?? 0;
+    } catch (e) {
+      console.warn("[actuator] challenge-halt check failed; failing closed",
+        (e as Error).message);
+      recentChallenges = null; // fail closed
+    }
+    if (shouldHaltForChallenge({ flagEnabled: true, recentChallengeCount: recentChallenges })) {
+      console.warn("[actuator] LinkedIn send HALTED: recent bot-challenge",
+        { org_id: orgId, recentChallenges });
+      return c.json(ActionableLinkedInResponseSchema.parse({ comments: [], dms: [] }));
+    }
+  }
+
+  // Server-side working-hours floor (backstops the extension's client-side
+  // 23:00-06:00 curfew, scheduler.ts). A wrong-clock/DST/tampered client must
+  // never make us serve writes at 3am. Disabled by default (both env unset) so
+  // there is NO behavior change until an operator sets a window. When a window
+  // IS configured but the values are garbage, we FAIL CLOSED (serve empty).
+  const sendWindow = resolveSendWindow(
+    process.env.NOELLE_LINKEDIN_SEND_WINDOW_START,
+    process.env.NOELLE_LINKEDIN_SEND_WINDOW_END,
+    process.env.NOELLE_LINKEDIN_TZ_OFFSET_MIN,
+  );
+  if (sendWindow.configured) {
+    // Partial/garbage config (e.g. only START or only END set => the other is
+    // NaN, never 0) fails CLOSED: a half-configured window must never widen to
+    // 24h and leak 3am sends.
+    if (!sendWindow.valid) {
+      console.warn("[actuator] send-window misconfigured (partial/garbage); failing closed (empty queue)", {
+        org_id: orgId,
+        winStartRaw: process.env.NOELLE_LINKEDIN_SEND_WINDOW_START,
+        winEndRaw: process.env.NOELLE_LINKEDIN_SEND_WINDOW_END,
+      });
+      return c.json(ActionableLinkedInResponseSchema.parse({ comments: [], dms: [] }));
+    }
+    if (!withinSendWindow(Date.now(), sendWindow.startHour, sendWindow.endHour, sendWindow.tzOffsetMin)) {
+      console.warn("[actuator] outside send window; serving empty queue", {
+        org_id: orgId,
+        startHour: sendWindow.startHour,
+        endHour: sendWindow.endHour,
+        tzOffsetMin: sendWindow.tzOffsetMin,
