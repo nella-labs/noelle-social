@@ -198,3 +198,203 @@ export async function getConnectionStatus(
   }
 
   if (orgProbe) {
+    return {
+      kind,
+      status: "connected",
+      preview: orgProbe.preview,
+      lastUpdatedAt: orgProbe.lastUpdatedAt,
+      errorMessage: null,
+      source: "org",
+    };
+  }
+
+  // 2. No per-org value — check the legacy global secret the worker falls back to.
+  //    Best-effort: never surface global-probe errors to the user. If the
+  //    global path is broken we just report "not_set", same as before.
+  try {
+    const globalProbe = await probeSecret(sm, globalName);
+    if (globalProbe) {
+      return {
+        kind,
+        status: "connected",
+        preview: globalProbe.preview,
+        lastUpdatedAt: globalProbe.lastUpdatedAt,
+        errorMessage: null,
+        source: "global",
+      };
+    }
+  } catch {
+    // swallow — fall through to not_set
+  }
+
+  return {
+    kind,
+    status: "not_set",
+    preview: null,
+    lastUpdatedAt: null,
+    errorMessage: null,
+    source: null,
+  };
+}
+
+/**
+ * List status for every kind in the registry.
+ * Used by the connections page render.
+ */
+export async function listConnectionStatuses(orgId: string): Promise<ConnectionStatus[]> {
+  return Promise.all(CONNECTIONS.map((spec) => getConnectionStatus(orgId, spec.id)));
+}
+
+/**
+ * Mode-agnostic Pushover connectivity check for the Alerts UI.
+ *
+ * Self-host (NOELLE_SECRETS_SOURCE=env, e.g. the Lima VM) puts the keys
+ * straight in the process env, so check that first — getConnectionStatus only
+ * knows about GCP Secret Manager and would falsely report "not connected" on a
+ * VM that's actually wired. Hosted falls back to the per-org / global Secret
+ * Manager probe.
+ */
+export async function getPushoverConnection(
+  orgId: string,
+): Promise<{ connected: boolean; source: "env" | "org" | "global" | null }> {
+  if (process.env.PUSHOVER_USER_KEY && process.env.PUSHOVER_APP_TOKEN) {
+    return { connected: true, source: "env" };
+  }
+  // env-sourced deployment with the keys missing → nothing in Secret Manager
+  // to probe, so don't pay the round-trip; report not connected.
+  if (process.env.NOELLE_SECRETS_SOURCE === "env") {
+    return { connected: false, source: null };
+  }
+  try {
+    const [user, token] = await Promise.all([
+      getConnectionStatus(orgId, "pushover_user"),
+      getConnectionStatus(orgId, "pushover_token"),
+    ]);
+    const connected = user.status === "connected" && token.status === "connected";
+    return { connected, source: connected ? (user.source ?? token.source) : null };
+  } catch {
+    return { connected: false, source: null };
+  }
+}
+
+/**
+ * Create the secret if it doesn't already exist, then add a new version with
+ * the pasted value. Validates the value before writing.
+ *
+ * Older enabled versions are disabled after the new version is added to keep
+ * storage tidy (the version history remains in the audit log).
+ *
+ * Throws on validation failure or IAM/API error.
+ */
+export async function setConnectionValue(
+  orgId: string,
+  kind: ConnectionKindId,
+  value: string,
+): Promise<void> {
+  const spec = specFor(kind);
+
+  // Validate before touching Secret Manager.
+  const validationError = await spec.validate(value);
+  if (validationError) {
+    throw new Error(`Validation failed: ${validationError}`);
+  }
+
+  const sm = await getSecretManagerClient();
+  const name = secretResourceName(orgId, kind);
+  const parent = `projects/${SM_PROJECT}`;
+  const secretId = name.replace(`${parent}/secrets/`, "");
+
+  // Create the secret if it doesn't exist yet (ignore ALREADY_EXISTS / code 6).
+  try {
+    await sm.createSecret({
+      parent,
+      secretId,
+      secret: {
+        name,
+        replication: { automatic: {} },
+        labels: { "noelle-org": orgId.toLowerCase().replace(/[^a-z0-9-_]/g, "-") },
+      },
+    });
+  } catch (err: unknown) {
+    if (
+      (err as { code?: number | string }).code !== 6 &&
+      (err as { code?: string }).code !== "ALREADY_EXISTS"
+    ) {
+      // 6 = ALREADY_EXISTS — anything else is a real error
+      throw err;
+    }
+  }
+
+  // Add the new version.
+  const [added] = await sm.addSecretVersion({
+    parent: name,
+    payload: { data: Buffer.from(value) },
+  });
+
+  // Keep the acknowledged version and any concurrent newer write enabled.
+  try {
+    await disableOlderSecretVersions(sm, name, added.name);
+  } catch {
+    // Cleanup failure is non-fatal.
+  }
+}
+
+/**
+ * Disable all enabled versions of the secret.
+ * We never delete — the version history remains in the audit log.
+ *
+ * Safe to call on a non-existent secret (no-op).
+ */
+export async function disableConnection(orgId: string, kind: ConnectionKindId): Promise<void> {
+  const sm = await getSecretManagerClient();
+  const name = secretResourceName(orgId, kind);
+
+  try {
+    await disableAllSecretVersions(sm, name);
+  } catch (err: unknown) {
+    if (
+      (err as { code?: number | string }).code === 5 ||
+      (err as { code?: string }).code === "NOT_FOUND"
+    )
+      return;
+    throw err;
+  }
+}
+
+/**
+ * Fetch the raw plaintext value of the latest enabled version.
+ *
+ * Returns null when the secret doesn't exist or has no enabled versions.
+ *
+ * SECURITY: This returns the raw secret value. Callers MUST NOT forward this
+ * to the client. Only used server-side (worker injection, re-validation).
+ */
+export async function peekConnectionValue(
+  orgId: string,
+  kind: ConnectionKindId,
+): Promise<string | null> {
+  const sm = await getSecretManagerClient();
+  const name = secretResourceName(orgId, kind);
+
+  try {
+    const [versions] = await sm.listSecretVersions({
+      parent: name,
+      filter: "state:ENABLED",
+      pageSize: 1,
+    });
+
+    if (!versions || versions.length === 0) return null;
+
+    const [accessed] = await sm.accessSecretVersion({ name: versions[0].name! });
+    const raw = accessed.payload?.data;
+
+    if (raw instanceof Uint8Array) return Buffer.from(raw).toString("utf-8");
+    if (typeof raw === "string") return raw;
+    return null;
+  } catch (err: unknown) {
+    if (
+      (err as { code?: number | string }).code === 5 ||
+      (err as { code?: string }).code === "NOT_FOUND"
+    )
+      return null;
+    throw err;
