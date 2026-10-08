@@ -598,3 +598,146 @@ export default async function ApprovalDetailPage({
                     classifierScore == null
                       ? "var(--ink-muted)"
                       : classifierScore >= 0.75
+                        ? "var(--accent)"
+                        : classifierScore >= 0.5
+                          ? "var(--ink-2)"
+                          : "var(--ink-muted)",
+                }}
+              >
+                {classifierScore != null ? `${Math.round(classifierScore * 100)}/100` : "—"}
+              </span>
+              <span style={{ color: "var(--ink-muted)" }}>·</span>
+              <span>{classifierLabel ?? "—"}</span>
+              <span style={{ color: "var(--ink-muted)" }}>·</span>
+              <span>{tier ?? "—"}</span>
+              <span style={{ color: "var(--ink-muted)" }}>·</span>
+              <span style={{ color: "var(--ink-muted)" }}>
+                {classifierKnown ? "synced" : "pending"}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function ActionedBanner({
+  status,
+  postedUrl,
+  skipReason,
+  decidedAt,
+  angles,
+  isDM,
+  dmBody,
+}: {
+  status: string;
+  postedUrl: string | null;
+  skipReason: string | null;
+  decidedAt: string | null;
+  angles: ReturnType<typeof buildAngles>;
+  isDM: boolean;
+  dmBody: string;
+}) {
+  const label =
+    status === "sent" && postedUrl
+      ? "Posted to X"
+      : status === "sent"
+        ? isDM
+          ? "Sent as a DM"
+          : "Approved — send worker pending"
+        : status === "skipped"
+          ? skipReason === "sibling-angle-sent"
+            ? "Skipped (another angle was sent)"
+            : "Skipped"
+          : status === "errored"
+            ? "Send failed"
+            : `Status: ${status}`;
+
+  const tone =
+    status === "sent"
+      ? "var(--accent)"
+      : status === "errored"
+        ? "var(--danger)"
+        : "var(--ink-muted)";
+
+  return (
+    <div>
+      <div className="eyebrow" style={{ marginBottom: 12 }}>
+        Resolved {decidedAt ? timeAgo(decidedAt) : ""}
+      </div>
+      <div
+        className="card"
+        style={{
+          padding: 18,
+          borderColor: tone,
+          boxShadow: `0 0 0 0.5px color-mix(in oklch, ${tone} 40%, var(--rule))`,
+          marginBottom: 18,
+        }}
+      >
+        <div
+          style={{
+            fontFamily: "var(--display)",
+            fontSize: 18,
+            color: tone,
+            marginBottom: 6,
+          }}
+        >
+          {label}
+        </div>
+        {postedUrl ? (
+          <a
+            href={postedUrl}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 12,
+              color: "var(--accent)",
+              textDecoration: "none",
+              wordBreak: "break-all",
+            }}
+          >
+            {postedUrl} ↗
+          </a>
+        ) : status === "errored" && skipReason ? (
+          <div
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 12,
+              color: "var(--ink-2)",
+              whiteSpace: "pre-wrap",
+            }}
+          >
+            {skipReason}
+          </div>
+        ) : null}
+      </div>
+
+      {/* Show the (historical) draft body so the reviewer remembers what they approved. */}
+      <div className="angle-stack" style={{ opacity: 0.7 }}>
+        {isDM ? (
+          <div className="angle">
+            <h4>
+              <span className="num">DM</span>
+              <span>Direct message</span>
+            </h4>
+            <div className="text" style={{ whiteSpace: "pre-wrap" }}>
+              {dmBody}
+            </div>
+          </div>
+        ) : (
+          angles.map((a, i) => (
+            <div key={a.id} className="angle">
+              <h4>
+                <span className="num">0{i + 1}</span>
+                <span>{a.kind}</span>
+              </h4>
+              <div className="text">{a.text}</div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
