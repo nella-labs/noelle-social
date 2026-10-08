@@ -398,3 +398,203 @@ const REDDIT_MICRO_DIRECTIVE =
 export const REDDIT_FORM_VARIANTS: FormVariant[] = X_FORM_VARIANTS.map((v) => ({
   ...v,
   allowStandaloneReaction: false,
+  weight: REDDIT_WEIGHTS[v.id] ?? v.weight,
+  ...(v.id === "MICRO" ? { directive: REDDIT_MICRO_DIRECTIVE } : {}),
+  ...(v.id === "ONE_SHORT" ? { directive: FORM_VARIANTS.find((shape) => shape.id === "ONE_SHORT")!.directive } : {}),
+}));
+
+/**
+ * Shapes whose directive prescribes a STANCE, not just a form.
+ *
+ * RIFF says "answer with the joke, and nothing else". FLAT_DISAGREE says
+ * "contradict the claim". AGREE_EXTEND says "agree in four words or fewer".
+ * Each of those decides WHAT the reply argues, not merely how long it is.
+ *
+ * That is fine when the prompt asks for ONE draft, which is Vega's shape. It is
+ * a direct contradiction when the prompt asks for several ANGLES in one call —
+ * Orion's T1 asks for empathetic + technical + contrarian, and Lyra's
+ * substantial path asks for three — because one assigned shape then governs all
+ * of them, and "answer with the joke, and nothing else" lands on the prompt
+ * that also demands an empathetic body. On Reddit each angle becomes its own
+ * queued reply and a queued reply is auto-sent, so the contradiction ships.
+ *
+ * Callers drafting more than one angle exclude these; every other shape governs
+ * form only and composes with any angle.
+ */
+export const STANCE_SHAPE_IDS: readonly string[] = ["RIFF", "FLAT_DISAGREE", "AGREE_EXTEND"];
+
+/**
+ * Shapes that leave the OPENER genuinely free, so an OPENING MOVE directive adds
+ * structural variety instead of contradicting the shape. Deliberately an
+ * ALLOWLIST, not a denylist, because most shapes are disqualified for one of two
+ * reasons and a denylist silently admits new shapes it was never checked against:
+ *
+ *  - too short to have an opening distinct from the whole reply: MICRO,
+ *    ONE_SHORT, QUESTION_ONLY.
+ *  - already prescribe their own opener, so a second directive fights the first:
+ *    HOOK_THEN_LINE ("open with a short punchy reaction"), OBSERVE_ASK ("one
+ *    concrete observation, then a question"), DETAIL_ZOOM ("zoom in on ONE small
+ *    detail"), and all four platform-exclusive shapes — SELF_STORY ("you are the
+ *    subject of both sentences"), AGREE_EXTEND ("agree in four words"), RIFF
+ *    ("answer with the joke, and nothing else") and FLAT_DISAGREE ("contradict
+ *    the claim, give the ONE reason").
+ *
+ * That leaves the four shapes that say what the reply IS without saying how it
+ * STARTS — about a third of leads, which is a real lane and not a token one.
+ */
+export const SHAPES_WITH_FREE_OPENER: readonly string[] = [
+  "TWO_FLAT",
+  "RUN_ON",
+  "ASIDE",
+  "THREE_BEAT",
+];
+
+/**
+ * Shapes whose directive forbids a question ("no question", "no question mark").
+ * The QUESTION opening move orders one, so it must be filtered out of the pool
+ * for these shapes or the prompt carries two directly contradicting orders.
+ */
+export const SHAPES_BANNING_QUESTIONS: readonly string[] = [
+  "TWO_FLAT",
+  "RUN_ON",
+  "SELF_STORY",
+  "AGREE_EXTEND",
+  "RIFF",
+  "FLAT_DISAGREE",
+];
+
+/**
+ * Variants excluded on the LIGHT (short supportive congrats) lane. A light lead
+ * is a win/launch/milestone that calls for a warm reaction; a bare question
+ * with no congrats in it (QUESTION_ONLY) is off-register there. Every other
+ * shape still congratulates, just in a different form.
+ */
+export const LIGHT_EXCLUDED_VARIANT_IDS: readonly string[] = [
+  "QUESTION_ONLY",
+  // You cannot disagree with someone's launch. FLAT_DISAGREE on a win is not a
+  // shape mismatch, it is the wrong reply.
+  "FLAT_DISAGREE",
+];
+
+/**
+ * Pick ONE form variant by weighted random choice, excluding `exclude` — the
+ * variant the PREVIOUS reply used, plus any lane-level exclusions (e.g.
+ * LIGHT_EXCLUDED_VARIANT_IDS) — so consecutive picks never share a shape. The
+ * remaining weights are renormalized (the walk scales by the reduced pool's
+ * total), the variants walked in FORM_VARIANTS order, and the first whose
+ * cumulative weight exceeds r wins. `rng` is injectable so tests are
+ * deterministic (defaults to Math.random in workers). A pathological r >= sum
+ * (or NaN) falls back to the last candidate. Exclusions matching nothing (or
+ * null) just sample the full set.
+ */
+export function pickFormVariant(
+  rng: () => number = Math.random,
+  exclude?: string | readonly string[] | null,
+  variants: readonly FormVariant[] = FORM_VARIANTS,
+): FormVariant {
+  const all = variants.length > 0 ? variants : FORM_VARIANTS;
+  const excluded = new Set(exclude == null ? [] : typeof exclude === "string" ? [exclude] : exclude);
+  const set = excluded.size > 0 ? all.filter((v) => !excluded.has(v.id)) : all;
+  const pool = set.length > 0 ? set : all;
+  const total = pool.reduce((acc, v) => acc + v.weight, 0);
+  const r = rng() * total;
+  let cumulative = 0;
+  for (const variant of pool) {
+    cumulative += variant.weight;
+    if (r < cumulative) return variant;
+  }
+  return pool[pool.length - 1]!;
+}
+
+/**
+ * Render a STANDALONE "assigned shape" SYSTEM block.
+ *
+ * Lyra renders the shape INSIDE the faithful style block (renderStyleBlock), so
+ * her rotation only fires when a voice is pinned AND the style pool loaded. Vega
+ * needs the shape to fire on EVERY reply — the whole complaint is that its feed
+ * reads as one mold — so the directive is emitted as its own block, independent
+ * of whether a style block rendered at all. Mutually exclusive with the ASSIGNED
+ * REGISTER block at the call site: one shape instruction per prompt, never two
+ * that contradict each other.
+ *
+ * Platform-neutral wording on purpose (no "LinkedIn"/"X" nouns) so either intern
+ * can render it.
+ */
+export function renderAssignedShapeBlock(variant: FormVariantForPrompt): string {
+  return [
+    "THIS REPLY'S ASSIGNED SHAPE (follow it exactly; it OVERRIDES the default reply length and sentence-count rules above)",
+    variant.directive,
+    "The shape governs FORM only. Every NEVER-DO rule still applies in full: no em dashes, no corporate buzzwords, no echoing or paraphrasing the post back at them, English only, the emoji allowlist, and never fabricate a story, a number, or a credential. If the shape is short, do NOT pad it out to feel substantial, because a genuinely short reply is the point. This never applies to a DM.",
+  ].join("\n");
+}
+
+/**
+ * How many recent shapes the rotation remembers and refuses to repeat.
+ *
+ * Was effectively 1 (only the previous pick was excluded), which stops the
+ * literal double but permits A/B/A/B — and with MICRO and RUN_ON carrying the
+ * two heaviest weights on X, alternating between a one-word reply and a
+ * 200-char run-on is exactly the pattern a reader notices. A window of 3 makes
+ * the local sequence genuinely unpredictable.
+ *
+ * The floor on the pool is what makes 3 safe, and the floor is TIGHTER than the
+ * LIGHT lane suggests. The smallest pool is not 12 minus the LIGHT lane's 2; it
+ * is an energy-scoped tone-first pick, where `joke` and `vent` resolve to 5
+ * shapes against X_FORM_VARIANTS. With a memory of 3 that leaves exactly
+ * MIN_CANDIDATES = 2, so the clamp in next() is already at its limit.
+ *
+ * Raising this constant therefore does NOT widen the window on those lanes: the
+ * clamp silently trims it back and the extra memory buys nothing. Widen
+ * ENERGY_SHAPE_IDS first, or accept that tone-first picks keep a 3-deep window
+ * while the rest go deeper.
+ *
+ * pickFormVariant also falls back to the full set rather than throwing if a
+ * caller ever over-excludes.
+ */
+export const DEFAULT_ROTATION_MEMORY = 3;
+
+/**
+ * The smallest candidate pool a rotation pick may run against. Below two there
+ * is no choice left to make, and the "the next shape is unpredictable" property
+ * the window exists for is gone.
+ */
+const MIN_CANDIDATES = 2;
+
+/**
+ * Stateful rotation over pickFormVariant: remembers the last
+ * `memory` variants it handed out and excludes them from the next pick (on top
+ * of any per-call `exclude` lane list). One instance per worker process gives
+ * "no shape repeats within the last N" across ticks, not just within one tick.
+ */
+export function createFormVariantRotation(
+  variants: readonly FormVariant[] = FORM_VARIANTS,
+  memory: number = DEFAULT_ROTATION_MEMORY,
+): {
+  next: (rng?: () => number, exclude?: readonly string[]) => FormVariant;
+} {
+  const all = variants.length > 0 ? variants : FORM_VARIANTS;
+  const window = Math.max(0, memory);
+  const recent: string[] = [];
+  return {
+    next(rng: () => number = Math.random, exclude?: readonly string[]): FormVariant {
+      // Drop the OLDEST remembered shapes until at least MIN_CANDIDATES remain
+      // selectable. The per-call lane exclusion (e.g. the LIGHT lane's two
+      // shapes) is only known here, so the clamp cannot live in the closure.
+      //
+      // This matters because pickFormVariant falls back to the FULL set when
+      // exclusions empty the pool — so an over-wide window would not error, it
+      // would silently reintroduce the repeats the window exists to prevent,
+      // and every test of the window would still pass.
+      const laneExcluded = new Set(exclude ?? []);
+      let memoryUsed = recent.length;
+      while (memoryUsed > 0) {
+        const excluded = new Set([...laneExcluded, ...recent.slice(recent.length - memoryUsed)]);
+        if (all.filter((v) => !excluded.has(v.id)).length >= MIN_CANDIDATES) break;
+        memoryUsed--;
+      }
+      const picked = pickFormVariant(
+        rng,
+        [...laneExcluded, ...recent.slice(recent.length - memoryUsed)],
+        variants,
+      );
+      if (window > 0) {
