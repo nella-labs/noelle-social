@@ -598,3 +598,203 @@ async function main() {
                   styleKinds.map((kind) =>
                     listStyleExemplars(sql, {
                       agentInstanceId: inst.id,
+                      platform: "linkedin",
+                      kind,
+                      limit: env.NOELLE_DRAFTER_STYLE_POOL,
+                      minPerformancePercentile: feederConfigPercentile(inst.account_feeder_config),
+                    }),
+                  ),
+                );
+                return pools.flat();
+              },
+              loadUltraProfiles: () =>
+                listUltraProfiles(sql, { agentInstanceId: inst.id, platform: "linkedin" }),
+              config: inst.account_feeder_config,
+              dense: env.NOELLE_DRAFTER_DENSE,
+            };
+          })(),
+          // F6b — tiered multi-lead batching (NOELLE_DRAFTER_BATCH; default OFF).
+          // When ON, non-Opus light leads are grouped into one model call per tick,
+          // each with its own post text + STYLE block. Falls back to per-lead calls
+          // on any parse failure. Gated by env flag AND per-instance batchLightLeads
+          // (AccountFeederConfig, default true) — set the instance config field to
+          // false to disable per-instance. When env flag is OFF, byte-identical to
+          // today regardless of the instance setting.
+          batch: {
+            enabled: env.NOELLE_DRAFTER_BATCH,
+            batchLightLeads: feederConfigBatchLight(inst.account_feeder_config),
+          },
+        });
+
+        const nRequested = replyRequests.length === 0
+          ? 0
+          : await runDrafterTick(drafterArgs(replyRequests, true));
+        if (replyPipelineBlocked || (!drafterLaneOn && !notifLaneOn) ||
+          (inst.status === "paused" && !isWorkerEnabled(inst, "watchlist") && !notificationsOnly)) {
+          await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted + dmDrafted + nRequested });
+          return;
+        }
+
+        // NOTIFICATIONS-ONLY tick. Answering someone who replied to you is not
+        // the same job as cold outbound, and the operator must be able to run one
+        // without the other. Before this, the only switch was the instance's
+        // status, so "answer my replies" also restarted discovery, classification
+        // and cold drafting.
+        //
+        // While PAUSED with the notifications lane on, claim ONLY notification
+        // leads. Note this cannot be done with the watchlist claim: a
+        // notification lead is priority=TRUE and so is essentially every
+        // LinkedIn lead, so that claim would drag the whole cold funnel back in.
+        if (notificationsOnly) {
+          const notifLeads = await claimNotificationLeadsForDrafting(sql, {
+            agentInstanceId: inst.id,
+            cap: 5,
+          });
+          const nNotif =
+            notifLeads.length === 0
+              ? 0
+              : await runDrafterTick(drafterArgs(notifLeads));
+          await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted + dmDrafted + nRequested + nNotif });
+          return;
+        }
+
+        // Two-lane drafting (0035): the keyword/funnel claim takes priority=FALSE
+        // leads; profile-first (Feeder A) + ICP-vetted authors are priority=TRUE
+        // and are claimed by the watchlist RPC (one newest per author). Claim both
+        // and draft them together — without the second claim, priority leads would
+        // sit at 'classified' forever (Lyra's main claim excludes them).
+        const observedLeads = await claimObservedLeadsForDrafting(sql, { agentInstanceId: inst.id, cap: 5 });
+        const keywordLeads = await claimLeadsForDrafting(sql, { agentInstanceId: inst.id, batch: 3 });
+        const priorityLeads = await claimWatchlistLeadsForDrafting(sql, {
+          agentInstanceId: inst.id,
+          cap: 5,
+        });
+        let n = nRequested;
+        for (const lane of planDraftLanes({
+          observed: observedLeads,
+          priority: priorityLeads,
+          keyword: keywordLeads,
+        })) {
+          n += await runDrafterTick(drafterArgs(lane.leads, lane.forceVerify));
+        }
+
+        // Intro DM lane (default OFF): one warm, one-time relationship-building DM
+        // per watchlist person, queued for approval. Gated on the per-instance
+        // toggle (0039 `linkedin_intro_dm_enabled`, set from the agent's Config
+        // page) AND the instance being ACTIVE (a paused instance still drafts
+        // watchlist replies above via watchlist_enabled, but the intro-DM backfill
+        // only runs when the operator has actually started the agent).
+        // claimIntroDmPeople claims + stamps under SKIP LOCKED, so each person gets
+        // exactly one DM, ever; the daily cap paces the rollout. Draft-only —
+        // runIntroDmTick never auto-sends.
+        //
+        // CRITICAL: never run during a goal-run. "Get N replies ready" is a
+        // reply-only objective; intro DMs are post-less leads that would otherwise
+        // bury the reply queue AND (pre-fix) count toward the target, auto-pausing
+        // the run before N real replies exist. Intro DMs trickle only on normal
+        // (non-goal) ticks.
+        const inGoalRun = goalTarget(inst) != null;
+        // The per-instance toggle is authoritative; the env var is only a fallback
+        // for a worker that booted before the 0039 column existed.
+        const introDmEnabled = inst.linkedin_intro_dm_enabled ?? env.LINKEDIN_INTRO_DM_ENABLED;
+        let introDmDrafted = 0;
+        if (introDmEnabled && inst.status !== "paused" && !inGoalRun) {
+          const introPeople = await claimIntroDmPeople(sql, {
+            agentInstanceId: inst.id,
+            cap: env.LINKEDIN_INTRO_DM_DAILY_CAP,
+          });
+          if (introPeople.length > 0) {
+            introDmDrafted = await runIntroDmTick({
+              log,
+              instance: inst,
+              claimedPeople: introPeople,
+              runner,
+              postOutbound,
+            });
+          }
+        }
+
+        // ── Pattern Breaker (default OFF: LINKEDIN_PATTERN_BREAKER). ──────────
+        // Drain the AI-refine queue every tick (cheap; no-op when empty), and
+        // re-audit the operator's last-N posts at most once per interval. Both
+        // fail-soft: any error is logged and the drafter tick still succeeds.
+        if (env.LINKEDIN_PATTERN_BREAKER) {
+          try {
+            await runPatternRefineTick({
+              log,
+              instance: inst,
+              runner,
+              bus,
+              loadQueue: () => loadRefiningAlerts(sql, {
+                orgId: inst.org_id,
+                agentInstanceId: inst.id,
+                role: "linkedin_intern",
+              }),
+              claim: (item) => claimRefinement(sql, {
+                orgId: inst.org_id,
+                agentInstanceId: inst.id,
+                role: "linkedin_intern",
+              }, item),
+              applyRefined: (a) => applyRefinedRule(sql, {
+                orgId: inst.org_id,
+                agentInstanceId: inst.id,
+                role: "linkedin_intern",
+              }, { ...a, decidedBy: "pattern-breaker" }),
+            });
+            const last = lastPatternAnalysisAt.get(inst.id) ?? 0;
+            if (Date.now() - last >= env.PATTERN_BREAKER_INTERVAL_MS) {
+              lastPatternAnalysisAt.set(inst.id, Date.now());
+              await runPatternBreakerTick({
+                log,
+                instance: inst,
+                runner,
+                bus,
+                minFrequency: env.PATTERN_BREAKER_MIN_FREQUENCY,
+                minRatio: env.PATTERN_BREAKER_MIN_RATIO,
+                loadCorpus: () => loadRecentPosts(sql, {
+                  orgId: inst.org_id,
+                  agentInstanceId: inst.id,
+                  role: "linkedin_intern",
+                }, env.PATTERN_BREAKER_MAX_POSTS),
+                loadExistingLabels: () => loadActiveRuleLabels(sql, {
+                  orgId: inst.org_id,
+                  agentInstanceId: inst.id,
+                  role: "linkedin_intern",
+                }),
+                persist: (finding, windowSize, corpus) =>
+                  persistPattern(sql, {
+                    orgId: inst.org_id,
+                    agentInstanceId: inst.id,
+                    role: "linkedin_intern",
+                    finding,
+                    windowSize,
+                    corpus,
+                  }),
+              });
+            }
+          } catch (err) {
+            log.warn({ instance: inst.id, err: (err as Error).message }, "pattern breaker pass failed (non-fatal)");
+          }
+        }
+
+        await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted + dmDrafted + n + introDmDrafted });
+      } catch (err) {
+        readyCache.reset(inst.org_id, "drafter");
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+    sleep: wake.sleep,
+  });
+}
+
+// Per-instance cadence for the (heavy) Pattern Breaker analysis pass. In-memory
+// is fine: it's a soft throttle, and a worker restart just re-runs the audit
+// once. The cheap refine-queue drain runs every tick regardless.
+const lastPatternAnalysisAt = new Map<string, number>();
+
+/**
+ * Extract the Account Feeder `minPerformancePercentile` floor from an instance's
+ * account_feeder_config so the style-pool query can apply it server-side.
+ * Defensive: a missing/malformed config falls back to the schema default (0 = no
