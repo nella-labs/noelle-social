@@ -998,3 +998,203 @@ actuator.post("/api/actuator/enable-send", async (c) => {
   // the extension can arm transition-aware: it only ever disarms at run end a
   // switch whose enable it flipped OFF→ON itself (prior=false), never the
   // operator's standing dashboard toggle (prior=true — the flag was already ON).
+  const owns = await sql<Array<{ id: string; reply_send_enabled: boolean }>>`
+    select id, reply_send_enabled from noelle.agent_instances
+    where id = ${instanceId} and org_id = ${orgId} limit 1
+  `;
+  if (owns.length === 0) return c.json({ error: "instance_not_in_org" }, 403);
+  const prior = owns[0]!.reply_send_enabled === true;
+
+  await sql`
+    update noelle.agent_instances
+    set reply_send_enabled = ${enabled}
+    where id = ${instanceId} and org_id = ${orgId}
+  `;
+  return c.json({ ok: true, instanceId, reply_send_enabled: enabled, prior });
+});
+
+// Long-poll early-return predicate: the operator's intent has ADVANCED past what
+// the extension last saw (`sinceMs`) only when a real command timestamp exists and
+// is strictly newer. A null commandAt (no command ever set) must NEVER early-return
+// — otherwise a never-commanded extension would busy-loop; it instead waits out the
+// poll and re-reconciles at timeout. Exported for unit tests.
+export function intentAdvanced(commandAtMs: number | null, sinceMs: number): boolean {
+  return commandAtMs != null && commandAtMs > sinceMs;
+}
+
+// ── Remote actuator start/stop (the "hands" master switch, 0089) ─────────────
+// GET /api/actuator/intent: the extension's LONG-POLL for the operator's remote
+// intent (agent_instances.actuator_desired_state). It reconciles its run
+// lifecycle to whatever this returns — 'running' resumes Full-automatic, 'stopped'
+// ends any live run and gates autonomy off, null leaves the local autonomy in
+// charge. The operator sets the intent from the phone (dashboard), the MCP, or —
+// on an explicit local panel action — the extension itself; all three write the
+// SAME server column, so this is the single source of truth.
+//
+// Long-poll semantics: return immediately once the command advances past the
+// `since` (epoch-ms) the extension last saw; otherwise hold the connection up to
+// waitMs (≤25s) and return the current value at timeout so the extension
+// re-reconciles periodically (self-heals run drift) and its in-flight fetch keeps
+// the MV3 service worker alive. The DB is polled every ~1.5s because writes also
+// arrive straight to Cloud SQL from the Vercel dashboard and the MCP — an
+// in-memory latch on this service would miss them. Token-authed + org-scoped.
+actuator.use("/api/actuator/intent", requireActuatorToken);
+
+actuator.get("/api/actuator/intent", async (c) => {
+  const { orgId } = c.get("actuator");
+  const instanceId = c.req.query("instanceId");
+  if (!instanceId) return c.json({ error: "missing_instanceId" }, 400);
+  const sinceRaw = Number(c.req.query("since") ?? "0");
+  const sinceMs = Number.isFinite(sinceRaw) && sinceRaw >= 0 ? sinceRaw : 0;
+  const waitRaw = Number(c.req.query("waitMs") ?? "25000");
+  const waitMs = Math.min(Math.max(Number.isFinite(waitRaw) ? waitRaw : 25000, 0), 25000);
+  const sql = noelleDb();
+
+  const read = async (): Promise<
+    { desired: "running" | "stopped" | null; commandAt: number | null } | "missing"
+  > => {
+    const rows = await sql<Array<{ desired: string | null; command_at_ms: string | null }>>`
+      select actuator_desired_state as desired,
+             (extract(epoch from actuator_command_at) * 1000)::bigint as command_at_ms
+      from noelle.agent_instances
+      where id = ${instanceId} and org_id = ${orgId}
+      limit 1
+    `;
+    if (rows.length === 0) return "missing";
+    const raw = rows[0]!;
+    const desired = raw.desired === "running" || raw.desired === "stopped" ? raw.desired : null;
+    const commandAt = raw.command_at_ms == null ? null : Number(raw.command_at_ms);
+    return { desired, commandAt };
+  };
+
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const cur = await read();
+    if (cur === "missing") return c.json({ error: "instance_not_in_org" }, 403);
+    if (intentAdvanced(cur.commandAt, sinceMs)) return c.json(cur);
+    if (Date.now() >= deadline) return c.json(cur);
+    await new Promise<void>((r) => setTimeout(r, 1500));
+  }
+});
+
+// POST /api/actuator/intent-ack: the extension reports its ACTUAL run state
+// ('running' | 'idle') for the dashboard's live status + liveness. `setDesired`
+// is present ONLY when a local panel action (Full-automatic / STOP) just changed
+// the operator's intent — so the local panel and the remote switch stay in sync
+// without a separate control endpoint; a routine ack never touches desired_state.
+actuator.use("/api/actuator/intent-ack", requireActuatorToken);
+
+actuator.post("/api/actuator/intent-ack", async (c) => {
+  const { orgId } = c.get("actuator");
+  const parsed = ActuatorIntentAckInSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
+  const { instanceId, runState, setDesired } = parsed.data;
+  const sql = noelleDb();
+
+  const rows = setDesired
+    ? await sql<Array<{ id: string }>>`
+        update noelle.agent_instances
+        set actuator_last_state = ${runState}, actuator_seen_at = now(),
+            actuator_desired_state = ${setDesired}, actuator_command_at = now(),
+            updated_at = now()
+        where id = ${instanceId} and org_id = ${orgId}
+        returning id
+      `
+    : await sql<Array<{ id: string }>>`
+        update noelle.agent_instances
+        set actuator_last_state = ${runState}, actuator_seen_at = now(), updated_at = now()
+        where id = ${instanceId} and org_id = ${orgId}
+        returning id
+      `;
+  if (rows.length === 0) return c.json({ error: "instance_not_in_org" }, 403);
+  return c.json({ ok: true, instanceId });
+});
+
+// GET /api/actuator/extension-build: the on-disk build stamp of the unpacked
+// LinkedIn actuator (`wxt build` writes build-stamp.json next to the manifest;
+// `noelle sync` refreshes it on every merge-driven deploy). The running
+// extension polls this on its 5-minute alarm and chrome.runtime.reload()s
+// itself when the stamp differs from the one compiled into its bundle, so
+// nobody has to click Reload on chrome://extensions after a deploy. Fail-soft:
+// a missing/unreadable stamp file serves { stamp: null } and the extension
+// does nothing. pm2 starts api-vm via `pnpm --filter @noelle/api-vm start`, so
+// cwd is apps/api-vm; the repo-root candidate covers a bare `node dist` start.
+actuator.use("/api/actuator/extension-build", requireActuatorToken);
+
+actuator.get("/api/actuator/extension-build", async (c) => {
+  const candidates = process.env.NOELLE_LINKEDIN_EXT_STAMP_PATH
+    ? [process.env.NOELLE_LINKEDIN_EXT_STAMP_PATH]
+    : [
+        join(process.cwd(), "../linkedin-actuator/.output/chrome-mv3/build-stamp.json"),
+        join(process.cwd(), "apps/linkedin-actuator/.output/chrome-mv3/build-stamp.json"),
+      ];
+  for (const p of candidates) {
+    try {
+      const raw = JSON.parse(await readFile(p, "utf8")) as { stamp?: unknown };
+      return c.json({ stamp: typeof raw.stamp === "string" ? raw.stamp : null });
+    } catch {
+      // try the next candidate; fall through to stamp:null when none is readable
+    }
+  }
+  return c.json({ stamp: null });
+});
+
+// GET /api/actuator/health: early-warning monitoring for lights-out operation.
+// Aggregates today's volume + the 24h challenge/skip signal from
+// noelle.linkedin_activity so an operator (or a watcher) can spot trouble before
+// it becomes a ban. status: halt = a challenge in the last hour (stop and back
+// off), warn = a challenge in the last 24h, ok = clean.
+actuator.use("/api/actuator/health", requireActuatorToken);
+
+actuator.get("/api/actuator/health", async (c) => {
+  const { orgId } = c.get("actuator");
+  const sql = noelleDb();
+  const rows = await sql<Array<{
+    likes_today: number; comments_today: number; dms_today: number;
+    skips_24h: number; challenges_24h: number; last_challenge_at: string | null;
+  }>>`
+    select
+      (count(*) filter (where type = 'like'    and created_at >= date_trunc('day', now())))::int as likes_today,
+      (count(*) filter (where type = 'comment' and created_at >= date_trunc('day', now())))::int as comments_today,
+      (count(*) filter (where type = 'dm'      and created_at >= date_trunc('day', now())))::int as dms_today,
+      (count(*) filter (where type = 'skip'    and created_at >= now() - interval '24 hours'))::int as skips_24h,
+      (count(*) filter (where reason = 'challenge' and created_at >= now() - interval '24 hours'))::int as challenges_24h,
+      max(created_at) filter (where reason = 'challenge') as last_challenge_at
+    from noelle.linkedin_activity
+    where org_id = ${orgId}
+  `;
+  const r = rows[0] ?? {
+    likes_today: 0, comments_today: 0, dms_today: 0,
+    skips_24h: 0, challenges_24h: 0, last_challenge_at: null,
+  };
+  const lastChallengeMs = r.last_challenge_at ? Date.parse(r.last_challenge_at) : 0;
+  const challengeWithinHour = lastChallengeMs > 0 && Date.now() - lastChallengeMs < 3600_000;
+  const status = challengeWithinHour ? "halt" : r.challenges_24h > 0 ? "warn" : "ok";
+  const rawWriteCap = (process.env.NOELLE_LINKEDIN_DAILY_WRITE_CAP ?? "").trim();
+  const parsedWriteCap = Number(rawWriteCap);
+  const writeCap = rawWriteCap !== "" && Number.isFinite(parsedWriteCap) ? parsedWriteCap : null;
+  return c.json({
+    status,
+    today: {
+      likes: r.likes_today, comments: r.comments_today, dms: r.dms_today,
+      writes: r.comments_today + r.dms_today, writeCap,
+    },
+    last24h: { skips: r.skips_24h, challenges: r.challenges_24h },
+    lastChallengeAt: r.last_challenge_at,
+  });
+});
+
+// GET /api/actionable-x: the X twin of /api/actionable-linkedin, reply-only.
+// The extension polls this, posts each reply from the operator's logged-in
+// x.com tab, then calls the shared /api/actuator/mark-sent/:id.
+actuator.use("/api/actionable-x", requireActuatorToken);
+actuator.use("/api/actionable-x/priority-ready", requireActuatorToken);
+
+const actionableX: Handler<{ Variables: { actuator: ActuatorContext } }> = async (c) => {
+  const { orgId } = c.get("actuator");
+  const priorityOnly = c.req.path === "/api/actionable-x/priority-ready";
+  const instanceId = c.req.query("instanceId");
+  if (!instanceId) return c.json({ error: "missing_instance_id" }, 400);
+  const sql = noelleDb();
+
+  // Verify the instance belongs to the configured actuator org (tenancy).
