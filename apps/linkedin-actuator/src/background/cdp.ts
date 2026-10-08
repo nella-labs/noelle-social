@@ -198,3 +198,168 @@ export class Cdp {
     // 4) pre-click hover dwell (~220ms logNormal) with tremor drift
     {
       const dwell = hoverDwellMs(rng);
+      // split the dwell into a variable number of UNEVEN slices — an equal split
+      // is N identical inter-move gaps, itself a fingerprint. The final slice
+      // drains the remainder so the TOTAL dwell is unchanged.
+      const slices = rng.int(2, 5);
+      let dwellLeft = dwell;
+      for (let h = 0; h < slices; h++) {
+        const hd = h === slices - 1 ? dwellLeft : dwellLeft * rng.float(0.3, 0.7);
+        dwellLeft -= hd;
+        await sleep(hd);
+        tElapsed += hd;
+        const j = tremor(target, tElapsed, rng);
+        await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: j.x, y: j.y, buttons: 0 });
+      }
+    }
+
+    // 5) press → hold → release at the (tremored) click point
+    {
+      const jp = tremor(target, tElapsed, rng);
+      // force:0.5 matches a real mouse button-down (PointerEvent.pressure); CDP's
+      // default of 0 is a per-event tell if a page reads pressure on pointerdown.
+      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: jp.x, y: jp.y, button: "left", clickCount: 1, buttons: 1, force: 0.5 });
+      const hold = clampMs(rng.logNormal(Math.log(95), 0.42), 50, 260);
+      await sleep(hold);
+      tElapsed += hold;
+      const jr = tremor(target, tElapsed, rng);
+      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: jr.x, y: jr.y, button: "left", clickCount: 1, buttons: 0 });
+    }
+
+    this.lastPos = target;
+  }
+
+  /**
+   * Approach `rect` and DWELL there (no click) long enough for a hover-triggered
+   * flyout to appear — LinkedIn reveals the six-reaction picker after ~0.5–0.8s
+   * of hovering the Like button. Keeps dispatching tremored mouseMoved events on
+   * the target so the page's :hover / mouseover state is sustained (a frozen
+   * cursor would neither open the menu nor read as human). Leaves the cursor
+   * parked ON the Like button, so the follow-up moveAndClick onto a reaction
+   * (which sits directly above it) travels a short path that stays inside the
+   * open menu and doesn't dismiss it.
+   */
+  async hover(tabId: number, rect: Rect, rng: Rng, sleep: Sleep, holdMs?: number): Promise<void> {
+    const { target, tElapsed: t0 } = await this.approach(tabId, rect, rng, sleep);
+    let tElapsed = t0;
+    const total = holdMs ?? rng.float(650, 1150);
+    const slices = rng.int(5, 8);
+    for (let h = 0; h < slices; h++) {
+      const hd = total / slices;
+      await sleep(hd);
+      tElapsed += hd;
+      const j = tremor(target, tElapsed, rng);
+      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: j.x, y: j.y, buttons: 0 });
+    }
+    this.lastPos = target;
+  }
+
+  /**
+   * Scroll `totalPx` driven by §3(a) momentum gestures (flick/slow-drag/
+   * micro-nudge/back-scroll mixture). Each gesture dispatches a decelerating
+   * `mouseWheel` delta series with non-uniform inter-delta sleeps + a post-dwell,
+   * with tremor on the wheel anchor x,y. Same `(tabId, at, totalPx, rng, sleep)`
+   * signature so existing callers keep working.
+   */
+  async wheel(
+    tabId: number,
+    at: Point,
+    totalPx: number,
+    rng: Rng,
+    sleep: Sleep,
+    contentHints?: { wordCount?: number; hasMedia?: boolean }[],
+  ): Promise<void> {
+    const gestures = planScrollGestures(rng, totalPx, contentHints);
+    let tElapsed = 0;
+    for (const g of gestures) {
+      for (let i = 0; i < g.deltas.length; i++) {
+        const j = tremor(at, tElapsed, rng);
+        await this.send(tabId, "Input.dispatchMouseEvent", {
+          type: "mouseWheel", x: j.x, y: j.y, deltaX: 0, deltaY: g.deltas[i]!,
+        });
+        const dt = g.interDeltaMs[i] ?? 0;
+        if (dt > 0) await sleep(dt);
+        tElapsed += dt;
+      }
+      if (g.postDwellMs != null && g.postDwellMs > 0) {
+        await sleep(g.postDwellMs);
+        tElapsed += g.postDwellMs;
+      }
+    }
+  }
+
+  /**
+   * Submit the focused comment/DM composer via a keyboard chord — Enter held with
+   * a modifier (Meta/⌘=4 on macOS, Ctrl=2 elsewhere). A fallback for when the
+   * submit BUTTON is off-viewport (short window) or never enabled, where a
+   * synthetic mouse click can't land. Deliberately fires ONLY keyDown/keyUp (no
+   * `char` event), so a plain Enter never slips through as an inserted newline;
+   * LinkedIn's composer keydown handler reads the modifier and posts. The caller
+   * picks the modifier and re-verifies the box cleared before trying the other.
+   */
+  async pressSubmitChord(tabId: number, modifiers: number): Promise<void> {
+    await this.send(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers });
+    await this.send(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers });
+  }
+
+  /**
+   * Type `text` one character at a time with full US-keyboard metadata so each
+   * keydown/keyup carries a real key/code/keyCode (not keyCode=0 / code="" /
+   * key="Unidentified", which no hardware produces and both LinkedIn and X can
+   * read from keystroke telemetry). Shift is held across consecutive shifted
+   * characters like a real typist.
+   *
+   * The character itself is committed with `Input.insertText`, NOT via the
+   * keyDown's `text` field. LinkedIn's 2026 comment/message composer is a
+   * TipTap/ProseMirror editor: it intercepts `beforeinput` and applies its own
+   * transaction. A keyDown-with-text produces a native edit that ProseMirror
+   * doesn't always sync from, so the character lands in the DOM but the editor's
+   * model stays empty — which keeps the "Submit" button DISABLED forever (the
+   * live symptom: text typed, box populated, submit never enables →
+   * submit-not-found). `Input.insertText` fires the `inputType:"insertText"`
+   * beforeinput/input that ProseMirror handles natively, so the model updates
+   * and the submit enables. We therefore send a text-less rawKeyDown (telemetry
+   * only), then insertText (the real, framework-observable edit), then keyUp.
+   */
+  async typeText(tabId: number, text: string, rng: Rng, sleep: Sleep): Promise<void> {
+    const delays = typingDelays(rng, text.length);
+    const shift = { down: false };
+    const releaseShift = async () => {
+      if (!shift.down) return;
+      await this.send(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, location: 1 });
+      shift.down = false;
+    };
+    let i = 0;
+    for (const ch of text) {
+      const def = keyStrokeFor(ch);
+      if (!def) {
+        await releaseShift();
+        await this.send(tabId, "Input.insertText", { text: ch });
+        await sleep(delays[i++] ?? 60);
+        continue;
+      }
+      if (def.shift && !shift.down) {
+        await this.send(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, modifiers: 8, location: 1 });
+        shift.down = true;
+      } else if (!def.shift && shift.down) {
+        await releaseShift();
+      }
+      const modifiers = shift.down ? 8 : 0;
+      // rawKeyDown (no `text`) → no native character insertion, just the
+      // keystroke telemetry with real US-keyboard metadata.
+      await this.send(tabId, "Input.dispatchKeyEvent", {
+        type: "rawKeyDown", key: def.key, code: def.code,
+        windowsVirtualKeyCode: def.keyCode, nativeVirtualKeyCode: def.keyCode,
+        unmodifiedText: def.unmodified, modifiers,
+      });
+      // The actual edit, via a path ProseMirror/TipTap observes and syncs from.
+      await this.send(tabId, "Input.insertText", { text: ch });
+      await this.send(tabId, "Input.dispatchKeyEvent", {
+        type: "keyUp", key: def.key, code: def.code,
+        windowsVirtualKeyCode: def.keyCode, nativeVirtualKeyCode: def.keyCode, modifiers,
+      });
+      await sleep(delays[i++] ?? 60);
+    }
+    await releaseShift();
+  }
+}
