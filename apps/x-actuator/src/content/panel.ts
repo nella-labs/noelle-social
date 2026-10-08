@@ -198,3 +198,84 @@ export function mountPanel(): void {
         log(`STOP FAILED: ${why}`);
         if (/context invalidated|Receiving end does not exist|message port closed|Could not establish connection/i.test(why)) {
           log("→ this TAB is running an old copy of the extension. Reload the page (Cmd-R) — the run may still be LIVE.");
+        }
+        return;
+      }
+      view.clearError();
+      view.render({ status: "stopped" }, false);
+      log("STOPPED");
+    })();
+  });
+  // Manual Auto: drain everything the operator approved, right now, at the hour
+  // they chose — no overnight hold.
+  q("#na-drain").addEventListener("click", () => {
+    void start("startDrain", "MANUAL AUTO", [
+      "draining ALL approved replies, newest first, random 1-60s/1-2min apart, browsing + liking between each",
+      "set-and-forget: survives reloads/restarts, resumes on its own — no re-click; press STOP to end",
+      "(no overnight pause — for that, use Auto instead)",
+    ]);
+  });
+  // Set-and-forget: the same persistent drain as the button above, but flagged
+  // UNATTENDED — so it holds replies through the operator's sleep window instead
+  // of posting at 3am. Nothing else stops it; STOP does.
+  q("#na-fullauto").addEventListener("click", () => {
+    void start("startFullAuto", "AUTO", [
+      "draining approvals + watching for new ones (safe to leave running)",
+      "pauses ALL writes overnight 1am–9am (replies AND likes); browsing stays on. Press STOP to end",
+    ]);
+  });
+  const discoverButton = q<HTMLButtonElement>("#na-discover");
+  let discoveryStarting = false;
+  discoverButton.addEventListener("click", () => {
+    if (discoveryStarting) return;
+    void (async () => {
+      discoveryStarting = true;
+      discoverButton.disabled = true;
+      try {
+        await scheduleReady;
+        // An edit can arrive while a prior save is pending. Follow the chain
+        // until the last edit has settled, then check that it actually saved.
+        let latest: Promise<boolean>;
+        let saved: boolean;
+        do {
+          latest = pendingSave;
+          saved = await latest;
+        } while (latest !== pendingSave);
+        if (!scheduleValid) {
+          log("DISCOVER + REPLY FAILED: save valid discovery hours first.");
+          return;
+        }
+        if (!saved || scheduleLoadFailed) return; // Keep the actionable storage error visible.
+        await start("startDiscovery", "DISCOVER + REPLY", [
+          "reading visible X posts at the existing browsing pace; Jev qualifies them for Vega",
+          "approved replies use the next allowed send slot; STOP ends discovery and sending",
+          "runs 24/7 unless the local-time quiet window above is on; the Vega reply-send switch still applies",
+        ]);
+      } finally {
+        discoveryStarting = false;
+        discoverButton.disabled = false;
+      }
+    })();
+  });
+  // Auto notifications: the conversation lane. It IS an unattended drain (so
+  // whatever Vega drafts from the sweep gets posted by this same run), plus a
+  // periodic sweep of the mentions tab that enqueues the people who replied to
+  // us. One click runs the whole loop.
+  if (NOTIFICATIONS_ACTOR_ENABLED) q("#na-notifs").addEventListener("click", () => {
+    void start("startNotifications", "AUTO NOTIFICATIONS", [
+      "checking mentions every ~10-20 min for people who replied to you",
+      "each one goes to Vega to draft, then this same run posts it in-thread. Press STOP to end",
+      "pauses ALL writes overnight 1am–9am (replies AND likes); browsing stays on. Press STOP to end",
+    ]);
+  });
+
+  setInterval(async () => {
+    // Drive the loop from here: the content script stays alive as long as the
+    // tab is open, unlike the MV3 service worker whose alarms/timers are
+    // unreliable. tick() is a no-op unless an action is actually due, so the
+    // human pacing (the schedule) is preserved.
+    await chrome.runtime.sendMessage({ cmd: "tick" }).catch(() => null);
+    const r = await chrome.runtime.sendMessage({ cmd: "getState" }).catch(() => null);
+    if (r?.ok) view.render(r.state ?? null, Boolean(r.discoveryActive));
+  }, 4_000);
+}
