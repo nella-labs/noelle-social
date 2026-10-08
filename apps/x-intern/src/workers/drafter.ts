@@ -398,3 +398,203 @@ async function main() {
         // the org's BYO Gemini key (the same key family the classifier uses);
         // NOT_FOUND is the common case and just disables vision (captionImages
         // returns empty context on transport failure). Secret errors disable
+        // captions; budget denial stops drafting for this tick.
+        let captionFn: CaptionFn | undefined;
+        const metering = { context: { orgId: inst.org_id, instanceId: inst.id, agentRole: "x_intern" as const,
+          worker: "drafter", bucket: "vision_caption" }, budget, recorder };
+        try {
+          const geminiKey = await secrets.getForOrg(inst.org_id, "gemini-api-key");
+          if (geminiKey) captionFn = createGeminiCaptionFn({ apiKey: geminiKey, metering });
+        } catch (err) {
+          if (!(err instanceof SecretAccessError) || !/NOT_FOUND/.test((err as Error).message)) {
+            log.warn({ org_id: inst.org_id, err: (err as Error).message }, "gemini key lookup for vision failed; captions disabled");
+          }
+        }
+        // No org BYO key: use the worker's global Gemini key (generativelanguage
+        // API — no ADC, no reauth) so vision stays on a cheap Google path instead
+        // of paid Bedrock. This is the primary self-host vision path now.
+        if (!captionFn && env.NOELLE_GEMINI_API_KEY) {
+          captionFn = createGeminiCaptionFn({ apiKey: env.NOELLE_GEMINI_API_KEY, metering });
+          log.info({ org_id: inst.org_id }, "vision captions via global Gemini key (no org key)");
+        }
+        // Last-resort fallback: a vision-capable Claude on Bedrock (PAID; the CLI
+        // subscription can't caption images). Default OFF now (NOELLE_VISION_BEDROCK)
+        // so image posts never silently bill AWS; set NOELLE_VISION_BEDROCK=1 to
+        // opt back in. Fails open to "" when no creds.
+        if (!captionFn && env.NOELLE_VISION_BEDROCK) {
+          captionFn = createBedrockCaptionFn({ metering });
+          log.info({ org_id: inst.org_id }, "vision captions via Bedrock Claude (opt-in)");
+        }
+
+        let n = 0;
+        if (claimed.length > 0 || observedLeads.length > 0 || replyRequests.length > 0) {
+          // preferShort: few-shot exemplars steer the drafter's length, and
+          // pure-recency selection was ratcheting replies longer over time
+          // (June avg 160 chars -> July 180 -> pending 209). The diversity
+          // corpus below deliberately does NOT opt in; it needs strict recency.
+          const examples = env.NOELLE_DRAFTER_EXAMPLES
+            ? await getRecentSentExamples(sql, inst.id, env.NOELLE_DRAFTER_EXAMPLES_TOPK, {
+                preferShort: true,
+              })
+            : undefined;
+          // Recently-sent replies as the near-duplicate corpus for the reply-
+          // diversity gate (default off; fail-open when empty). Separate topK
+          // from the few-shot examples above.
+          const replyPriors = quality.diversityGate
+            ? await getRecentSentExamples(sql, inst.id, env.NOELLE_REPLY_DIVERSITY_TOPK)
+            : undefined;
+          // "Read the room": resolve the org's Apify handle ONCE this tick and hand
+          // the drafter a per-lead fetch of the top replies on each post (via the
+          // conversation_id operator). Fail-open: no token / no handle / any error →
+          // no room context (the tick catches the throw). Metered as worker='drafter'.
+          const siblingHandle = resolveApify
+            ? await resolveApify(inst.org_id).catch(() => null)
+            : null;
+          const fetchSiblingComments = siblingHandle
+            ? async (lead: LeadRow): Promise<SiblingComment[]> => {
+                const { tweets } = await withMeteredApifyCall({
+                  client: siblingHandle.client, recorder: siblingRecorder, log,
+                  orgId: inst.org_id,
+                  instanceId: inst.id,
+                  agentRole: "x_intern",
+                  worker: "drafter",
+                  actor: X_SCRAPER_ACTOR,
+                  startedAt: new Date(),
+                  credentialId: siblingHandle.credentialId,
+                }, operation => operation.conversationReplies({
+                  conversationId: lead.external_id,
+                  limit: env.NOELLE_DRAFTER_COMMENT_MAX,
+                }));
+                return tweets.map((t) => ({
+                  text: t.text,
+                  author: `@${t.author.handle}`,
+                  score: t.likes,
+                }));
+              }
+            : undefined;
+          // The operator's real POST -> REPLY pairs, once per tick. Noelle
+          // already had this data and used it only as an avoid-list; nothing
+          // ever showed the model what a reply DID with a post.
+          const voiceExemplars = await getVoiceExemplars(sql, {
+            agentInstanceId: inst.id,
+            limit: VOICE_EXEMPLAR_COUNT,
+          });
+          const draftLeads = (claimedLeads: LeadRow[], forceVerify = false) => runDrafterTick({
+            log,
+            notifier,
+            voiceExemplars,
+            instance: inst,
+            claimedLeads,
+            patternRules,
+            runner,
+            kb,
+            postOutbound,
+            markStatus: (a) => markLeadStatus(sql, a),
+            // Pushover the operator for a notification too important to answer
+            // with an agent. Fail-soft by construction: createNotifier returns
+            // { status: 'no_channel' } without throwing when no Pushover keys
+            // exist, so an org with no channel simply gets no push.
+            pinNotification: async ({ title, message, url }) => {
+              // Report DELIVERY, not just "we tried": the tick keeps the lead
+              // visible (status 'errored') when a pin does not actually land,
+              // so a real opportunity can never vanish into the skip pile.
+              const r = await notifier.notify({
+                orgId: inst.org_id,
+                title,
+                message,
+                ...(url ? { url, url_title: "open the thread" } : {}),
+              });
+              return r.status === "sent";
+            },
+            relevanceThreshold: env.DRAFTER_RELEVANCE_THRESHOLD,
+            // Per-instance bar (mig 0042) beats the env default. Lyra and Orion
+            // have honoured this column since #184/#230; Vega ignored it, so the
+            // dashboard's strictness control did nothing for the X intern.
+            // Now graded on REPLY-WORTHINESS (q) rather than the velocity proxy.
+            qualityThreshold: (inst.classifier_threshold ?? env.X_Q_THRESHOLD) / 100,
+            // Escalate a genuinely high-traction lead to the smarter model;
+            // engagement-bait reply counts are discounted (see decideOpus).
+            opusLikesThreshold: env.X_OPUS_LIKES,
+            opusRepliesThreshold: env.X_OPUS_REPLIES,
+            voiceDirs: parseIncludeDirs(env.NOELLE_VOICE_DIRS),
+            knowledgeDirs: parseIncludeDirs(env.NOELLE_KNOWLEDGE_DIRS),
+            knowledgeTopK: env.NOELLE_DRAFTER_KNOWLEDGE_TOPK,
+            examples,
+            replyPriors,
+            // Per-person memory: don't re-say a take to someone Vega already
+            // replied to. Also feeds the verifier's `novelty` axis.
+            getPriorReplies: (a) =>
+              getRecentRepliesToAuthor(sql, { ...a, agentInstanceId: inst.id }),
+            priorRepliesTopK: env.X_DRAFTER_SENT_TOPK,
+            // Feed-wide avoid-list: keep openers/phrasings varied across the
+            // whole feed, not just per person. Feeds the verifier's deterministic
+            // `diversity` leg too.
+            getRecentPhrasings: (a) =>
+              getRecentReplyPhrasings(sql, { ...a, agentInstanceId: inst.id }),
+            recentPhrasingsTopK: env.X_DRAFTER_RECENT_PHRASINGS_TOPK,
+            verify: (forceVerify || env.NOELLE_DRAFTER_VERIFY)
+              ? {
+                  enabled: true,
+                  retries: env.NOELLE_DRAFTER_VERIFY_RETRIES,
+                  voiceFloor: env.NOELLE_DRAFTER_VOICE_FLOOR,
+                  // Judge runs through the drafter's own (wired) routing. Use
+                  // one high-reasoning Codex judge for browser-observed leads
+                  // so each review/repair step does not fan out 3x. Keep the
+                  // adversarial panel for legacy priority/watchlist leads.
+                  makeCalls: (priority, options): VerifierCall[] => {
+                    // Grade on the cheap Haiku tier when NOELLE_DRAFTER_VERIFY_CHEAP is set;
+                    // otherwise the drafter's own (Sonnet/Opus) routing, unchanged. The judge
+                    // only scores — the drafter stays on its full model regardless.
+                    const judgeModelRouting = env.NOELLE_DRAFTER_VERIFY_CHEAP
+                      ? judgeRouting()
+                      : xInternRouting(inst);
+                    const judge: VerifierCall = (system, prompt) =>
+                      runner
+                        .draft({
+                          bucket: "drafter-verify",
+                          routing: judgeModelRouting,
+                          orgId: inst.org_id,
+                          instanceId: inst.id,
+                          worker: "drafter",
+                          agentRole: "x_intern",
+                          system,
+                          prompt,
+                          ...(options?.directRouting ? { directRouting: true } : {}),
+                          ...(options?.codexSubscriptionOnly
+                            ? { codexSubscriptionOnly: true }
+                            : {}),
+                          ...(options?.codexReasoningEffort
+                            ? { codexReasoningEffort: options.codexReasoningEffort }
+                            : {}),
+                        })
+                        .then((r) => r.text);
+                    return priority && !options?.codexSubscriptionOnly
+                      ? [judge, judge, judge]
+                      : [judge];
+                  },
+                }
+              : undefined,
+            sql,
+            bus,
+            // Vision caption for tweets with images (no-op when no key resolved).
+            captionFn,
+            // Voice variety: per-lead FORM assignment injected into the reply
+            // prompt (gated on NOELLE_DRAFTER_VARIETY, or auto-engaged for an
+            // autosend instance via the quality master flag; default off → unchanged).
+            //
+            // This used to be ANDed with "no faithful voice pinned AND style on"
+            // (Lyra fix #428): a random SLANG/HYPE register fights a pinned voice,
+            // so variety was switched off entirely for a pinned instance. In
+            // production that turned Vega static — Vega HAS a voice pinned and
+            // NOELLE_DRAFTER_STYLE=1, so it drafted with no register, no shape and
+            // (energy being off) no energy hint: one fixed mold for every reply.
+            //
+            // Lyra already replaced #428 with per-lead form variants in #498, and
+            // the tick now does the same for Vega: it assigns a rotating SHAPE and
+            // suppresses the register for that lead, so the pinned voice is never
+            // fought by a contradicting register while form still varies. The
+            // suppression therefore moves INTO the tick, per lead, and the flag
+            // here is just the master switch again.
+            variety: { enabled: quality.variety },
+            // Post-energy mirroring (NOELLE_DRAFTER_ENERGY; default off → blind
+            // register + celebration/neutral style only, byte-identical). On → the
