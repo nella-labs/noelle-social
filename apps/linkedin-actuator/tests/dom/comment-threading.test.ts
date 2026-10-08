@@ -398,3 +398,203 @@ describe("commentDeepLink — arrive where a human would", () => {
   });
 
   it("returns the url UNCHANGED when it cannot build one — never a reason to skip", () => {
+    expect(commentDeepLink(POSTURL, null, `urn:li:comment:${THEIRS}`)).toBe(POSTURL);
+    expect(commentDeepLink(POSTURL, "urn:li:ugcPost:1", null)).toBe(POSTURL);
+    expect(commentDeepLink(POSTURL, "urn:li:ugcPost:1", "not-a-urn")).toBe(POSTURL);
+  });
+
+  it("appends correctly to a url that already has a query", () => {
+    const out = commentDeepLink(`${POSTURL}?foo=1`, "urn:li:ugcPost:1", `urn:li:comment:${THEIRS}`);
+    expect(out).toContain("?foo=1&commentUrn=");
+  });
+});
+
+// Post permalinks can serve legacy Ember markup. The locator must support
+// its comment identifiers as well as the current page shape.
+describe("the legacy ember post page (what the actuator actually meets)", () => {
+  const legacy = () =>
+    readFileSync(join(here, "..", "fixtures", "post-comments-legacy-ember.html"), "utf8");
+
+  it("finds a comment by its data-id, where the post half has NO urn:li: prefix", () => {
+    // data-id="urn:li:comment:(ugcPost:748…,7487199472029192192)" — matching on
+    // the ",<id>)" suffix is what makes the two generations interchangeable.
+    const el = locateCommentByUrn(mount(legacy()), THEIRS);
+    expect(el).not.toBeNull();
+    expect(el!.textContent).toContain("thank you so much!! I will");
+  });
+
+  it("returns the REPLY, not the parent comment it is nested inside", () => {
+    // Here replies live INSIDE the parent's <article>, so a naive match returns
+    // the parent — and we would answer the wrong person.
+    const root = mount(legacy());
+    const theirs = locateCommentByUrn(root, THEIRS)!;
+    const ours = locateCommentByUrn(root, OURS)!;
+    expect(theirs).not.toBe(ours);
+    expect(ours.contains(theirs)).toBe(true); // nested, as LinkedIn renders it
+    expect(theirs.getAttribute("data-id")).toContain(THEIRS);
+  });
+
+  it("finds THAT comment's own Reply button, not a nested one", () => {
+    // Through the REAL API, and with per-element rects so the two calls are
+    // actually distinguishable — a single shared stub made every button return
+    // identical coordinates, which hid whether the nesting logic worked at all.
+    const root = mount(legacy());
+    const label = (el: Element) => el.getAttribute("aria-label") ?? "";
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      // Alex's button at y=100, Malena's at y=200 — so a wrong pick is visible.
+      const y = label(this).includes("Malena") ? 200 : label(this).includes("Alex") ? 100 : 50;
+      return { x: 10, y, width: 40, height: 20, top: y, left: 10, right: 50, bottom: y + 20, toJSON: () => ({}) } as DOMRect;
+    });
+
+    const forOurs = locateCommentReplyButton(root, OURS);
+    const forTheirs = locateCommentReplyButton(root, THEIRS);
+    expect(forOurs.ok && forTheirs.ok).toBe(true);
+    // The parent's article CONTAINS the child's button, so these MUST differ.
+    expect(forOurs.y).toBe(110); // centre of Alex's own button
+    expect(forTheirs.y).toBe(210); // centre of Malena's
+    expect(forOurs.y).not.toBe(forTheirs.y);
+  });
+
+  it("recognises the legacy expander (aria-label, not text)", () => {
+    expect(locateLoadMoreComments(mount(legacy())).ok).toBe(true);
+  });
+
+  it("finds the legacy Quill composer", () => {
+    const root = mount(legacy());
+    // The post-level box is the only composer open here; the reply box appears
+    // after clicking. What matters is that the editor is addressable at all.
+    expect(root.querySelector(".ql-editor[contenteditable='true']")).not.toBeNull();
+  });
+
+  it("still refuses an id that is not on the page", () => {
+    const r = locateCommentReplyButton(mount(legacy()), "9999999999999999999");
+    expect(r.ok).toBe(false);
+    expect(r.skipReason).toBe("comment-reply:comment-not-found");
+  });
+});
+
+describe("registered threaded locator ownership", () => {
+  type Reply = {
+    ok: boolean;
+    skipReason?: string;
+    rect?: { x: number };
+    observed?: unknown;
+    mention?: string | null;
+  };
+  let handler: (message: unknown, sender: unknown, reply: (value: Reply) => void) => boolean;
+  function command(cmd: string, extra: Record<string, unknown> = {}) {
+    let result!: Reply;
+    expect(
+      handler({ cmd, commentUrn: "111", ...extra }, {}, (value) => {
+        result = value;
+      }),
+    ).toBe(true);
+    return result;
+  }
+  const anchor = (inner = "") =>
+    `<article data-id="urn:li:comment:(ugcPost:123,111)"><button aria-label="Reply">Reply</button>${inner}</article>`;
+  const box = (keyed = false, mention = "Ann Smith") =>
+    `<div ${keyed ? 'componentkey="commentBox-target"' : 'class="comments-comment-box"'}><div contenteditable="true" role="textbox" data-x="10"><span data-type="mention">${mention}</span> approved body</div><section id="commentButtonSection-target"><button data-x="20">Reply</button></section></div>`;
+  const foreign = () =>
+    `<article data-id="urn:li:comment:(ugcPost:123,222)"><div componentkey="commentBox-foreign"><div contenteditable="true" role="textbox" data-x="200">other</div></div></article>`;
+  beforeEach(() => {
+    vi.stubGlobal("chrome", {
+      runtime: {
+        onMessage: {
+          addListener: (fn: typeof handler) => {
+            handler = fn;
+          },
+        },
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        throw new Error("network forbidden");
+      }),
+    );
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      const x = Number(this.getAttribute("data-x") ?? 1);
+      return {
+        x,
+        y: 20,
+        width: 40,
+        height: 20,
+        top: 20,
+        left: x,
+        right: x + 40,
+        bottom: 40,
+        toJSON: () => ({}),
+      } as DOMRect;
+    });
+    initContent();
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+  });
+
+  it.each([false, true])("accepts a sole %s keyed target composer", (keyed) => {
+    document.body.innerHTML = anchor(box(keyed));
+    expect(command("locateReplyComposer").ok).toBe(true);
+    expect(command("locateReplySubmit", { expectMention: "Ann Smith" }).ok).toBe(true);
+  });
+  it.each(["nested", "adjacent"])(
+    "chooses the existing %s target before a later foreign higher selector tier",
+    (layout) => {
+      document.body.innerHTML =
+        (layout === "nested" ? anchor(box()) : anchor() + box()) + foreign();
+      expect(command("locateReplyComposer")).toMatchObject({ ok: true, rect: { x: 10 } });
+      expect(command("locateReplySubmit", { expectMention: "Ann Smith" })).toMatchObject({
+        ok: true,
+        rect: { x: 20 },
+      });
+      expect(command("readReplyComposer")).toMatchObject({
+        ok: true,
+        observed: { text: "approved body" },
+      });
+    },
+  );
+  it("refuses a foreign following composer when the target has none", () => {
+    document.body.innerHTML = anchor() + foreign();
+    expect(command("locateReplyComposer").ok).toBe(false);
+  });
+  it("refuses a different first name sharing the expected prefix", () => {
+    document.body.innerHTML = anchor(box(true, "Anna Jones"));
+    expect(command("locateReplySubmit", { expectMention: "Ann Smith" })).toMatchObject({
+      ok: false,
+      skipReason: "reply-submit:wrong-person",
+    });
+  });
+  it("accepts the exact first name when the chip omits surname", () => {
+    document.body.innerHTML = anchor(box(true, "Ann"));
+    expect(command("locateReplySubmit", { expectMention: "Ann Smith" }).ok).toBe(true);
+  });
+  it("accepts matching first name with case and whitespace differences", () => {
+    document.body.innerHTML = anchor(box(true, "  ANN   Smith  "));
+    expect(command("locateReplySubmit", { expectMention: "ann smith" }).ok).toBe(true);
+  });
+  it("refuses an absent expected mention", () => {
+    document.body.innerHTML = anchor(box(true, ""));
+    expect(command("locateReplySubmit", { expectMention: "Ann Smith" }).ok).toBe(false);
+  });
+
+  it("prefers the explicitly target-owned box after a nested foreign comment composer", () => {
+    document.body.innerHTML = anchor(foreign() + box());
+    expect(command("locateReplyComposer")).toMatchObject({ ok: true, rect: { x: 10 } });
+  });
+  it("refuses a nested foreign composer when the target has no own box", () => {
+    document.body.innerHTML = anchor(foreign());
+    expect(command("locateReplyComposer").ok).toBe(false);
+  });
+  it("preserves a keyed target-owned box before a nested foreign comment", () => {
+    document.body.innerHTML = anchor(box(true) + foreign());
+    expect(command("locateReplyComposer")).toMatchObject({ ok: true, rect: { x: 10 } });
+  });
+
+  it("reads a mention-only target as measured empty body", () => {
