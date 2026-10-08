@@ -198,3 +198,194 @@ export type PostVerifierMeta = z.infer<typeof PostVerifierMetaSchema>;
 export const PostDraftCreateSchema = z.object({
   ideaId: z.string().uuid(),
   platform: PostPlatformSchema,
+  body: z.string().min(1),
+  // The chosen opening line, surfaced into the editor's HOOK field so the
+  // operator can see it (and see it change on every regen). Derived from body's
+  // first line — body still contains it, so the posted text is unchanged.
+  hook: z.string().nullable().optional(),
+  charCount: z.number().int().nonnegative(),
+  sourceEngine: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  qualityScore: z.number().nullable().optional(),
+  qualityPassed: z.boolean().nullable().optional(),
+  verifierMeta: PostVerifierMetaSchema.nullable().optional(),
+  // Durable MCP/operator generation request id. The worker echoes it so callers
+  // can poll the exact drafts created for that request instead of latest old drafts.
+  generationRequestId: z.string().uuid().nullable().optional(),
+  // Worker-finalization signal for durable generation requests. False/absent means
+  // more planned variants may still be running.
+  generationComplete: z.boolean().optional(),
+});
+export type PostDraftCreate = z.infer<typeof PostDraftCreateSchema>;
+
+export const PostDraftCreatedSchema = z.object({
+  draft_id: UuidSchema,
+  idea_id: UuidSchema,
+});
+export type PostDraftCreated = z.infer<typeof PostDraftCreatedSchema>;
+
+// POST /api/posts/:ideaId/generate (JWT) — flip a proposed idea to approved so
+// the post-drafter claims it and fans out to its target platforms. An optional
+// `platforms` scopes a regenerate to a subset (a per-platform "+ Version"); when
+// absent the drafter (re)drafts every target platform. Optional `guidance` is a
+// one-off steer for THIS regen (e.g. "make it punchier, drop the stat") — stored
+// as a post-scoped drafter note the worker reads, so the new version follows it.
+export const PostGenerateInSchema = z.object({
+  platforms: z.array(PostPlatformSchema).min(1).max(3).optional(),
+  guidance: z.string().max(2000).optional(),
+});
+export type PostGenerateIn = z.infer<typeof PostGenerateInSchema>;
+
+export const PostGenerateOutSchema = z.object({
+  idea_id: UuidSchema,
+  status: PostIdeaStatusSchema,
+});
+export type PostGenerateOut = z.infer<typeof PostGenerateOutSchema>;
+
+// POST /api/posts/:draftId/chat (JWT) — operator guidance → synchronous regen.
+export const PostChatInSchema = z.object({
+  message: z.string().min(1).max(4000),
+  // When true, also persist this guidance as a standing rule for all future
+  // posts (drafter_notes scope='standing', pinned=true).
+  pin: z.boolean().default(false),
+});
+export type PostChatIn = z.infer<typeof PostChatInSchema>;
+
+// The chat regenerates the post by re-queuing the idea for the post-drafter
+// (which re-gathers with the new guidance) — so the response is "queued", not a
+// synchronous body. The new draft appears on the Drafts board shortly after.
+export const PostChatOutSchema = z.object({
+  idea_id: UuidSchema,
+  queued: z.boolean(),
+  pinned: z.boolean(),
+});
+export type PostChatOut = z.infer<typeof PostChatOutSchema>;
+
+// POST /api/posts/:ideaId/polish (JWT) — operator asks the agent to sharpen ONE
+// idea's hook/thesis IN PLACE. Enqueues a mode='polish' ideation_requests row;
+// the ideation worker refines it (async, like generate/ideate). The refined idea
+// appears on the next refresh.
+export const PostPolishOutSchema = z.object({
+  idea_id: UuidSchema,
+  queued: z.boolean(),
+});
+export type PostPolishOut = z.infer<typeof PostPolishOutSchema>;
+
+// POST /api/posts/:noteId/pin (JWT) — pin an existing chat turn as standing.
+export const PostPinNoteInSchema = z.object({
+  pinned: z.boolean().default(true),
+});
+export type PostPinNoteIn = z.infer<typeof PostPinNoteInSchema>;
+
+// POST /api/posts/:draftId/mark-ready (JWT) — operator approves the draft.
+// edited body (if the operator changed it inline) lands in final_body.
+export const PostMarkReadyInSchema = z.object({
+  editedBody: z.string().max(8000).optional(),
+});
+export type PostMarkReadyIn = z.infer<typeof PostMarkReadyInSchema>;
+
+// POST /api/posts/:id/mark-posted (JWT) — operator published this variant by
+// hand (the interns never post). Archives the draft; an optional posted URL is
+// stored so the operator can jump back to the live post.
+export const PostMarkPostedInSchema = z.object({
+  postedUrl: z.string().url().max(2000).nullable().optional(),
+});
+export type PostMarkPostedIn = z.infer<typeof PostMarkPostedInSchema>;
+
+// The per-column lifecycle shown in the STATUS row (content-pipeline parity).
+// The route syncs the board `status` from it (draft→draft, written/scheduled→
+// ready, posted→published).
+export const PostStageSchema = z.enum(["draft", "written", "scheduled", "posted"]);
+export type PostStage = z.infer<typeof PostStageSchema>;
+
+export const POST_CATEGORIES = ["building", "studying", "workout", "gtm"] as const;
+export const PostCategorySchema = z.enum(POST_CATEGORIES);
+export type PostCategory = z.infer<typeof PostCategorySchema>;
+
+// POST /api/posts/:draftId/patch (JWT) — operator edits one platform variant's
+// fields inline (the rich column). Every field optional; only provided ones are
+// written. `body` is the CONTENT (its edit lands in final_body + the edits
+// ledger); `stage` drives the board status sync.
+export const PostPatchInSchema = z
+  .object({
+    hook: z.string().max(2000).nullable().optional(),
+    cta: z.string().max(2000).nullable().optional(),
+    notes: z.string().max(8000).nullable().optional(),
+    category: PostCategorySchema.nullable().optional(),
+    stage: PostStageSchema.optional(),
+    body: z.string().max(8000).optional(),
+    postedUrl: z.string().url().max(2000).nullable().optional(),
+  })
+  .refine((d) => Object.keys(d).length > 0, { message: "patch must set at least one field" });
+export type PostPatchIn = z.infer<typeof PostPatchInSchema>;
+
+// POST /api/posts/:id/dismiss (JWT) — drop an idea or draft. `target` says which
+// table the id refers to (the inbox knows which surface the click came from).
+//
+// `scope` (target:"draft" only): the Drafts board renders ONE card per
+// (idea, platform) = the LATEST of N versions (the drafter writes 3 X versions
+// per idea and never supersedes). "row" dismisses only the passed version, so
+// the board just resurfaces the previous version and the card looks
+// undeletable; "set" dismisses EVERY live version of that (idea, platform) so
+// the card actually leaves the board. The board sends "set"; the per-version
+// Dismiss in the refine detail view keeps the default "row". Ignored for
+// target:"idea". Defaults to "row" (backward compatible).
+export const PostDismissInSchema = z.object({
+  target: z.enum(["idea", "draft"]),
+  scope: z.enum(["row", "set"]).default("row"),
+});
+export type PostDismissIn = z.infer<typeof PostDismissInSchema>;
+
+export const PostActionOutSchema = z.object({
+  id: UuidSchema,
+  status: z.string(),
+});
+export type PostActionOut = z.infer<typeof PostActionOutSchema>;
+
+// Kill-and-replace: dismiss one idea AND enqueue a single replacement ideation on
+// the same theme (the review board's "kill an idea → another appears"). Atomic.
+export const PostReplaceOutSchema = z.object({
+  id: UuidSchema,
+  status: z.literal("dismissed"),
+  replacement_queued: z.boolean(),
+});
+export type PostReplaceOut = z.infer<typeof PostReplaceOutSchema>;
+
+// Read models (dashboard server components / queries).
+export const PostIdeaViewSchema = z.object({
+  id: UuidSchema,
+  platform: PostPlatformSchema,
+  target_platforms: z.array(PostPlatformSchema),
+  hook: z.string(),
+  thesis: z.string().nullable(),
+  angle: z.string().nullable(),
+  pillar: z.string().nullable(),
+  inspiration_refs: z.array(InspirationRefSchema),
+  suggested_day: z.string().nullable(),
+  batch_id: UuidSchema.nullable(),
+  status: PostIdeaStatusSchema,
+  created_at: TimestampSchema,
+});
+export type PostIdeaView = z.infer<typeof PostIdeaViewSchema>;
+
+export const PostDraftViewSchema = z.object({
+  id: UuidSchema,
+  idea_id: UuidSchema,
+  platform: PostPlatformSchema,
+  body: z.string(),
+  final_body: z.string().nullable(),
+  char_count: z.number().int().nullable(),
+  posted_url: z.string().nullable(),
+  // Rich per-column fields (0060). draft_hook is the column's own HOOK line
+  // (distinct from the idea hook used as the title).
+  draft_hook: z.string().nullable(),
+  cta: z.string().nullable(),
+  notes: z.string().nullable(),
+  category: z.string().nullable(),
+  stage: PostStageSchema,
+  quality_score: z.number().nullable(),
+  quality_passed: z.boolean().nullable(),
+  status: PostDraftStatusSchema,
+  created_at: TimestampSchema,
+});
+export type PostDraftView = z.infer<typeof PostDraftViewSchema>;
