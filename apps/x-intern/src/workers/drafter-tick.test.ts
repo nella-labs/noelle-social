@@ -2598,3 +2598,203 @@ describe("runDrafterTick voice variety (NOELLE_DRAFTER_VARIETY)", () => {
         instance: { id: "i", org_id: "o" } as never,
         claimedLeads: [mkLead()] as never,
         runner: runner as never,
+        kb: mkKb() as never,
+        postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+        markStatus: vi.fn().mockResolvedValue(undefined),
+        variety: {
+          enabled: true,
+          rng: () => 0,
+          formVariantRotation: { next: () => X_FORM_VARIANTS.find((v) => v.id === shapeId)! },
+        },
+      });
+      return runner.draft.mock.calls[0]![0].prompt as string;
+    };
+    // RUN_ON says what the reply IS, not how it starts → gets an opening move.
+    expect(await pick("RUN_ON")).toContain("OPENING MOVE FOR THIS REPLY");
+    // HOOK_THEN_LINE already prescribes the opener → a second directive would fight it.
+    expect(await pick("HOOK_THEN_LINE")).not.toContain("OPENING MOVE FOR THIS REPLY");
+    // MICRO is one to eight words → no opening distinct from the whole reply.
+    expect(await pick("MICRO")).not.toContain("OPENING MOVE FOR THIS REPLY");
+  });
+
+  it("never asks Vega for an ANECDOTE opener (burned-props failure mode)", async () => {
+    // Sweep the rng across the whole pool; ANECDOTE must never surface on X.
+    for (let i = 0; i < 40; i++) {
+      const runner = mkRunner();
+      await runDrafterTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [mkLead()] as never,
+        runner: runner as never,
+        kb: mkKb() as never,
+        postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+        markStatus: vi.fn().mockResolvedValue(undefined),
+        variety: {
+          enabled: true,
+          rng: () => i / 40,
+          formVariantRotation: { next: () => X_FORM_VARIANTS.find((v) => v.id === "RUN_ON")! },
+        },
+      });
+      const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+      expect(prompt).not.toContain("first-person observation from your own work");
+    }
+  });
+
+  it("fails OPEN on an unscored lead — a classifier outage must not drop every lead", async () => {
+    const runner = mkRunner();
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      // classifier_score null = the scoring call failed, NOT junk.
+      claimedLeads: [{ ...mkLead(), classifier_score: null, priority: false }] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      qualityThreshold: 0.5,
+    });
+    expect(postOutbound).toHaveBeenCalled();
+  });
+
+  it("still drops a genuinely low-scored lead (the gate is not disabled)", async () => {
+    const runner = mkRunner();
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [{ ...mkLead(), classifier_score: 0.1, priority: false }] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus,
+      qualityThreshold: 0.5,
+    });
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "skipped" }),
+    );
+  });
+
+  it("routes a LIGHT lead to a short warm reply and never a bare question", async () => {
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [{ ...mkLead(), classifier_label: "light" }] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      // r=0 would pick QUESTION_ONLY out of the unfiltered pool on some seeds;
+      // the light lane must exclude it whatever the rng does.
+      variety: { enabled: true, rng: () => 0.35 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("THIS POST IS A WIN, LAUNCH, OR MILESTONE");
+    expect(prompt).not.toContain("The whole reply is ONE genuine, specific question");
+  });
+
+  it("never assigns QUESTION_ONLY on the light lane, across the whole rng range", async () => {
+    for (let i = 0; i < 40; i++) {
+      const runner = mkRunner();
+      await runDrafterTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [{ ...mkLead(), classifier_label: "light" }] as never,
+        runner: runner as never,
+        kb: mkKb() as never,
+        postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+        markStatus: vi.fn().mockResolvedValue(undefined),
+        variety: { enabled: true, rng: () => i / 40 },
+      });
+      const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+      expect(prompt).not.toContain("The whole reply is ONE genuine, specific question");
+    }
+  });
+
+  it("leaves a non-light lead without the light directive (byte-identical)", async () => {
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      variety: { enabled: true, rng: () => 0.35 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("THIS POST IS A WIN, LAUNCH, OR MILESTONE");
+  });
+
+  it("injects NOTHING when variety is OFF (byte-identical to today)", async () => {
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      variety: { enabled: false, rng: () => 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("ASSIGNED REGISTER");
+  });
+
+  it("injects NOTHING when the variety arg is omitted entirely", async () => {
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("ASSIGNED REGISTER");
+  });
+});
+
+describe("poolForFaithfulLead (faithful multi-voice rotation)", () => {
+  const row = (handle: string, i: number) =>
+    ({ id: `${handle}-${i}`, account_handle: handle, body: `post ${i} by ${handle}` }) as never;
+  const pool = [row("kaia", 1), row("kaia", 2), row("henry", 1)];
+
+  it("returns the pool untouched for zero or one voice (single-pin unchanged)", async () => {
+    const { poolForFaithfulLead } = await import("./drafter-tick.js");
+    expect(poolForFaithfulLead(pool, [], "any post")).toBe(pool);
+    expect(poolForFaithfulLead(pool, ["kaia"], "any post")).toBe(pool);
+  });
+
+  it("restricts the pool to ONE voice, deterministically per post text", async () => {
+    const { poolForFaithfulLead } = await import("./drafter-tick.js");
+    const out1 = poolForFaithfulLead(pool, ["kaia", "henry"], "some lead post");
+    const out2 = poolForFaithfulLead(pool, ["kaia", "henry"], "some lead post");
+    expect(out1).toEqual(out2); // stable per lead
+    const handles = new Set(out1.map((r) => (r as { account_handle: string }).account_handle));
+    expect(handles.size).toBe(1); // a single writer's corpus
+  });
+
+  it("rotates across different posts (both voices reachable)", async () => {
+    const { poolForFaithfulLead } = await import("./drafter-tick.js");
+    const seen = new Set<string>();
+    for (let i = 0; i < 40; i++) {
+      const out = poolForFaithfulLead(pool, ["kaia", "henry"], `post number ${i}`);
+      seen.add((out[0] as { account_handle: string }).account_handle);
+    }
+    expect(seen).toEqual(new Set(["kaia", "henry"]));
+  });
+
+  it("a zero weight makes that voice unreachable (weights bias the draw)", async () => {
+    const { poolForFaithfulLead } = await import("./drafter-tick.js");
+    for (let i = 0; i < 40; i++) {
+      const out = poolForFaithfulLead(pool, ["kaia", "henry"], `post number ${i}`, [1, 0]);
+      expect((out[0] as { account_handle: string }).account_handle).toBe("kaia");
+    }
