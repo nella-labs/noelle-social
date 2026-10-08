@@ -198,3 +198,139 @@ async function listLeads(args: Record<string, unknown>, ctx: NoelleContext): Pro
     ["id", "author", "platform", "status", "tier", "score", "priority", "snippet"],
     rows.map((r) => [
       r.id,
+      r.author_handle ? `@${r.author_handle}` : "—",
+      r.platform,
+      r.status,
+      r.tier,
+      r.classifier_score,
+      r.priority,
+      truncate(r.lead_text, 80),
+    ]),
+  );
+  return text(`**${org.name}** — ${rows.length} lead(s)\n\n${table}`);
+}
+
+async function getLead(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const leadId = reqStr(args, "leadId");
+
+  const [lead] = await ctx.sql<Array<Record<string, unknown>>>`
+    select * from noelle.leads where id = ${leadId} and org_id = ${org.orgId}`;
+  if (!lead) throw new NoelleError(`Lead ${leadId} not found in this org.`);
+
+  const angles = await ctx.sql<
+    Array<{
+      a_id: string;
+      a_status: string;
+      kind: string;
+      body: string | null;
+      sent_external_id: string | null;
+    }>
+  >`
+    select a.id a_id, a.status a_status, coalesce(d.payload->>'kind','reply') as kind,
+      coalesce(d.payload->>'edited_body', d.payload->>'body') as body, d.sent_external_id
+    from noelle.approvals a join noelle.drafts d on d.id = a.draft_id
+    where a.lead_id = ${leadId} and a.org_id = ${org.orgId} order by a.created_at asc`;
+
+  const payload =
+    lead.payload && typeof lead.payload === "object"
+      ? (lead.payload as Record<string, unknown>)
+      : {};
+  const leadText = typeof payload.text === "string" ? payload.text : null;
+  const authorName = typeof payload.authorName === "string" ? payload.authorName : null;
+
+  const header = mdFields({
+    id: lead.id,
+    author: lead.author_handle ? `@${String(lead.author_handle)}` : authorName,
+    platform: lead.platform,
+    status: lead.status,
+    tier: lead.tier,
+    label: lead.classifier_label,
+    score: lead.classifier_score,
+    priority: lead.priority,
+    external_id: lead.external_id,
+  });
+
+  const angleBlocks = angles.length
+    ? angles
+        .map(
+          (a) =>
+            `- **${a.kind}** · ${a.a_status}${a.sent_external_id ? ` · sent:${a.sent_external_id}` : ""}  (approval \`${a.a_id}\`)\n\n${a.body ?? ""}`,
+        )
+        .join("\n\n")
+    : "_no drafts yet_";
+
+  const parts: string[] = [`## Lead \`${leadId}\``, header];
+  if (leadText) parts.push("", "### Text", leadText);
+  parts.push("", `### Drafts / angles (${angles.length})`, angleBlocks);
+  return text(parts.join("\n"));
+}
+
+async function flagLead(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("flag a lead");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const leadId = reqStr(args, "leadId");
+  const priority = optBool(args, "priority") ?? true;
+
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    update noelle.leads set priority = ${priority}, updated_at = now()
+    where id = ${leadId} and org_id = ${org.orgId} returning id`;
+  if (rows.length === 0) throw new NoelleError(`Lead ${leadId} not found in this org.`);
+  return text(`Lead \`${leadId}\` ${priority ? "flagged as **priority**" : "**unflagged**"}.`);
+}
+
+async function requestDm(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("request a DM for a lead");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const leadId = reqStr(args, "leadId");
+
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    update noelle.leads
+    set payload = coalesce(payload, '{}'::jsonb) || '{"dm_requested": true}'::jsonb, updated_at = now()
+    where id = ${leadId} and org_id = ${org.orgId} returning id`;
+  if (rows.length === 0) throw new NoelleError(`Lead ${leadId} not found in this org.`);
+  return text(`DM requested for lead \`${leadId}\`. The DM auto-draft lane will pick it up.`);
+}
+
+async function deleteLead(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("delete a lead");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const leadId = reqStr(args, "leadId");
+  const confirm = optBool(args, "confirm") ?? false;
+  if (!confirm)
+    return text(
+      "Refusing to delete without confirm:true. This will permanently delete the lead and cascade-delete all of its drafts and approvals. Re-run with confirm:true to proceed.",
+    );
+
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    delete from noelle.leads where id = ${leadId} and org_id = ${org.orgId} returning id`;
+  if (rows.length === 0) throw new NoelleError(`Lead ${leadId} not found in this org.`);
+  return text(`Deleted lead \`${leadId}\` (and its drafts + approvals).`);
+}
+
+async function handle(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult | null> {
+  switch (name) {
+    case "noelle_list_leads":
+      return guard(() => listLeads(args, ctx));
+    case "noelle_get_lead":
+      return guard(() => getLead(args, ctx));
+    case "noelle_flag_lead":
+      return guard(() => flagLead(args, ctx));
+    case "noelle_request_dm":
+      return guard(() => requestDm(args, ctx));
+    case "noelle_request_reply":
+      return guard(() => requestReply(args, ctx));
+    case "noelle_get_reply_request_status":
+      return guard(() => getReplyRequestStatus(args, ctx));
+    case "noelle_delete_lead":
+      return guard(() => deleteLead(args, ctx));
+    default:
+      return null;
+  }
+}
+
+export const leadsModule: ToolModule = { tools, handle };
