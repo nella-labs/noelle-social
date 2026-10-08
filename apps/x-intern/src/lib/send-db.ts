@@ -198,3 +198,16 @@ export async function releaseAutoSendRowsForReview(
   if (ids.length === 0) return;
   await sql.begin(async (tx) => {
     await tx`set local lock_timeout = '5s'`;
+    await tx`set local statement_timeout = '10s'`;
+    await tx`select id from noelle.drafts where id in ${tx(ids)} order by id for update`;
+    await tx`
+      update noelle.approvals a
+      set status = 'pending', decided_by = null, decided_at = null, auto_send_target_at = null
+      from noelle.drafts d, noelle.leads l
+      where ${replyApprovalContextSql(tx)} and d.id in ${tx(ids)}
+        and a.status='sent' and a.decided_by='auto-send'
+        and d.sent_external_id is null and d.sent_at is null
+        and not exists (select 1 from noelle.x_reply_claims claim where claim.org_id=a.org_id and claim.approval_id=a.id)
+    `;
+  });
+}
