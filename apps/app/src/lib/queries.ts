@@ -198,3 +198,203 @@ export async function getWatchlistForInstance(
     where agent_instance_id = ${inst.id} and org_id = ${inst.org_id}
     order by created_at asc
   `;
+  return {
+    handles: rows.filter((r) => r.kind === "handle").map((r) => r.value),
+    keywords: rows.filter((r) => r.kind === "keyword").map((r) => r.value),
+  };
+}
+
+export interface WatchlistPersonRow {
+  id: string;
+  handle: string;
+  added_at: string;
+  objective_kind: WatchlistObjectiveKind | null;
+  objective_note: string | null;
+  /**
+   * The Contacts person this watchlist row maps to (the CRM is the single
+   * person surface). Backfilled by `ensurePersonForHandle` on every add, so it
+   * is non-null in practice; nullable only for legacy rows that predate the
+   * link. Lets the watchlist card deep-link straight into `/contacts/[id]`.
+   */
+  person_id: string | null;
+}
+
+/**
+ * People the X intern must always reply to — its x_watchlist_people. Distinct
+ * from getWatchlistForInstance (targeting handles/keywords): every new post
+ * from one of these gets a drafted reply, bypassing the classifier + drafter
+ * filters. Tenancy piggybacks on getAgentInstance (assertOrgMember).
+ */
+export async function getWatchlistPeopleForInstance(
+  instanceId: string,
+): Promise<WatchlistPersonRow[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+  const rows = await readSql<WatchlistPersonRow[]>`
+    select id, handle, added_at, objective_kind, objective_note, person_id
+    from noelle.x_watchlist_people
+    where agent_instance_id = ${inst.id} and org_id = ${inst.org_id}
+    order by added_at asc
+  `;
+  return [...rows];
+}
+
+export interface PendingApprovalRow {
+  approval: NoelleApproval;
+  draft: NoelleDraft | null;
+  lead: NoelleLead | null;
+  /**
+   * Relationship-scout verdict the classifier attached to the lead
+   * (noelle.leads.vip_signal). null when the scout never ran / the author isn't
+   * high-leverage. Carried alongside `lead` rather than on it because the
+   * generated NoelleLead type doesn't model the new column.
+   */
+  vipSignal: VipSignal | null;
+}
+
+/**
+ * A lead's full approval detail: the representative approval row PLUS every
+ * sibling approval for the same lead (the 3 reply angles + the DM are separate
+ * approval rows). The detail page assembles all reply angles + the DM onto one
+ * page from `siblings`. `siblings` includes the representative row itself.
+ */
+export interface ApprovalDetail extends PendingApprovalRow {
+  siblings: PendingApprovalRow[];
+}
+
+/**
+ * Collapse per-draft-variant approval rows to ONE representative per lead.
+ *
+ * The drafter writes 4 approvals per lead (3 reply angles + 1 DM), so the raw
+ * list shows each lead 4×. The review inbox + the detail pager want one entry
+ * per lead. Preserves the incoming order (score desc, then newest) and prefers
+ * a reply draft as the representative over a DM so the row preview + detail
+ * entry point land on the reply. Rows with no lead are kept as their own entry.
+ */
+export function dedupeApprovalsByLead(
+  rows: PendingApprovalRow[],
+): PendingApprovalRow[] {
+  const byLead = new Map<string, PendingApprovalRow>();
+  const out: PendingApprovalRow[] = [];
+  for (const r of rows) {
+    const leadId = r.approval.lead_id ?? r.draft?.lead_id ?? null;
+    if (!leadId) {
+      out.push(r);
+      continue;
+    }
+    const existing = byLead.get(leadId);
+    if (!existing) {
+      byLead.set(leadId, r);
+      out.push(r);
+      continue;
+    }
+    // Upgrade the representative to a reply if the first one seen was a DM.
+    const existingIsDm = draftPayload(existing.draft).kind === "dm";
+    const candidateIsReply = draftPayload(r.draft).kind !== "dm";
+    if (existingIsDm && candidateIsReply) {
+      const idx = out.indexOf(existing);
+      if (idx !== -1) out[idx] = r;
+      byLead.set(leadId, r);
+    }
+  }
+  return out;
+}
+
+/** Stable author identity for an X lead: numeric id first, then handle. */
+function xAuthorKey(lead: NoelleLead): string | null {
+  const lp = leadPayload(lead);
+  return (
+    lead.author_id ??
+    lp.author_id ??
+    lead.author_handle ??
+    lp.author_handle ??
+    null
+  );
+}
+
+/** A post's own creation time in epoch ms, or 0 when absent/unparseable. */
+function xLeadPostedAtMs(lead: NoelleLead): number {
+  const raw = leadPayload(lead).posted_at;
+  if (!raw) return 0;
+  const t = Date.parse(raw);
+  return Number.isFinite(t) ? t : 0;
+}
+
+/**
+ * Collapse each WATCHLISTED person down to just their single most-recent post.
+ *
+ * Watchlist accounts (`leads.priority = true`, the always-reply people) often
+ * have several pending posts queued at once, so the same person shows up many
+ * times in the inbox / speedrun. With this collapse on, we keep — per watched
+ * author — only the approvals tied to their newest post (by the post's own
+ * `posted_at`), so each watched person occupies one slot. Ties and missing
+ * timestamps keep whichever post the active sort surfaced first.
+ *
+ * Non-watchlisted leads (keyword discovery) and lead-less rows pass through
+ * untouched. Run this on the RAW per-approval rows BEFORE dedupeApprovalsByLead
+ * / toSpeedrunLeads so the Review list, Speedrun, and the detail-page stepper
+ * all walk the same collapsed set.
+ */
+export function keepLatestPostPerWatchlistedPerson(
+  rows: PendingApprovalRow[],
+): PendingApprovalRow[] {
+  // Pass 1: find the newest post (lead) per watched author.
+  const newestLeadByAuthor = new Map<
+    string,
+    { leadId: string; postedAt: number }
+  >();
+  for (const r of rows) {
+    const lead = r.lead;
+    if (!lead || lead.priority !== true) continue;
+    const author = xAuthorKey(lead);
+    const leadId = lead.id ?? r.approval.lead_id ?? r.draft?.lead_id ?? null;
+    if (!author || !leadId) continue;
+    const postedAt = xLeadPostedAtMs(lead);
+    const best = newestLeadByAuthor.get(author);
+    if (!best || postedAt > best.postedAt) {
+      newestLeadByAuthor.set(author, { leadId, postedAt });
+    }
+  }
+  // Pass 2: keep every non-watched row, plus the watched rows whose lead is the
+  // author's newest.
+  return rows.filter((r) => {
+    const lead = r.lead;
+    if (!lead || lead.priority !== true) return true;
+    const author = xAuthorKey(lead);
+    const leadId = lead.id ?? r.approval.lead_id ?? r.draft?.lead_id ?? null;
+    if (!author || !leadId) return true;
+    const best = newestLeadByAuthor.get(author);
+    return !best || best.leadId === leadId;
+  });
+}
+
+/**
+ * Pending approvals for an org, joined to the underlying draft + lead.
+ *
+ * Previously this was a three-step stitch (approvals → drafts via `.in()` →
+ * leads via `.in()`) because Supabase JS couldn't compose the join across
+ * the embedded jsonb payloads cleanly. With direct Postgres we collapse
+ * that to a single SQL statement:
+ *
+ *   approvals ⨝ drafts (drafts.id = approvals.draft_id)
+ *             ⨝ leads  (leads.id  = drafts.lead_id)
+ *
+ * Both sides use `left join` so a stale approval with a soft-deleted draft
+ * still appears in the inbox (matches the prior behavior where the stitch
+ * step returned `null` for the missing side). Each row is unpacked back
+ * into the `{ approval, draft, lead }` shape the consumers already expect.
+ */
+/** Which approval status the inbox shows. Defaults to the live work queue. */
+export type ApprovalStatusFilter = "pending" | "sent" | "skipped" | "all";
+
+/**
+ * Lead source filter. `real` (default) hides synthetic seed leads whose
+ * `external_id` is prefixed `synthetic-` (test data that leaked into
+ * noelle.leads out-of-band — see 0017_purge_synthetic_leads.sql). `synthetic`
+ * shows only those; `all` shows everything.
+ */
+export type ApprovalSourceFilter = "real" | "synthetic" | "all";
+
+/**
+ * Watchlist filter. `all` (default) shows every lead; `only` shows just
+ * watchlist-person leads (leads.priority = true, the always-reply accounts);
