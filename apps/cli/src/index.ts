@@ -1598,3 +1598,203 @@ function isConnRefused(e: unknown): boolean {
 async function doctorStatus(): Promise<number> {
   const p = paths();
   const reportPath = resolve(p.doctor, "last-report.json");
+  if (!existsSync(reportPath)) {
+    ui.info("The actuator-doctor hasn't run yet (no ~/.noelle/doctor/last-report.json).");
+    ui.info("Start it with `noelle doctor start` (or `noelle up`).");
+    return 0;
+  }
+  let report: DoctorReport;
+  try {
+    report = JSON.parse(readFileSync(reportPath, "utf8")) as DoctorReport;
+  } catch (e) {
+    ui.err(`couldn't read the doctor report: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
+  ui.step("Actuator Doctor status");
+  ui.plain(`  overall     ${report.healthy ? "✓ healthy" : "✗ unhealthy"}  (tick ${report.tick}, ${report.at})`);
+  ui.plain(`  autofix     ${report.autofixEnabled ? "ON (LLM fixer armed)" : "off (NOELLE_DOCTOR_AUTOFIX=0)"}`);
+  ui.plain("  targets:");
+  const targets = report.targets ?? [];
+  for (const t of targets) {
+    const flags = `${t.armed ? "armed" : "off"}, ${t.inWindow ? "in-window" : "out-of-window"}`;
+    ui.plain(`    ${t.healthy ? "✓" : "✗"} ${t.target}  (${flags})`);
+    if (t.openIncident) {
+      const inc = t.openIncident;
+      ui.plain(
+        `        ⚠ ${inc.signatureId ?? "unmatched"}: ${inc.summary} → ${inc.actionTaken}${inc.resolved ? " (resolved)" : ""}`,
+      );
+    }
+  }
+  const openCount = targets.filter((t) => t.openIncident).length;
+  ui.plain(`  open incidents  ${openCount}`);
+  const remed = Object.entries(report.remediationsThisHour ?? {});
+  if (remed.length > 0)
+    ui.plain(`  remediations/hr ${remed.map(([k, v]) => `${k}=${v}`).join(", ")}`);
+  return report.healthy ? 0 : 1;
+}
+
+// Ensure the live ecosystem file actually contains `appName`. `noelle sync`
+// never regenerates the ecosystem, so an app added to generateEcosystem() after
+// the last `noelle init` is ABSENT from the live file — and `pm2 start --only
+// <app>` on a file that lacks it silently starts nothing. Regenerate from config
+// when the entry is missing (safe + idempotent: the generated file reads env
+// LIVE from ~/.noelle/.env at pm2-load time, so a regen only adds entries, it
+// never snapshots or drifts env). Returns false (with guidance) if there is no
+// config to regenerate from. When the entry is already present, the file is left
+// untouched.
+function ensureEcosystemHasApp(repoRoot: string, p: ReturnType<typeof ensureHome>, appName: string): boolean {
+  if (existsSync(p.ecosystem) && readFileSync(p.ecosystem, "utf8").includes(`"${appName}"`)) {
+    return true;
+  }
+  const config = loadConfig();
+  if (!config) {
+    ui.err("No noelle config yet — run `noelle init` first.");
+    return false;
+  }
+  writeEcosystem({ config, repoRoot, paths: p });
+  ui.info(`Regenerated ${p.ecosystem} to include "${appName}".`);
+  return true;
+}
+
+// `noelle doctor start` — first-launch the actuator-doctor pm2 app. `noelle
+// sync` never starts NEW apps, so this (or `noelle up`) is how it comes online
+// after the wiring lands. No-op if already online.
+async function doctorStart(args: Args): Promise<number> {
+  const repoRoot = str(args.flags, "repo") ? expandHome(str(args.flags, "repo")!) : findRepoRoot();
+  const p = ensureHome();
+  if (!ensureEcosystemHasApp(repoRoot, p, "actuator-doctor")) return 1;
+  const already = (await pm2Status(repoRoot)).find((x) => x.name === "actuator-doctor");
+  if (already?.status === "online") {
+    ui.info(`actuator-doctor already online (↺${already.restarts}, ${already.memoryMb}MB).`);
+    return 0;
+  }
+  ui.step("Starting actuator-doctor (pm2)");
+  await pm2StartApp(repoRoot, p.ecosystem, "actuator-doctor");
+  ui.ok("actuator-doctor started. `noelle doctor status` for its latest tick.");
+  return 0;
+}
+
+// `noelle doctor logs [n]` — one-shot tail of the actuator-doctor pm2 logs.
+async function doctorLogs(args: Args): Promise<number> {
+  const repoRoot = findRepoRoot();
+  const n = Number(args._[2]) || 80;
+  await pm2LogsOnce(repoRoot, "actuator-doctor", n);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// bridge — Chrome Bridge control server (Claude's hands on Chrome). Thin
+// status/start/logs over the loopback HTTP server + pm2. `noelle sync` never
+// starts NEW apps, so `noelle bridge start` is the first-launch path.
+// ---------------------------------------------------------------------------
+async function cmdBridge(args: Args): Promise<number> {
+  const repoRoot = str(args.flags, "repo") ? expandHome(str(args.flags, "repo")!) : findRepoRoot();
+  const p = ensureHome();
+  const sub = args._[1] ?? "status";
+
+  if (sub === "start") {
+    if (!ensureEcosystemHasApp(repoRoot, p, "chrome-bridge")) return 1;
+    const already = (await pm2Status(repoRoot)).find((x) => x.name === "chrome-bridge");
+    if (already?.status === "online") {
+      ui.info(`chrome-bridge already online (↺${already.restarts}, ${already.memoryMb}MB).`);
+      return 0;
+    }
+    ui.step("Starting chrome-bridge (pm2)");
+    await pm2StartApp(repoRoot, p.ecosystem, "chrome-bridge");
+    ui.ok("chrome-bridge started. `noelle bridge status` to check the extension link.");
+    return 0;
+  }
+
+  if (sub === "logs") {
+    const n = Number(args._[2]) || 80;
+    await pm2LogsOnce(repoRoot, "chrome-bridge", n);
+    return 0;
+  }
+
+  // status (default): hit /health (no auth) and summarize the extension link.
+  const env = { ...process.env, ...readEnvFile(p.envFile) };
+  const port = Number(env.NOELLE_BRIDGE_PORT) || 18792;
+  const url = `http://127.0.0.1:${port}/health`;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+    const health = (await res.json()) as BridgeHealth;
+    ui.step(`Chrome Bridge (:${port})`);
+    ui.plain(
+      `  server      ${health.ok ? "✓ ok" : "✗ not ok"}  (v${health.version}, up ${Math.round((health.uptime_ms ?? 0) / 1000)}s)`,
+    );
+    ui.plain(
+      `  extension   ${health.ext_connected ? `✓ connected${health.ext_version ? " (v" + health.ext_version + ")" : ""}` : "✗ not connected — load unpacked at chrome://extensions"}`,
+    );
+    ui.plain(`  chrome      ${health.chrome_version ?? "(unknown)"}`);
+    ui.plain(
+      `  sources     ${health.sources && health.sources.length > 0 ? health.sources.join(", ") : "(none seen yet)"}`,
+    );
+    return health.ok ? 0 : 1;
+  } catch (e) {
+    if (isConnRefused(e)) {
+      ui.err("bridge not running — run `noelle bridge start`");
+      return 1;
+    }
+    ui.err(`bridge status failed: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// vega — X-intern lifecycle + spend cap
+// ---------------------------------------------------------------------------
+async function cmdVega(args: Args): Promise<number> {
+  const p = ensureHome();
+  const config = loadConfig() ?? defaultConfig();
+  const secrets = loadOrCreateSecrets(p);
+  const dbUrl = adminUrlFor(config, secrets);
+  const sub = args._[1] ?? "status";
+
+  if (sub === "enable") {
+    if (str(args.flags, "budget-cents"))
+      config.budgetCapCents = Number(str(args.flags, "budget-cents"));
+    const v = await vegaEnable({
+      dbUrl,
+      orgSlug: config.orgSlug,
+      budgetCapCents: config.budgetCapCents,
+      log: (m) => ui.ok(m),
+    });
+    return v.found ? 0 : 1;
+  }
+  if (sub === "disable") {
+    await vegaDisable({ dbUrl, orgSlug: config.orgSlug });
+    ui.ok("Vega paused (status='paused'); workers idle within one poll cycle.");
+    return 0;
+  }
+  if (sub === "style") {
+    return cmdVegaStyle(args, dbUrl, config.orgSlug);
+  }
+  // status (default)
+  const v = await vegaState({ dbUrl, orgSlug: config.orgSlug });
+  if (!v.found) {
+    ui.err(`No x_intern instance for org "${config.orgSlug}".`);
+    return 1;
+  }
+  const cap =
+    v.budgetCapCents == null ? "none (UNCAPPED)" : `$${(v.budgetCapCents / 100).toFixed(2)}`;
+  ui.step("Vega status");
+  ui.plain(`  status        ${v.status}`);
+  ui.plain(`  spend cap     ${cap}`);
+  ui.plain(`  discovery     ${v.flags.discovery ? "on" : "off"}`);
+  ui.plain(`  classifier    ${v.flags.classifier ? "on" : "off"}`);
+  ui.plain(`  drafter       ${v.flags.drafter ? "on" : "off"}`);
+  ui.plain(`  send          ${v.flags.send ? "ON (posts!)" : "off"}`);
+  ui.plain(`  auto-send     ${v.flags.autoSend ? "ON (posts!)" : "off"}`);
+  if (v.budgetCapCents == null)
+    ui.warn("No spend cap set — run `noelle vega enable` to apply one.");
+  return 0;
+}
+
+// `noelle vega style <add|remove|pin|unpin|run|list>` — the Account Feeder: pick
+// the X account(s) whose FORM becomes the voice of Vega's posts (pin one exact
+// voice, or blend several). CONTENT still comes from the operator's own vault.
+async function cmdVegaStyle(args: Args, dbUrl: string, orgSlug: string): Promise<number> {
+  const sub = args._[2] ?? "list";
+  const rawHandle = (args._[3] ?? "").trim();
+  const shownHandle = rawHandle.replace(/^@/, "").toLowerCase();
+
