@@ -198,3 +198,68 @@ it("shares the original native deadline across missing org and legacy secret rea
     first!.statusCode = 404;
     first!.end(JSON.stringify({ error: { code: 404, message: "missing" } }));
     await until(() => hits === 2);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(await pending).toMatchObject({ code: "timeout" });
+    await until(() => server.sockets.size === 0);
+    await delay(80);
+    expect(hits).toBe(2);
+  } finally {
+    if (pending && vi.isFakeTimers()) {
+      await vi.advanceTimersByTimeAsync(30_000);
+      await pending;
+    }
+    vi.useRealTimers();
+    await server.close();
+  }
+}, 15_000);
+it("does not treat an OAuth404 as a missing secret or dispatch a legacy read", async () => {
+  const create = await nativeSecrets();
+  let authHits = 0,
+    providerHits = 0;
+  const server = await serve((req, res) => {
+    if (req.url === "/token") {
+      authHits++;
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "fixture auth unavailable" }));
+    } else {
+      providerHits++;
+      secret(res);
+    }
+  });
+  try {
+    await expect(create(options(server)).getForOrg("org", "key")).rejects.toMatchObject({
+      code: "failed",
+    });
+    expect(authHits).toBe(1);
+    expect(providerHits).toBe(0);
+    await until(() => server.sockets.size === 0);
+  } finally {
+    await server.close();
+  }
+});
+it("enforces a real whole-call clock while native OAuth is stalled", async () => {
+  const create = await nativeSecrets();
+  let authHits = 0,
+    providerHits = 0;
+  const server = await serve((req, res) => {
+    if (req.url === "/token") authHits++;
+    else {
+      providerHits++;
+      secret(res);
+    }
+  });
+  const started = performance.now();
+  try {
+    await expect(create({ ...options(server), timeoutMs: 1200 }).get("one")).rejects.toMatchObject({
+      code: "timeout",
+    });
+    const elapsed = performance.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(1100);
+    expect(elapsed).toBeLessThan(4000);
+    expect(authHits).toBe(1);
+    expect(providerHits).toBe(0);
+    await until(() => server.sockets.size === 0);
+  } finally {
+    await server.close();
+  }
+});
