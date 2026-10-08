@@ -398,3 +398,57 @@ describe("actual registered worker tick composed with current content handler", 
     const h = await boot(mode);
     expect(await h.tick()).toEqual({ ok: true });
     expect(h.snapshot().done.comments).toBe(0);
+    expect(seams.markSent).not.toHaveBeenCalled();
+    expect(h.snapshot().doneDraftIds).toContain("draft");
+    expect(h.snapshot().commentPool).toEqual([]);
+    const clicks = seams.moveAndClick.mock.calls.filter((call) => call[1].x === 30).length;
+    expect(clicks).toBe(1);
+    expect(seams.claimComment).toHaveBeenCalledTimes(1);
+    expect(await h.tick()).toEqual({ ok: true });
+    expect(seams.claimComment).toHaveBeenCalledTimes(1);
+    expect(seams.moveAndClick.mock.calls.filter((call) => call[1].x === 30)).toHaveLength(1);
+    expect(seams.markSent).not.toHaveBeenCalled();
+  });
+  it("a denied claim dispatches no submit and records no sent count", async () => {
+    seams.claimComment.mockResolvedValue({ claimed: false });
+    const h = await boot("thread-still");
+    expect(await h.tick()).toEqual({ ok: true });
+    expect(h.snapshot().done.comments).toBe(0);
+    expect(seams.moveAndClick.mock.calls.filter((call) => call[1].x === 30)).toEqual([]);
+    expect(seams.markSent).not.toHaveBeenCalled();
+    expect(seams.pressSubmitChord).not.toHaveBeenCalled();
+  });
+  it("failed threaded cleanup clears only the named reply and preserves other drafts", async () => {
+    const h = await boot("thread-unrelated");
+    expect(await h.tick()).toEqual({ ok: true });
+    expect(document.getElementById("body")!.textContent).toBe("");
+    expect(document.getElementById("unrelated")!.textContent).toBe("unrelated comment draft");
+    expect(document.querySelector(".msg-form")!.textContent).toBe("private operator draft");
+    expect(seams.clearFocusedEditor).toHaveBeenCalledTimes(1);
+    expect(seams.markSent).not.toHaveBeenCalled();
+    expect(h.snapshot().done.comments).toBe(0);
+  });
+  it("STOP before the reply claim prevents the browser submit", async () => {
+    const h = await boot("thread-still", { stopBeforeClaim: true });
+    expect(await h.tick()).toEqual({ ok: true });
+    expect(h.snapshot().status).toBe("stopped");
+    expect(seams.markSent).not.toHaveBeenCalled();
+    expect(seams.claimComment).not.toHaveBeenCalled();
+    expect(seams.moveAndClick.mock.calls.filter((call) => call[1].x === 30)).toEqual([]);
+  });
+  it("a lost editor after Meta cannot receive the Ctrl fallback", async () => {
+    const h = await boot("post-meta-lost");
+    expect(await h.tick()).toEqual({ ok: true });
+    expect(seams.pressSubmitChord.mock.calls.map((call) => call[1])).toEqual([4]);
+    expect(seams.markSent).not.toHaveBeenCalled();
+    expect(h.snapshot().done.comments).toBe(0);
+    expect(document.querySelector(".msg-form")!.textContent).toBe("private operator draft");
+  });
+  it("a different current body receives no fallback chord", async () => {
+    const h = await boot("post-other-body");
+    expect(await h.tick()).toEqual({ ok: true });
+    expect(seams.pressSubmitChord).not.toHaveBeenCalled();
+    expect(seams.claimComment).not.toHaveBeenCalled();
+    expect(seams.markSent).not.toHaveBeenCalled();
+  });
+});
