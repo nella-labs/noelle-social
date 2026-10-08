@@ -198,3 +198,36 @@ describe("batchMap", () => {
     let inFlight = 0;
     let maxInFlight = 0;
     await batchMap(
+      [1, 2, 3, 4, 5],
+      async (n) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await delay(2);
+        inFlight -= 1;
+        return n;
+      },
+      { concurrency: Number.POSITIVE_INFINITY },
+    );
+    expect(maxInFlight).toBe(1);
+  });
+
+  it("never starts more workers than items (concurrency > item count)", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const items = [1, 2];
+    await batchMap(
+      items,
+      async (n) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await delay(5);
+        inFlight -= 1;
+        return n;
+      },
+      { concurrency: 100 },
+    );
+    // At most `items.length` can ever be in flight.
+    expect(maxInFlight).toBeLessThanOrEqual(items.length);
+    expect(maxInFlight).toBe(2);
+  });
+});
