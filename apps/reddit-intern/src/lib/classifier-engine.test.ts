@@ -198,3 +198,71 @@ describe("classifier", () => {
 
   it("asks for comment_bait in the system prompt", () => {
     const sys = buildClassifierSystem();
+    expect(sys).toContain("comment_bait");
+    expect(sys.toLowerCase()).toContain("engagement-bait");
+  });
+
+  it("surfaces token usage from the backend call", async () => {
+    const { backend } = stubBackend(substantialJson, { input_tokens: 412, output_tokens: 37 });
+    const c = createClassifier({ backend });
+    const out = await c.classify({ postText: "p" });
+    expect(out.usage).toEqual({ inputTokens: 412, outputTokens: 37 });
+  });
+
+  it("still carries usage on a post-call fail-open (unparseable response cost tokens)", async () => {
+    const { backend } = stubBackend("not json", { input_tokens: 300, output_tokens: 5 });
+    const c = createClassifier({ backend });
+    const out = await c.classify({ postText: "p" });
+    expect(out.q).toBeNull();
+    expect(out.usage).toEqual({ inputTokens: 300, outputTokens: 5 });
+  });
+
+  it("reports zero usage when the backend call throws (no metered response)", async () => {
+    const backend: EngineBackend = {
+      call: vi.fn(async () => {
+        throw new Error("vertex 500");
+      }),
+    };
+    const c = createClassifier({ backend });
+    const out = await c.classify({ postText: "p" });
+    expect(out.usage).toEqual({ inputTokens: 0, outputTokens: 0 });
+  });
+});
+
+describe("buildClassifierSystem", () => {
+  it("returns the base triage prompt with no custom objective", () => {
+    const base = buildClassifierSystem();
+    expect(base).toContain("triage Reddit posts");
+    expect(base.toLowerCase()).not.toContain("founder's mission");
+  });
+
+  it("encodes the substantial/light/skip routing rules", () => {
+    const base = buildClassifierSystem();
+    expect(base).toContain("substantial");
+    expect(base).toContain("light");
+    expect(base).toContain("skip");
+  });
+
+  it("weaves the mission into the triage definition", () => {
+    const out = buildClassifierSystem("target LLM eval tooling buyers");
+    expect(out).toContain("triage Reddit posts");
+    expect(out).toContain("target LLM eval tooling buyers");
+  });
+
+  it("uses the supplied q threshold in the prompt", () => {
+    const out = buildClassifierSystem(null, 82);
+    expect(out).toContain("q >= 82");
+  });
+});
+
+describe("budget admission failures", () => {
+  it.each([
+    new BudgetExceededError({ layer: "instance", spent_cents: 8, cap_cents: 10, estimated_cents: 8 }),
+    new PgOperationError("deadline"),
+  ])("does not turn %s into a legacy fail-open verdict", async (error) => {
+    const call = vi.fn().mockRejectedValue(error);
+    const classifier = createClassifier({ backend: { call }, evaluate: async () => ({ kind: "unavailable", provider: "jev" }) });
+    await expect(classifier.classify({ postText: "specific engineering question" })).rejects.toBe(error);
+    expect(call).toHaveBeenCalledOnce();
+  });
+});
