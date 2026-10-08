@@ -32,7 +32,7 @@ jobs:
     # Safety cap: a hung step can't run away and burn hours of Linux minutes.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # `turbo run --affected` (PRs) diffs against the PR base commit, so the
           # runner needs that history present, not a depth-1 shallow clone.

@@ -49,7 +49,7 @@ jobs:
       migrations: ${{ steps.changes.outputs.migrations }}
       functions: ${{ steps.changes.outputs.functions }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 2
       - id: changes
@@ -87,7 +87,7 @@ jobs:
     if: needs.detect-changes.outputs.migrations == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: supabase/setup-cli@v2
         with:
           version: latest
@@ -106,7 +106,7 @@ jobs:
     if: needs.detect-changes.outputs.functions == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: supabase/setup-cli@v2
         with:
           version: latest
