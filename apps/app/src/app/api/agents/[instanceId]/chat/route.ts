@@ -398,3 +398,33 @@ export async function POST(
       conversationId,
       userBody: body.message,
       agentBody: sc.text,
+      proposal: p.proposal,
+      vaultEdit: storedVaultEdit,
+      expectedOwner: { orgId: instance.org_id, role: instance.role },
+    }).catch(() => {
+      console.error("[chat] turn persistence failed");
+      return null;
+    });
+
+    return NextResponse.json({
+      text: sc.text,
+      proposal: p.proposal,
+      vaultEdit: v.vaultEdit,
+      vaultEditReceipt: storedVaultEdit ? publicVaultEditReceipt(storedVaultEdit, messageId) : null,
+      scriptEdit: sc.scriptEdit,
+      conversationId,
+      model: chatModel,
+      usage: res.usage,
+    });
+  } catch (err) {
+    console.error(
+      `[chat] bedrock call failed model=${chatModel} ${JSON.stringify(
+        serializeError(err),
+      )}`,
+    );
+    return NextResponse.json(
+      { error: "model_error", message: "Model call failed. Try again in a moment." },
+      { status: 502 },
+    );
+  }
+}
