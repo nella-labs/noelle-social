@@ -1198,3 +1198,203 @@ describe("scoreFormat — anti-ai wordbank excludes everyday/proper-noun adjecti
     "the beacon endpoint was 404ing all morning",
   ];
   for (const body of MUST_PASS) {
+    it(`passes: "${body.slice(0, 42)}…"`, () => {
+      expect(strict(body).score).toBe(1);
+    });
+  }
+});
+
+// Curly quotes: every pattern spells contractions with a straight `'?`, so a
+// U+2019 would slip the whole significance-marker family. No live draft uses
+// them today, which is exactly why this needs a test rather than a sweep.
+describe("scoreFormat — anti-ai sweep is curly-quote safe", () => {
+  const PAIRS: Array<[string, string]> = [
+    ["here's the thing, nobody reads the docs", "here’s the thing, nobody reads the docs"],
+    ["and that's the point", "and that’s the point"],
+    ["that's what kills me about it", "that’s what kills me about it"],
+    ["that's the bit that got me", "that’s the bit that got me"],
+  ];
+  for (const [straight, curly] of PAIRS) {
+    it(`catches the curly form too: "${curly.slice(0, 34)}…"`, () => {
+      expect(strict(straight).score).toBe(0);
+      expect(strict(curly).score).toBe(0);
+    });
+  }
+  it("a curly-quoted span is NOT exempt (the ‘90s collision makes it unsafe)", () => {
+    expect(strict("everyone kept saying ‘here’s the thing’ until it meant nothing").score).toBe(0);
+  });
+  it("does not let a curly apostrophe open a quoted span and blank the body", () => {
+    // "it’s" must not open a span — the tell after it has to still be caught.
+    expect(strict("it’s the founders’ call, don’t let that sink in get lost").score).toBe(0);
+  });
+});
+
+// ---- round-2 adversarial review: holes in the round-1 FIXES -----------------
+// Each case below reproduced a real defect in the first round of corrections.
+// The elision/possessive family is the most important: those scored a clean 1.00
+// with NO reason attached, i.e. a silent false negative rather than a noisy one.
+describe("scoreFormat — anti-ai sweep, round-2 corrections", () => {
+  it("an apostrophe elision + plural possessive cannot blank prose and hide a tell", () => {
+    // "Since '21 …" opened a span and "founders'" closed it, blanking 30 chars.
+    for (const b of [
+      "Since '21 studies show the founders' plan was doomed.",
+      "back in '17, here's the thing about the founders' pitch",
+      "give 'em credit, that's the point the founders' deck missed.",
+      "we shipped in '22 and the thing is the users' churn never moved.",
+      "wait 'til you see how they leveraged the users' trust here.",
+    ]) {
+      expect(strict(b).score, b).toBe(0);
+    }
+  });
+  it("no single-quote form can silently hide a tell (curly or straight)", () => {
+    // Single-quote spans are NOT exempt in either form. Straight ' collides with
+    // apostrophes; curly ‘ collides with a WORD-LEADING apostrophe, which is what
+    // smart-quote autocorrect produces ("back in the ‘90s"). Both produced a
+    // clean 1.00 with ZERO reasons — a silent false negative.
+    for (const b of [
+      "back in the ‘90s studies show growth wasn’t real.",
+      "‘21 was rough, studies show the market hasn’t recovered.",
+      "give ‘em credit, the data shows it isn’t working.",
+      "everyone kept saying 'here's the thing' until it meant nothing",
+    ]) {
+      expect(strict(b).score, b).toBe(0);
+    }
+  });
+  it("double-quoted spans are still exempt, including a mixed open/close pair", () => {
+    expect(strict('"experts pointed to, experts noted" is a consultation that produced verbs').score).toBe(1);
+    expect(strict('he said "studies show it” and left').score).toBe(1);
+  });
+
+  it("vague authority: exempts owned/named sources, including hyphens and possessives", () => {
+    for (const b of [
+      "our in-house data shows a 3x lift",
+      "our A/B test data shows a lift",
+      "our 30-day retention data shows a lift",
+      "Demooperator's benchmark data shows a 3x speedup",
+      "my own telemetry data shows most calls touch 2 files",
+    ]) {
+      expect(strict(b).score, b).toBe(1);
+    }
+  });
+  it("vague authority: a possessive elsewhere in the sentence does NOT exempt", () => {
+    for (const b of [
+      "your competitor keeps claiming the data shows growth",
+      "their marketing says the data shows X",
+      "the data shows most teams never hit that path",
+      "studies show incremental builds are faster",
+    ]) {
+      expect(strict(b).score, b).toBe(0);
+    }
+  });
+
+  it("leverage: the founder-sense NOUN survives a following relative clause", () => {
+    for (const b of [
+      "distribution is the leverage a small team has",
+      "that's the leverage the market gives you",
+      "the leverage an indie founder has is speed",
+      "if you're a young builder, know your leverage",
+      "when you're 17 with no leverage, volume is the strategy",
+    ]) {
+      expect(strict(b).score, b).toBe(1);
+    }
+  });
+  // Bare "leverage" is PROMPT-ONLY. Two attempts to separate the noun from the
+  // verb by neighbouring words both failed: a right-hand object list re-caught
+  // the noun before a relative clause ("the leverage a small team has"), and a
+  // left-hand determiner list still caught it after an adjective or verb
+  // ("financial leverage", "gained leverage over suppliers"). Determiners,
+  // adjectives and verbs can all precede the noun, so position cannot decide it,
+  // and the noun is core founder vocabulary here. Only the unambiguous inflected
+  // forms stay deterministic.
+  it("leverage: inflected VERB forms are caught deterministically", () => {
+    for (const b of [
+      "leveraging what you already built is the move",
+      "they leveraged the cache layer",
+      "the team leverages every channel it has",
+    ]) {
+      expect(strict(b).score, b).toBe(0);
+    }
+  });
+  it("leverage: the bare form is prompt-only, so every noun sense survives", () => {
+    for (const b of [
+      "they finally gained leverage over suppliers",
+      "they run on operating leverage and it shows",
+      "financial leverage got them killed",
+      "he negotiated with maximum leverage",
+      "using leverage well is underrated",
+      // Accepted cost of that decision: the bare VERB also passes here.
+      "you should leverage it",
+    ]) {
+      expect(strict(b).score, b).toBe(1);
+    }
+  });
+
+  it("vague authority: an early sourced clause cannot mask a later unsourced one", () => {
+    // String.match without /g returns only the FIRST match; the scan must be global.
+    expect(strict("our data shows a lift but studies show the opposite").score).toBe(0);
+    expect(strict("studies show the opposite even though our data shows a lift").score).toBe(0);
+    // ...and an all-sourced sentence still passes.
+    expect(strict("our data shows a lift and our telemetry data shows the same").score).toBe(1);
+  });
+
+  it("does not hard-zero ordinary English added to the wordbank without a sweep", () => {
+    for (const b of [
+      "she embarked on a new role at stripe, congrats",     // LinkedIn promotion post
+      "when it comes to hiring, i just look at what they shipped",
+      "their roadmaps are intertwined with ours",
+      "Additionally we cut the p99 in half",
+      "happy to serve as a reference for her",              // LinkedIn role post
+      "he will serve as interim CTO while they search",
+    ]) {
+      expect(strict(b).score, b).toBe(1);
+    }
+  });
+  it("still catches the unambiguous stock phrases", () => {
+    for (const b of [
+      "that being said, the resolver is fine",
+      "look no further, the cache was the issue",
+      "hope this email finds you well",
+      "the migration stands as a testament to the rewrite",
+    ]) {
+      expect(strict(b).score, b).toBe(0);
+    }
+  });
+
+  it("reasons interleave across families instead of one crowding the cap", () => {
+    const f = strict("Let that sink in. The thing is, it boasts a seamless synergy.");
+    const rs = f.reasons.filter((r) => /significance-marking|AI construction|tier-1 AI vocab/.test(r));
+    expect(rs.length).toBe(3);
+    // All three families must be represented, not three significance markers.
+    expect(rs.some((r) => r.startsWith("significance-marking"))).toBe(true);
+    expect(rs.some((r) => r.startsWith("AI construction"))).toBe(true);
+    expect(rs.some((r) => r.startsWith("tier-1 AI vocabulary"))).toBe(true);
+  });
+});
+
+// ---- PROPERTY tests -------------------------------------------------------
+// Three review rounds each shipped a narrower version of the same bug because
+// the tests pinned the exact strings the previous round named. These generate
+// their inputs instead, so a future narrowing has to satisfy the RULE rather
+// than the examples.
+describe("scoreFormat — vague-authority ownership, property-based", () => {
+  const OWNERS = ["our", "my", "your", "his", "her", "their", "its"];
+  const TRIGGERS = ["studies show", "research shows", "the data shows", "the numbers show"];
+  const TERMINATORS = [".", "!", "?", ";", ":", "\n\n"];
+
+  it("an owner NEVER reaches across a sentence boundary", () => {
+    for (const owner of OWNERS) {
+      for (const term of TERMINATORS) {
+        for (const trigger of TRIGGERS) {
+          const body = `that was ${owner} call${term} ${trigger} otherwise`;
+          expect(strict(body).score, body).toBe(0);
+        }
+      }
+    }
+  });
+
+  it("a contraction-shaped X's is never read as ownership", () => {
+    // English spells "it is" and "it has" identically to a possessive.
+    const CONTRACTIONS = ["here's", "that's", "it's", "there's", "what's", "who's", "he's", "she's", "today's", "everyone's"];
+    for (const c of CONTRACTIONS) {
+      for (const trigger of TRIGGERS) {
+        const body = `${c} the claim, ${trigger} otherwise`;
