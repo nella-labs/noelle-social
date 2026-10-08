@@ -398,3 +398,68 @@ posts.post("/api/posts/notes/:noteId/pin", async (c) => {
   }
 
   if (body.pinned) {
+    await sql`
+      insert into noelle.drafter_notes
+        (org_id, agent_instance_id, scope, lane, idea_id, role, body, pinned)
+      values
+        (${note.org_id}, ${note.agent_instance_id}, 'standing', ${note.lane}, null,
+         'operator', ${note.body}, true)
+    `;
+  } else {
+    // Unpin: drop any standing copy with the same body for this lane.
+    await sql`
+      update noelle.drafter_notes
+      set pinned = false
+      where agent_instance_id = ${note.agent_instance_id}
+        and scope = 'standing' and lane = ${note.lane} and body = ${note.body}
+    `;
+  }
+  return c.json({ id: noteId, status: body.pinned ? "pinned" : "unpinned" }, 200);
+});
+
+// POST /api/posts/:id/dismiss — drop an idea OR a draft (target disambiguates).
+posts.post("/api/posts/:id/dismiss", async (c) => {
+  const auth = c.get("auth");
+  const id = c.req.param("id");
+  let body: PostDismissIn;
+  try {
+    body = PostDismissInSchema.parse(await c.req.json().catch(() => ({})));
+  } catch (err) {
+    return c.json({ error: "invalid_body", detail: err instanceof Error ? err.message : String(err) }, 400);
+  }
+
+  const sql = noelleDb();
+
+  const [row] = body.target === "idea"
+    ? await sql<{ org_id: string }[]>`select org_id from noelle.post_ideas where id=${id} limit 1`
+    : await sql<{ org_id: string }[]>`select org_id from noelle.post_drafts where id=${id} limit 1`;
+  if (!row) return c.json({ error: "not_found" }, 404);
+  if (!(await isOrgMember(auth.userId,row.org_id))) return c.json({ error: "not_org_member" }, 403);
+  await dismissContentPost(sql, { orgId: row.org_id, ...(body.target === "idea" ? { ideaId: id } : { draftId: id }) }, body.scope === "set");
+  return c.json({ id, status: "dismissed" }, 200);
+});
+
+// POST /api/posts/:ideaId/replace — the review board's "kill → another appears".
+// Atomically DISMISSES the idea AND enqueues ONE replacement ideation on the same
+// theme (topics ← the idea's pillar), owned by the SAME intern instance + fan-out
+// targets. The Lima ideation worker drains it and a fresh `proposed` idea surfaces
+// shortly (the operator sees it on the next auto-refresh).
+posts.post("/api/posts/:ideaId/replace", async (c) => {
+  const auth = c.get("auth");
+  const ideaId = c.req.param("ideaId");
+  const sql = noelleDb();
+
+  const rows = await sql<Array<{ org_id: string }>>`
+    select org_id from noelle.post_ideas where id=${ideaId} limit 1
+  `;
+  const idea = rows[0];
+  if (!idea) return c.json({ error: "not_found" }, 404);
+  if (!(await isOrgMember(auth.userId, idea.org_id))) {
+    return c.json({ error: "not_org_member" }, 403);
+  }
+
+  await replaceContentPostIdea(sql, { orgId: idea.org_id, ideaId });
+  return c.json({ id: ideaId, status: "dismissed", replacement_queued: true }, 200);
+});
+
+export { posts };
