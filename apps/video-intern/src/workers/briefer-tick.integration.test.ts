@@ -198,3 +198,29 @@ describe.skipIf(!url)("Durable recording brief claims (native PostgreSQL)", () =
     for (let n = 0; n < 9; n++) await readyDraft();
     expect(await claims(9)).toHaveLength(9);
     expect(await listHeldBriefClaims(sql, instance, org)).toHaveLength(8);
+  });
+  it("revalidates a freshly changed parent after its row lock is released", async () => {
+    await readyDraft(); let release!: () => void; let enter!: () => void;
+    const unlocked = new Promise<void>(resolve => { release = resolve; });
+    const locked = new Promise<void>(resolve => { enter = resolve; });
+    const parent = sql.begin(async tx => {
+      await tx`update noelle.agent_instances set role='linkedin_intern' where id=${instance}`;
+      enter(); await unlocked;
+    });
+    await locked; let settled = false; let calls = 0;
+    const result = tick({ brief: async () => { calls++; return output; } }).then(n => { settled = true; return n; });
+    try { await new Promise(resolve => setTimeout(resolve, 40)); expect(settled).toBe(false); }
+    finally { release(); await parent; }
+    expect(await result).toBe(0); expect(calls).toBe(0); expect(await rows()).toHaveLength(0);
+  });
+  it("a held parent times out without a claim appearing after the lock is released", async () => {
+    await readyDraft(); let release!: () => void; let enter!: () => void;
+    const unlocked = new Promise<void>(resolve => { release = resolve; });
+    const locked = new Promise<void>(resolve => { enter = resolve; });
+    const parent = sql.begin(async tx => { await tx`select id from noelle.agent_instances where id=${instance} for update`; enter(); await unlocked; });
+    await locked;
+    try { await expect(claims()).rejects.toMatchObject({ category: "deadline" }); }
+    finally { release(); await parent; }
+    expect(await rows()).toHaveLength(0);
+  }, 10000);
+});
