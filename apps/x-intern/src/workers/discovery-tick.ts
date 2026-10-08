@@ -398,3 +398,109 @@ export async function runDiscoveryTick(args: RunDiscoveryTickArgs): Promise<numb
             displayName: null,
             bio: t.author.bio ?? null,
           })
+          .catch(() => {});
+      }
+      if (
+        !isWatchPerson &&
+        config.minFaves != null &&
+        t.likes != null &&
+        t.likes < config.minFaves
+      ) {
+        skippedLowFaves++;
+        continue;
+      }
+      // A watchlist person's posts from BEFORE they were added are NOT drafted —
+      // their history is owned by the profiler (deep fetch + summary), not the
+      // reply pipeline. Skip them so adding someone never backfills their old
+      // posts into the approval queue. EXCEPT when the handle is also a targeting
+      // handle: then its pre-added_at posts are still ingested as normal
+      // (non-priority) leads, preserving the targeting coverage. Posts on/after
+      // added_at from a watchlist person are priority ("from the day added").
+      const handle = laneHandle;
+      const addedAt = peopleAddedAt.get(handle);
+      const postedAt = readSourceTimestamp(t.created_at);
+      const beforeAdded =
+        addedAt != null && postedAt != null && new Date(postedAt).getTime() < new Date(addedAt).getTime();
+      if (beforeAdded && !targetingHandles.has(handle)) {
+        skippedBackfill++;
+        continue;
+      }
+      const priority = addedAt != null && !beforeAdded;
+      const res = await upsertLead({
+        orgId: instance.org_id,
+        agentInstanceId: instance.id,
+        platform: "x",
+        externalId: t.id,
+        authorHandle: t.author.handle,
+        authorId: t.author.id,
+        payload: {
+          text: t.text,
+          url: t.url,
+          // `author_followers` is the canonical field the dashboard and the
+          // classifier's follower-floor both read. (Was `followers` — a name
+          // the UI never picked up.) null = unknown, never punished.
+          author_followers: t.author.followers,
+          // Author bio when the actor sent one (often absent). Feeds the ICP
+          // author gate, which treats a missing bio as UNKNOWN and fails open.
+          ...(t.author.bio ? { author_bio: t.author.bio } : {}),
+          // Engagement counts when the scraper carried them (null = unknown).
+          // The ideation worker reads these to rank a watchlist author's best
+          // posts; the reply selector also uses them as observed activity signals.
+          ...(t.likes != null ? { likes: t.likes } : {}),
+          ...(t.reposts != null ? { reposts: t.reposts } : {}),
+          ...(t.replies != null ? { replies: t.replies } : {}),
+          // Post media image URLs for a downstream vision-caption step. Only
+          // present on tweets that actually have media (omitted otherwise).
+          ...(t.images && t.images.length > 0 ? { images: t.images } : {}),
+          // Reply marker (kept for debugging/UI). When excludeReplies is on these
+          // are filtered out above, so a stored is_reply only appears with the
+          // filter off — but recording it makes the lane's behaviour auditable.
+          ...(t.is_reply ? { is_reply: true } : {}),
+          ...(t.conversation_id ? { conversation_id: t.conversation_id } : {}),
+          ...(t.in_reply_to_id ? { in_reply_to_id: t.in_reply_to_id } : {}),
+        },
+        postedAt,
+        priority,
+      });
+      if (res.inserted) {
+        inserted++;
+        await bus?.emit({
+          topic: "lead.discovered",
+          worker: "discovery",
+          summary: `discovered @${t.author.handle}`,
+          payload: {
+            lead_id: res.id,
+            external_id: t.id,
+            handle: t.author.handle,
+            followers: t.author.followers ?? null,
+            priority,
+          },
+          correlationId: res.id,
+        });
+      }
+    } catch (err) {
+      log.error({ tweetId: t.id, err: (err as Error).message }, "lead upsert failed");
+    }
+  }
+  log.info(
+    {
+      inserted,
+      scanned: all.length,
+      duplicates: batches.reduce((count, batch) => count + batch.length, 0) - all.length,
+      skippedBackfill,
+      skippedRepost,
+      skippedReply,
+      skippedLowFaves,
+      windowHours: config.timeWindowHours,
+      limit,
+      minFaves: config.minFaves,
+      minReplies: config.minReplies,
+    },
+    "discovery tick complete",
+  );
+  // The pool died mid-ring. Everything fetched before that point is now saved,
+  // so surfacing the failure costs nothing — and it is what makes the worker's
+  // handler mark the run errored and page the operator.
+  if (exhausted) throw exhausted;
+  return inserted;
+}
