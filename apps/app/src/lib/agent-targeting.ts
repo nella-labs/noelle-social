@@ -198,3 +198,6 @@ async function applyRedditChange(tx: TransactionSql, orgId: string, instanceId: 
       on conflict (agent_instance_id,subreddit) do nothing returning id`;
     applied.addedSubreddits = rows.length;
   }
+  if (proposal.removeSubreddits.length) applied.removedSubreddits = (await tx`delete from noelle.reddit_watchlist
+    where org_id=${orgId} and agent_instance_id=${instanceId} and subreddit=any(${proposal.removeSubreddits}) returning id`).length;
+}
