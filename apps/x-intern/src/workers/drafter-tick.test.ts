@@ -798,3 +798,203 @@ describe("runDrafterTick", () => {
     expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({
       status: "skipped",
       meta: expect.objectContaining({ skip_reason: "low-voice" }),
+    }));
+  });
+
+  it("keeps bounded private-safe verifier evidence when a browser lead fails the voice floor", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({ drafts: [{ angle: "technical", body: "A concrete reply", char_count: 16 }] }),
+      engine: "codex", model: "gpt-5",
+    }) };
+    const judge = vi.fn()
+      .mockResolvedValueOnce(JSON.stringify({
+        voice: 0.4, grounding: 0.9, relevance: 0.9,
+        reasons: ["Unsupported claim about Alice at @alice in the draft A concrete reply"],
+        fix: "Remove Alice's unsupported claim and do not quote her message",
+      }))
+      .mockResolvedValueOnce(JSON.stringify({
+        voice: 0.5, grounding: 0.9, relevance: 0.9,
+        reasons: ["Voice still sounds generic and copies Bob's phrasing at bob@example.com"],
+        fix: "Make the voice less generic without copying Bob's words",
+      }))
+      .mockResolvedValueOnce(JSON.stringify({
+        voice: 0.6, grounding: 0.9, relevance: 0.9,
+        reasons: ["The voice remains generic for https://x.com/alice/status/1"],
+        fix: "Use a natural voice; mention Alice's startup",
+      }));
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [{ ...mkLead(), payload: { ...mkLead().payload, source: "extension_observed" } }],
+      runner: runner as never, kb: mkKb() as never, postOutbound, markStatus,
+      verify: { enabled: true, retries: 2, voiceFloor: 0.8, makeCalls: () => [judge] },
+    });
+
+    expect(postOutbound).not.toHaveBeenCalled();
+    const skipped = markStatus.mock.calls.find(([arg]) => arg.status === "skipped")?.[0];
+    expect(skipped).toMatchObject({ leadId: "L", meta: { skip_reason: "low-voice" } });
+    const diagnostic = skipped.meta.voice_verifier_diagnostic;
+    expect(diagnostic).toMatchObject({ version: 1, voice_floor: 0.8 });
+    expect(diagnostic.verdicts).toHaveLength(3);
+    expect(diagnostic.verdicts.map((entry: { attempt: number; scores: { voice: number } }) =>
+      [entry.attempt, entry.scores.voice])).toEqual([[0, 0.4], [1, 0.5], [2, 0.6]]);
+    expect(diagnostic.verdicts[0]).toMatchObject({ reason: "unsupported claim", fix: "remove unsupported claim" });
+    expect(diagnostic.verdicts[1]).toMatchObject({
+      reason: "generic voice; echoes source",
+      fix: "use natural voice; add an original point",
+    });
+    expect(JSON.stringify(diagnostic)).not.toMatch(/Alice|Bob|@alice|bob@example|https:\/\/|A concrete reply/);
+  });
+
+  it("keeps legacy reply drafts on the default model routing path", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "bedrock", model: "claude-sonnet-4-6" }) };
+
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [mkLead()],
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(runner.draft).toHaveBeenCalledOnce();
+    expect(runner.draft.mock.calls[0]![0]).not.toHaveProperty("directRouting");
+    expect(runner.draft.mock.calls[0]![0]).not.toHaveProperty("codexSubscriptionOnly");
+  });
+
+  it("verifier: gives up after `retries` and queues the best attempt with a failing verdict", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    const judge = vi.fn().mockResolvedValue(verdict(false)); // always fails
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead()],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(3); // initial + 2 retries
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.verifierMeta.pass).toBe(false);
+    expect(body.verifierMeta.attempts).toBe(2);
+    expect(postOutbound).toHaveBeenCalledTimes(1); // still queued
+  });
+
+  it("verifier: priority lead uses the adversarial (3-judge) panel", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead(true)],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 2, makeCalls: (priority) => (priority ? [judge, judge, judge] : [judge]) },
+    });
+    expect(judge).toHaveBeenCalledTimes(12); // 3 judges for the set and each of 3 final angles
+  });
+
+  it("reviews each final reply separately so a weak sibling does not block strong angles", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({ ...JSON.parse(draftsJson), dm: { body: "hellooo\n\nsaw your post\n\nexample.test" } }),
+      engine: "codex", model: "gpt-5",
+    }) };
+    const judge = vi.fn()
+      .mockResolvedValueOnce(verdict(false)) // whole set fails
+      .mockResolvedValueOnce(verdict(true))  // empathetic passes alone
+      .mockResolvedValueOnce(verdict(false)) // technical fails alone
+      .mockResolvedValueOnce(verdict(true)); // contrarian passes alone
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o", dm_autodraft_enabled: true }, claimedLeads: [mkLead()],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 0, voiceFloor: 0.65, makeCalls: () => [judge] },
+    });
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.verifierMeta.pass).toBe(false);
+    expect(body.drafts.filter((d: { kind: string }) => d.kind === "reply")
+      .map((d: { verifierMeta?: { pass: boolean; judgeOk: boolean } }) => [d.verifierMeta?.pass, d.verifierMeta?.judgeOk]))
+      .toEqual([[true, true], [false, true], [true, true]]);
+    expect(body.drafts.find((d: { kind: string }) => d.kind === "dm").verifierMeta).toBeUndefined();
+    expect(judge).toHaveBeenCalledTimes(4);
+    expect(String(judge.mock.calls[1]![1])).toContain("rust builds are slow");
+    expect(String(judge.mock.calls[1]![1])).toContain("i ship small and often");
+  });
+
+  it("reviews the exact cleaned reply body that outbound will persist", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const original = "sccache—saved my rust builds";
+    const runner = { draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({ drafts: [{ angle: "technical", body: original }] }), engine: "codex", model: "gpt-5",
+    }) };
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead()],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+    const finalReply = postOutbound.mock.calls[0]![0].drafts[0];
+    expect(finalReply.body).not.toBe(original);
+    expect(finalReply.body).not.toContain("—");
+    expect(String(judge.mock.calls[1]![1])).toContain(finalReply.body);
+    expect(finalReply.verifierMeta).toMatchObject({ pass: true, judgeOk: true });
+  });
+
+  it("marks a fail-open judge result for a cleaned reply as ineligible for unattended sending", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify({ drafts: [{ angle: "empathetic", body: "sccache helped my builds  " }] }), engine: "codex", model: "gpt-5" }) };
+    const judge = vi.fn().mockResolvedValueOnce(verdict(true)).mockRejectedValue(new Error("judge down"));
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead()],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.verifierMeta).toMatchObject({ pass: true, judgeOk: true });
+    expect(body.drafts[0].body).toBe("sccache helped my builds");
+    expect(body.drafts[0].verifierMeta).toMatchObject({ pass: false, judgeOk: false, judgeProvider: "none" });
+  });
+
+  it("budget cap: HOLDS a priority (watchlist) lead as re-claimable 'classified' — never errored/lost", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockRejectedValue(
+        new BudgetExceededError({ layer: "instance", spent_cents: 2500, cap_cents: 2500, estimated_cents: 20 }),
+      ),
+    };
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead(true)],
+      runner: runner as never, kb: mkKb() as never, postOutbound, markStatus,
+    });
+    // A watched account must not be dropped by a temporary cap: held as
+    // 'classified' so it drafts once budget frees. Nothing queued to the inbox.
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ leadId: "L", status: "classified" }),
+    );
+  });
+
+  it("budget cap: a non-priority lead is still dropped to 'errored' (won't retry)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockRejectedValue(
+        new BudgetExceededError({ layer: "instance", spent_cents: 2500, cap_cents: 2500, estimated_cents: 20 }),
+      ),
+    };
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
