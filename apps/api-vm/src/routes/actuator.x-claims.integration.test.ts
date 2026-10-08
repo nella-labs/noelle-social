@@ -198,3 +198,27 @@ describe.skipIf(!url)("browser X reservations (dedicated PostgreSQL)", () => {
   it("applies the conversation window when reserving a notification reply", async () => {
     const row = await candidate("101", "notification", 14);
     expect((await claim(row.id)).body.claimed).toBe(false);
+    expect(await sql`select * from noelle.x_reply_claims`).toHaveLength(0);
+  });
+  it.each(["review", "decision", "body"])("rechecks a committing %s change before reserving", async (change) => {
+    const row = await candidate();
+    let request: ReturnType<typeof claim> | undefined;
+    let settled = false;
+    await sql.begin(async tx => {
+      await tx`select id from noelle.drafts where id=${row.draftId} for update`;
+      if (change === "review") await tx`update noelle.drafts set payload=payload-'verifier_meta' where id=${row.draftId}`;
+      else if (change === "body") await tx`update noelle.drafts set payload=payload||'{"edited_body":"new unreviewed text"}' where id=${row.draftId}`;
+      else await tx`update noelle.approvals set status='skipped' where id=${row.id}`;
+      request = claim(row.id);
+      void request.then(() => { settled = true; });
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const [state] = await sql<{ waiting: boolean }[]>`select exists(select 1 from pg_stat_activity where datname=current_database() and wait_event_type='Lock' and query like '%noelle.drafts%') as waiting`;
+        if (settled || state?.waiting) return;
+        await new Promise(resolve => setTimeout(resolve,10));
+      }
+      throw new Error("browser reservation did not reach a decision or row lock");
+    });
+    expect((await request)?.body.claimed).toBe(false);
+    expect(await sql`select * from noelle.x_reply_claims`).toHaveLength(0);
+  });
+});
