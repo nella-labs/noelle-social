@@ -398,3 +398,47 @@ export interface Database {
             foreignKeyName: "vault_wizard_answers_org_id_fkey";
             columns: ["org_id"];
             isOneToOne: true;
+            referencedRelation: "organizations";
+            referencedColumns: ["id"];
+          }
+        ];
+      };
+      sync_runs: {
+        Row: {
+          id: string;
+          source: string;
+          started_at: string;
+          finished_at: string | null;
+          rows_upserted: number | null;
+          error: string | null;
+        };
+        Insert: {
+          id?: string;
+          source: string;
+          started_at?: string;
+          finished_at?: string | null;
+          rows_upserted?: number | null;
+          error?: string | null;
+        };
+        Update: {
+          id?: string;
+          source?: string;
+          started_at?: string;
+          finished_at?: string | null;
+          rows_upserted?: number | null;
+          error?: string | null;
+        };
+        Relationships: [];
+      };
+    };
+    Views: Record<string, never>;
+    Functions: {
+      is_org_member: {
+        Args: { target_org: string };
+        Returns: boolean;
+      };
+    };
+    Enums: Record<string, never>;
+    CompositeTypes: Record<string, never>;
+  };
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@noelle/types",
+  "version": "0.0.1-alpha.0",
+  "private": true,
+  "type": "module",
+  "description": "Generated Supabase types for the noelle.* schema.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./src/index.ts"
+    },
+    "./database": {
+      "types": "./dist/database.d.ts",
+      "import": "./dist/database.js",
+      "default": "./src/database.ts"
+    }
+  },
+  "scripts": {
+    "generate": "test -n \"$SUPABASE_PROJECT_REF\" && supabase gen types typescript --project-id \"$SUPABASE_PROJECT_REF\" --schema public,noelle > src/database.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "echo \"lint placeholder\"",
+    "test": "echo \"no tests yet\""
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
