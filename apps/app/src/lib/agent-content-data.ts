@@ -198,3 +198,18 @@ export async function loadWorkspaceData(args: {
     lane,
     orgSlug,
     section,
+    platform,
+    today,
+    ideas,
+    drafts,
+    media,
+    focusId: args.focusParam ?? null,
+    // The Drafts nav badge counts the ACTIVE queue (draft + ready), not archived
+    // posted items — otherwise including 'published' above would inflate it.
+    counts: {
+      ideas: ideas.filter((i) => i.status === "proposed").length,
+      drafts: drafts.filter((d) => d.status !== "published").length,
+    },
+    style,
+  };
+}

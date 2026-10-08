@@ -398,3 +398,20 @@ function SlotChip({
           position: "absolute",
           top: 4,
           right: 4,
+          width: 16,
+          height: 16,
+          borderRadius: 5,
+          border: "none",
+          background: "transparent",
+          color: "var(--ink-soft)",
+          cursor: "pointer",
+          fontSize: 12,
+          lineHeight: 1,
+          opacity: 0.6,
+        }}
+      >
+        ×
+      </button>}
+    </div>
+  );
+}
