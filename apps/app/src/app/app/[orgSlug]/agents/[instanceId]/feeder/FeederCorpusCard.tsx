@@ -198,3 +198,59 @@ export function FeederCorpusCard({
 }
 
 /**
+ * How often this source's voice was actually sampled into a draft. `draftsUsed`
+ * of `totalStyledDrafts` styled drafts blended it in; `avgWeight` is its mean
+ * share of the blend on the drafts that used it. A tiny bar makes the "% of
+ * answers" legible at a glance — the operator's "what's actually being used" ask.
+ */
+function UsageStat({
+  enabled,
+  draftsUsed,
+  totalStyledDrafts,
+  avgWeight,
+}: {
+  enabled: boolean;
+  draftsUsed: number;
+  totalStyledDrafts: number;
+  avgWeight: number | null;
+}) {
+  if (totalStyledDrafts === 0) {
+    return <span style={{ color: "var(--ink-muted)" }}>no styled drafts yet</span>;
+  }
+  const pct = Math.round((draftsUsed / totalStyledDrafts) * 100);
+  const sharePct = avgWeight != null ? Math.round(avgWeight * 100) : null;
+  return (
+    <span
+      title={`Sampled into ${draftsUsed} of ${totalStyledDrafts} styled drafts${
+        sharePct != null ? ` · ~${sharePct}% of the style blend when used` : ""
+      }${enabled ? "" : " · disabled, excluded from new drafts"}`}
+      style={{ display: "inline-flex", alignItems: "center", gap: 8, color: "var(--ink-2)" }}
+    >
+      <span
+        aria-hidden
+        style={{
+          display: "inline-block",
+          width: 54,
+          height: 5,
+          borderRadius: 999,
+          background: "color-mix(in oklch, var(--ink) 10%, transparent)",
+          position: "relative",
+          overflow: "hidden",
+        }}
+      >
+        <span
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: `${pct}%`,
+            background: enabled ? "var(--accent)" : "var(--ink-soft)",
+          }}
+        />
+      </span>
+      <span>
+        used in {pct}% of answers
+        {sharePct != null ? ` · ${sharePct}% share` : ""}
+      </span>
+    </span>
+  );
+}
