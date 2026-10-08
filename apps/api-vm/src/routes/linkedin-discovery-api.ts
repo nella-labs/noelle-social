@@ -198,3 +198,112 @@ linkedinDiscovery.get("/api/actuator/discovery-identities", async (c) => {
   const { orgId } = c.get("actuator");
   if (!(await ownsInstance(instanceId, orgId))) return c.json({ error: "instance_not_in_org" }, 403);
   const candidates = await noelleDb()<Array<{ leadId: string; fingerprint: string; status: string }>>`
+    select id::text as "leadId", payload->>'fingerprint' as fingerprint, status
+    from noelle.leads
+    where org_id = ${orgId} and agent_instance_id = ${instanceId}
+      and platform = 'linkedin'
+      and external_id like 'browser:%'
+      and payload->>'source' = 'extension_observed'
+      and ((status = 'identity_pending' and payload->'classifier'->>'provider' = 'jev')
+        or (${fingerprints !== null} and status in ('observed', 'observed_classifying')))
+      and nullif(payload->>'fingerprint', '') is not null
+      and (${fingerprints === null} or payload->>'fingerprint' = any(${fingerprints ?? []}::text[]))
+    order by created_at desc limit ${fingerprints === null ? 20 : 50}
+  `;
+  return c.json({
+    items: candidates.filter((row) => row.status === "identity_pending")
+      .map(({ leadId, fingerprint }) => ({ leadId, fingerprint })),
+    processing: candidates.filter((row) => row.status === "observed" || row.status === "observed_classifying").length,
+  });
+});
+
+linkedinDiscovery.post("/api/actuator/discovery-identities", async (c) => {
+  const parsed = identitySchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: "invalid_identity" }, 400);
+  const { instanceId, leadId, fingerprint, urn, url, shortUrl } = parsed.data;
+  if (!isLinkedInShortUrl(shortUrl ?? "") &&
+      !/^urn:li:(?:activity|share):\d{10,}$/.test(urn ?? "") &&
+      !/^https:\/\/www\.linkedin\.com\/(?:feed\/update\/urn:li:activity:\d{10,}|posts\/[^?#]*activity-\d{10,})/.test(url ?? "")) {
+    return c.json({ error: "invalid_identity" }, 400);
+  }
+  const { orgId } = c.get("actuator");
+  if (!(await ownsInstance(instanceId, orgId))) return c.json({ error: "instance_not_in_org" }, 403);
+  const sql = noelleDb();
+  // The model verdict must be persisted before an embed fetch. A browser cannot
+  // use this endpoint to probe links for rejected or unclassified cards.
+  const [candidate] = await sql<Array<{ id: string }>>`
+    select id from noelle.leads
+    where org_id = ${orgId} and agent_instance_id = ${instanceId}
+      and id = ${leadId} and payload->>'fingerprint' = ${fingerprint}
+      and platform = 'linkedin' and status = 'identity_pending'
+      and external_id like 'browser:%'
+      and payload->>'source' = 'extension_observed'
+      and payload->'classifier'->>'provider' = 'jev'
+    limit 1
+  `;
+  if (!candidate) return c.json({ error: "identity_not_pending" }, 409);
+
+  let identity;
+  try {
+    identity = shortUrl
+      ? await resolveLinkedInShortUrl(shortUrl)
+      : await resolveLinkedInIdentity({ urn, url });
+  } catch {
+    // The actor retries at its next ambient read. No new qualified lead or
+    // fabricated permalink is created on a transient public embed outage.
+    return c.json({ error: "identity_unavailable" }, 503);
+  }
+  if (!identity) return c.json({ error: "invalid_identity" }, 400);
+
+  const markDuplicate = async () => {
+    await sql`
+      update noelle.leads set status = 'skipped',
+        payload = payload || ${sql.json({ identity_duplicate_of: identity.externalId })}::jsonb,
+        updated_at = now()
+      where org_id = ${orgId} and agent_instance_id = ${instanceId}
+        and id = ${leadId} and status = 'identity_pending'
+    `;
+    return c.json({ resolved: false, duplicate: true });
+  };
+  const existing = await sql<Array<{ id: string }>>`
+    select id from noelle.leads
+    where org_id = ${orgId} and platform = 'linkedin' and external_id = ${identity.externalId}
+    limit 1
+  `;
+  if (existing.length) return markDuplicate();
+
+  let updated: Array<{ id: string }>;
+  try {
+    updated = await sql<Array<{ id: string }>>`
+      update noelle.leads set external_id = ${identity.externalId},
+        payload = payload || ${sql.json({ urn: identity.urn, url: identity.url,
+          original_post_url: identity.url, identity_resolved_at: new Date().toISOString() })}::jsonb,
+        status = 'classified', updated_at = now()
+      where org_id = ${orgId} and agent_instance_id = ${instanceId}
+        and id = ${leadId} and status = 'identity_pending'
+        and payload->>'fingerprint' = ${fingerprint}
+        and payload->'classifier'->>'provider' = 'jev'
+        and not exists (
+          select 1 from noelle.leads other
+          where other.org_id = ${orgId} and other.platform = 'linkedin'
+            and other.external_id = ${identity.externalId}
+        )
+      returning id
+    `;
+  } catch (error) {
+    // A competing actor may have canonicalized this activity between SELECT
+    // and UPDATE. The unique index is the final dedupe guard.
+    if ((error as { code?: string }).code !== "23505") throw error;
+    return markDuplicate();
+  }
+  if (updated.length === 0) {
+    const duplicates = await sql<Array<{ id: string }>>`
+      select id from noelle.leads
+      where org_id = ${orgId} and platform = 'linkedin' and external_id = ${identity.externalId}
+      limit 1
+    `;
+    return duplicates.length ? markDuplicate() : c.json({ error: "identity_not_pending" }, 409);
+  }
+  await sql`select pg_notify('noelle_linkedin_priority', ${instanceId})`;
+  return c.json({ resolved: true, duplicate: false });
+});
