@@ -198,3 +198,39 @@ describe("background pre-click refresh", () => {
       throw new Error(`unexpected command ${msg.cmd}`);
     });
     const addListener = () => {};
+    vi.stubGlobal("chrome", {
+      storage: { local: storage(local), session: storage(session) },
+      tabs: { sendMessage, get: async () => ({ id: 1, url: "https://x.com/home", status: "complete" }),
+        query: async () => [{ id: 1, url: "https://x.com/home" }],
+        onCreated: { addListener }, onUpdated: { addListener } },
+      alarms: { create: async () => {}, clear: async () => {}, onAlarm: { addListener } },
+      runtime: { onStartup: { addListener }, onInstalled: { addListener }, onMessage: {
+        addListener: (listener: typeof message) => { message = listener; },
+      } },
+    });
+    await import("../src/background/index.js");
+    const command = (cmd: string, params?: unknown) => new Promise<void>((resolve) => {
+      message({ cmd, params }, null, (response) => {
+        expect(response).toEqual({ ok: true });
+        resolve();
+      });
+    });
+    await command("startRun", { windowHours: 1, targetComments: 0, targetLikes: 1 });
+    vi.clearAllTimers();
+    const state = Object.values(session).find((value) => value && typeof value === "object"
+      && "sessionId" in value) as { actions: unknown[]; warmupSuppressMs: number; done: { likes: number } };
+    state.actions = [{ kind: "like", atMs: Date.now() - 1, executed: false }];
+    state.warmupSuppressMs = 0;
+    const tick = command("tick");
+    await vi.runAllTimersAsync();
+    await tick;
+    expect(scrolled).toBe(outcome !== "miss");
+    if (outcome === "fresh") {
+      expect(background.click).toHaveBeenCalledWith(1, FRESH_LIKE_LOC.rect, expect.anything(), expect.anything());
+      expect(state.done.likes).toBe(1);
+    } else {
+      expect(background.click).not.toHaveBeenCalled();
+      expect(state.done.likes).toBe(0);
+    }
+  });
+});

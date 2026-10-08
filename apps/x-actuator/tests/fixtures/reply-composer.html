@@ -1,0 +1,37 @@
+<!-- X tweet detail page (reply surface), condensed from live-DOM shapes: the
+     action-bar reply ICON precedes the composer; the inline submit follows it
+     and is DISABLED until the editor model registers text; the DM drawer
+     persists bottom-right with its own type=submit-shaped Send button. The
+     tweet body deliberately mentions verify/unusual-activity so the challenge
+     regression tests run against a realistic page. -->
+<main role="main">
+  <article data-testid="tweet" tabindex="-1">
+    <div data-testid="User-Name">
+      <span>Jack Friks</span>
+      <a href="/jackfriks/status/1900000000000000001"><time datetime="2026-07-01T12:00:00.000Z">Jul 1</time></a>
+      <span>@jackfriks</span>
+    </div>
+    <div data-testid="tweetText" lang="en">shipping a tiny agent every day — unusual activity is the point. verify your identity as a builder: suspicious amounts of output</div>
+    <div role="group" aria-label="12 replies, 4 reposts, 30 likes">
+      <button data-testid="reply" aria-label="12 Replies. Reply" type="button"><svg viewBox="0 0 24 24"></svg><span>12</span></button>
+      <button data-testid="retweet" aria-label="4 reposts. Repost" type="button"><svg viewBox="0 0 24 24"></svg><span>4</span></button>
+      <button data-testid="like" aria-label="30 Likes. Like" type="button"><svg viewBox="0 0 24 24"></svg><span>30</span></button>
+      <button data-testid="bookmark" aria-label="Bookmark" type="button"><svg viewBox="0 0 24 24"></svg></button>
+    </div>
+  </article>
+  <div class="r-composer-row">
+    <div data-testid="tweetTextarea_0" class="r-editor-wrap">
+      <div class="DraftEditor-root">
+        <div class="public-DraftEditorPlaceholder-root"><span>Post your reply</span></div>
+        <div class="DraftEditor-editorContainer">
+          <div class="public-DraftEditor-content" role="textbox" contenteditable="true" aria-label="Post text"></div>
+        </div>
+      </div>
+    </div>
+    <button data-testid="tweetButtonInline" disabled aria-disabled="true" type="button" class="r-submit"><span>Reply</span></button>
+  </div>
+</main>
+<aside data-testid="DMDrawer" aria-label="Messages">
+  <div role="textbox" contenteditable="true" data-testid="dmComposerTextInput" aria-label="Start a new message"></div>
+  <button data-testid="dmComposerSendButton" type="submit" aria-label="Send" class="dm-send"><svg viewBox="0 0 24 24"></svg></button>
+</aside>
