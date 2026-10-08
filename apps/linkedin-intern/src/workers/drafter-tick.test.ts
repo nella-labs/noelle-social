@@ -3398,3 +3398,203 @@ describe("runDrafterTick — F6b tiered reply batching (NOELLE_DRAFTER_BATCH)", 
       runner: runner as never,
       kb: kb as never,
       postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("post A by alice");
+    expect(prompt).toContain("post B by bob");
+    expect(prompt).toContain("Alice");
+    expect(prompt).toContain("Bob");
+  });
+
+  it("BATCH ON: each lead's reply is correctly cross-matched by id (no cross-wiring)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    // Model returns replies in REVERSE order — verify each lead still gets its own
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify([
+          { id: "L2", reply: "reply for L2" },
+          { id: "L1", reply: "reply for L1" },
+        ]),
+        engine: "bedrock",
+        model: "m",
+      }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lightLead("L1", "1"),
+        lightLead("L2", "2"),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+    });
+    // Both leads drafted, each with the right reply body
+    expect(postOutbound).toHaveBeenCalledTimes(2);
+    const bodies = postOutbound.mock.calls.map(
+      (c: unknown[]) => (c[0] as { drafts: Array<{ body: string }> }).drafts[0]!.body,
+    );
+    expect(bodies).toContain("reply for L1");
+    expect(bodies).toContain("reply for L2");
+  });
+
+  it("BATCH ON: parse failure (malformed JSON) → falls back to per-lead single calls, no lead dropped", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const runner = {
+      draft: vi
+        .fn()
+        // First call (batch): malformed — triggers fallback
+        .mockResolvedValueOnce({ text: "not valid json", engine: "bedrock", model: "m" })
+        // Fallback: per-lead single calls (oneLight for each lead)
+        .mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }),
+    };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+    });
+    // Both leads drafted via the fallback (total = 3 calls: 1 batch attempt + 2 singles)
+    expect(runner.draft).toHaveBeenCalledTimes(3);
+    expect(n).toBe(2);
+    expect(postOutbound).toHaveBeenCalledTimes(2);
+  });
+
+  it("BATCH ON: short array (count mismatch) → falls back to per-lead single calls", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const runner = {
+      draft: vi
+        .fn()
+        // Only returns 1 entry for 2 leads
+        .mockResolvedValueOnce({ text: JSON.stringify([{ id: "L1", reply: "hi" }]), engine: "bedrock", model: "m" })
+        .mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }),
+    };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+    });
+    // Fallback runs both leads individually
+    expect(runner.draft).toHaveBeenCalledTimes(3);
+    expect(n).toBe(2);
+  });
+
+  it("BATCH ON: id mismatch in batch output → falls back to per-lead single calls", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const runner = {
+      draft: vi
+        .fn()
+        // Returns 2 entries but with WRONG ids
+        .mockResolvedValueOnce({
+          text: JSON.stringify([{ id: "WRONG1", reply: "x" }, { id: "WRONG2", reply: "y" }]),
+          engine: "bedrock", model: "m",
+        })
+        .mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }),
+    };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(3);
+    expect(n).toBe(2);
+  });
+
+  it("BATCH ON: high-engagement (Opus-eligible) light lead is NEVER batched — stays single-call", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }),
+    };
+    // L1: normal light → batchable
+    // L2: 240 likes → Opus-eligible → single-call even when batch is on
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lightLead("L1", "1"),
+        lightLead("L2", "2", { payload: { text: "high-engagement post", reactions: 240, comments: 5 } }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+      opusLikesThreshold: 80,
+      opusCommentsThreshold: 30,
+      opusModel: "claude-opus-4-6",
+    });
+    // L2 (Opus) must use single-call with Opus routing. L1 may go batch.
+    // The Opus single call for L2 is identifiable by routing.primary.model.
+    const opusCalls = runner.draft.mock.calls.filter(
+      (c: unknown[]) =>
+        (c[0] as { routing: { primary: { model: string } } }).routing.primary.model === "claude-opus-4-6",
+    );
+    expect(opusCalls).toHaveLength(1);
+  });
+
+  it("BATCH ON: verifier-on light leads are NOT batched (each gets a single call)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const judge = vi.fn().mockResolvedValue(
+      JSON.stringify({ voice: 0.9, grounding: 0.9, relevance: 0.9, reasons: [], fix: null }),
+    );
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }),
+    };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lightLead("L1", "1"), lightLead("L2", "2")] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      batch: { enabled: true, batchLightLeads: true },
+      // verifier ON → disables batch path
+      verify: { enabled: true, retries: 1, makeCalls: () => [judge] },
+    });
+    // Each lead gets its own per-lead call (batch disabled by verifier)
+    expect(runner.draft).toHaveBeenCalledTimes(2);
+    expect(n).toBe(2);
+    // Calls are per-lead (each prompt is a single-lead LIGHT prompt, not a batch)
+    for (const c of runner.draft.mock.calls) {
+      expect((c[0] as { system: string }).system).not.toContain("BATCHED MODE");
+    }
+  });
+
+  it("BATCH ON: model error → falls back to per-lead single calls (no lead dropped)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    const runner = {
+      draft: vi
