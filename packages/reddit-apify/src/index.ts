@@ -398,3 +398,203 @@ export function normalizeRedditPost(
     ...firstArray(item.comments, item.topComments, item.commentList),
     ...(opts?.extraComments ?? []),
   ];
+  const topComments = rawComments
+    .map((c) => normalizeRedditComment(c))
+    .filter((c): c is RedditComment => c !== null)
+    .sort(byVoteScore)
+    .slice(0, Math.max(0, commentsPerPost));
+
+  return {
+    id,
+    title,
+    body,
+    url,
+    ...(externalUrl ? { externalUrl } : {}),
+    subreddit,
+    createdAt,
+    score: readSourceVoteScore(item.score, item.ups),
+    ...(ratio !== null ? { upvoteRatio: ratio } : {}),
+    numComments: readSourceCount(item.numComments, item.num_comments),
+    author: { username: author },
+    ...(images.length > 0 ? { images } : {}),
+    ...(topComments.length > 0 ? { topComments } : {}),
+  };
+}
+
+export function createApifyRedditClient(opts: CreateApifyRedditClientOpts): ApifyRedditClient {
+  const transport = createApifyTransport({
+    token: opts.token,
+    ...(opts.baseUrl ? { baseUrl: opts.baseUrl } : {}),
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    errorFactory: (message, status) => new ApifyError(message, status),
+  });
+  const subredditPostsActorId = opts.subredditPostsActorId ?? SUBREDDIT_POSTS_ACTOR_ID;
+
+  return {
+    drainLastRunUsd: transport.drainLastRunUsd,
+    drainRunReceipts: transport.drainRunReceipts,
+    async subredditPosts({ subreddit, sort = "new", time = "day", maxItems = 50, sinceISO, commentsPerPost }) {
+      transport.beginOperation();
+      if (commentsPerPost !== undefined && (!Number.isSafeInteger(commentsPerPost) || commentsPerPost < 0 || commentsPerPost > 500)) {
+        throw new ApifyError("commentsPerPost must be an integer between 0 and 500", 400);
+      }
+      if (!subreddit) throw new ApifyError("subredditPosts requires a subreddit", 0);
+      // Comments are OPT-IN: only fetched when the caller asks (commentsPerPost > 0).
+      // The Reddit intern (Orion) passes it to engage with the most-upvoted comments;
+      // consumers that omit comments omit it and pay only for posts+media —
+      // fetching comments they ignore would multiply the per-post Apify cost.
+      const wantComments = (commentsPerPost ?? 0) > 0;
+      // The actor bounds posts and comments together with maxItems. Unknown
+      // output fields still pass through the defensive source normalizers.
+      const { items } = await transport.runActor({
+        actorId: subredditPostsActorId, actor: "reddit-posts-comments-scraper", itemLimit: maxItems, input: {
+          mode: "subreddit",
+          subreddit,
+          sort,
+          timeRange: time,
+          maxItems,
+          postType: "all",
+          includeComments: wantComments,
+          commentsPerPost: commentsPerPost ?? 0,
+          commentSort: "top",
+          includeNsfw: false,
+          // This actor requires a proxy config; route through Apify's residential pool.
+          proxyConfiguration: { useApifyProxy: true, apifyProxyGroups: ["RESIDENTIAL"] },
+        },
+      });
+
+      // Separate-items mode: some runs return comments as their own rows (a
+      // dataType/type='comment' discriminator). Group those under their parent post
+      // id so normalizeRedditPost folds them in. The common case has comments
+      // nested inside each post item and this map stays empty.
+      const extraByParent = new Map<string, unknown[]>();
+      const postItems: unknown[] = [];
+      for (const it of items) {
+        if (isStandaloneCommentItem(it)) {
+          const parent = commentParentPostId(it as ApifyRedditComment);
+          if (parent) {
+            const arr = extraByParent.get(parent) ?? [];
+            arr.push(it);
+            extraByParent.set(parent, arr);
+          }
+          continue;
+        }
+        postItems.push(it);
+      }
+
+      const since = sinceISO ? new Date(sinceISO).getTime() : 0;
+      const seen = new Set<string>();
+      const out: RedditPost[] = [];
+      for (const item of postItems) {
+        const pid = rawPostId(item as ApifyRedditItem);
+        const extraComments = extraByParent.get(pid);
+        const p = normalizeRedditPost(item, {
+          commentsPerPost: commentsPerPost ?? 0,
+          ...(extraComments ? { extraComments } : {}),
+        });
+        if (!p || seen.has(p.id)) continue;
+        // Precise recency floor (mirrors the LinkedIn normalize-all step). Keep
+        // posts with no timestamp — dropping them would silently lose data.
+        if (since && p.createdAt && new Date(p.createdAt).getTime() < since) continue;
+        seen.add(p.id);
+        out.push(p);
+      }
+      return out.slice(0, maxItems);
+    },
+  };
+}
+
+// --- Post comments (the drafter's "read the room" fetch) ----------------------
+// The parseforge posts scraper returns numComments as a COUNT only, never the
+// bodies. Rather than pay for a dedicated Apify comments actor (which would burn
+// the shared FREE token pool), the drafter reads the top comments straight off
+// Reddit's FREE public JSON endpoint — https://www.reddit.com/comments/<id>.json —
+// which needs no token, no Apify run, and no spend. The Reddit intern runs on the
+// Mac's residential IP where this is reliable; on a 429/403/parse error we fail
+// OPEN (return []), so a comment-fetch outage never blocks a draft. depth=1 keeps
+// it to top-level comments (the siblings we want, not deep reply chains).
+
+interface RedditListingChild {
+  kind?: string;
+  data?: {
+    author?: unknown;
+    body?: unknown;
+    score?: unknown;
+    stickied?: unknown;
+    distinguished?: unknown;
+  };
+}
+
+const DEFAULT_REDDIT_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) noelle-reddit-intern/1.0 (read-only, draft-only)";
+
+/**
+ * Fetch the top-level comments on a Reddit post via the free public .json endpoint.
+ * Ranked by score desc, capped at `limit`, with deleted/removed/AutoModerator/
+ * stickied comments dropped. FAIL-OPEN: any network error, non-200, or shape
+ * surprise returns [] so drafting proceeds with no sibling context.
+ */
+export async function fetchRedditPostComments(args: {
+  /** Reddit post id (t3 stripped) — the leads.external_id. */
+  postId: string;
+  limit?: number;
+  sort?: "top" | "best" | "new" | "confidence" | "controversial";
+  /** Base (default https://www.reddit.com). */
+  baseUrl?: string;
+  /** A real-ish User-Agent; Reddit blocks empty/obvious-bot UAs. */
+  userAgent?: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}): Promise<RedditComment[]> {
+  const postId = stripT3(String(args.postId ?? "").trim());
+  if (!postId) return [];
+  const limit = args.limit ?? 12;
+  const sort = args.sort ?? "top";
+  const baseUrl = (args.baseUrl ?? "https://www.reddit.com").replace(/\/+$/, "");
+  const fetchImpl = args.fetchImpl ?? fetch;
+  const timeoutMs = args.timeoutMs ?? 15_000;
+  // limit + a cushion, since some children are dropped (stickied/deleted/"more").
+  const url = `${baseUrl}/comments/${postId}.json?sort=${sort}&limit=${limit + 8}&depth=1&raw_json=1`;
+
+  let res: Response;
+  try {
+    res = await fetchImpl(url, {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+        "user-agent": args.userAgent ?? DEFAULT_REDDIT_UA,
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch {
+    return []; // network error / timeout → fail open
+  }
+  if (!res.ok) return []; // 429 / 403 / 404 → fail open
+
+  let json: unknown;
+  try {
+    json = await res.json();
+  } catch {
+    return [];
+  }
+  // Shape: [postListing, commentListing]; comments live under [1].data.children.
+  if (!Array.isArray(json) || json.length < 2) return [];
+  const listing = json[1] as { data?: { children?: unknown } } | null;
+  const children = listing?.data?.children;
+  if (!Array.isArray(children)) return [];
+
+  const out: RedditComment[] = [];
+  for (const raw of children as RedditListingChild[]) {
+    if (!raw || raw.kind !== "t1") continue; // skip "more" nodes and non-comments
+    const d = raw.data ?? {};
+    const author = typeof d.author === "string" ? d.author : "";
+    const body = (typeof d.body === "string" ? d.body : "").trim();
+    if (!body || body === "[deleted]" || body === "[removed]") continue;
+    if (d.stickied === true) continue; // pinned mod/rules comments aren't "the room"
+    if (author === "AutoModerator" || author === "[deleted]" || author === "") continue;
+    const score = readSourceVoteScore(d.score);
+    out.push({ author: `u/${author}`, body, score });
+  }
+  out.sort(byVoteScore);
+  return out.slice(0, limit);
