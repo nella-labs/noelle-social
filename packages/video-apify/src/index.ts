@@ -398,3 +398,203 @@ const coderxIgProvider: IgProvider = {
     items.flatMap((item) => {
       const profile = (item ?? {}) as Record<string, unknown>;
       const posts = Array.isArray(profile.latestPosts) ? profile.latestPosts : [];
+      const username = asStr(profile.username);
+      const followers = profile.followersCount;
+      return posts.map((post) => {
+        const p = (post ?? {}) as Record<string, unknown>;
+        return {
+          ...p,
+          ownerUsername: firstStr(p.ownerUsername, username),
+          ownerFollowersCount: p.ownerFollowersCount ?? followers,
+        };
+      });
+    }),
+};
+
+export function createApifyVideoClient(opts: CreateApifyVideoClientOpts): ApifyVideoClient {
+  const transport = createApifyTransport({
+    token: opts.token,
+    ...(opts.baseUrl ? { baseUrl: opts.baseUrl } : {}),
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    errorFactory: (message, status) => new ApifyError(message, status),
+  });
+  const tiktokActorId = opts.tiktokActorId ?? TIKTOK_ACTOR_ID;
+  // OPT-IN, default OFF. See CreateApifyVideoClientOpts.tiktokKeywordSearch —
+  // UNVERIFIED clockworks input; confirm with one live run before prod use.
+  const tiktokKeywordSearch = opts.tiktokKeywordSearch ?? false;
+  // The general scraper's actor — also the details/snapshot actor (the discovery
+  // actors don't do profile details), so it's named once and reused below.
+  const igDetailsActorId = opts.instagramActorId ?? INSTAGRAM_ACTOR_ID;
+  // IG provider chain. Hashtag/keyword lane: the dedicated discovery actors FIRST
+  // (they survive the IG block that kills the general scraper's hashtag path),
+  // then the general scraper as a last resort. Creator lane: the discovery actors
+  // return null and are skipped, so creator harvest is unchanged — general
+  // scraper, then coderx fallback. TikTok stays a single actor (independent block
+  // profile, no equivalent split).
+  const igSearchActorId = opts.instagramSearchActorId ?? INSTAGRAM_SEARCH_ACTOR_ID;
+  const igProviders: IgProvider[] = [
+    igSearchProvider(igSearchActorId),
+    igHashtagProvider(opts.instagramHashtagActorId ?? INSTAGRAM_HASHTAG_ACTOR_ID),
+    apifyIgProvider(igDetailsActorId),
+    coderxIgProvider,
+  ];
+
+  async function runActorSync(actorId: string, input: unknown, itemLimit: number): Promise<unknown[]> {
+    const actor = actorId.includes("~") ? actorId.split("~").at(-1)! : actorId;
+    return (await transport.runActor({ actorId, actor, input, itemLimit })).items;
+  }
+
+  function normalizeAll(platform: VideoPlatform, items: unknown[], maxItems: number, sinceISO?: string): VideoClip[] {
+    const normalize = normalizerFor(platform);
+    const sourceSince = readSourceTimestamp(sinceISO);
+    const since = sourceSince ? new Date(sourceSince).getTime() : null;
+    const seen = new Set<string>();
+    const out: VideoClip[] = [];
+    for (const item of items) {
+      const clip = normalize(item);
+      if (!clip || seen.has(clip.id)) continue;
+      // Recency floor — keep clips with no timestamp (dropping would lose data).
+      if (since !== null && clip.postedAt && new Date(clip.postedAt).getTime() < since) continue;
+      seen.add(clip.id);
+      out.push(clip);
+    }
+    return out.slice(0, maxItems);
+  }
+
+  // Run the IG provider chain for a creator or hashtag lane. Returns the first
+  // provider's clips that come back non-empty. A confirmed terminal failure or
+  // completed empty response may advance to the next provider. Ambiguous paid
+  // dispatch, dataset and token failures surface immediately.
+  async function runIgChain(
+    lane: "creator" | "hashtag",
+    arg: string,
+    maxItems: number,
+    sinceISO: string | undefined,
+  ): Promise<VideoClip[]> {
+    let firstErr: unknown = null;
+    let sawCleanResponse = false;
+    for (const provider of igProviders) {
+      const input =
+        lane === "creator" ? provider.creatorInput(arg, maxItems) : provider.hashtagInput(arg, maxItems);
+      if (input == null) continue; // provider has no lane for this kind (coderx + hashtag)
+      let items: unknown[];
+      try {
+        items = await runActorSync(provider.actorId, input, maxItems);
+      } catch (err) {
+        if (!isRetryableActorFailure(err)) throw err;
+        firstErr ??= err;
+        continue;
+      }
+      sawCleanResponse = true;
+      const clips = normalizeAll("instagram", provider.extract(items), maxItems, sinceISO);
+      if (clips.length > 0) return clips;
+    }
+    if (!sawCleanResponse && firstErr) throw firstErr;
+    return [];
+  }
+
+  async function fetchHashtagReels({ platform, query, maxItems = 30, sinceISO }: Parameters<ApifyVideoClient["hashtagReels"]>[0]): Promise<VideoClip[]> {
+    if (!query) throw new ApifyError("hashtagReels requires a query", 0);
+    const tag = query.replace(/^#/, "");
+    if (platform === "instagram") return runIgChain("hashtag", tag, maxItems, sinceISO);
+    const items = await runActorSync(tiktokActorId, {
+      hashtags: [tag],
+      resultsPerPage: maxItems,
+      shouldDownloadVideos: false,
+      shouldDownloadCovers: false,
+    }, maxItems);
+    return normalizeAll(platform, items, maxItems, sinceISO);
+  }
+
+  return {
+    drainLastRunUsd: transport.drainLastRunUsd,
+    drainRunReceipts: transport.drainRunReceipts,
+    async creatorReels({ platform, handle, maxItems = 30, sinceISO }) {
+      transport.beginOperation();
+      if (!handle) throw new ApifyError("creatorReels requires a handle", 0);
+      const clean = handle.replace(/^@/, "");
+      if (platform === "instagram") return runIgChain("creator", clean, maxItems, sinceISO);
+      const items = await runActorSync(tiktokActorId, {
+        profiles: [clean],
+        resultsPerPage: maxItems,
+        shouldDownloadVideos: false,
+        shouldDownloadCovers: false,
+      }, maxItems);
+      return normalizeAll(platform, items, maxItems, sinceISO);
+    },
+
+    async hashtagReels(args) {
+      transport.beginOperation();
+      return fetchHashtagReels(args);
+    },
+
+    async nicheCreatorReels({ platform, query, maxItems = 30, maxCreators = 4, sinceISO }) {
+      transport.beginOperation();
+      assertApifyItemLimit(maxItems, (message, status) => new ApifyError(message, status));
+      if (platform === "instagram") assertApifyItemLimit(maxCreators, (message, status) => new ApifyError(message, status));
+      if (maxItems === 0) return [];
+      if (!query) throw new ApifyError("nicheCreatorReels requires a query", 0);
+      // TikTok has no user-search that returns profiles, so niche discovery is
+      // hashtag-based there by default. OPT-IN (tiktokKeywordSearch, default
+      // OFF): route through the clockworks `searchQueries` keyword input instead.
+      // UNVERIFIED — confirm the shape returns videos with one live run before
+      // enabling in prod (see docs/content-studio.md "Activating TikTok").
+      if (platform !== "instagram") {
+        if (platform === "tiktok" && tiktokKeywordSearch) {
+          const items = await runActorSync(tiktokActorId, {
+            searchQueries: [query.replace(/^#/, "")],
+            resultsPerPage: maxItems,
+            shouldDownloadVideos: false,
+            shouldDownloadCovers: false,
+          }, maxItems);
+          return normalizeAll(platform, items, maxItems, sinceISO);
+        }
+        return fetchHashtagReels({ platform, query, maxItems, ...(sinceISO ? { sinceISO } : {}) });
+      }
+
+      // 1. Discover creators who post in the niche (searchType:"user"). A person
+      //    who uploads in a niche is a more reliable signal than a hashtag a reel
+      //    may not even carry.
+      let handles: string[] = [];
+      try {
+        const users = await runActorSync(igSearchActorId, {
+          search: query.replace(/^#/, ""),
+          searchType: "user",
+          searchLimit: maxCreators,
+        }, maxCreators);
+        const seenH = new Set<string>();
+        for (const u of users) {
+          const name = asStr((u as Record<string, unknown>)?.username).toLowerCase();
+          if (name && !seenH.has(name)) {
+            seenH.add(name);
+            handles.push(name);
+          }
+          if (handles.length >= maxCreators) break;
+        }
+      } catch (err) {
+        if (!isRetryableActorFailure(err)) throw err;
+        handles = [];
+      }
+
+      // 2. Harvest each discovered creator's recent reels via the creator chain
+      //    and merge (dedupe by clip id). Per-creator failures are skipped.
+      const seen = new Set<string>();
+      const out: VideoClip[] = [];
+      for (const h of handles) {
+        if (out.length >= maxItems) break;
+        let clips: VideoClip[] = [];
+        try {
+          clips = await runIgChain("creator", h, maxItems - out.length, sinceISO);
+        } catch (err) {
+          if (!isRetryableActorFailure(err)) throw err;
+          clips = [];
+        }
+        for (const c of clips) {
+          if (!seen.has(c.id)) {
+            seen.add(c.id);
+            out.push(c);
+          }
+        }
+      }
+
