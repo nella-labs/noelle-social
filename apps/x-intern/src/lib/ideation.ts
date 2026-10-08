@@ -398,3 +398,64 @@ export function assembleIdeas(
     const refs: InspirationRef[] = [];
     const seen = new Set<string>();
     for (const tag of idea.inspiration_tags) {
+      const ref = sources.get(tag.trim().toUpperCase());
+      if (ref && !seen.has(tag)) {
+        refs.push(ref.note && ref.note.length > 280 ? { ...ref, note: ref.note.slice(0, 280) } : ref);
+        seen.add(tag);
+      }
+    }
+    return {
+      id: opts.idFactory(),
+      platform: "x",
+      targetPlatforms,
+      hook: idea.hook.slice(0, 600),
+      thesis: idea.thesis ? idea.thesis.slice(0, 1200) : null,
+      angle: idea.angle ? idea.angle.slice(0, 60) : null,
+      pillar: idea.pillar ? idea.pillar.slice(0, 120) : null,
+      inspirationRefs: refs.slice(0, 12),
+      suggestedDay: opts.weekStart ? addDays(opts.weekStart, i) : null,
+      batchId: opts.batchId ?? null,
+      sourceEngine: opts.sourceEngine,
+      model: opts.model,
+    };
+  });
+}
+
+/** YYYY-MM-DD + n days, as YYYY-MM-DD (UTC, no Date.now needed). */
+export function addDays(isoDate: string, days: number): string {
+  const d = new Date(`${isoDate}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function oneLine(s: string | null, max: number): string {
+  return (s ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function watchlistCounts(post: AuthorEngagement["samplePosts"][number]): string {
+  return `${post.likes ?? "unknown"} likes, ${post.reposts ?? "unknown"} reposts, ${post.replies ?? "unknown"} replies`;
+}
+
+/** Tolerant JSON parse (raw / fenced / first-brace-to-last). */
+export function safeJsonParse(s: string): unknown {
+  try {
+    return JSON.parse(s);
+  } catch {
+    /* fall through */
+  }
+  try {
+    return JSON.parse(s.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, ""));
+  } catch {
+    /* fall through */
+  }
+  const a = s.indexOf("{");
+  const b = s.lastIndexOf("}");
+  if (a >= 0 && b > a) {
+    try {
+      return JSON.parse(s.slice(a, b + 1));
+    } catch {
+      /* fall through */
+    }
+  }
+  return null;
+}

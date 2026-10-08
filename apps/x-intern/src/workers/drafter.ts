@@ -598,3 +598,140 @@ async function main() {
             variety: { enabled: quality.variety },
             // Post-energy mirroring (NOELLE_DRAFTER_ENERGY; default off → blind
             // register + celebration/neutral style only, byte-identical). On → the
+            // register is energy-aware and a "POST ENERGY" hint tells the model to
+            // answer satire with satire, a vent with commiseration, etc.
+            energy: { enabled: env.NOELLE_DRAFTER_ENERGY },
+            // Sibling-comment "read the room" fetch (NOELLE_DRAFTER_COMMENT_ENERGY;
+            // undefined when off → byte-identical). Injects the top existing replies
+            // so the draft mirrors the room's energy + never echoes an existing take.
+            ...(fetchSiblingComments ? { fetchSiblingComments } : {}),
+            // Prompt-injection fence (NOELLE_DRAFTER_FENCE; default off → the
+            // untrusted post text/caption is fenced as data, not instructions).
+            fenceUntrusted: env.NOELLE_DRAFTER_FENCE,
+          });
+          if (replyRequests.length > 0) n += await draftLeads(replyRequests, true);
+          if (observedLeads.length > 0) n += await draftLeads(observedLeads, true);
+          if (claimed.length > 0) n += await draftLeads(claimed);
+
+          // Newest-post rule: once a watched author's newest lead is drafted, drop
+          // their older still-classified priority leads so a stale post is never
+          // drafted next time they become eligible.
+          for (const { author, leadId } of watchlistAuthors) {
+            await supersedeOlderPriorityLeads(sql, {
+              agentInstanceId: inst.id,
+              authorHandle: author,
+              keepLeadId: leadId,
+            });
+          }
+        }
+
+        // On-demand DM generation pass — reuses the same kb + runner.
+        if (dmRequests.length > 0) {
+          n += await runDmRequestTick({
+            log,
+            instance: inst,
+            claimedLeads: dmRequests,
+            runner,
+            kb,
+            postOutbound,
+            // Drives the DM ladder: how many DMs were already sent to this
+            // person decides which rung this one is.
+            sql,
+            bus,
+            // Cold DM is the higher-risk vector — fence it too when enabled.
+            fenceUntrusted: env.NOELLE_DRAFTER_FENCE,
+          });
+        }
+        if (relationshipDmOnly) {
+          await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted + n });
+          return;
+        }
+
+        // ── Pattern Breaker (default OFF: X_PATTERN_BREAKER). ─────────────────
+        // Ported from Lyra. Drain the AI-refine queue every tick (cheap; no-op
+        // when empty), and re-audit the operator's last-N posts at most once per
+        // interval. Both fail-soft: any error is logged and the drafter tick
+        // still succeeds. Rules land as active immediately and reshape replies
+        // autosend can post unattended — that is why the master flag stays OFF
+        // until the operator has the dashboard Pattern Breaker panel in view.
+        if (env.X_PATTERN_BREAKER) {
+          try {
+            await runPatternRefineTick({
+              log,
+              instance: inst,
+              runner,
+              bus,
+              loadQueue: () => loadRefiningAlerts(sql, {
+                orgId: inst.org_id,
+                agentInstanceId: inst.id,
+                role: "x_intern",
+              }),
+              claim: (item) => claimRefinement(sql, {
+                orgId: inst.org_id,
+                agentInstanceId: inst.id,
+                role: "x_intern",
+              }, item),
+              applyRefined: (a) => applyRefinedRule(sql, {
+                orgId: inst.org_id,
+                agentInstanceId: inst.id,
+                role: "x_intern",
+              }, { ...a, decidedBy: "pattern-breaker" }),
+            });
+            const last = lastPatternAnalysisAt.get(inst.id) ?? 0;
+            if (Date.now() - last >= env.PATTERN_BREAKER_INTERVAL_MS) {
+              lastPatternAnalysisAt.set(inst.id, Date.now());
+              await runPatternBreakerTick({
+                log,
+                instance: inst,
+                runner,
+                bus,
+                minFrequency: env.PATTERN_BREAKER_MIN_FREQUENCY,
+                minRatio: env.PATTERN_BREAKER_MIN_RATIO,
+                loadCorpus: () => loadRecentPosts(sql, {
+                  orgId: inst.org_id,
+                  agentInstanceId: inst.id,
+                  role: "x_intern",
+                }, env.PATTERN_BREAKER_MAX_POSTS),
+                loadExistingLabels: () => loadActiveRuleLabels(sql, {
+                  orgId: inst.org_id,
+                  agentInstanceId: inst.id,
+                  role: "x_intern",
+                }),
+                persist: (finding, windowSize, corpus) =>
+                  persistPattern(sql, {
+                    orgId: inst.org_id,
+                    agentInstanceId: inst.id,
+                    role: "x_intern",
+                    finding,
+                    windowSize,
+                    corpus,
+                  }),
+              });
+            }
+          } catch (err) {
+            log.warn({ instance: inst.id, err: (err as Error).message }, "pattern breaker pass failed (non-fatal)");
+          }
+        }
+
+        await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted + n });
+        if (observedLeads.length > 0) wake.wake();
+      } catch (err) {
+        readyCache.reset(inst.org_id, "drafter");
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+    sleep: wake.sleep,
+  });
+}
+
+// Per-instance cadence for the (heavy) Pattern Breaker analysis pass. In-memory
+// is fine: it's a soft throttle, and a worker restart just re-runs the audit
+// once. The cheap refine-queue drain runs every tick regardless.
+const lastPatternAnalysisAt = new Map<string, number>();
+
+main().catch((err) => {
+  console.error("drafter fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
