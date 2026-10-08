@@ -198,3 +198,203 @@ export async function getFeederRunStatus(
 /** The extracted Gemini "ultra profile" for a style source, as the UI renders it. */
 export interface UltraProfileView {
   voiceSummary: string | null;
+  tone: string | null;
+  structureNotes: string | null;
+  hookPatterns: string[];
+  signaturePhrases: string[];
+  topTopics: string[];
+  postsAnalyzed: number;
+  model: string | null;
+  generatedAt: string | null;
+}
+
+/**
+ * The style-source face of a contact: when a person (by their X or LinkedIn
+ * handle) is also one of Lyra's Account-Feeder source accounts, this is what the
+ * contacts page shows — the source row's status + how much corpus was pulled +
+ * the Gemini ultra-profile (or null when the feeder pulled posts but hasn't
+ * distilled a profile yet). `null` from the query means "not a style source".
+ */
+export interface PersonStyleSource {
+  sourceId: string;
+  agentInstanceId: string;
+  platform: string;
+  handle: string;
+  enabled: boolean;
+  lastPulledAt: string | null;
+  postCount: number;
+  commentCount: number;
+  /** The distilled style profile, or null if pulled-but-not-yet-extracted. */
+  profile: UltraProfileView | null;
+}
+
+/** jsonb array column → string[] (postgres.js parses jsonb; guard the shape). */
+function asStringArray(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
+/**
+ * Is this contact also one of Lyra's style sources? Matches the person's X or
+ * LinkedIn handle against noelle.account_feeder_sources (org-scoped), and joins
+ * the account's ultra profile + corpus counts. Returns null when the person is
+ * not a source. Tenancy: scoped by org_id, same trust model as the sibling
+ * contact reads (getLinkedInProfileForOrg) — the page already membership-guards
+ * the org via getOrgBySlug.
+ */
+export async function getStyleSourceForPerson(
+  orgId: string,
+  handles: { xHandle: string | null; linkedinHandle: string | null },
+): Promise<PersonStyleSource | null> {
+  const x = handles.xHandle?.trim().toLowerCase() || null;
+  // Match LinkedIn on the suffix-stripped handle so a contact merged onto the
+  // clean vanity (`kaia-tham`) still resolves a feeder source stored under the
+  // raw slug (`kaia-tham-7bb065343`). See normalizeLinkedinHandle / reconcile.
+  const li = handles.linkedinHandle ? normalizeLinkedinHandle(handles.linkedinHandle) : null;
+  if (!x && !li) return null;
+
+  const rows = await sql<
+    Array<{
+      source_id: string;
+      agent_instance_id: string;
+      platform: string;
+      handle: string;
+      enabled: boolean;
+      last_pulled_at: string | null;
+      post_count: number;
+      comment_count: number;
+      voice_summary: string | null;
+      tone: string | null;
+      structure_notes: string | null;
+      hook_patterns: unknown;
+      signature_phrases: unknown;
+      top_topics: unknown;
+      posts_analyzed: number | null;
+      model: string | null;
+      generated_at: string | null;
+    }>
+  >`
+    select
+      s.id as source_id, s.agent_instance_id, s.platform, s.handle, s.enabled,
+      s.last_pulled_at::text as last_pulled_at,
+      (
+        select count(*)::int from noelle.account_style_posts p
+        where p.agent_instance_id = s.agent_instance_id and p.platform = s.platform
+          and lower(p.account_handle) = lower(s.handle) and p.kind = 'post'
+      ) as post_count,
+      (
+        select count(*)::int from noelle.account_style_posts p
+        where p.agent_instance_id = s.agent_instance_id and p.platform = s.platform
+          and lower(p.account_handle) = lower(s.handle) and p.kind = 'comment'
+      ) as comment_count,
+      up.voice_summary, up.tone, up.structure_notes,
+      up.hook_patterns, up.signature_phrases, up.top_topics,
+      up.posts_analyzed, up.model, up.generated_at::text as generated_at
+    from noelle.account_feeder_sources s
+    left join noelle.account_ultra_profiles up
+      on up.agent_instance_id = s.agent_instance_id and up.platform = s.platform
+      and lower(up.account_handle) = lower(s.handle) and up.org_id = s.org_id
+    where s.org_id = ${orgId}
+      and (
+        (s.platform = 'linkedin' and ${li}::text is not null
+           and regexp_replace(lower(s.handle), '-[0-9a-f]{6,}$', '') = ${li}) or
+        (s.platform = 'x' and ${x}::text is not null and lower(s.handle) = ${x})
+      )
+    order by s.enabled desc, s.last_pulled_at desc nulls last
+    limit 1
+  `;
+  const r = rows[0];
+  if (!r) return null;
+
+  const hasProfile = r.voice_summary != null || r.tone != null || (r.posts_analyzed ?? 0) > 0;
+  return {
+    sourceId: r.source_id,
+    agentInstanceId: r.agent_instance_id,
+    platform: r.platform,
+    handle: r.handle,
+    enabled: r.enabled,
+    lastPulledAt: r.last_pulled_at,
+    postCount: r.post_count,
+    commentCount: r.comment_count,
+    profile: hasProfile
+      ? {
+          voiceSummary: r.voice_summary,
+          tone: r.tone,
+          structureNotes: r.structure_notes,
+          hookPatterns: asStringArray(r.hook_patterns),
+          signaturePhrases: asStringArray(r.signature_phrases),
+          topTopics: asStringArray(r.top_topics),
+          postsAnalyzed: r.posts_analyzed ?? 0,
+          model: r.model,
+          generatedAt: r.generated_at,
+        }
+      : null,
+  };
+}
+
+/** One feeder source's pull status + distilled profile, for the Styles page. */
+export interface FeederSourceProfile {
+  /** account_feeder_sources.id — drives the inline enable/disable toggle. */
+  sourceId: string;
+  platform: string;
+  handle: string;
+  displayName: string | null;
+  enabled: boolean;
+  lastPulledAt: string | null;
+  postCount: number;
+  commentCount: number;
+  /** The Gemini ultra-profile, or null if pulled-but-not-yet-extracted. */
+  profile: UltraProfileView | null;
+  /** Contact (noelle.persons) this source resolves to, or null if not yet a contact. */
+  contactPersonId: string | null;
+  /**
+   * Usage attribution: how often this source's voice was actually sampled into a
+   * draft. `draftsUsed` of `totalStyledDrafts` styled drafts blended in this
+   * source; `avgWeight` is its mean share (0..1) on the drafts that used it.
+   */
+  draftsUsed: number;
+  totalStyledDrafts: number;
+  avgWeight: number | null;
+}
+
+/**
+ * Per-source pull status + ultra-profile for every Account-Feeder source on an
+ * instance — backs the Styles page "what's been pulled / how the feeder
+ * interpreted it / already styled?" view. Membership-guarded via getAgentInstance.
+ */
+export async function listFeederSourceProfiles(
+  instanceId: string,
+): Promise<FeederSourceProfile[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+  const rows = await sql<
+    Array<{
+      source_id: string;
+      platform: string;
+      handle: string;
+      display_name: string | null;
+      enabled: boolean;
+      last_pulled_at: string | null;
+      post_count: number;
+      comment_count: number;
+      contact_person_id: string | null;
+      drafts_used: number;
+      total_styled_drafts: number;
+      avg_weight: string | null;
+      voice_summary: string | null;
+      tone: string | null;
+      structure_notes: string | null;
+      hook_patterns: unknown;
+      signature_phrases: unknown;
+      top_topics: unknown;
+      posts_analyzed: number | null;
+      model: string | null;
+      generated_at: string | null;
+    }>
+  >`
+    with scoped_styles as materialized (
+      select distinct d.id, l.platform,
+        case when jsonb_typeof(d.payload->'style_source'->'blend') = 'array'
+          then d.payload->'style_source'->'blend' else '[]'::jsonb end as blend
+      from noelle.approvals a
+      ${approvalMemoryJoins(fragmentSql)}
+      where a.agent_instance_id = ${inst.id} and a.org_id = ${inst.org_id}
