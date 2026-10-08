@@ -198,3 +198,27 @@ export function parseCodexUsage(stdout: string): TokenUsage {
  * parses — otherwise the operator reads an escaped blob.
  */
 export function parseCodexError(stdout: string): string | null {
+  for (const line of stdout.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("{")) continue;
+    try {
+      const d = JSON.parse(t) as {
+        type?: string;
+        message?: string;
+        error?: { message?: string };
+      };
+      if (d.type !== "error" && d.type !== "turn.failed") continue;
+      const raw = d.message ?? d.error?.message;
+      if (!raw) continue;
+      try {
+        const inner = JSON.parse(raw) as { error?: { message?: string }; message?: string };
+        return inner.error?.message ?? inner.message ?? raw;
+      } catch {
+        return raw;
+      }
+    } catch {
+      /* partial line */
+    }
+  }
+  return null;
+}
