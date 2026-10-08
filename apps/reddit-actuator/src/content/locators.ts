@@ -398,3 +398,24 @@ export function detectChallenge(root: ParentNode, opts: { url?: string; title?: 
  * merely-absent post shell (`post-absent` — transient interstitials produce it
  * too, so session-local handling only). Read-only.
  */
+export function checkPostRemoved(
+  root: ParentNode,
+  hostname?: string,
+): { removed: boolean; reason?: string; positive?: boolean } {
+  const flavor = detectFlavor(root, hostname);
+  const { unavailable, reason, positive } = isPostUnavailable(root, flavor);
+  return { removed: unavailable, ...(reason ? { reason } : {}), ...(positive ? { positive } : {}) };
+}
+
+/**
+ * Are the thread's comments locked/archived — i.e. will a composer NEVER render?
+ * Derives the flavor exactly like every other locator here and delegates to the
+ * read-only selector. The background calls this right after the removed-post gate
+ * (and re-probes on a missing reply box, since the banner can render late) and
+ * skips a blocked thread WITHOUT ever hunting for a composer. Read-only.
+ */
+export function checkCommentsLocked(root: ParentNode, hostname?: string): { blocked: boolean; reason?: string } {
+  const flavor = detectFlavor(root, hostname);
+  const { blocked, reason } = isCommentsUnavailable(root, flavor);
+  return { blocked, ...(reason ? { reason } : {}) };
+}
