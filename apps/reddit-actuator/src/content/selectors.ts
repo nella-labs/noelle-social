@@ -198,3 +198,203 @@ function findUpvoteButtonsAnywhere(root: ParentNode, flavor: RedditFlavor): HTML
  * ancestor that still contains exactly this one upvote affordance (its parent
  * would also wrap the NEXT post's). Lands on the feed list-item / card even when
  * its tag and attributes have drifted, so postId / postSubreddit (queried within
+ * the returned container) still resolve. When the button lives inside a
+ * shreddit-post's OPEN shadow root the climb crosses the boundary via
+ * getRootNode().host — parentElement is null at the top of a shadow tree.
+ * Mirrors linkedin's postContainerOf; UPVOTE-ONLY.
+ */
+function postContainerOf(btn: Element, root: ParentNode, flavor: RedditFlavor): Element | null {
+  const rootEl = root instanceof Element ? root : null;
+  const parentOf = (n: Element): Element | null => {
+    if (n.parentElement) return n.parentElement;
+    const r = n.getRootNode();
+    return r instanceof ShadowRoot ? r.host : null;
+  };
+  let node = parentOf(btn);
+  let best: Element | null = null;
+  while (node && node !== rootEl) {
+    if (findUpvoteButtonsAnywhere(node, flavor).length === 1) best = node;
+    else break; // parent now wraps a second post → stop at the previous ancestor
+    node = parentOf(node);
+  }
+  return best;
+}
+
+/**
+ * Every feed post container in the document (home / r/all / r/popular / a
+ * subreddit listing). The single source for "what counts as a feed post" so the
+ * upvote target scan and the skip-reason diagnostics can never disagree.
+ *
+ * Drift-resistant fallback (ports linkedin/x findFeedPosts): when EVERY container
+ * selector misses (a renamed tag/attrs — the exact `posts=0` failure that
+ * countUpvoteButtons only DETECTS), derive posts from their upvote buttons
+ * instead, reusing the one shared upvote-affordance definition. The upvote button
+ * keeps its stable hook across redesigns, so each button ⇒ climb to the
+ * post-sized container that wraps exactly it. UPVOTE-ONLY — the fallback never
+ * widens to a downvote. Deduped so a button shared with a nested container can't
+ * double-count.
+ */
+export function findFeedPosts(root: ParentNode, flavor: RedditFlavor): Element[] {
+  const out = new Set<Element>();
+  const primary = flavor === "old" ? ".thing.link" : "shreddit-post";
+  for (const el of Array.from(root.querySelectorAll(primary))) out.add(el);
+  if (out.size === 0) {
+    for (const btn of findUpvoteButtonsAnywhere(root, flavor)) {
+      const post = postContainerOf(btn, root, flavor);
+      if (post) out.add(post);
+    }
+  }
+  return Array.from(out);
+}
+
+/**
+ * Does this post carry an upvote button at all — pressed or not? Diagnostic-only
+ * companion to findUpvoteButton (which returns null for an already-upvoted post):
+ * the two together separate "all already upvoted" from "no button rendered".
+ */
+export function postHasUpvoteButton(post: Element, flavor: RedditFlavor): boolean {
+  if (flavor === "old") return post.querySelector(OLD_UPVOTE_SEL) !== null;
+  const shadow = (post as HTMLElement).shadowRoot;
+  return (shadow?.querySelector(NEW_UPVOTE_SEL) ?? post.querySelector(NEW_UPVOTE_SEL)) !== null;
+}
+
+/**
+ * Count upvote buttons ANYWHERE on the page — light DOM plus every shreddit-post
+ * open shadow root — regardless of pressed state or owning container. A pure
+ * diagnostic for the enriched no-upvotable-post skip reason: btns>0 with posts=0
+ * means the container selectors drifted while the affordance survived.
+ */
+export function countUpvoteButtons(root: ParentNode, flavor: RedditFlavor): number {
+  // Same button definition as findFeedPosts' drift fallback (findUpvoteButtonsAnywhere)
+  // so a `btns>0, posts=0` skip reason can never be an artefact of two selectors.
+  return findUpvoteButtonsAnywhere(root, flavor).length;
+}
+
+/**
+ * On a feed (home / r/all / r/popular / a subreddit) a post whose upvote button
+ * is not already pressed, plus that owning post (for the observed post
+ * id/subreddit). With an `rng` the pick is a RANDOM IN-VIEW candidate — always
+ * taking the topmost not-yet-upvoted post is a positional fingerprint (ports
+ * LinkedIn #429's locateLikeTarget randomization); without one (older
+ * callers/tests) it stays the first match. Returns null when every post is
+ * already upvoted, or none is found. UPVOTE-ONLY.
+ *
+ * IN-VIEW FILTER (ports locateLikeTarget's viewport restriction): after a
+ * session of ambient scrolling the feed DOM holds pages of posts, and a uniform
+ * pick over ALL of them regularly lands far off-screen — the caller's
+ * scrollIntoView then executes an instantaneous multi-page teleport with zero
+ * wheel gestures, itself a bot fingerprint (the exact class #429 removes) that
+ * also yanks the viewport away from where the simulated reader was. So the pick
+ * is restricted to posts whose top edge is in/just-below the current viewport
+ * (top in (-200, 1.4×viewportHeight)), falling back to every candidate only
+ * when none is in view. Post containers come from findFeedPosts (single source).
+ */
+export function findFeedUpvoteTarget(
+  root: ParentNode,
+  flavor: RedditFlavor,
+  rng?: { int(min: number, max: number): number },
+): { el: HTMLElement; post: Element } | null {
+  const candidates: Array<{ el: HTMLElement; post: Element }> = [];
+  for (const p of findFeedPosts(root, flavor)) {
+    const btn = findUpvoteButton(p, flavor);
+    if (btn) candidates.push({ el: btn, post: p });
+  }
+  if (candidates.length === 0) return null;
+  const vh = typeof window !== "undefined" ? window.innerHeight || 800 : 800;
+  const inView = candidates.filter(({ post }) => {
+    const top = post.getBoundingClientRect().top;
+    return top > -200 && top < vh * 1.4;
+  });
+  const pool = inView.length > 0 ? inView : candidates;
+  return pool[rng ? rng.int(0, pool.length - 1) : 0]!;
+}
+
+// ── Save (operator opt-in; SAVE-ONLY, never a vote) ──────────────────────────
+
+// A post-SAVE is a private bookmark — NOT a vote — so it does not touch the
+// Reddit vote-manipulation ToS clause the upvote path skirts (a downvote would).
+// Mirrors the X actuator's default-OFF bookmark. SAVE-ONLY: there is deliberately
+// no downvote/vote counterpart located here or anywhere in this file.
+//
+// New Reddit: Save is NOT in the post's action bar — it lives inside the post's
+// overflow "…" (more) menu. So findSaveButton returns the overflow MENU OPENER
+// (the affordance to click to reveal the Save item), reusing the SAME shadow-DOM
+// reach as findUpvoteButton (through `post.shadowRoot`, with a light-DOM
+// fallback). The Save item itself is located separately by findSaveMenuItem once
+// the menu is open. An already-saved post is skipped via the shreddit-post
+// `saved` boolean attribute — never re-save.
+//
+// Old Reddit: Save is a direct `.save-button` / form link on the `.thing.link`;
+// once saved the link text flips to "unsave" and the thing gains `.saved`, so
+// both are skipped. LIVE-TUNE: the exact new-Reddit overflow hook may drift — a
+// miss just returns null and the caller falls back to a plain upvote (the
+// engagement is never lost), so best-effort selectors are safe here by design.
+const NEW_SAVE_MENU_SEL =
+  'button[data-action-bar-action="overflow"], shreddit-post-overflow-menu button, button[aria-label*="more option" i], shreddit-post-overflow-menu';
+const OLD_SAVE_SEL = ".save-button a, .link-save-button a, form.save-button a";
+
+/** True when a new-Reddit shreddit-post carries a truthy `saved` boolean
+ * attribute (already saved). Mirrors newPostFlagAttr's boolean-attr semantics:
+ * present with any value other than "false" ⇒ saved. */
+function newPostSaved(post: Element): boolean {
+  const v = post.getAttribute("saved");
+  return v !== null && v.trim().toLowerCase() !== "false";
+}
+
+/**
+ * A post's SAVE affordance, or null if none is found OR the post is already saved.
+ * SAVE-ONLY — there is deliberately no downvote/vote counterpart in this file.
+ *
+ * New Reddit: returns the overflow "…" MENU OPENER inside shreddit-post's OPEN
+ * shadow root (light-DOM fallback for resilience) — clicking it reveals the Save
+ * item (located by findSaveMenuItem). A truthy `saved` attribute ⇒ already saved
+ * → return null (skip; never re-save). getBoundingClientRect works across an open
+ * shadow boundary, so the caller still derives a click rect from the returned
+ * element.
+ *
+ * Old Reddit: the `.save-button` link whose text is "save" (never "unsave" — that
+ * is the already-saved state), and only when the `.thing.link` lacks `.saved`.
+ */
+export function findSaveButton(post: Element, flavor: RedditFlavor): HTMLElement | null {
+  if (flavor === "old") {
+    if ((post as HTMLElement).classList?.contains("saved")) return null; // already saved → skip
+    for (const a of Array.from(post.querySelectorAll<HTMLElement>(OLD_SAVE_SEL))) {
+      if ((a.textContent ?? "").trim().toLowerCase() === "save") return a; // skips "unsave"
+    }
+    return null;
+  }
+  if (newPostSaved(post)) return null; // already saved → skip
+  const shadow = (post as HTMLElement).shadowRoot;
+  return (
+    shadow?.querySelector<HTMLElement>(NEW_SAVE_MENU_SEL) ??
+    post.querySelector<HTMLElement>(NEW_SAVE_MENU_SEL) ??
+    null
+  );
+}
+
+/**
+ * The "Save" item inside the open overflow menu (New Reddit two-step only). The
+ * menu portals out of the post (a faceplate/shreddit menu), so search from the
+ * root. Match a menu item whose EXACT trimmed text/aria is "Save" — never "Saved"
+ * or "Unsave" (the already-saved states we must never click). Mirrors x-actuator
+ * findRetweetConfirm: the caller must NOT scrollIntoView it — a scroll dismisses
+ * the menu. Returns null when the menu isn't open / the item drifted, so the
+ * caller Escape-dismisses and falls back to a plain upvote.
+ */
+export function findSaveMenuItem(root: ParentNode): HTMLElement | null {
+  const byHook = root.querySelector<HTMLElement>(
+    'button[data-action-bar-action="save"], [role="menuitem"][aria-label="Save" i]',
+  );
+  if (byHook) return byHook;
+  const menu = root.querySelector<HTMLElement>('[role="menu"], shreddit-post-overflow-menu, faceplate-menu');
+  const scope: ParentNode = menu ?? root;
+  for (const item of Array.from(scope.querySelectorAll<HTMLElement>('[role="menuitem"], button, li, a'))) {
+    const label = ((item.getAttribute("aria-label") || item.textContent) ?? "").trim();
+    if (/^save$/i.test(label)) return item; // exact word — never "Saved"/"Unsave"
+  }
+  return null;
+}
+
+/**
+ * On a feed, a post whose SAVE affordance is available (not already saved), plus
+ * that owning post (for the observed post id/subreddit). Mirrors
