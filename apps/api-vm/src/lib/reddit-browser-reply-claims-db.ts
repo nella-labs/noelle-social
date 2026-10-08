@@ -198,3 +198,8 @@ export async function recordRedditClaimSent(
   orgId: string,
   approvalId: string,
 ): Promise<void> {
+  await tx`update noelle.reddit_reply_claims claim set status='sent',sent_at=coalesce(claim.sent_at,now()),
+    receipt_draft_sha256=encode(sha256(convert_to(d.payload::text,'UTF8')),'hex')
+    from noelle.drafts d where claim.org_id=${orgId} and claim.approval_id=${approvalId}
+      and d.id=claim.draft_id and d.org_id=claim.org_id`;
+}
