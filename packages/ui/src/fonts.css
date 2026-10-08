@@ -1,0 +1,22 @@
+/**
+ * @noelle/ui — fonts.css
+ *
+ * Placeholder. This file is intentionally empty of @font-face rules because
+ * each consumer loads fonts in the way that's idiomatic for its framework:
+ *
+ * - apps/app (Next.js): use `next/font/google` or `@fontsource/inter` etc.
+ *   in `app/layout.tsx`. Assign the resulting CSS variables to <html>.
+ *
+ * - apps/www (Astro): use <link> tags in the base layout pointing at
+ *   Google Fonts (or self-host via @fontsource).
+ *
+ * The Constellation system expects these three families to resolve at the
+ * font-family chains declared in `tailwind-preset.cjs` / `tokens.ts`:
+ *
+ *   - "Inter"            (sans)   — 400, 500, 600, 700
+ *   - "Instrument Serif" (serif)  — 400, 400 italic
+ *   - "JetBrains Mono"   (mono)   — 400, 500
+ *
+ * If a consumer prefers @font-face declarations colocated with the design
+ * system, add them here and import `@noelle/ui/fonts.css` once per app.
+ */
