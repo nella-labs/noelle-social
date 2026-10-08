@@ -198,3 +198,129 @@ export async function runContentPublishTick(args: {
         receipt ??= err instanceof XWriteUncertainError ? err.receipt : undefined;
         // Preserve the external receipt even if this second DB write also fails.
         // The original publishing claim remains outside the ready-only selector.
+        const reconciliationPersisted = await sql`
+          update noelle.content_schedule_slots
+             set status='failed', posted_url=coalesce(${receipt?.url ?? null}, posted_url),
+                 posted_tweet_id=coalesce(${receipt?.id ?? null}, posted_tweet_id),
+                 published_at=case when ${receipt?.id ?? null}::text is not null then coalesce(published_at, now()) else published_at end,
+                 error_message=${CONTENT_PUBLISH_UNCERTAIN_ERROR}, updated_at=now()
+           where id=${slot.id} and agent_instance_id=${instanceId} and org_id=${orgId}
+             and draft_id=${slot.draft_id} and idea_id=${slot.idea_id}
+          returning id
+        `.then(
+          (rows) => rows.length > 0,
+          () => false,
+        );
+        outcomes.push({
+          slotId: slot.id,
+          status: "uncertain",
+          ...(receipt ? { receipt } : {}),
+          reconciliationPersisted,
+        });
+        break;
+      }
+      if (err instanceof XDuplicateError) {
+        // X rejected this attempt, but does not identify the existing post.
+        // Release its budget and hold the slot until a receipt is reconciled.
+        await refundOnce();
+        const reconciliationPersisted = await sql`
+          update noelle.content_schedule_slots
+             set status='failed', error_message=${CONTENT_PUBLISH_DUPLICATE_ERROR}, updated_at=now()
+           where id=${slot.id} and agent_instance_id=${instanceId} and org_id=${orgId}
+             and draft_id=${slot.draft_id} and idea_id=${slot.idea_id}
+          returning id
+        `.then(
+          (rows) => rows.length > 0,
+          () => false,
+        );
+        outcomes.push({ slotId: slot.id, status: "duplicate", reconciliationPersisted });
+        break;
+      }
+      // Definitively-not-sent → release the reservation + return the slot.
+      await refundOnce();
+      await restoreContentPublishClaim(sql, scope, slot);
+      if (err instanceof XLockError) {
+        outcomes.push({ slotId: slot.id, status: "locked" });
+        break;
+      }
+      if (err instanceof XChallengeError) {
+        outcomes.push({ slotId: slot.id, status: "challenged" });
+        break;
+      }
+      if (err instanceof XRateLimitError) {
+        outcomes.push({ slotId: slot.id, status: "rate_limited" });
+        break;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      await sql`update noelle.content_schedule_slots set error_message=${msg}
+        where id=${slot.id} and org_id=${orgId} and agent_instance_id=${instanceId}
+          and draft_id=${slot.draft_id} and idea_id=${slot.idea_id}`;
+      outcomes.push({ slotId: slot.id, status: "failed" });
+    }
+  }
+  return outcomes;
+}
+
+/** Resolve → read → upload the slot's image(s); returns the X media ids to attach. */
+export async function uploadSlotMedia(
+  sql: Sql,
+  client: XWriteClient,
+  draftId: string | null,
+  mediaDir: string | null,
+  scope: Pick<ContentPublishScope, "orgId" | "instanceId">,
+  resolveUrls?: (ids: string[]) => Promise<Array<{ id: string; url: string | null }>>,
+): Promise<string[]> {
+  return (await prepareSlotMedia(sql, client, draftId, mediaDir, scope, resolveUrls)).ids;
+}
+
+/** Upload outside the authorization transaction and retain its source snapshot. */
+async function prepareSlotMedia(
+  sql: Sql,
+  client: XWriteClient,
+  draftId: string | null,
+  mediaDir: string | null,
+  scope: Pick<ContentPublishScope, "orgId" | "instanceId">,
+  resolveUrls?: (ids: string[]) => Promise<Array<{ id: string; url: string | null }>>,
+): Promise<{ ids: string[]; descriptors: ContentPublishMedia[] }> {
+  if (!draftId) return { ids: [], descriptors: [] };
+  const descriptors = await loadContentPublishMedia(sql, scope, draftId);
+  const urls = resolveUrls && descriptors.length
+    ? new Map((await resolveUrls(descriptors.map(row => row.id))).map(row => [row.id.toLowerCase(), row.url])) : null;
+  const ids: string[] = [];
+  for (const d of descriptors) {
+    const bytes = await readContentMedia(mediaDir, urls ? { ...d, url: urls.get(d.id.toLowerCase()) ?? null } : d);
+    if (!bytes) continue; // unreadable asset — don't block the post
+    const { mediaId } = await client.uploadMedia({
+      bytes,
+      mimeType: d.mime_type ?? "application/octet-stream",
+    });
+    if (mediaId) ids.push(mediaId);
+  }
+  return { ids, descriptors };
+}
+
+async function recordXApiSpend(
+  sql: Sql,
+  orgId: string,
+  instanceId: string,
+  startedAt: Date,
+): Promise<void> {
+  const row = xApiActionRow({
+    orgId,
+    instanceId,
+    worker: "content-publish",
+    kind: "post",
+    startedAt,
+  });
+  await sql`
+    insert into noelle.llm_calls
+      (org_id, agent_instance_id, agent_role, worker, engine, model, bucket,
+       input_tokens, output_tokens, cents, latency_ms, status, started_at)
+    values
+      (${row.orgId}, ${row.instanceId}, ${row.agentRole}, ${row.worker}, ${row.engine},
+       ${row.model}, ${row.bucket}, ${row.inputTokens}, ${row.outputTokens}, ${row.cents},
+       ${row.latencyMs}, ${row.status}, ${row.startedAt})
+  `.catch(() => {
+    /* spend metering is best-effort, never blocks a publish */
+  });
+}

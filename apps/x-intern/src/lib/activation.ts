@@ -198,3 +198,77 @@ async function listXInternInstancesByStatus(
       escalate_on_cap,
       pause_on_5xx,
       notify_low_confidence,
+      auto_send_enabled,
+      auto_send_min_delay_sec,
+      auto_send_max_delay_sec,
+      auto_send_max_per_hour,
+      pending_drafts_cap,
+      lead_backlog_cap,
+      objective,
+      brand_config,
+      classifier_threshold,
+      icp_config,
+      discovery_enabled,
+      classifier_enabled,
+      drafter_enabled,
+      notifications_enabled,
+      send_enabled,
+      reply_send_enabled,
+      profiler_enabled,
+      watchlist_enabled,
+      dm_autodraft_enabled,
+      pipeline_started_at,
+      goal_target,
+      goal_started_at,
+      discovery_config,
+      run_config,
+      lane_config,
+      account_feeder_config
+    from noelle.agent_instances
+    where role = 'x_intern'
+      and status = any(${statuses as string[]})
+  `;
+  return [...rows];
+}
+
+// "Should the pipeline workers do work?" — discovery/classifier/drafter/send
+// only act on rows returned here. Status flips on the dashboard Start/Pause
+// button propagate within one poll cycle. Per-worker enable flags are returned
+// too; each worker gates on its own via isWorkerEnabled.
+export async function listActiveXInternInstances(
+  sql: Sql,
+): Promise<ActiveInstance[]> {
+  return listXInternInstancesByStatus(sql, ["active"]);
+}
+
+// The profiler is decoupled from Start/Pause (0024): watchlist profiling is
+// passive enrichment, useful while the pipeline is paused. So it sees active
+// AND paused instances and gates only on profiler_enabled in its onTick.
+export async function listProfilerXInternInstances(
+  sql: Sql,
+): Promise<ActiveInstance[]> {
+  return listXInternInstancesByStatus(sql, ["active", "paused"]);
+}
+
+// Discovery/classifier/drafter use this so they can run the always-on WATCHLIST
+// lane (replies to watchlist people) for paused instances too — not just active
+// ones. Each worker branches on inst.status: when 'active' it runs both the
+// keyword lane and the watchlist lane; when 'paused' it runs only the watchlist
+// lane (gated on watchlist_enabled). See 0034_watchlist_enabled.sql.
+export async function listWatchlistOrActiveXInternInstances(
+  sql: Sql,
+): Promise<ActiveInstance[]> {
+  return listXInternInstancesByStatus(sql, ["active", "paused"]);
+}
+
+// The send worker also runs for paused instances: an operator can schedule a
+// batch of replies for auto-send (auto_send_target_at) and expect them to fire
+// on their staggered schedule even while the rest of the pipeline (discovery /
+// classify / draft) is paused. Per-instance gating still applies via
+// isWorkerEnabled(inst, "send"); a paused instance with nothing due is a
+// cheap no-op tick.
+export async function listSendXInternInstances(
+  sql: Sql,
+): Promise<ActiveInstance[]> {
+  return listXInternInstancesByStatus(sql, ["active", "paused"]);
+}
