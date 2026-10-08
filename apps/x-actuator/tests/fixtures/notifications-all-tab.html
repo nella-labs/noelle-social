@@ -1,0 +1,68 @@
+<!-- REAL structure from a logged-in x.com/notifications (the "All" tab),
+     captured 2026-07-26. Handles/text anonymized; avatars, SVG paths and the
+     virtualized wrappers trimmed. The one structural fact this locks:
+
+       - likes / follows / trending render as article[data-testid="notification"]
+       - a genuine REPLY to the operator renders as article[data-testid="tweet"]
+
+     findFeedTweets targets data-testid="tweet", so the All tab already filters
+     itself down to real replies. If a future edit widens that selector, this
+     fixture fails loudly instead of the sweep quietly ingesting every like. -->
+<div aria-label="Timeline: Notifications">
+
+  <article role="article" tabindex="0" class="css-175oi2r r-1mmae3n" data-testid="notification">
+    <div class="css-175oi2r r-18u37iz r-136ojw6">
+      <div class="css-175oi2r r-18kxxzh"><svg viewBox="0 0 24 24" aria-hidden="true"><g></g></svg></div>
+      <div class="css-175oi2r r-1iusvr4">
+        <div class="css-175oi2r r-6gpygo">
+          <ul role="list" class="css-175oi2r r-18u37iz">
+            <div class="css-175oi2r r-1wbh5a2 r-dnmrzs">
+              <div class="css-175oi2r r-1adg3ll" data-testid="UserAvatar-Container-dana"><a href="/dana" aria-hidden="true" role="link" tabindex="-1"></a></div>
+            </div>
+          </ul>
+        </div>
+        <div dir="ltr" class="css-146c3p1"><span dir="ltr"><div class="css-175oi2r r-xoduu5"><a href="/dana" role="link"><span>Dana</span></a></div><span><span> liked your reply</span></span></span><span aria-label="Jul 24"><time datetime="2026-07-24T22:56:39.889Z">Jul 24</time></span></div>
+        <div dir="auto" lang="en" class="css-146c3p1" data-testid="tweetText" style="-webkit-line-clamp: 3;"><span>buzz is the one i'd actually watch, agents with signed identities changes who you let near your repo</span></div>
+      </div>
+    </div>
+  </article>
+
+  <article role="article" tabindex="0" class="css-175oi2r r-1mmae3n" data-testid="notification">
+    <div class="css-175oi2r r-18u37iz r-136ojw6">
+      <div class="css-175oi2r r-18kxxzh"><svg viewBox="0 0 24 24" aria-hidden="true"><g></g></svg></div>
+      <div class="css-175oi2r r-1iusvr4">
+        <div dir="ltr" class="css-146c3p1"><span dir="ltr"><div class="css-175oi2r r-xoduu5"><a href="/erin" role="link"><span>Erin</span></a></div><span><span> followed you</span></span></span><span aria-label="Jul 24"><time datetime="2026-07-24T15:44:35.079Z">Jul 24</time></span></div>
+      </div>
+    </div>
+  </article>
+
+  <article aria-labelledby="id__a id__b" role="article" tabindex="0" class="css-175oi2r r-18u37iz r-1udh08x" data-testid="tweet">
+    <div class="css-175oi2r r-eqz5dr">
+      <div class="css-175oi2r r-16y2uox">
+        <div class="css-175oi2r r-18u37iz r-136ojw6">
+          <div class="css-175oi2r r-18kxxzh"><div class="css-175oi2r" data-testid="Tweet-User-Avatar"><div data-testid="UserAvatar-Container-ada"><a href="/ada" aria-hidden="true" role="link" tabindex="-1"></a></div></div></div>
+          <div class="css-175oi2r r-1iusvr4">
+            <div class="css-175oi2r r-zl2h9q">
+              <div class="css-175oi2r r-1wbh5a2 r-dnmrzs r-1ny4l3l r-1awozwy r-18u37iz" data-testid="User-Name">
+                <a href="/ada" role="link"><div dir="ltr" class="css-146c3p1"><span><span>Ada</span></span></div></a>
+                <div class="css-175oi2r r-18u37iz"><a href="/ada" role="link" tabindex="-1"><div dir="ltr" class="css-146c3p1"><span>@ada</span></div></a>
+                  <div class="css-175oi2r r-18u37iz r-1q142lx"><a href="/ada/status/2080744715796803921" dir="ltr" aria-label="Jul 24" role="link"><time datetime="2026-07-24T19:59:33.000Z">Jul 24</time></a></div>
+                </div>
+              </div>
+            </div>
+            <div class="css-175oi2r r-4qtqp9 r-zl2h9q">
+              <div dir="ltr" class="css-146c3p1" id="id__ctx" style="color: rgb(113, 118, 123);">Replying to <div class="css-175oi2r r-xoduu5"><a dir="ltr" href="/operator" role="link"><span>@operator</span></a></div></div>
+            </div>
+            <div class="css-175oi2r"><div dir="auto" lang="en" class="css-146c3p1" data-testid="tweetText"><span>It's an easy way to get a first push</span></div></div>
+            <div class="css-175oi2r"><div aria-label="1 like, Liked, 24 views" role="group" class="css-175oi2r r-1kbdv8c">
+              <button aria-label="0 Replies. Reply" role="button" data-testid="reply" type="button"></button>
+              <button aria-label="1 Like. Liked" role="button" data-testid="unlike" type="button"></button>
+              <button aria-label="Bookmark" role="button" data-testid="bookmark" type="button"></button>
+            </div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </article>
+
+</div>
