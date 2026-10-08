@@ -198,3 +198,141 @@ describe("a page that does not answer is not an empty inbox", () => {
         if (calls < 3) return { ok: true, items: [] };
         return { ok: true, items: [{
           external_id: "urn:li:comment:1", public_id: "mara", name: "Mara",
+          text: "thank you so much!! I will",
+          url: "https://www.linkedin.com/feed/update/urn:li:ugcPost:1/",
+          activity_urn: "urn:li:ugcPost:1", post_context: "", age_minutes: 30,
+        }] };
+      },
+    } as never);
+    expect(calls).toBeGreaterThanOrEqual(3);
+    expect(out.fresh).toBe(1);
+    expect(out.detail).toBeUndefined();
+  });
+
+  it("a genuinely empty inbox still reports zero, not an error", async () => {
+    setupChrome();
+    const out = await runNotificationSweep(1, {
+      ...base,
+      send: async () => ({ ok: true, items: [] }),
+    } as never);
+    expect(out.fresh).toBe(0);
+    expect(out.harvested).toBe(0);
+    // No detail: the caller's own "page rendered NO cards — selectors may have
+    // drifted" line is the better wording, and overwriting it here would make
+    // that branch dead code (it is the signal added when a silent page was
+    // being reported as an empty inbox).
+    expect(out.detail).toBeUndefined();
+  });
+});
+
+// Mutation testing found LinkedIn's describeEmptySweep had ZERO direct tests:
+// you could replace the whole ageBuckets call with hardcoded zeros and the
+// suite stayed green. X's twin had six.
+describe("describeEmptySweep tells the truth about WHICH zero this is", () => {
+  const ages = (recent: number, stale: number, undated: number) => ({ recent, stale, undated });
+
+  it("says nothing when the page rendered no cards at all", () => {
+    expect(describeEmptySweep({ harvested: 0, ages: ages(0, 0, 0) })).toBeUndefined();
+  });
+
+  it("says nothing when cards rendered but none were replies — the ORDINARY quiet inbox", () => {
+    // This is most sweeps. It must not be described as a window problem, and
+    // (see the sweep test below) must not trip the selector-drift alarm.
+    expect(describeEmptySweep({ harvested: 20, ages: ages(0, 0, 0) })).toBeUndefined();
+  });
+
+  it("blames the window only when the window is the reason", () => {
+    const d = describeEmptySweep({ harvested: 20, ages: ages(0, 2, 0) })!;
+    expect(d).toBe("2 replies, none within 12h (2 older, 0 undated)");
+  });
+
+  it("names the seen-ring case WITHOUT claiming the person was answered", () => {
+    const d = describeEmptySweep({ harvested: 20, ages: ages(3, 0, 0) })!;
+    expect(d).toMatch(/already ingested/);
+    expect(d).not.toMatch(/none within/);
+  });
+
+  it("calls out a markup break when every candidate is undated", () => {
+    const d = describeEmptySweep({ harvested: 9, ages: ages(0, 0, 2) })!;
+    expect(d).toBe("no readable timestamp on any of 2 replies — time-ago markup may have changed");
+  });
+
+  it("never emits a line whose own counts contradict it", () => {
+    for (const a of [ages(3, 0, 0), ages(0, 3, 0), ages(0, 0, 3), ages(1, 1, 1), ages(2, 5, 1)]) {
+      const d = describeEmptySweep({ harvested: 10, ages: a });
+      if (!d) continue;
+      const total = a.recent + a.stale + a.undated;
+      const claimed = Number(/^(\d+)/.exec(d)?.[1] ?? -1);
+      if (d.includes("none within")) {
+        expect(a.recent).toBe(0);
+        expect(claimed).toBe(total);
+      }
+      if (d.includes("already ingested")) expect(claimed).toBe(a.recent);
+      if (d.includes("no readable timestamp")) expect(a.undated).toBe(total);
+    }
+  });
+});
+
+// The defect this fixes: LinkedIn's harvestNotifications returns ONLY reply
+// cards, so `harvested === 0` was the ordinary "nobody replied to me" state —
+// but the panel renders that as "page rendered NO notification cards —
+// selectors may have drifted". A healthy install cried wolf every 10-20
+// minutes, degrading the one alarm that should mean something.
+describe("a quiet inbox is not a selector break", () => {
+  const setupChrome = () => {
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      storage: { local: { get: async () => ({}), set: async () => undefined } },
+    };
+  };
+  const base = {
+    cdp: { wheel: async () => undefined } as never,
+    rng: { float: () => 1, int: () => 1, normal: () => 40, gamma: () => 1, next: () => 0.5, pickWeighted: () => 0 } as never,
+    sleep: async () => undefined,
+    api: { postInboundReplies: async () => ({ accepted: 1, skipped: 0, results: [] }) } as never,
+    instanceId: "i",
+    wpm: 300,
+    stopped: () => false,
+    navigate: async () => undefined,
+  };
+
+  it("reports the CARDS the page rendered, not just the replies", async () => {
+    setupChrome();
+    // 20 cards on the page (likes, follows, job alerts), none of them replies.
+    const out = await runNotificationSweep(1, {
+      ...base,
+      send: async () => ({ ok: true, items: [], cards: 20 }),
+    } as never);
+    expect(out.harvested).toBe(20); // NOT 0 — the page rendered fine
+    expect(out.detail).toBeUndefined(); // caller: "read 20 cards, none are new replies"
+  });
+
+  it("still reports zero cards when the page really rendered nothing", async () => {
+    setupChrome();
+    const out = await runNotificationSweep(1, {
+      ...base,
+      send: async () => ({ ok: true, items: [], cards: 0 }),
+    } as never);
+    expect(out.harvested).toBe(0); // the genuine selector-drift signal
+    expect(out.detail).toBeUndefined();
+  });
+
+  it("falls back to the reply count when the content script is older than the background", async () => {
+    // Mid-upgrade the content script may not send `cards` yet. Never report
+    // fewer cards than replies we actually got.
+    setupChrome();
+    const out = await runNotificationSweep(1, {
+      ...base,
+      send: async () => ({
+        ok: true,
+        items: [{
+          external_id: "urn:li:comment:1", public_id: "mara", name: "Mara",
+          text: "a real question for you?",
+          url: "https://www.linkedin.com/feed/update/urn:li:ugcPost:1/",
+          activity_urn: "urn:li:ugcPost:1", post_context: "", age_minutes: 4320,
+        }],
+      }),
+    } as never);
+    expect(out.harvested).toBe(1);
+    expect(out.detail).toBe("1 replies, none within 12h (1 older, 0 undated)");
+  });
+});
