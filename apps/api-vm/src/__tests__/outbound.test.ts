@@ -198,3 +198,203 @@ function makeFakeDb(initial: Record<string, TableState>) {
             out[c] = isJsonMarker(v) ? (v as JsonMarker).value : v;
           }
           return out;
+        });
+      } else {
+        // Single-row insert. Parse the column list and the VALUES list.
+        const colMatch = text.match(
+          /insert\s+into\s+noelle\.[a-z_]+\s*\(([^)]+)\)/i
+        );
+        const valMatch = text.match(/values\s*\(([^)]+)\)/i);
+        if (colMatch && valMatch) {
+          const cols = colMatch[1]!.split(",").map((s) => s.trim());
+          const valTokens = valMatch[1]!.split(",").map((s) => s.trim());
+          const row: Row = {};
+          for (let i = 0; i < cols.length; i++) {
+            const tok = valTokens[i] ?? "";
+            const ph = tok.match(/<<v(\d+)>>/);
+            if (ph) {
+              const v = values[Number(ph[1])];
+              row[cols[i]!] = isJsonMarker(v)
+                ? (v as JsonMarker).value
+                : v;
+            }
+          }
+          toInsert = [row];
+        }
+      }
+
+      // Conflict resolution: parse `on conflict (<cols>)`. `do nothing`
+      // skips duplicates; `do update` patches existing rows.
+      const conflictMatch = text.match(/on\s+conflict\s*\(([^)]+)\)/i);
+      const conflictCols = conflictMatch?.[1]?.split(",").map((col) => col.trim()) ?? [];
+      const doNothing = /do\s+nothing/i.test(text);
+
+      const stored: Row[] = [];
+      for (const row of toInsert) {
+        let idx = -1;
+        if (conflictCols.length && conflictCols.every((col) => (row as Row)[col] !== undefined)) {
+          idx = t.rows.findIndex(
+            (r) => conflictCols.every((col) => (r as Row)[col] === (row as Row)[col])
+          );
+        }
+        if (idx >= 0) {
+          if (!doNothing) {
+            // do update — patch the existing row with the new values. Model a
+            // jsonb merge (`set payload = noelle.leads.payload || excluded.payload`)
+            // when the SQL asks for it, so a merge upsert keeps the keys the
+            // incoming row omits instead of clobbering the whole column.
+            const merged: Row = { ...t.rows[idx], ...row };
+            if (/payload\s*\|\|\s*(?:excluded\.payload|case)/i.test(text)) {
+              const incoming = { ...(((row as Row).payload as Record<string, unknown>) ?? {}) };
+              if (/excluded\.payload\s*-\s*'posted_at'/i.test(text) && incoming.posted_at == null) {
+                delete incoming.posted_at;
+              }
+              merged.payload = {
+                ...((t.rows[idx] as Row).payload as Record<string, unknown>),
+                ...incoming,
+              };
+            }
+            t.rows[idx] = merged;
+          }
+          stored.push(t.rows[idx]!);
+        } else {
+          const withId: Row = { ...row };
+          if (!("id" in withId) || withId.id === undefined) {
+            withId.id = genId();
+          }
+          if (!("created_at" in withId)) {
+            withId.created_at = new Date().toISOString();
+          }
+          t.rows.push(withId);
+          stored.push(withId);
+        }
+      }
+
+      if (/returning/i.test(text)) {
+        result = stored;
+      } else {
+        result = [];
+      }
+    } else if (op === "update" && t) {
+      // `update noelle.X set <patch> where id = <<vN>>` is the shape we
+      // care about. Pull the where clause's column + placeholder, find
+      // matching rows, then apply each `set <col> = <<vM>>` pair.
+      const whereMatch = text.match(/where\s+([a-z_]+)\s*=\s*<<v(\d+)>>/i);
+      if (whereMatch) {
+        const col = whereMatch[1]!;
+        const val = values[Number(whereMatch[2])];
+        // Pull `set col = <<vN>>` pairs (anything before WHERE).
+        const setBlock = text.slice(
+          text.toLowerCase().indexOf("set ") + 4,
+          text.toLowerCase().indexOf("where")
+        );
+        const setRe = /([a-z_]+)\s*=\s*<<v(\d+)>>/gi;
+        const setters: Array<[string, unknown]> = [];
+        let sm: RegExpExecArray | null;
+        while ((sm = setRe.exec(setBlock)) !== null) {
+          const c = sm[1]!;
+          const v = values[Number(sm[2])];
+          setters.push([c, isJsonMarker(v) ? (v as JsonMarker).value : v]);
+        }
+        for (const r of t.rows) {
+          if ((r as Row)[col] === val) {
+            for (const [c, v] of setters) (r as Row)[c] = v;
+          }
+        }
+      }
+      result = [];
+    }
+
+    // Routes always `await sql\`...\`` before indexing, so a plain Promise
+    // is enough. (Real postgres.js returns a thenable RowList; we don't
+    // need that complexity in the stub.)
+    return Promise.resolve(result) as Promise<Row[]> & Row[];
+  }
+
+  // Helper used by sql.unsafe(query, params) — fixed parametrised SQL with
+  // $1, $2 placeholders. Used by the tenancy guard's QueryExecutor adapter.
+  function unsafe(query: string, params: unknown[]): Promise<Row[]> {
+    // Substitute $N with placeholder markers compatible with the tag parser.
+    const text = query.replace(/\$(\d+)/g, (_, n) => `<<v${Number(n) - 1}>>`);
+    // Wrap into the same tag-style dispatch.
+    const arr: string[] = [text];
+    const withRaw: unknown = Object.assign(arr, {
+      raw: [text] as readonly string[],
+    });
+    const fakeStrings = withRaw as TemplateStringsArray;
+    return tag(fakeStrings, ...params) as unknown as Promise<Row[]>;
+  }
+
+  // sql.json(obj) marker — wraps an object so the stub knows to store it
+  // verbatim (no string conversion).
+  function json(value: unknown): JsonMarker {
+    return { __kind: "json", value };
+  }
+
+  // sql(rowsArray, ...cols) — marks a multi-row VALUES insertion. Real
+  // postgres.js returns an opaque marker that the template interpolator
+  // expands; the stub stashes the rows + cols.
+  function rowsHelper(
+    rows: ReadonlyArray<Row>,
+    ...cols: string[]
+  ): RowsMarker | ListMarker {
+    if (!cols.length) return { __kind: "list", values: rows };
+    return { __kind: "rows", rows, cols };
+  }
+
+  // Assemble the callable: postgres.js's `sql` is both a tag and a function.
+  const sql = Object.assign((...args: unknown[]) => {
+    // Tagged-template call: first arg is a TemplateStringsArray.
+    if (Array.isArray(args[0]) && "raw" in (args[0] as object)) {
+      return tag(args[0] as unknown as TemplateStringsArray, ...args.slice(1));
+    }
+    // sql(rowsArray, ...cols)
+    if (Array.isArray(args[0])) {
+      return rowsHelper(args[0] as Row[], ...(args.slice(1) as string[]));
+    }
+    throw new Error("unexpected sql() call shape in test stub");
+  }, {
+    json,
+    unsafe,
+    async begin(callback: (tx: Sql) => Promise<unknown>): Promise<unknown> {
+      const snapshot = structuredClone(state);
+      try { return await callback(sql as unknown as Sql); }
+      catch (error) {
+        for (const key of Object.keys(state)) delete state[key];
+        Object.assign(state, snapshot);
+        throw error;
+      }
+    },
+    __state: state,
+  });
+  return sql as unknown as Sql & { __state: Record<string, TableState> };
+}
+
+const ORG_ID = "00000000-0000-4000-8000-000000000001";
+const INSTANCE_ID = "00000000-0000-4000-8000-000000000002";
+const LEAD_EXTERNAL_ID = "ext-lead-001";
+const DRAFT_ID_E = "00000000-0000-4000-8000-000000000010";
+const DRAFT_ID_T = "00000000-0000-4000-8000-000000000011";
+const DRAFT_ID_C = "00000000-0000-4000-8000-000000000012";
+
+function basePayload(): OutboundIn {
+  return {
+    leadId: LEAD_EXTERNAL_ID,
+    batchNumber: 12,
+    platform: "x",
+    authorHandle: "danabra_mov",
+    authorId: "12345",
+    authorFollowers: 42000,
+    allowsDms: true,
+    originalPostId: "1976543210987654321",
+    originalPostText: "shipping daily is the only thing that matters",
+    originalPostUrl: "https://x.com/danabra_mov/status/1976543210987654321",
+    postedAt: "2026-05-17T18:00:00.000Z",
+    matchedTrigger: "agent",
+    drafts: [
+      { id: DRAFT_ID_E, kind: "reply", angle: "empathetic", body: "ok", charCount: 2 },
+      { id: DRAFT_ID_T, kind: "reply", angle: "technical", body: "ok", charCount: 2 },
+      { id: DRAFT_ID_C, kind: "reply", angle: "contrarian", body: "ok", charCount: 2 },
+    ],
+    qualityScore: 0.82,
+    qualityGatePassed: true,
