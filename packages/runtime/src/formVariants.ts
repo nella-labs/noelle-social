@@ -598,3 +598,10 @@ export function createFormVariantRotation(
         variants,
       );
       if (window > 0) {
+        recent.push(picked.id);
+        while (recent.length > window) recent.shift();
+      }
+      return picked;
+    },
+  };
+}
