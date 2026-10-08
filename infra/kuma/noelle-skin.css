@@ -1,0 +1,148 @@
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+  --noelle-paper: #FAF5E6;
+  --noelle-paper-2: #F0E9D4;
+  --noelle-paper-deep: #E8DFC4;
+  --noelle-ink: #1F1A12;
+  --noelle-ink-2: #3D352A;
+  --noelle-ink-muted: #7A6E5A;
+  --noelle-rule: #D9CFB4;
+  --noelle-rule-soft: #E5DCC4;
+  --noelle-accent: oklch(0.60 0.13 40);
+  --noelle-ok: oklch(0.55 0.09 145);
+  --noelle-warn: oklch(0.68 0.13 75);
+  --noelle-danger: oklch(0.55 0.16 28);
+  --bs-body-bg: var(--noelle-paper);
+  --bs-body-color: var(--noelle-ink);
+  --bs-border-color: var(--noelle-rule);
+}
+
+html, body, #app {
+  background: var(--noelle-paper) !important;
+  color: var(--noelle-ink) !important;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif !important;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, .h1, .h2, .h3, .h4, .header-title, .title, .status-page-title {
+  font-family: 'Instrument Serif', 'EB Garamond', Georgia, serif !important;
+  font-weight: 400 !important;
+  letter-spacing: -0.01em !important;
+  color: var(--noelle-ink) !important;
+}
+
+.card, .shadow-box, .monitor-list, .monitor-list .item, .group, .group-name {
+  background: var(--noelle-paper-2) !important;
+  color: var(--noelle-ink) !important;
+  border: 1px solid var(--noelle-rule) !important;
+  box-shadow: none !important;
+  border-radius: 8px !important;
+}
+
+.monitor-list .item { border: 0 !important; border-bottom: 1px solid var(--noelle-rule-soft) !important; border-radius: 0 !important; }
+.monitor-list .item:last-child { border-bottom: 0 !important; }
+
+.percent, .uptime, code, pre, .small.text-muted, .text-muted, .badge {
+  font-family: 'JetBrains Mono', ui-monospace, monospace !important;
+}
+.text-muted, small { color: var(--noelle-ink-muted) !important; }
+
+.overall-status, .status, .alert {
+  background: var(--noelle-paper-2) !important;
+  color: var(--noelle-ink) !important;
+  border: 1px solid var(--noelle-rule) !important;
+  font-family: 'Instrument Serif', serif !important;
+  font-weight: 400 !important;
+  font-size: 24px !important;
+  border-radius: 10px !important;
+  padding: 18px 22px !important;
+}
+
+.bg-success, .alert-success, .btn-success {
+  background-color: var(--noelle-ok) !important;
+  color: var(--noelle-paper) !important;
+  border-color: transparent !important;
+}
+.bg-warning, .alert-warning, .btn-warning {
+  background-color: var(--noelle-warn) !important;
+  color: var(--noelle-ink) !important;
+  border-color: transparent !important;
+}
+.bg-danger, .alert-danger, .btn-danger {
+  background-color: var(--noelle-danger) !important;
+  color: var(--noelle-paper) !important;
+  border-color: transparent !important;
+}
+.text-success { color: var(--noelle-ok) !important; }
+.text-warning { color: var(--noelle-warn) !important; }
+.text-danger  { color: var(--noelle-danger) !important; }
+.text-primary { color: var(--noelle-accent) !important; }
+
+.heartbeat-bar .beat,
+.beat {
+  border-radius: 2px !important;
+}
+.heartbeat-bar .beat.empty,
+.beat.empty { background-color: var(--noelle-rule) !important; }
+.heartbeat-bar .beat.up,
+.beat.up { background-color: var(--noelle-ok) !important; }
+.heartbeat-bar .beat.down,
+.beat.down { background-color: var(--noelle-danger) !important; }
+.heartbeat-bar .beat.warning,
+.beat.warning,
+.beat.pending { background-color: var(--noelle-warn) !important; }
+
+a { color: var(--noelle-accent) !important; text-decoration: none !important; }
+a:hover { color: var(--noelle-ink) !important; }
+
+.btn-primary, .btn-outline-primary {
+  background: var(--noelle-ink) !important;
+  border-color: var(--noelle-ink) !important;
+  color: var(--noelle-paper) !important;
+}
+
+.powered-by, [class*="powered"], .footer a[href*="uptime-kuma"], .footer a[href*="louislam"] {
+  display: none !important;
+}
+
+nav, .navbar, header {
+  background: var(--noelle-paper) !important;
+  border-color: var(--noelle-rule) !important;
+}
+
+.group .group-name, .group-name span, h2.group-name {
+  font-family: 'Instrument Serif', serif !important;
+  font-size: 28px !important;
+  font-weight: 400 !important;
+  color: var(--noelle-ink) !important;
+  letter-spacing: -0.01em !important;
+  background: transparent !important;
+  border: 0 !important;
+}
+
+footer, .footer {
+  color: var(--noelle-ink-muted) !important;
+  background: transparent !important;
+  border-top: 1px solid var(--noelle-rule) !important;
+}
+
+img[alt="Uptime Kuma"], img[src*="icon.svg"], .logo, .navbar-brand img {
+  display: none !important;
+}
+.navbar-brand, .header-title {
+  font-family: 'Instrument Serif', serif !important;
+  font-size: 26px !important;
+  font-weight: 400 !important;
+  letter-spacing: -0.01em !important;
+  color: var(--noelle-ink) !important;
+}
+.navbar-brand::before {
+  content: 'noelle / status';
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--noelle-ink-muted);
+  margin-right: 12px;
+}

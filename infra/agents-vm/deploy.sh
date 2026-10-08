@@ -198,3 +198,54 @@ sudo systemctl enable --now \
 sudo systemctl restart \
   'noelle-discovery@*' \
   'noelle-classifier@*' \
+  'noelle-drafter@*' \
+  'noelle-profiler@*' \
+  'noelle-send@*' \
+  'noelle-reddit-discovery@*' \
+  'noelle-reddit-classifier@*' \
+  'noelle-reddit-drafter@*' 2>/dev/null || true
+
+api_ok=0
+for i in {1..20}; do
+  if curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null; then
+    log "api-vm health check passed (try $i)"
+    api_ok=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$api_ok" != "1" ]]; then
+  log "api-vm health check FAILED after 20s"
+  sudo systemctl status noelle-api-vm --no-pager || true
+  exit 1
+fi
+
+# Worker-pool gate: a green deploy must mean the workers actually started, not
+# just api-vm. Without this, a worker crash-loop (e.g. a missing build artifact)
+# slips through as a "successful" deploy while the whole X-intern pool is down.
+WORKER_UNITS=(noelle-discovery@0 noelle-classifier@0 noelle-send@0 noelle-profiler@0 \
+  noelle-drafter@0 noelle-drafter@1 noelle-drafter@2 noelle-drafter@3 \
+  noelle-reddit-discovery@0 noelle-reddit-classifier@0 noelle-reddit-drafter@0)
+failed_units=""
+for i in {1..15}; do
+  failed_units=""
+  for u in "${WORKER_UNITS[@]}"; do
+    if [[ "$(sudo systemctl is-active "$u" 2>/dev/null || true)" != "active" ]]; then
+      failed_units="$failed_units $u"
+    fi
+  done
+  [[ -z "$failed_units" ]] && break
+  sleep 1
+done
+if [[ -n "$failed_units" ]]; then
+  log "worker-pool health FAILED — units not active:$failed_units"
+  for u in $failed_units; do
+    log "--- recent logs for $u ---"
+    sudo journalctl -u "$u" -n 15 --no-pager 2>/dev/null || true
+  done
+  exit 1
+fi
+
+log "worker pool healthy (${#WORKER_UNITS[@]} units active)"
+log "deploy complete @ $HEAD_SHA"
+exit 0
