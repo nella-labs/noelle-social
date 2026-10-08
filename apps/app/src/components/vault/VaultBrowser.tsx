@@ -198,3 +198,197 @@ function Tree({ nodes, depth, selected, onSelect, collapsed, setCollapsed }: Tre
                   style={{
                     width: 12,
                     color: "var(--ink-soft)",
+                    fontFamily: "var(--mono)",
+                    fontSize: 10,
+                  }}
+                >
+                  {open ? "▾" : "▸"}
+                </span>
+                <span style={{ color: "var(--accent)", fontFamily: "var(--mono)" }}>
+                  ▤
+                </span>
+                <span
+                  style={{
+                    flex: 1,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {node.name}
+                </span>
+              </button>
+              {open && (
+                <Tree
+                  nodes={node.children}
+                  depth={depth + 1}
+                  selected={selected}
+                  onSelect={onSelect}
+                  collapsed={collapsed}
+                  setCollapsed={setCollapsed}
+                />
+              )}
+            </div>
+          );
+        }
+
+        const isSelected = selected === node.path;
+        return (
+          <div
+            key={node.path}
+            style={{
+              background: isSelected ? "var(--paper-2)" : "transparent",
+              borderLeft: isSelected
+                ? "2px solid var(--accent)"
+                : "2px solid transparent",
+            }}
+          >
+            <button
+              onClick={() => onSelect(node.path)}
+              style={{
+                width: "100%",
+                textAlign: "left",
+                border: 0,
+                cursor: "pointer",
+                background: "transparent",
+                padding: `5px 8px 5px ${12 + depth * 14}px`,
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                fontSize: 12.5,
+                color: isSelected ? "var(--ink)" : "var(--ink-2)",
+                fontFamily: "var(--mono)",
+              }}
+            >
+              <span style={{ width: 12 }} />
+              <span style={{ color: "var(--ink-soft)", fontFamily: "var(--mono)" }}>
+                ·
+              </span>
+              <span
+                style={{
+                  flex: 1,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {node.name}
+              </span>
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+interface FileViewerProps {
+  file: VaultFile;
+  body: string | null;
+  error: string | null;
+  loadingBody: boolean;
+}
+
+function FileViewer({ file, body, error, loadingBody }: FileViewerProps) {
+  // Relative "Xs ago" depends on the current clock — defer past hydration.
+  const mounted = useMounted();
+  const parts = file.path.split("/");
+  const parentTrail = parts.slice(0, -1).join(" / ") || "root";
+  const displayName = file.name.replace(/\.md$/, "");
+  const searchable = file.name.toLowerCase().endsWith(".md");
+  const anchoredBy = file.anchoredBy ?? [];
+
+  return (
+    <div className="card" style={{ padding: 0, overflow: "hidden", ["--pad" as string]: "0px" }}>
+      <div
+        style={{
+          padding: "16px 22px",
+          borderBottom: "1px solid var(--rule-soft)",
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+        }}
+      >
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            className="mono"
+            style={{
+              fontSize: 10.5,
+              letterSpacing: "0.08em",
+              color: "var(--ink-muted)",
+              textTransform: "uppercase",
+            }}
+          >
+            {parentTrail}
+          </div>
+          <div
+            className="serif"
+            style={{ fontSize: 24, lineHeight: 1.1, marginTop: 4 }}
+          >
+            {displayName}
+          </div>
+        </div>
+        {searchable ? (
+          <span className="tag tag-ok">
+            <span className="dot dot-ok" /> searchable
+          </span>
+        ) : (
+          <span className="tag">stored</span>
+        )}
+        {typeof file.wordCount === "number" && (
+          <span className="tag">{file.wordCount} words</span>
+        )}
+      </div>
+
+      {error ? <div role="alert" style={{ padding: "20px 24px", color: "var(--ink-muted)", fontSize: 13 }}>{error}</div> : <pre
+        style={{
+          margin: 0,
+          padding: "20px 24px",
+          background: "var(--paper)",
+          color: "var(--ink-2)",
+          fontFamily: "var(--mono)",
+          fontSize: 13,
+          lineHeight: 1.7,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+        }}
+      >
+        {loadingBody ? "loading…" : (body ?? file.body ?? "")}
+      </pre>}
+
+      <div
+        style={{
+          padding: "14px 22px",
+          background: "var(--paper-2)",
+          borderTop: "1px solid var(--rule-soft)",
+        }}
+      >
+        <div className="kv">
+          <span className="k">Last modified</span>
+          <span className="v">{mounted ? timeAgoShort(file.lastModifiedISO) : "—"}</span>
+        </div>
+        <div className="kv">
+          <span className="k">Path</span>
+          <span className="v">{file.path}</span>
+        </div>
+        <div className="kv">
+          <span className="k">Anchored by</span>
+          <span
+            className="v"
+            style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}
+          >
+            {anchoredBy.length === 0 ? (
+              <span style={{ color: "var(--ink-soft)" }}>— no draft has pulled this yet</span>
+            ) : (
+              anchoredBy.map((slug) => (
+                <span key={slug} className="tag tag-acc">
+                  {slug}
+                </span>
+              ))
+            )}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
