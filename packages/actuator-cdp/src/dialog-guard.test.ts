@@ -198,3 +198,94 @@ describe("createDialogGuard", () => {
     await guard.arm(7);
     sends.length = 0;
     fire({ tabId: 7 }, "Page.javascriptDialogOpening", opening("confirm", "Discard post?"));
+    await vi.waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]?.params).toEqual({ accept: false });
+  });
+
+  // The guard listens on ONE global chrome.debugger.onEvent, so it sees events
+  // for every tab this extension attached. Handling all of them (not just a
+  // bookkeeping set) is deliberate: an unhandled dialog is a wedged run.
+  it("handles a dialog on a tab it never armed", async () => {
+    const { guard, sends, fire } = harness();
+    void guard;
+    fire({ tabId: 99 }, "Page.javascriptDialogOpening", opening("beforeunload"));
+    await vi.waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]?.tabId).toBe(99);
+  });
+
+  it("ignores every other debugger event", async () => {
+    const { guard, sends, fire } = harness();
+    await guard.arm(7);
+    sends.length = 0;
+    fire({ tabId: 7 }, "Page.frameNavigated", { frame: {} });
+    fire({ tabId: 7 }, "Page.loadEventFired", {});
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sends).toEqual([]);
+  });
+
+  it("ignores an event with no tabId (target-scoped debuggee)", async () => {
+    const { guard, sends, fire } = harness();
+    void guard;
+    fire({}, "Page.javascriptDialogOpening", opening("beforeunload"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sends).toEqual([]);
+  });
+
+  // A dialog on a tab that closed mid-run makes handleJavaScriptDialog reject.
+  // The listener is fired by Chrome, so an escaping rejection is an unhandled
+  // one — it must be swallowed.
+  it("swallows a rejecting handleJavaScriptDialog instead of throwing", async () => {
+    const send = vi.fn(async (_tabId: number, method: string) => {
+      if (method === "Page.handleJavaScriptDialog") throw new Error("No tab with given id 7.");
+      return undefined;
+    });
+    const { guard, logs, fire } = harness({ send });
+    await guard.arm(7);
+    expect(() => fire({ tabId: 7 }, "Page.javascriptDialogOpening", opening("beforeunload"))).not.toThrow();
+    await vi.waitFor(() => expect(logs.some((l) => l.level === "warn")).toBe(true));
+  });
+
+  // Page.enable is best-effort: a tab that dies between attach and arm must not
+  // take the run down with it.
+  it("swallows a rejecting Page.enable", async () => {
+    const send = vi.fn(async () => {
+      throw new Error("Debugger is not attached to the tab with id: 7.");
+    });
+    const { guard } = harness({ send });
+    await expect(guard.arm(7)).resolves.toBeUndefined();
+  });
+
+  it("disarming disables the Page domain and allows a later re-arm", async () => {
+    const { guard, sends } = harness();
+    await guard.arm(7);
+    await guard.disarm(7);
+    await guard.arm(7);
+    expect(sends.map((s) => s.method)).toEqual(["Page.enable", "Page.disable", "Page.enable"]);
+  });
+
+  // The dialog is invisible in the DB and DevTools can't be open during a run
+  // (chrome.debugger holds the tab), so this log line is the only evidence that
+  // the wall was hit and cleared.
+  it("logs each dialog it closed so a wedge leaves a trace", async () => {
+    const { guard, logs, fire } = harness();
+    await guard.arm(7);
+    fire({ tabId: 7 }, "Page.javascriptDialogOpening", opening("beforeunload", "Changes you made may not be saved."));
+    await vi.waitFor(() => expect(logs.filter((l) => l.level === "info")).toHaveLength(1));
+    expect(logs[0]?.meta).toEqual({
+      tabId: 7,
+      type: "beforeunload",
+      accept: true,
+      message: "Changes you made may not be saved.",
+    });
+  });
+
+  // A 120-char cap: the sink buffers these, and an adversarial page could set a
+  // multi-megabyte dialog message.
+  it("truncates a huge dialog message before logging it", async () => {
+    const { guard, logs, fire } = harness();
+    await guard.arm(7);
+    fire({ tabId: 7 }, "Page.javascriptDialogOpening", opening("beforeunload", "x".repeat(5000)));
+    await vi.waitFor(() => expect(logs).toHaveLength(1));
+    expect((logs[0]?.meta as { message: string }).message).toHaveLength(120);
+  });
+});
