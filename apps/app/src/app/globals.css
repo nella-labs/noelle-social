@@ -598,3 +598,203 @@ code, pre { font-family: "JetBrains Mono", ui-monospace, monospace; }
 .guided-foot {
   margin-top: 20px;
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  font-family: var(--mono, "JetBrains Mono", ui-monospace, monospace);
+  font-size: 10.5px; letter-spacing: 0.06em;
+  color: color-mix(in oklch, var(--paper) 50%, transparent);
+}
+.guided-dismiss {
+  background: none; border: none; cursor: pointer;
+  font: inherit; letter-spacing: inherit;
+  color: color-mix(in oklch, var(--paper) 50%, transparent);
+  text-decoration: underline; text-underline-offset: 3px;
+  padding: 4px;
+}
+.guided-dismiss:hover { color: var(--paper); }
+.guided-dismiss:disabled { opacity: 0.5; cursor: default; }
+
+@media (max-width: 768px) {
+  .guided { padding: 22px 18px; border-radius: 14px; }
+  .guided-title { font-size: 26px; }
+  /* Let the CTA drop under the copy instead of squeezing the title column. */
+  .guided-step { grid-template-columns: 24px 1fr; }
+  .guided-cta { grid-column: 2; justify-self: start; margin-top: 10px; }
+  .guided-foot { flex-direction: column; align-items: flex-start; }
+}
+
+/* focus + selection */
+::selection { background: color-mix(in oklch, var(--accent) 30%, transparent); color: var(--ink); }
+:is(button, a, input, select, textarea, summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+/* keep old utilities so existing components don't break overnight */
+@layer utilities {
+  .clay-glow { box-shadow: 0 0 0 0.5px var(--rule), 0 12px 32px -16px rgba(31,26,18, .18); }
+  .clay-glow-rust { box-shadow: 0 0 0 0.5px var(--accent-deep), 0 6px 14px -8px color-mix(in oklch, var(--accent) 60%, transparent); }
+  .grain-overlay { position: relative; }
+  .grain-overlay::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    opacity: 0.045; mix-blend-mode: multiply;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  }
+  .scanlines { position: relative; }
+  .scanlines::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: repeating-linear-gradient(to bottom, transparent 0 2px, rgba(31,26,18,.025) 2px 3px);
+    border-radius: inherit;
+  }
+}
+
+@media (max-width: 1100px) {
+  .sidebar { gap: 14px; }
+  .sidebar > .nav-workspace { display: none; }
+  .workspace-nav { margin-left: auto; }
+}
+
+/* ── Phone tier (≤768px) ──────────────────────────────────────────────────
+   Everything below the tablet icon-rail breakpoint. Desktop and tablet
+   (>768px) are deliberately untouched — these rules only ADD at phone width,
+   and they sit AFTER the 980px block so they win where the two overlap.
+   The hamburger drawer that replaces the icon rail lands in a later commit;
+   this block is the shell polish (spacing, type scale, touch targets) that
+   stands on its own and keeps the 64px rail usable in the meantime. */
+@media (max-width: 768px) {
+  /* Dynamic viewport height so the iOS URL-bar collapse can't crop the inner
+     scroller (the shell is a fixed-height frame with one scrolling child). */
+  .app { height: 100dvh; }
+  .main { height: 100dvh; }
+
+  /* Tighter gutters for a ~375px screen; generous bottom space past the home
+     indicator so the last row clears the safe-area inset. */
+  .main-scroll {
+    padding: 18px 16px calc(72px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Page header stacks: title above its action cluster, actions full-width. */
+  .page-h { flex-direction: column; align-items: stretch; gap: 14px; margin-bottom: 22px; }
+  .page-h-copy { flex-basis: auto; }
+  .page-h-actions { justify-content: flex-start; margin-left: 0; }
+  .page-title { font-size: 28px; }
+  .page-sub { font-size: 13px; }
+
+  /* Cards shed a little padding + radius so dense content isn't squeezed. */
+  .card { padding: 18px; border-radius: 18px; }
+
+  /* Comfortable touch targets (~44px) for primary buttons; leave the compact
+     .btn-sm pills alone so toolbar/inline rows don't balloon. */
+  .btn:not(.btn-sm) { height: 42px; padding: 0 18px; }
+  .btn-icon:not(.btn-sm) { width: 42px; }
+
+  /* Self-contained restatement of the multi-col → single-col collapse. */
+  .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+
+  /* Agent activity log: a 5-col row would crush the detail at phone width, so
+     reflow to "when · verb" on top, the detail spanning its own line, then
+     "model · cost" beneath. */
+  .activity-row { grid-template-columns: auto 1fr !important; }
+  .activity-row > :nth-child(3) { grid-column: 1 / -1; }
+
+  /* In the inbox card stack the preview wraps to two lines instead of the
+     single-line ellipsis it uses in the desktop grid. */
+  .inbox-preview {
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+  }
+}
+
+/* ── Phone tier (≤768px) · send/approve flow + dense panels ────────────────
+   PR #132 made the shell responsive (nav drawer, page headers, grid collapse).
+   This block adds the primitives it never reached — the action-dense surfaces
+   where the operator actually sends, saves, and reads on a 375px phone. Every
+   rule only ADDS at phone width; desktop/tablet (>768px) stay untouched, and
+   these sit after the shell block so they win where the two overlap. */
+@media (max-width: 768px) {
+  /* Action bar → vertical stack. The load-bearing fix for the approve/send
+     flow. A hand-rolled `display:flex` action row (DraftReviewPanel,
+     DMReviewPanel, the XInternStream toolbar) collapses to a full-width column,
+     and — critically — every inline `margin-left:auto` that pinned a primary
+     button to the right edge is reset, so the red Send / Send-DM button can
+     never land off-screen. The nested primary cluster keeps its row but wraps,
+     and its buttons grow to fill the width so they're easy to tap. */
+  .action-bar-phone { flex-direction: column !important; align-items: flex-start !important; gap: 8px; }
+  .action-bar-phone > * { margin-left: 0 !important; margin-right: 0 !important; }
+  .action-bar-phone > .btn,
+  .action-bar-phone > .input,
+  .action-bar-phone > input,
+  .action-bar-phone > .action-bar-primary { width: 100% !important; }
+  .action-bar-phone > .input { flex: 0 0 auto; }
+  .action-bar-phone .action-bar-primary { flex-wrap: wrap; }
+  .action-bar-phone .action-bar-primary > .btn { flex: 1 1 auto; justify-content: center; }
+  /* Status/error chips wrap to their own line instead of stretching the row
+     wide enough to shove the send button off-screen. */
+  .action-bar-phone .tag {
+    white-space: normal; max-width: 100%; word-break: break-word;
+    height: auto; min-height: 22px; padding: 3px 8px;
+  }
+
+  /* Single fixed-width control → fills its row. For an input sized with an
+     inline `width:NNN` (paste-X-link field, toolbar search boxes) that would
+     otherwise crowd the row or force horizontal scroll on a narrow screen. */
+  .w-full-phone { width: 100% !important; min-width: 0 !important; max-width: 100% !important; }
+
+  /* Horizontally-scrollable strip — a tab row with more triggers than fit
+     (admin console tabs, shadcn TabsList) swipes sideways instead of clipping
+     the rightmost tabs off-screen. */
+  .scroll-x-phone {
+    flex-wrap: nowrap !important; overflow-x: auto; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .scroll-x-phone::-webkit-scrollbar { display: none; }
+  .scroll-x-phone > * { flex: 0 0 auto; }
+
+  /* Lift compact `.btn-sm` toolbar pills to a real tap target without
+     ballooning dense toolbars; small primary/accent buttons (the only ones
+     tapped as a main action on phone — Retry, Send) get the full ~40px. */
+  .btn-sm { min-height: 34px; }
+  .btn-sm.btn-primary, .btn-sm.btn-accent { min-height: 40px; }
+
+  /* Speedrun approve cards — the fixed grids never collapsed, pushing Send /
+     Mark-sent off the right edge. Stack the header, wrap its action row, and
+     reduce each angle row to radio + text with copy/X on their own line
+     (mirrors the .activity-row reflow above). */
+  .speedrun-head { grid-template-columns: 1fr !important; gap: 10px; }
+  .speedrun-actions { flex-wrap: wrap; width: 100%; }
+  .speedrun-actions > .btn { flex: 1 1 auto; justify-content: center; }
+  .speedrun-angle { grid-template-columns: auto 1fr !important; gap: 10px; }
+  .speedrun-angle > .speedrun-angle-meta { display: none; }
+  .speedrun-angle > .speedrun-angle-actions { grid-column: 1 / -1; justify-content: flex-end; }
+
+  /* Config save bar — the operator's only commit control. Stack the help text
+     over two full-width Revert/Save buttons so Save is always reachable. */
+  .savebar { flex-direction: column; align-items: stretch; }
+  .savebar .savebar-actions { width: 100%; display: flex; gap: 10px; }
+  .savebar .savebar-actions > .btn { flex: 1; }
+
+  /* Stepper +/− get a 40px tap target — tapped repeatedly on phone. */
+  .stepper-btn { width: 40px !important; height: 40px !important; }
+
+  /* A flex item that should claim a full row on phone — e.g. a primary CTA that
+     sits inline-right (margin-left:auto) on desktop but reads better full-width
+     and reachable on a narrow screen. */
+  .grow-phone { flex: 1 1 100% !important; justify-content: center; }
+
+  /* Pipeline worker rows: the worker name + On/Off switch share row 1, and the
+     lifetime/run/today metrics span a full second line instead of being crushed
+     into a ~140px middle column. */
+  .worker-row { flex-wrap: wrap; }
+  .worker-row > .worker-row-metrics { flex: 1 1 100% !important; order: 3; min-width: 0; }
+
+  /* Admin event rows: let the message column wrap instead of single-line clip
+     once the row has stacked. */
+  .event-row > :last-child { white-space: normal !important; overflow: visible !important; }
+
+  /* Vault folder tree: once the 280px+1fr grid stacks (.stack-phone), drop the
+     sticky pin + height cap so it doesn't permanently eat the screen. */
+  .vault-tree { position: static !important; max-height: none !important; }
+
+  /* Clusters pinned right via margin-left:auto on desktop drop to a full-width
+     row on phone (issues search toolbar, spend Plan-B actions). */
+  .plan-b-actions { margin-left: 0 !important; }
+
