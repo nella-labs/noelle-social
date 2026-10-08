@@ -198,3 +198,203 @@ describe("analyzePatterns", () => {
     const out = await analyzePatterns({ posts, call: () => Promise.resolve(broadFinding), minFrequency: 3 });
 
     expect(out).toHaveLength(2);
+    const broad = out.find((entry) => entry.finding.label === "entire post regex");
+    const short = out.find((entry) => entry.finding.label === "short phrase regex");
+    expect(broad).toBeDefined();
+    expect(short).toBeDefined();
+    expect(broad!.finding.frequencyCount).toBe(3);
+    expect(broad!.finding.examples.map((example) => example.draftId)).toEqual([
+      "real-draft-0",
+      "real-draft-1",
+      "real-draft-2",
+    ]);
+    expect(broad!.finding.examples.every((example) => example.snippet.length <= 600)).toBe(true);
+    expect(posts[0]!.body).toContain(broad!.finding.examples[0]!.snippet);
+    expect(PatternFindingSchema.safeParse(broad!.finding).success).toBe(true);
+    expect(short!.finding.examples.map((example) => example.snippet)).toEqual(["short-match", "short-match", "short-match"]);
+    expect(PatternFindingSchema.safeParse(short!.finding).success).toBe(true);
+  });
+
+  it.each(["(unclosed", "(word)\\1", "(?=trust)trust", "(?:a{1000}){1000}"])(
+    "keeps an unsupported phrase as structure only with valid evidence: %s", async (regex) => {
+    const badRegex = JSON.stringify({
+      findings: [
+        {
+          label: "broken regex pattern",
+          kind: "phrase",
+          description: "The same broad lesson ending shows up repeatedly.",
+          instruction: "Do not force a broad lesson after operational claims.",
+          regex,
+          severity: "medium",
+          frequencyCount: 5,
+          examples: [],
+          evidence: [
+            { sourceIndex: 0, snippet: "turning the delay into a lesson about trust" },
+            { sourceIndex: 1, snippet: "turns the result into a lesson about trust" },
+            { sourceIndex: 2, snippet: "making the incident a lesson about trust" },
+          ],
+        },
+      ],
+    });
+    const out = await analyzePatterns({
+      posts: lessonCorpus(),
+      call: () => Promise.resolve(badRegex),
+      minFrequency: 3,
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.finding.kind).toBe("structure");
+    expect(out[0]!.finding.regex).toBeNull();
+  });
+
+  it("dedups against existing active rule labels", async () => {
+    const out = await analyzePatterns({
+      posts: congratsCorpus(),
+      call: () => Promise.resolve(phraseFinding),
+      existingLabels: ["Tacked-on 'congrats' closer"], // case-insensitive match
+      minFrequency: 3,
+    });
+    expect(out).toEqual([]);
+  });
+
+  it("fails closed (returns []) on unparseable LLM output", async () => {
+    const out = await analyzePatterns({ posts: congratsCorpus(), call: () => Promise.resolve("not json at all") });
+    expect(out).toEqual([]);
+  });
+
+  it("asks the model for source evidence and scoped positive revisions", async () => {
+    let system = "";
+    await analyzePatterns({
+      posts: congratsCorpus(),
+      call: async (s) => {
+        system = s;
+        return JSON.stringify({ findings: [] });
+      },
+    });
+    expect(system).toContain("supporting evidence");
+    expect(system).toContain("repeated meaning");
+    expect(system).toContain("mere punctuation");
+    expect(system).toContain("positive revision");
+  });
+
+  it("drops a structure finding without source evidence", async () => {
+    const structure = JSON.stringify({
+      findings: [
+        {
+          label: "one-line hook then blank line opener",
+          kind: "structure",
+          description: "Every recent post opens with a one-line hook then a blank line.",
+          instruction: "Vary your openers; don't always lead with a one-line hook followed by a blank line.",
+          regex: null,
+          severity: "medium",
+          frequencyCount: 7,
+          examples: [],
+        },
+      ],
+    });
+    const out = await analyzePatterns({ posts: congratsCorpus(), call: () => Promise.resolve(structure), minFrequency: 3 });
+    expect(out).toEqual([]);
+  });
+
+  it("counts only distinct source-grounded structure evidence and remaps examples to draft ids", async () => {
+    const structure = JSON.stringify({
+      findings: [
+        {
+          label: "claim-to-lesson ending",
+          kind: "structure",
+          description: "Recent replies turn an operational claim into the same broad lesson.",
+          instruction: "Do not force a broad lesson after operational claims.",
+          suggestion: "Use a scoped positive revision tied to the source claim.",
+          regex: null,
+          severity: "medium",
+          frequencyCount: 100,
+          examples: [],
+          evidence: [
+            { sourceIndex: 0, snippet: "turning the delay into a lesson about trust" },
+            { sourceIndex: 0, snippet: "turning the delay into a lesson about trust" },
+            { sourceIndex: 1, snippet: "turns the result into a lesson about trust" },
+            { sourceIndex: 2, snippet: "making the incident a lesson about trust" },
+            { sourceIndex: 22, snippet: "out of range" },
+            { sourceIndex: 3, snippet: "not actually in this body" },
+          ],
+        },
+      ],
+    });
+    const out = await analyzePatterns({ posts: lessonCorpus(), call: () => Promise.resolve(structure), minFrequency: 3 });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.finding.kind).toBe("structure");
+    expect(out[0]!.finding.frequencyCount).toBe(3);
+    expect(out[0]!.finding.examples).toEqual([
+      { draftId: "actual-0", snippet: "turning the delay into a lesson about trust" },
+      { draftId: "actual-1", snippet: "turns the result into a lesson about trust" },
+      { draftId: "actual-2", snippet: "making the incident a lesson about trust" },
+    ]);
+    expect(out[0]!.windowSize).toBe(10);
+  });
+
+  it("does not count duplicate corpus rows with the same real draft id as distinct structure evidence", async () => {
+    const corpus: PatternPost[] = [
+      {
+        draftId: "same-real-draft",
+        kind: "reply",
+        body: "First row repeats the same claim-to-lesson ending.",
+      },
+      {
+        draftId: "same-real-draft",
+        kind: "reply",
+        body: "Second row repeats the same claim-to-lesson ending.",
+      },
+      {
+        draftId: "same-real-draft",
+        kind: "reply",
+        body: "Third row repeats the same claim-to-lesson ending.",
+      },
+      ...lessonCorpus(7),
+    ];
+    const structure = JSON.stringify({
+      findings: [
+        {
+          label: "claim-to-lesson ending",
+          kind: "structure",
+          description: "The same real draft appears three times with the same structure.",
+          instruction: "Do not force a broad lesson after operational claims.",
+          regex: null,
+          severity: "medium",
+          frequencyCount: 3,
+          examples: [],
+          evidence: [
+            { sourceIndex: 0, snippet: "repeats the same claim-to-lesson ending" },
+            { sourceIndex: 1, snippet: "repeats the same claim-to-lesson ending" },
+            { sourceIndex: 2, snippet: "repeats the same claim-to-lesson ending" },
+          ],
+        },
+      ],
+    });
+    const out = await analyzePatterns({ posts: corpus, call: () => Promise.resolve(structure), minFrequency: 3 });
+    expect(out).toEqual([]);
+  });
+
+  it("drops a contradictory structure finding when claimed counts lack real evidence", async () => {
+    const structure = JSON.stringify({
+      findings: [
+        {
+          label: "claim-to-lesson ending",
+          kind: "structure",
+          description: "The model claims this appears everywhere.",
+          instruction: "Do not force a broad lesson after operational claims.",
+          regex: null,
+          severity: "medium",
+          frequencyCount: 100,
+          examples: [],
+          evidence: [{ sourceIndex: 0, snippet: "turning the delay into a lesson about trust" }],
+        },
+      ],
+    });
+    const out = await analyzePatterns({ posts: lessonCorpus(), call: () => Promise.resolve(structure), minFrequency: 3 });
+    expect(out).toEqual([]);
+  });
+
+  it("uses the tightest window that contains enough verified structure evidence", async () => {
+    const corpus: PatternPost[] = Array.from({ length: 30 }, (_, i) => ({
+      draftId: `p${i}`,
+      kind: "post" as const,
+      body: i >= 10 && i < 16 ? `Post ${i} repeats the same claim-to-lesson ending.` : `Post ${i} has a different shape.`,
