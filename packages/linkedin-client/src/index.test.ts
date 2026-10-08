@@ -198,3 +198,61 @@ describe("memberPosts", () => {
   });
 });
 
+describe("resolveProfile", () => {
+  it("resolves a slug to fsdProfileId + name + headline", async () => {
+    const data = {
+      included: [
+        {
+          entityUrn: "urn:li:fsd_profile:ACoAA-xyz",
+          publicIdentifier: "bosco-maldonado",
+          firstName: "Bosco",
+          lastName: "Maldonado-Arias",
+          headline: "Attention is the new Currency",
+        },
+      ],
+    };
+    const li = clientWith((url) => (url.includes("/feed/") ? mintResponse() : jsonResponse(data)));
+    const p = await li.resolveProfile("https://www.linkedin.com/in/bosco-maldonado/");
+    expect(p?.fsdProfileId).toBe("ACoAA-xyz");
+    expect(p?.publicId).toBe("bosco-maldonado");
+    expect(p?.name).toBe("Bosco Maldonado-Arias");
+    expect(p?.headline).toContain("Currency");
+  });
+});
+
+// ---- cadence -------------------------------------------------------------
+
+describe("cadence", () => {
+  it("throws LinkedInRateLimitError once the per-hour call cap is hit", async () => {
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.includes("/feed/")) return mintResponse();
+      return jsonResponse({ data: { "*miniProfile": "urn:li:fs_miniProfile:OK" }, included: [] });
+    }) as unknown as typeof fetch;
+    const li = createLinkedInClient({
+      liAt: "x",
+      minDelayMs: 0,
+      jitterMs: 0,
+      maxCallsPerHour: 2,
+      sleepImpl: async () => {},
+      nowImpl: () => 1_700_000_000_000,
+      fetchImpl,
+    });
+    await li.me(); // call 1
+    await li.me(); // call 2
+    await expect(li.me()).rejects.toBeInstanceOf(LinkedInRateLimitError); // over cap
+  });
+});
+
+// ---- the never-write invariant ------------------------------------------
+
+describe("read-only invariant", () => {
+  it("exposes no write/send/comment/connect/message methods", () => {
+    const li = clientWith(() => jsonResponse({}));
+    const surface = Object.keys(li);
+    for (const banned of ["createComment", "comment", "reply", "sendMessage", "dm", "connect", "like", "post", "createPost"]) {
+      expect(surface).not.toContain(banned);
+    }
+    expect(surface.sort()).toEqual(["connections", "me", "memberPosts", "resolveProfile"]);
+  });
+});
