@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-sesv2": "^3.1050.0",
-    "@fontsource/instrument-serif": "^5.1.0",
+    "@fontsource/instrument-serif": "^5.3.0",
     "@fontsource/jetbrains-mono": "^5.1.0",
     "@fontsource/manrope": "5.2.8",
     "@google-cloud/cloud-sql-connector": "^1.7.0",
