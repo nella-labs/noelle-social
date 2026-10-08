@@ -398,3 +398,203 @@ describe("runDrafterTick", () => {
     });
     // Two retrieval passes: voice (no filterDirs) + knowledge (filterDirs).
     expect(nella.search).toHaveBeenCalledTimes(2);
+    expect(nella.search.mock.calls.some((c) => c[2]?.filterDirs?.includes("01-business"))).toBe(true);
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("Product knowledge");
+    expect(prompt).toContain("AST-aware code search");
+  });
+
+  it("skips the knowledge pass when no knowledge dirs are configured (one search only)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({ drafts: [{ angle: "empathetic", body: "e", char_count: 1 }] }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "post text", url: "https://x.com/u/status/1" }, author_handle: "u", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(nella.search).toHaveBeenCalledTimes(1);
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("Product knowledge");
+  });
+
+  const draftsJson = JSON.stringify({
+    drafts: [
+      { angle: "empathetic", body: "sccache cut my rust builds in half, worth a look", char_count: 47 },
+      { angle: "technical", body: "the bottleneck is usually linking, not compiling", char_count: 48 },
+      { angle: "contrarian", body: "honestly incremental builds matter more than cold ones here", char_count: 59 },
+    ],
+  });
+  const verdict = (pass: boolean) =>
+    JSON.stringify(
+      pass
+        ? { voice: 0.9, grounding: 0.9, relevance: 0.9, reasons: [], fix: null }
+        : { voice: 0.3, grounding: 0.4, relevance: 0.5, reasons: ["too generic"], fix: "name a concrete build tool" },
+    );
+  const mkKb = () => ({
+    search: vi.fn().mockResolvedValue([
+      { snippet: "i ship small and often", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+    ]),
+  });
+  const mkLead = (priority = false) => ({
+    id: "L", external_id: "x1", payload: { text: "rust builds are slow", url: "https://x.com/u/status/1" },
+    author_handle: "u", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority,
+  });
+
+  it("verifier: passes on the first try → no regenerate, verdict attached", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    const makeCalls = vi.fn(() => [judge]);
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead()],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 2, makeCalls },
+    });
+    expect(makeCalls.mock.calls).toEqual([[false]]);
+    expect(runner.draft).toHaveBeenCalledTimes(1); // no regenerate
+    expect(judge).toHaveBeenCalledTimes(4); // reply set + each final angle
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.verifierMeta.pass).toBe(true);
+    expect(body.verifierMeta).toMatchObject({ judgeOk: true, judgeProvider: "legacy" });
+    expect(body.verifierMeta.attempts).toBe(0);
+  });
+
+  it("keeps the chosen verdict for an unchanged single browser reply", async () => {
+    const reply = "sccache might help if rebuilds are the slow bit";
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({ drafts: [{ angle: "technical", body: reply }] }),
+      engine: "codex", model: "gpt-5",
+    }) };
+    const judge = vi.fn()
+      .mockResolvedValueOnce(JSON.stringify({ voice: 0.82, grounding: 0.84, relevance: 0.86, reasons: [], fix: null }))
+      .mockResolvedValueOnce(JSON.stringify({ voice: 0.66, grounding: 0.84, relevance: 0.86, reasons: ["off voice"], fix: "rewrite voice" }));
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [{ ...mkLead(), payload: { ...mkLead().payload, source: "extension_observed" } }],
+      runner: runner as never, kb: mkKb() as never, postOutbound, markStatus,
+      verify: { enabled: true, retries: 0, voiceFloor: 0.7, makeCalls: () => [judge] },
+    });
+
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    const outbound = postOutbound.mock.calls[0]![0];
+    expect(outbound.drafts[0]).toMatchObject({
+      angle: "technical", body: reply,
+      verifierMeta: { pass: true, judgeOk: true, judgeProvider: "legacy", scores: expect.objectContaining({ voice: 0.82 }), reasons: [], attempts: 0 },
+    });
+    expect(markStatus).not.toHaveBeenCalledWith(expect.objectContaining({ meta: expect.objectContaining({ skip_reason: "low-voice" }) }));
+  });
+
+  it("verifier: regenerates with feedback on a failing verdict, keeps the improved draft", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = { draft: vi.fn().mockResolvedValue({ text: draftsJson, engine: "codex", model: "gpt-5" }) };
+    // Judge fails first, passes after the regenerate.
+    const judge = vi.fn().mockResolvedValueOnce(verdict(false)).mockResolvedValue(verdict(true));
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
+      log, instance: { id: "i", org_id: "o" }, claimedLeads: [mkLead()],
+      runner: runner as never, kb: mkKb() as never, postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(2); // initial + 1 regenerate
+    // The regenerate prompt carries the critique.
+    expect(runner.draft.mock.calls[1]![0].prompt).toContain("REVIEW FEEDBACK");
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.verifierMeta.pass).toBe(true);
+    expect(body.verifierMeta.attempts).toBe(1);
+  });
+
+  it("verifier: keeps progress on the weakest score so the next repair gets current feedback", async () => {
+    const output = (body: string) => JSON.stringify({
+      drafts: [{ angle: "technical", body, char_count: body.length }],
+    });
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockImplementation(async ({ prompt }: { prompt: string }) => {
+        const body = runner.draft.mock.calls.length === 1
+          ? "baseline reply"
+          : runner.draft.mock.calls.length === 2
+            ? "voice fixed but grounding needs work"
+            : prompt.includes("finish the grounding repair")
+              ? "final grounded reply"
+              : "stale voice repair";
+        return { text: output(body), engine: "codex", model: "gpt-5" };
+      }),
+    };
+    const judge = vi.fn().mockImplementation(async (_system: string, prompt: string) => {
+      if (prompt.includes("final grounded reply")) {
+        return JSON.stringify({ voice: 0.82, grounding: 0.81, relevance: 0.84, reasons: [], fix: null });
+      }
+      if (prompt.includes("voice fixed but grounding needs work")) {
+        return JSON.stringify({
+          voice: 0.72,
+          grounding: 0.69,
+          relevance: 0.76,
+          reasons: ["grounding is now the weakest score"],
+          fix: "finish the grounding repair",
+        });
+      }
+      return JSON.stringify({
+        voice: 0.68,
+        grounding: 0.99,
+        relevance: 0.99,
+        reasons: ["voice is the weakest score"],
+        fix: "fix the voice",
+      });
+    });
+
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [mkLead()],
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+
+    expect(runner.draft).toHaveBeenCalledTimes(3);
+    expect(runner.draft.mock.calls[1]![0].prompt).toContain("baseline reply");
+    expect(runner.draft.mock.calls[2]![0].prompt).toContain("finish the grounding repair");
+    expect(runner.draft.mock.calls[2]![0].prompt).toContain("voice fixed but grounding needs work");
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.drafts[0].body).toBe("final grounded reply");
+    expect(body.verifierMeta).toMatchObject({ pass: true, attempts: 2 });
+  });
+
+  it("browser verifier judges repair candidates in parallel and keeps only the passing reply", async () => {
+    const output = (drafts: Array<{ angle: "empathetic" | "technical" | "contrarian"; body: string }>) =>
+      JSON.stringify({ drafts: drafts.map((draft) => ({ ...draft, char_count: draft.body.length })) });
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn()
+        .mockResolvedValueOnce({
+          text: output([{ angle: "technical", body: "baseline reply" }]),
+          engine: "codex",
