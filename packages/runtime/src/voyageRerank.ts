@@ -198,3 +198,25 @@ export async function rankStyleExemplars<T>(
   query: string,
   candidates: T[],
   toText: (c: T) => string,
+  opts?: RankStyleExemplarsOptions,
+): Promise<T[]> {
+  const topK = voyageTopK(candidates.length, opts?.topK);
+  if (topK === 0) return [];
+
+  const documents = candidates.map(toText);
+  // `RankStyleExemplarsOptions` is a structural subset of `VoyageRerankOptions`
+  // (it omits only `model`), so forward it as-is. Spreading rather than naming
+  // each field keeps `undefined` off the keys under exactOptionalPropertyTypes.
+  const ranked = await voyageRerank(query, documents, { ...opts });
+
+  // Partial responses keep omitted candidates after the received ranking.
+  // `voyageRerank` only ever yields in-bounds indices, but `candidates[i]` is
+  // `T | undefined` under noUncheckedIndexedAccess — filter to stay type-safe
+  // (and resilient if an index ever slipped through).
+  const reordered: T[] = [];
+  for (const index of completeVoyageOrder(ranked.map(r => r.index), candidates.length).slice(0, topK)) {
+    const candidate = candidates[index];
+    if (candidate !== undefined) reordered.push(candidate);
+  }
+  return reordered;
+}
