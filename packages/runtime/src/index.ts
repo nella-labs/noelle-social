@@ -198,3 +198,203 @@ export {
 export {
   MemoryCache,
   CacheBusyError,
+  UpstashCache,
+  getCache,
+  type Cache,
+  type CacheDriver,
+} from "./cache.js";
+export {
+  MemoryTokenBucket,
+  UpstashTokenBucket,
+  getRateLimit,
+  enforce,
+  rateLimitedResponse,
+  _resetRateLimitRegistryForTests,
+  type RateLimit,
+  type RateLimitDecision,
+  type RateLimitDriver,
+  type TokenBucketOptions,
+  type UpstashTokenBucketOptions,
+  type EnforceOptions,
+  type EnforceResult,
+  type RateLimitedResponse,
+} from "./ratelimit.js";
+
+// Tenancy guards — Phase 2 of the Supabase → Cloud SQL migration.
+// Used by apps/api-vm routes and apps/app server actions to verify a
+// signed-in user belongs to an org before touching `noelle.*` data.
+// See packages/runtime/src/tenancy.ts and tasks/supabase-to-gcp-migration.md.
+export {
+  assertOrgMember,
+  isOrgMember,
+  OrgMembershipError,
+  type OrgMembersQueryClient,
+  type QueryExecutor,
+} from "./tenancy.js";
+
+// Shared memory bus — a Postgres-backed store any agent/worker writes to and
+// reads from at any moment, so every agent knows what is happening org-wide.
+// Fail-soft writes; consumes the same QueryExecutor seam as tenancy.
+// See packages/runtime/src/bus.ts and docs/shared-memory-bus.md.
+export {
+  createBus,
+  type Bus,
+  type BusBucket,
+  type BusEmit,
+  type BusEventRow,
+  type BusPutOptions,
+  type BusSeverity,
+  type BusStateRow,
+  type CreateBusArgs,
+} from "./bus.js";
+
+// LLM spend audit — D27 follow-up.
+// Shared spend telemetry and budget ownership.
+export {
+  KNOWN_PRICES,
+  estimateCallCents,
+  getPrice,
+  type Price,
+  type EstimateArgs,
+  type EngineKey as PriceEngineKey,
+} from "./llmPrices.js";
+export {
+  noopSpendRecorder,
+  type SpendRecorder,
+  type SpendRow,
+  type SpendEngine,
+  type SpendStatus,
+  type SpendCostBasis,
+} from "./spendRecorder.js";
+
+// Model catalog + per-worker routing — feeds the dashboard's per-worker
+// model picker and the worker code that needs to know which engine to
+// invoke for a given (instance, worker) pair.
+export {
+  MODEL_CATALOG,
+  lookupCatalogEntry,
+  catalogWinnerForModel,
+  handleForModel,
+  effectiveHandle,
+  type CatalogEntry,
+  type CatalogStatus,
+} from "./modelCatalog.js";
+export {
+  resolveWorkerRouting,
+  resolveWorkerRoutingDisplay,
+  WORKER_DEFAULTS,
+  type PersistedModelOverrides,
+} from "./workerRouting.js";
+
+// Grounded-drafting pipeline: the context-assembly distill (gather → 1 brief)
+// and the post-draft verifier (judge → regenerate). Both are pure modules —
+// the model call is injected by the worker, which owns routing + budget.
+export {
+  verifyDrafts,
+  verifyTiered,
+  scoreFormat,
+  refineDmVoice,
+  replyDiversityScore,
+  type DraftToVerify,
+  type VerifyContext,
+  type DimensionScores,
+  type DraftVerdict,
+  type VerifierCall,
+  type DynamicPattern,
+} from "./drafting/draftVerifier.js";
+export { toOutboundVerifierMeta } from "./drafting/outboundReview.js";
+export {
+  JEV_MODEL,
+  evaluateJevBoolean,
+  evaluateJevBooleans,
+  evaluateJevChoice,
+  withJevFallbackBoolean,
+  type JevBooleanDecision,
+  type JevChoiceDecision,
+  type JevRun,
+} from "./jev.js";
+export {
+  analyzePatterns,
+  refineRule,
+  DEFAULT_WINDOWS,
+  type PatternPost,
+  type PatternAnalyzerCall,
+  type AnalyzePatternsArgs,
+  type AnalyzedPattern,
+  type RefineRuleArgs,
+} from "./patternBreaker/analyze.js";
+export {
+  synthesizeBrief,
+  renderBriefBlock,
+  hasGatheredContent,
+  type GatheredContext,
+  type DraftingBrief,
+  type SynthesizerCall,
+} from "./drafting/contextAssembly.js";
+export {
+  captionImages,
+  createGeminiCaptionFn,
+  createVertexCaptionFn,
+  createBedrockCaptionFn,
+  type CaptionFn,
+  type CaptionImagesArgs,
+  type VisionAuthClient,
+  type BedrockVisionClient,
+  type CaptionMetering,
+} from "./drafting/visionCaption.js";
+
+export {
+  generateImageGemini,
+  generateImageVertex,
+  type GenerateImageOpts,
+  type GenerateImageKeyOpts,
+  type ImageAuthClient,
+} from "./drafting/imageGen.js";
+
+// Bounded-concurrency fan-out — the repo's first concurrency primitive.
+// `Promise.allSettled`-style isolation with a hand-rolled, order-preserving
+// worker pool. First consumer: the Account Feeder's parallel Gemini extractors.
+// See packages/runtime/src/batchMap.ts and the Account Feeder design doc §2.13.
+export {
+  batchMap,
+  type BatchResult,
+  type BatchMapOptions,
+} from "./batchMap.js";
+
+// Account Feeder (F4a) — Voyage rerank-2.5 style-exemplar ranking. Fail-open:
+// returns input order when VOYAGE_API_KEY is unset or the call fails/times out.
+// See packages/runtime/src/voyageRerank.ts and the feeder spec §7 F4a.
+export {
+  voyageRerank,
+  rankStyleExemplars,
+  type RerankResult,
+  type VoyageRerankOptions,
+  type RankStyleExemplarsOptions,
+} from "./voyageRerank.js";
+
+// Account Feeder (F4b) — phase-2 DENSE layer: Voyage `voyage-3-large`
+// embeddings (1024d) + Reciprocal Rank Fusion of the dense cosine ranking with
+// the F4a rerank. Dormant until the corpus is embedded (migration 0052 +
+// backfill) and `NOELLE_DRAFTER_DENSE` (read by F6) is ON. Fails open at every
+// step to the F4a rerank-only path, then to input order.
+// See packages/runtime/src/{voyageEmbed,rrf,hybridRank}.ts and the feeder spec §7 F4b.
+export {
+  voyageEmbed,
+  type VoyageEmbedOptions,
+} from "./voyageEmbed.js";
+export {
+  rrfFuse,
+  cosineSim,
+} from "./rrf.js";
+export {
+  hybridRankStyleExemplars,
+  type HybridRankOptions,
+} from "./hybridRank.js";
+
+// KnowledgeBase HYBRID DENSE lane — Voyage `voyage-context-4` CONTEXTUALIZED
+// chunk embeddings, fused with BM25 (RRF) inside `createLocalFsKnowledgeBase`.
+// Shared by every agent via one factory; opt-in with `NOELLE_KB_DENSE=1`.
+// Fail-open to pure BM25. See knowledgeBase.ts + docs/grounded-drafting.md.
+export {
+  voyageContextEmbed,
+  voyageContextEmbedQuery,
