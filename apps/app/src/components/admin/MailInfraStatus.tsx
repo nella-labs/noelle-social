@@ -198,3 +198,153 @@ function CardHeader({
         >
           {title}
         </div>
+        <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 8 }}>
+          <span className={`dot dot-${tone}`} />
+          <span
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 11,
+              letterSpacing: "0.06em",
+              color: "var(--ink-2)",
+            }}
+          >
+            {toneLabel}
+          </span>
+        </div>
+      </div>
+      {right}
+    </div>
+  );
+}
+
+type Tone = "ok" | "warn" | "down" | "muted";
+
+interface StatRow {
+  label: string;
+  value: React.ReactNode;
+  unit?: string;
+  tone?: Tone;
+}
+
+function Stats({ rows }: { rows: StatRow[] }) {
+  return (
+    <div
+      className="kpi-strip"
+      style={{
+        gap: 12,
+        marginTop: 2,
+      }}
+    >
+      {rows.map((r) => (
+        <div
+          key={r.label}
+          style={{
+            padding: 12,
+            background: "var(--paper-2)",
+            borderRadius: 8,
+            boxShadow: "0 0 0 0.5px var(--rule)",
+          }}
+        >
+          <div
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 9.5,
+              letterSpacing: "0.14em",
+              textTransform: "uppercase",
+              color: "var(--ink-muted)",
+            }}
+          >
+            {r.label}
+          </div>
+          <div
+            className="serif"
+            style={{
+              fontSize: 24,
+              marginTop: 4,
+              lineHeight: 1.05,
+              color: toneToInk(r.tone),
+            }}
+          >
+            {r.value}
+          </div>
+          {r.unit ? (
+            <div style={{ fontSize: 11, marginTop: 4, color: "var(--ink-muted)" }}>{r.unit}</div>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ExternalLink({ href, children }: { href: string; children: React.ReactNode }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      className="mono"
+      style={{
+        fontSize: 11,
+        letterSpacing: "0.06em",
+        color: "var(--ink-muted)",
+        textDecoration: "none",
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
+function Hint({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        padding: 12,
+        background: "var(--paper-2)",
+        borderRadius: 8,
+        boxShadow: "0 0 0 0.5px var(--rule)",
+        fontSize: 12.5,
+        lineHeight: 1.5,
+        color: "var(--ink-2)",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function ErrorRow({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        padding: 12,
+        background: "var(--paper-2)",
+        borderRadius: 8,
+        boxShadow: "0 0 0 0.5px var(--danger)",
+        fontFamily: "var(--mono)",
+        fontSize: 11.5,
+        color: "var(--danger)",
+        wordBreak: "break-word",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function fmtInt(n: number): string {
+  return n.toLocaleString();
+}
+
+function toneToInk(tone: Tone | undefined): string {
+  switch (tone) {
+    case "ok":
+      return "var(--ok)";
+    case "warn":
+      return "var(--warn)";
+    case "down":
+      return "var(--danger)";
+    default:
+      return "var(--ink)";
+  }
+}

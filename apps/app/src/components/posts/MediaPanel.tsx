@@ -198,3 +198,53 @@ export function MediaPanel({
 }
 
 function MediaCard({
+  media,
+  pending,
+  onRemove,
+}: {
+  media: ContentMediaRow;
+  pending: boolean;
+  onRemove: () => void;
+}) {
+  const [playing, setPlaying] = useState(false);
+  const isVideo = media.kind === "video";
+  const available = media.status === "ready" && Boolean(media.url);
+  const deleting = media.status === "deleting";
+  // External (content-pipeline) clips are read-only — no Delete.
+  const isExternal = media.id.startsWith("ext:");
+  return (
+    <li className="clay media-card">
+      <div className="media-thumb-wrap">
+        {!available ? <span className="mono media-meta" role="status">{deleting ? "Deletion pending" : "File unavailable"}</span> : isVideo ? (
+          playing ? (
+            <video src={media.url ?? undefined} controls autoPlay className="media-thumb" />
+          ) : (
+            <button type="button" className="media-thumb-play" onClick={() => setPlaying(true)} aria-label="Play">
+              {/* preload metadata renders the first frame as a poster */}
+              <video src={media.url ?? undefined} preload="metadata" className="media-thumb" muted />
+              <span className="media-thumb-play__icon">▶</span>
+            </button>
+          )
+        ) : (
+          // User-uploaded media of arbitrary origin/size — a plain img is right here.
+          <img src={media.url ?? ""} alt={mediaName(media)} className="media-thumb" />
+        )}
+      </div>
+      <div className="media-card__foot">
+        <span className="media-name" title={mediaName(media)}>{mediaName(media)}</span>
+        <div className="media-card__meta">
+          <span className="mono media-meta">{dayLabel(dayKey(media.created_at))}</span>
+          <span className="mono media-meta">{sizeLabel(media.bytes)}</span>
+        </div>
+        <div className="media-card__actions">
+          {available && media.url && <CopyButton text={mediaCopyPath(media.url)} label="Copy path" />}
+          {!isExternal && (
+            <button className="btn btn-ghost btn-xs media-del" onClick={onRemove} disabled={pending}>
+              {deleting ? "Retry delete" : "Delete"}
+            </button>
+          )}
+        </div>
+      </div>
+    </li>
+  );
+}
