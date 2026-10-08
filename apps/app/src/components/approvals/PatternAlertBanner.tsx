@@ -198,3 +198,134 @@ export function PatternAlertBanner({ orgSlug, alerts }: Props) {
             </button>
           </div>
         </div>
+
+        <h2 id="pattern-alert-title" className={styles.title}>
+          {current.patternName}
+        </h2>
+        <p id="pattern-alert-desc" className={styles.description}>
+          {current.description}
+        </p>
+        <p className={styles.meta}>
+          Observed in {current.frequencyCount} of {current.windowSize} analyzed posts. The current
+          rule guides the drafter.
+        </p>
+
+        {current.examples[0]?.snippet ? (
+          <blockquote className={styles.example}>
+            &ldquo;{current.examples[0].snippet}&rdquo;
+          </blockquote>
+        ) : null}
+
+        {current.suggestion?.trim() ? (
+          <div className={styles.suggestion}>
+            <p className={styles.suggestionLabel}>
+              <ArrowRight className="h-3 w-3" aria-hidden />
+              Try instead
+            </p>
+            <p className={styles.suggestionCopy}>{current.suggestion.trim()}</p>
+          </div>
+        ) : null}
+
+        {(isRefining || isRefined) && current.refineNote?.trim() ? (
+          <p className={styles.note}>
+            <strong>You told the drafter:</strong>{" "}
+            {current.refineNote.trim()}
+          </p>
+        ) : null}
+
+        {isRefined && current.ruleInstruction ? (
+          <p className={styles.note}>
+            <strong>Refined rule:</strong>{" "}
+            {current.ruleInstruction}
+          </p>
+        ) : null}
+
+        {refineFor === current.id ? (
+          <div className={styles.refine}>
+            <label
+              htmlFor="refine-note"
+            >
+              How should the AI refine this? (optional)
+            </label>
+            <Textarea
+              id="refine-note"
+              value={note}
+              onChange={(e) => setNote(e.target.value.slice(0, 600))}
+              placeholder="e.g. it's fine when it's a genuine congrats on a launch"
+              disabled={disabled}
+              className="mt-1 min-h-16"
+            />
+          </div>
+        ) : null}
+
+        {isRefining ? (
+          <p className={styles.status}>
+            {current.refineClaimed
+              ? "Awaiting refinement result. An uncertain attempt will not retry automatically."
+              : "Queued for refinement."}
+          </p>
+        ) : current.refineFailed ? (
+          <p className={styles.error}>
+            Refinement did not produce a usable result. The original rule is unchanged.
+          </p>
+        ) : null}
+        {isRetry && refineFor === current.id ? (
+          <p className={styles.status}>
+            Retry requests one new refinement attempt and replaces the previous pending request.
+          </p>
+        ) : null}
+
+        {error ? <p className={styles.error}>{error}</p> : null}
+
+        <div className={styles.actions}>
+          {refineFor === current.id ? (
+            <>
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => setRefineFor(null)}
+                disabled={disabled}
+              >
+                Cancel
+              </Button>
+              <Button type="button" variant="primary" onClick={onRefine} disabled={disabled}>
+                <Sparkles className="mr-1 h-3.5 w-3.5" />
+                {disabled ? "Sending…" : isRetry ? "Retry with AI" : "Refine with AI"}
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button type="button" variant="ghost" onClick={onRevert} disabled={disabled}>
+                <Undo2 className="mr-1 h-3.5 w-3.5" />
+                Revert
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setRefineFor(current.id)}
+                disabled={disabled || (isRefining && !current.refineRequestId)}
+              >
+                <Sparkles className="mr-1 h-3.5 w-3.5" />
+                {isRetry ? "Retry refinement" : "Refine"}
+              </Button>
+              <Button type="button" variant="primary" onClick={onAcknowledge} disabled={disabled}>
+                <Check className="mr-1 h-3.5 w-3.5" />
+                Keep
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PatternLabel({ count, severity, refined }: { count: number; severity: PatternAlertItem["severity"]; refined: boolean }) {
+  return (
+    <div className={styles.label}>
+      <span className={`${styles.dot} ${SEVERITY_DOT[severity]}`} aria-hidden="true" />
+      <span>Pattern breaker · {count}</span>
+      {refined ? <span className={styles.refined}><Check size={10} aria-hidden="true" /> Refined</span> : null}
+    </div>
+  );
+}
