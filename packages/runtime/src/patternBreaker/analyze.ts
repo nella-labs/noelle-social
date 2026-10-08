@@ -198,3 +198,131 @@ export async function analyzePatterns(args: AnalyzePatternsArgs): Promise<Analyz
 
   const seenLabels = new Set(existingLabels.map(normalizeLabel));
   const sortedWindows = [...windows].sort((a, b) => a - b);
+  const corpusSize = posts.length;
+
+  let raw: string;
+  try {
+    raw = await call(ANALYZER_SYSTEM, renderAnalyzerPrompt(posts, existingLabels));
+  } catch {
+    return [];
+  }
+
+  const parsed = PatternAnalysisSchema.safeParse(extractJson(raw));
+  if (!parsed.success) return [];
+
+  const out: AnalyzedPattern[] = [];
+  for (const finding of parsed.data.findings) {
+    const label = normalizeLabel(finding.label);
+    if (seenLabels.has(label)) continue; // dedup vs active rules AND within this batch
+    seenLabels.add(label);
+
+    // Drop a phrase finding whose regex doesn't compile — degrade it to structure
+    // so a malformed pattern never reaches the DB as a deterministic rule.
+    let normalized: PatternFinding = finding;
+    if (finding.kind === "phrase" && (!finding.regex || !compiles(finding.regex))) {
+      normalized = { ...finding, kind: "structure", regex: null };
+    }
+
+    if (normalized.kind === "phrase" && normalized.regex) {
+      // Deterministic recount: find the tightest window where it's over-represented.
+      const re = compileLearnedPattern(normalized.regex);
+      if (!re) continue;
+      let chosen: { window: number; matches: PatternPost[] } | null = null;
+      for (const w of sortedWindows) {
+        const slice = posts.slice(0, Math.min(w, corpusSize));
+        const matches = slice.filter((p) => re.test(p.body));
+        if (matches.length >= minFrequency && matches.length / slice.length >= minRatio) {
+          chosen = { window: Math.min(w, corpusSize), matches };
+          break;
+        }
+      }
+      if (!chosen) continue; // not actually over-used in any window — skip
+      out.push({
+        finding: {
+          ...normalized,
+          frequencyCount: chosen.matches.length,
+          examples: chosen.matches.slice(0, 6).map((post) => ({
+            draftId: post.draftId,
+            snippet: boundedPhraseSnippet(post.body, re, normalized.regex!),
+          })),
+        },
+        windowSize: chosen.window,
+      });
+    } else {
+      const evidence = verifiedStructureEvidence(normalized, posts);
+      const chosen = chooseWindowForEvidence(evidence, posts, sortedWindows, minFrequency, minRatio);
+      if (!chosen) continue;
+      out.push({
+        finding: {
+          ...normalized,
+          frequencyCount: chosen.matches.length,
+          examples: chosen.matches.slice(0, 6),
+        },
+        windowSize: chosen.window,
+      });
+    }
+  }
+  return out;
+}
+
+// ---- Refine ---------------------------------------------------------------
+// "Refine with AI": the operator hit Refine on an alert (optionally with a
+// steer). Rewrite the rule's NEVER-DO instruction so it's sharper / scoped the
+// way the operator wants. Pure + LLM-injected, like analyzePatterns.
+
+export interface RefineRuleArgs {
+  /** The rule's current instruction (what the drafter is told to avoid). */
+  currentInstruction: string;
+  /** The plain-English description of the habit (for context). */
+  description: string;
+  /** Example offending snippets (for context). */
+  examples?: PatternExample[];
+  /** The operator's optional steer ("only when it's a genuine congrats"). */
+  note?: string | null;
+  call: PatternAnalyzerCall;
+}
+
+const REFINE_SYSTEM = [
+  "You refine a single anti-pattern rule for an operator's social-post drafter.",
+  "You are given the rule's current NEVER-DO instruction, a description of the habit, example offending snippets, and an optional steer from the operator.",
+  "Rewrite the instruction so it is sharper and more useful to the drafter: imperative, specific, one or two sentences, no preamble.",
+  "If the operator's steer narrows or changes the rule (e.g. 'this is fine when it's a genuine congrats'), honor it exactly.",
+  "Do NOT widen the rule into a blanket ban that would hurt good writing. Keep it about the SPECIFIC over-used habit.",
+  "Output STRICT JSON, no markdown fences, no preamble. First char `{`, last `}`:",
+  '  {"instruction":"…"}',
+].join("\n");
+
+function renderRefinePrompt(args: RefineRuleArgs): string {
+  const parts: string[] = [];
+  parts.push("CURRENT INSTRUCTION:", args.currentInstruction);
+  parts.push("", "HABIT DESCRIPTION:", args.description);
+  if (args.examples?.length) {
+    parts.push("", "EXAMPLE OFFENDING SNIPPETS:");
+    parts.push(...args.examples.slice(0, 4).map((e, i) => `[${i + 1}] ${e.snippet}`));
+  }
+  if (args.note?.trim()) {
+    parts.push("", "OPERATOR STEER (honor this):", args.note.trim());
+  }
+  parts.push("", "Rewrite the instruction. Output the strict JSON only.");
+  return parts.join("\n");
+}
+
+/**
+ * Rewrite a rule instruction with AI. Returns the new instruction, or null if
+ * the model output was unusable (caller keeps the current instruction).
+ */
+export async function refineRule(args: RefineRuleArgs): Promise<string | null> {
+  let raw: string;
+  try {
+    raw = await args.call(REFINE_SYSTEM, renderRefinePrompt(args));
+  } catch {
+    return null;
+  }
+  const obj = extractJson(raw);
+  if (!obj || typeof obj !== "object") return null;
+  const instruction = (obj as Record<string, unknown>).instruction;
+  if (typeof instruction !== "string") return null;
+  const trimmed = instruction.trim();
+  const admitted = PatternFindingSchema.shape.instruction.safeParse(trimmed);
+  return admitted.success ? admitted.data : null;
+}
