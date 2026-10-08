@@ -398,3 +398,203 @@ describe("real captured LinkedIn notifications PAGE", () => {
     expect(isReplyType("REACTED_TO_COMMENT_MENTIONING_YOU")).toBe(false);
     expect(isReplyType("COMMENT_VIEWS")).toBe(false);
     expect(isReplyType("TOPIC_TRENDING_CONVERSATION_IN_YOUR_NETWORK")).toBe(false);
+    expect(isReplyType(null)).toBe(false);
+  });
+
+  it("gives the actuator a canonical post permalink, not the tracking link", () => {
+    expect(harvest()[0]!.url).toBe("https://www.linkedin.com/feed/update/urn:li:ugcPost:7486054278927835136/");
+  });
+
+  it("carries the quoted original post as free conversation context", () => {
+    expect(harvest()[0]!.post_context).toMatch(/^Happy to share that I finished first/);
+  });
+});
+
+// LinkedIn renders human-readable ages instead of an ISO time attribute.
+// Parse the supported units before applying the recency window.
+describe("ageMinutesFromText", () => {
+  it("reads the forms LinkedIn actually renders", () => {
+    expect(ageMinutesFromText("2h")).toBe(120);
+    expect(ageMinutesFromText("6h")).toBe(360);
+    expect(ageMinutesFromText("10h")).toBe(600);
+    expect(ageMinutesFromText("23h")).toBe(1380);
+    expect(ageMinutesFromText("1d")).toBe(1440);
+    expect(ageMinutesFromText("45m")).toBe(45);
+    expect(ageMinutesFromText("2w")).toBe(20160);
+  });
+
+  it("reads 'now' as zero", () => {
+    expect(ageMinutesFromText("now")).toBe(0);
+    expect(ageMinutesFromText("just now")).toBe(0);
+  });
+
+  it("does NOT read months as minutes", () => {
+    // The bug this ordering exists to prevent: "3mo" matching the /m/ rule
+    // would make a quarter-old notification look three minutes fresh, and it
+    // would sail through the window and get answered.
+    expect(ageMinutesFromText("3mo")).toBe(129_600);
+    expect(ageMinutesFromText("1mo")).toBe(43_200);
+    expect(ageMinutesFromText("3m")).toBe(3);
+  });
+
+  it("tolerates spacing and long unit spellings", () => {
+    expect(ageMinutesFromText("6 h")).toBe(360);
+    expect(ageMinutesFromText(" 2 hours ")).toBe(120);
+    expect(ageMinutesFromText("15 minutes")).toBe(15);
+  });
+
+  it("returns null rather than guessing", () => {
+    expect(ageMinutesFromText("")).toBeNull();
+    expect(ageMinutesFromText(null)).toBeNull();
+    expect(ageMinutesFromText("yesterday")).toBeNull();
+    expect(ageMinutesFromText("Alice Smith")).toBeNull();
+  });
+});
+
+describe("cardAgeMinutes", () => {
+  it("reads the real .nt-card__time-ago element", () => {
+    const root = mount(`
+      <article class="nt-card">
+        <p class="nt-card__time-ago t-12 t-black--light t-normal">6h</p>
+      </article>`);
+    expect(cardAgeMinutes(root.querySelector("article")!)).toBe(360);
+  });
+
+  it("falls back structurally when the class is renamed", () => {
+    // Same rule as the rest of this file: nothing depends on one class name.
+    // A rename must degrade, not silently zero every card's age — which would
+    // make the actor answer nothing and look identical to an empty inbox.
+    const root = mount(`
+      <article class="nt-card">
+        <div class="nt-card__headline">Alice Smith commented on your post</div>
+        <span class="totally-renamed">2h</span>
+      </article>`);
+    expect(cardAgeMinutes(root.querySelector("article")!)).toBe(120);
+  });
+
+  it("is not fooled by prose that merely contains a number", () => {
+    const root = mount(`
+      <article class="nt-card">
+        <div class="nt-card__headline">Alice replied: we tried this at 40k rows</div>
+      </article>`);
+    expect(cardAgeMinutes(root.querySelector("article")!)).toBeNull();
+  });
+
+  it("returns null when the card renders no age at all", () => {
+    const root = mount(`<article class="nt-card"><p>great point</p></article>`);
+    expect(cardAgeMinutes(root.querySelector("article")!)).toBeNull();
+  });
+});
+
+describe("the 12h recency window", () => {
+  const item = (age: number | null) => ({
+    external_id: "urn:li:comment:1",
+    public_id: "alice",
+    name: "Alice",
+    text: "a real question for you?",
+    url: "https://www.linkedin.com/feed/update/urn:li:activity:1/",
+    activity_urn: "urn:li:activity:1",
+    post_context: "",
+    age_minutes: age,
+  });
+  const pick = (age: number | null) => selectRepliesToMe([item(age)], { seen: [], max: 5 });
+
+  it("is twelve hours", () => {
+    expect(MAX_AGE_MINUTES).toBe(720);
+  });
+
+  it("keeps a 2h-old reply", () => {
+    expect(pick(120)).toHaveLength(1);
+  });
+
+  it("keeps one at exactly 12h (inclusive boundary)", () => {
+    expect(pick(720)).toHaveLength(1);
+  });
+
+  it("drops one at 12h01m", () => {
+    expect(pick(721)).toEqual([]);
+  });
+
+  it("keeps an 8h-old overnight reply — the reason for 9h over 6h", () => {
+    expect(pick(480)).toHaveLength(1);
+  });
+
+  it("drops a 1d-old reply the seen-ring has never seen", () => {
+    // The case the window exists for: unseen, therefore "new" by the old rule.
+    expect(pick(1440)).toEqual([]);
+  });
+
+  it("drops a card whose age could not be read", () => {
+    expect(pick(null)).toEqual([]);
+  });
+});
+
+describe("ageBuckets — the sweep's markup-break signal", () => {
+  const mk = (age: number | null) => ({
+    external_id: "x", public_id: "a", name: "A", text: "t", url: "u",
+    activity_urn: null, post_context: "", age_minutes: age,
+  });
+
+  it("counts recent, stale and undated separately", () => {
+    expect(ageBuckets([mk(60), mk(480), mk(1440), mk(null)], MAX_AGE_MINUTES)).toEqual({
+      recent: 2, stale: 1, undated: 1,
+    });
+  });
+
+  it("reports all-undated, which is what a time-ago rename looks like", () => {
+    expect(ageBuckets([mk(null), mk(null)], MAX_AGE_MINUTES)).toEqual({
+      recent: 0, stale: 0, undated: 2,
+    });
+  });
+});
+
+// The fixture includes 2h, 10h and 1d ages. Every supported card must have
+// a parsed age rather than silently becoming undated.
+describe("the recency window against the real captured notifications page", () => {
+  const here2 = dirname(fileURLToPath(import.meta.url));
+  const page = () => readFileSync(join(here2, "..", "fixtures", "notifications-page.html"), "utf8");
+
+  it("reads an age for every harvested card — none are undated", () => {
+    const items = harvestNotifications(mount(page()));
+    expect(items.length).toBeGreaterThan(0);
+    expect(items.filter((i) => i.age_minutes === null)).toEqual([]);
+  });
+
+  it("keeps the fresh ones and drops the ones older than 6h", () => {
+    const items = harvestNotifications(mount(page()));
+    // Exact numbers, not ">0": the real page has 2 reply cards at 2h and 1d.
+    expect(items.map((i) => i.age_minutes).sort((a, b) => a! - b!)).toEqual([120, 1440]);
+    expect(ageBuckets(items, MAX_AGE_MINUTES)).toEqual({ recent: 1, stale: 1, undated: 0 });
+
+    const picked = selectRepliesToMe(items, { seen: [], max: 50 });
+    expect(picked.map((p) => p.age_minutes)).toEqual([120]);
+  });
+});
+
+// Adversarial review found the parser's rules were only START-anchored, so
+// non-English time text parsed WRONG rather than null — and always in the
+// dangerous direction, toward "just now". The harvest is language-independent
+// (it keys on highlightedUpdateType, not prose), so the sweep genuinely does
+// run on a non-English UI.
+describe("ageMinutesFromText never guesses on foreign-language time text", () => {
+  const wrongAndFresh = [
+    ["3 sem", "Spanish/French weeks — was read as 3 SECONDS"],
+    ["3 semanas", "Spanish weeks"],
+    ["1 sem.", "abbreviated weeks"],
+    ["3 semaines", "French weeks"],
+    ["2 sett", "Italian weeks"],
+    ["1 mes", "Spanish month — was read as 1 MINUTE"],
+    ["3 meses", "Spanish months"],
+    ["3 mesi", "Italian months"],
+    ["12 Sep", "an absolute date — was read as 12 seconds"],
+  ] as const;
+
+  for (const [text, why] of wrongAndFresh) {
+    it(`returns null for "${text}" (${why})`, () => {
+      expect(ageMinutesFromText(text)).toBeNull();
+    });
+  }
+
+  it("a months-old notification can never look minutes old", () => {
+    // The property behind all of the above: nothing that is not really recent
+    // may parse to a small number. Null is a skip; a small number is a reply.
