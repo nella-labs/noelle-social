@@ -1198,3 +1198,118 @@ function ModelPills({
             fontFamily: "var(--body)",
           }}
         >
+          {options.find((o) => o.value === defaultValue)?.hint}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Number input for a soft-pause cap. Renders blank when the DB value is
+ * null so the founder can see "no cap" at a glance and doesn't have to
+ * delete a zero to clear it. The server action treats "" → null.
+ */
+// Discovery numeric input — like CapInput but with configurable bounds and no
+// "no cap" helper text (a blank field means "no filter" / the worker default,
+// which the field's hint already explains).
+function DiscNumInput({
+  name,
+  defaultValue,
+  disabled,
+  placeholder,
+  min,
+  max,
+}: {
+  name: string;
+  defaultValue: number | null;
+  disabled?: boolean;
+  placeholder?: string;
+  min: number;
+  max: number;
+}) {
+  return (
+    <input
+      type="number"
+      name={name}
+      defaultValue={defaultValue ?? ""}
+      min={min}
+      max={max}
+      step={1}
+      disabled={disabled}
+      placeholder={placeholder}
+      inputMode="numeric"
+      style={{
+        width: "100%",
+        maxWidth: 140,
+        padding: "8px 10px",
+        borderRadius: 7,
+        fontFamily: "var(--mono)",
+        fontSize: 13,
+        background: "var(--paper)",
+        color: "var(--ink)",
+        border: "none",
+        boxShadow: "0 0 0 0.5px var(--rule)",
+        opacity: disabled ? 0.55 : 1,
+      }}
+    />
+  );
+}
+
+function CapInput({
+  name,
+  defaultValue,
+  disabled,
+  placeholder,
+}: {
+  name: string;
+  defaultValue: number | null;
+  disabled?: boolean;
+  placeholder?: string;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        flexWrap: "wrap",
+        opacity: disabled ? 0.55 : 1,
+      }}
+    >
+      <input
+        type="number"
+        name={name}
+        defaultValue={defaultValue ?? ""}
+        min={1}
+        step={1}
+        disabled={disabled}
+        placeholder={placeholder}
+        inputMode="numeric"
+        style={{
+          width: "100%",
+          maxWidth: 140,
+          minWidth: 0,
+          padding: "8px 10px",
+          borderRadius: 7,
+          fontFamily: "var(--mono)",
+          fontSize: 13,
+          background: "var(--paper)",
+          color: "var(--ink)",
+          border: "none",
+          boxShadow: "0 0 0 0.5px var(--rule)",
+        }}
+      />
+      <span
+        style={{
+          fontSize: 11.5,
+          color: "var(--ink-muted)",
+          fontFamily: "var(--mono)",
+        }}
+      >
+        {defaultValue == null ? "blank = no cap" : `currently capped at ${defaultValue}`}
+      </span>
+    </div>
+  );
+}
+
