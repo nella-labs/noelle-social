@@ -798,3 +798,203 @@ describe("Jev-first draft verification", () => {
       postText: "A demo shows the workflow; a showcase proves what people built with it.",
       voiceAnchors: ["Pinned writer example (FORM and voice only): I built my own agent workflow."],
     }, legacy, { jevRun: async () => ({ answers: {
+      voice: { type: "boolean", probability: 0.91 },
+      grounding: { type: "boolean", probability: 0.23 },
+      relevance: { type: "boolean", probability: 0.92 },
+    } }) });
+
+    expect(verdict.pass).toBe(false);
+    expect(verdict.judgeProvider).toBe("jev");
+    expect(verdict.scores.grounding).toBe(0.23);
+    expect(verdict.fix).toMatch(/remove.*unsupported.*(experience|process|product)/i);
+    expect(verdict.fix).toMatch(/original post/i);
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it("grades short LinkedIn voice by transferable tone rather than pinned post length or topic", async () => {
+    let voiceQuestion = "";
+    const verdict = await verifyDrafts([reply("the showcase bit makes this feel real")], {
+      ...ctx,
+      platform: "linkedin",
+      voiceAnchors: ["Pinned writer example (FORM and voice only): A long personal founder story."],
+    }, goodJudge, { jevRun: async (request) => {
+      voiceQuestion = request.questions.voice!.instructions;
+      return { answers: {
+        voice: { type: "boolean", probability: 0.12 },
+        grounding: { type: "boolean", probability: 0.92 },
+        relevance: { type: "boolean", probability: 0.91 },
+      } };
+    } });
+    expect(voiceQuestion).toMatch(/tone.*register.*cadence/i);
+    expect(voiceQuestion).toMatch(/length.*topic/i);
+    expect(verdict.pass).toBe(false);
+    expect(verdict.fix).toMatch(/short.*comment/i);
+    expect(verdict.fix).toMatch(/tone.*register.*cadence/i);
+  });
+
+  it("asks Jev to check every draft when a LinkedIn set also includes a DM", async () => {
+    let voiceQuestion = "";
+    await verifyDrafts([
+      reply("the showcase bit makes this feel real"),
+      { kind: "dm", angle: null, body: "I liked the distinction you made between demos and showcases" },
+    ], { ...ctx, platform: "linkedin" }, goodJudge, { jevRun: async (request) => {
+      voiceQuestion = request.questions.voice!.instructions;
+      return { answers: {
+        voice: { type: "boolean", probability: 0.91 },
+        grounding: { type: "boolean", probability: 0.92 },
+        relevance: { type: "boolean", probability: 0.93 },
+      } };
+    } });
+
+    expect(voiceQuestion).toMatch(/every draft/i);
+    expect(voiceQuestion).not.toMatch(/each short comment/i);
+    expect(voiceQuestion).toMatch(/reply drafts.*final period/i);
+    expect(voiceQuestion).toMatch(/DMs.*punctuation/i);
+  });
+
+  it("falls back to the legacy judge for uncertain Jev dimensions", async () => {
+    const verdict = await verifyDrafts([reply("sccache cut my rust builds in half, worth a look")], ctx,
+      goodJudge, { jevRun: jevAnswers(0.6) });
+    expect(verdict.judgeProvider).toBe("legacy");
+    expect(verdict.judgeOk).toBe(true);
+    expect(verdict.scores.voice).toBe(0.9);
+  });
+
+  it("tells the uncertain LinkedIn fallback that a public reply may end without a full stop", async () => {
+    let system = "";
+    await verifyDrafts([reply("A profile visit may warm up the next conversation")],
+      { ...ctx, platform: "linkedin" }, async (instructions) => {
+        system = instructions;
+        return goodJudge();
+      }, { jevRun: jevAnswers(0.6) });
+    expect(system).toContain("Public replies intentionally omit full stops");
+    expect(system).toContain("Do not penalize a missing final period");
+  });
+
+  it("keeps a clear Jev failure when another dimension is uncertain", async () => {
+    const legacy = vi.fn(goodJudge);
+    const verdict = await verifyDrafts([reply("sccache cut my rust builds in half, worth a look")], ctx,
+      legacy, { jevRun: async () => ({ answers: {
+        voice: { type: "boolean", probability: 0.15 },
+        grounding: { type: "boolean", probability: 0.74 },
+        relevance: { type: "boolean", probability: 0.93 },
+      } }) });
+    expect(verdict.pass).toBe(false);
+    expect(verdict.judgeOk).toBe(true);
+    expect(verdict.judgeProvider).toBe("jev");
+    expect(verdict.scores.voice).toBe(0.15);
+    expect(verdict.fix).toContain("voice");
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it("uses the legacy judge only to fill uncertain dimensions", async () => {
+    const verdict = await verifyDrafts([reply("sccache cut my rust builds in half, worth a look")], ctx,
+      async () => JSON.stringify({ voice: 0.2, grounding: 0.9, relevance: 0.1, reasons: [], fix: null }),
+      { jevRun: async () => ({ answers: {
+        voice: { type: "boolean", probability: 0.92 },
+        grounding: { type: "boolean", probability: 0.62 },
+        relevance: { type: "boolean", probability: 0.94 },
+      } }) });
+    expect(verdict.pass).toBe(true);
+    expect(verdict.judgeOk).toBe(true);
+    expect(verdict.judgeProvider).toBe("mixed");
+    expect(verdict.scores).toMatchObject({ voice: 0.92, grounding: 0.9, relevance: 0.94 });
+  });
+
+  it("keeps fallback feedback on the dimensions the fallback actually decides", async () => {
+    const verdict = await verifyDrafts([reply("sccache cut my rust builds in half, worth a look")], ctx,
+      async () => JSON.stringify({ voice: 0.2, grounding: 0.2, relevance: 0.1,
+        reasons: ["Voice is too generic"], fix: "Rewrite the voice" }),
+      { jevRun: async () => ({ answers: {
+        voice: { type: "boolean", probability: 0.92 },
+        grounding: { type: "boolean", probability: 0.62 },
+        relevance: { type: "boolean", probability: 0.94 },
+      } }) });
+    expect(verdict.pass).toBe(false);
+    expect(verdict.judgeProvider).toBe("mixed");
+    expect(verdict.reasons.join(" ")).toContain("grounding");
+    expect(verdict.reasons.join(" ")).not.toContain("Voice is too generic");
+    expect(verdict.fix).toContain("grounding");
+    expect(verdict.fix).not.toContain("Rewrite the voice");
+  });
+
+  it("turns an uncertain LinkedIn voice failure into a specific non-summary repair", async () => {
+    const verdict = await verifyDrafts([reply("Seven touchpoints may warm up the cold message")],
+      { ...ctx, platform: "linkedin" },
+      async () => JSON.stringify({ voice: 0.45, grounding: 0.9, relevance: 0.9,
+        reasons: ["It only repeats the post"], fix: "Add a new angle" }),
+      { jevRun: async () => ({ answers: {
+        voice: { type: "boolean", probability: 0.61 },
+        grounding: { type: "boolean", probability: 0.93 },
+        relevance: { type: "boolean", probability: 0.91 },
+      } }) });
+    expect(verdict.pass).toBe(false);
+    expect(verdict.judgeProvider).toBe("mixed");
+    expect(verdict.fix).toMatch(/source-grounded.*question/i);
+    expect(verdict.fix).toMatch(/not.*(?:recap|restate).*number/i);
+    expect(verdict.fix).not.toContain("Add a new angle");
+  });
+
+  it("cannot auto-approve clear Jev passes when their uncertain fallback fails", async () => {
+    const verdict = await verifyDrafts([reply("sccache cut my rust builds in half, worth a look")], ctx,
+      async () => { throw new Error("legacy down"); },
+      { jevRun: async () => ({ answers: {
+        voice: { type: "boolean", probability: 0.91 },
+        grounding: { type: "boolean", probability: 0.67 },
+        relevance: { type: "boolean", probability: 0.95 },
+      } }) });
+    expect(verdict.judgeOk).toBe(false);
+    expect(verdict.judgeProvider).toBe("none");
+    expect(verdict.scores.voice).toBe(0.91);
+  });
+
+  it("does not mark a double-failed judge as genuine", async () => {
+    const verdict = await verifyDrafts([reply("sccache cut my rust builds in half, worth a look")], ctx,
+      async () => { throw new Error("legacy down"); }, { jevRun: async () => { throw new Error("jev down"); } });
+    expect(verdict.judgeProvider).toBe("none");
+    expect(verdict.judgeOk).toBe(false);
+  });
+});
+
+// ---- anti-ai skill: reader-mode tells (LinkedIn/strictVoice only) ----------
+// Sourced from the operator's `anti-ai` skill. Every case below asserts BOTH
+// legs: the tell hard-zeroes when strictVoice is on, and the SAME body is
+// untouched when it is off (so Vega/Orion behavior is provably unchanged).
+const strict = (body: string) => scoreFormat(reply(body), undefined, false, true);
+const loose = (body: string) => scoreFormat(reply(body), undefined, false, false);
+
+describe("scoreFormat — anti-ai significance markers (constraint 14)", () => {
+  const MARKERS = [
+    // NB: "that's the PART that…" is intentionally NOT here — SLOP_PHRASES
+    // already bans it platform-wide, so duplicating it only crowded the
+    // approval card. "bit" is the variant this family genuinely adds.
+    "sccache cut our builds to 40s. that's the bit that got me",
+    "we shipped it in a week, that's the uncomfortable part",
+    "what got me was how long the cold start took",
+    "the retries never fire, that's what kills me",
+    "here's the thing, incremental builds were never the bottleneck",
+    "the thing is, cargo caches the wrong layer",
+    "we rewrote the resolver and that's the point",
+    "it retries on a 500 which is exactly the problem",
+    "four hours of CI per merge. let that sink in",
+  ];
+  for (const body of MARKERS) {
+    it(`hard-zeroes a significance marker: "${body.slice(0, 34)}…"`, () => {
+      const f = strict(body);
+      expect(f.score).toBe(0);
+      expect(f.reasons.join(" ")).toMatch(/significance-marking meta commentary/);
+      // The fix must be DELETION, not rewording — that is what flipped the
+      // verdict in the skill's single-variable field test.
+      expect(f.reasons.join(" ")).toMatch(/DELETE the sentence outright/);
+    });
+    // NB: assert the NEW rule stays silent rather than score===1 — some of these
+    // bodies also trip a pre-existing platform-agnostic SLOP_PHRASES entry (e.g.
+    // "that's the part that…" already matched the "the part where/about/of/that"
+    // ban), so a score assertion here would test the old rule, not this one.
+    it(`does not fire the new rule when strictVoice is off: "${body.slice(0, 34)}…"`, () => {
+      expect(loose(body).reasons.join(" ")).not.toMatch(/significance-marking meta commentary/);
+    });
+  }
+});
+
+describe("scoreFormat — anti-ai reader-mode constructions", () => {
