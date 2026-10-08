@@ -198,3 +198,103 @@ describe("voyageContextEmbed — fail-open (returns [], never throws)", () => {
   it("returns [] on a malformed / empty body", async () => {
     process.env["VOYAGE_API_KEY"] = "k";
     vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ nope: true }), { status: 200 })),
+    );
+
+    expect(await voyageContextEmbed([["a"]])).toEqual([]);
+  });
+
+  it("returns [] when a document's chunk count doesn't match the input", async () => {
+    process.env["VOYAGE_API_KEY"] = "k";
+    // Asked for 2 chunks in doc0, got 1 → partial → fail open rather than holes.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => contextResponse([[{ index: 0, embedding: [1] }]])),
+    );
+
+    expect(await voyageContextEmbed([["a", "b"]])).toEqual([]);
+  });
+
+  it("returns [] when the document count doesn't match the input", async () => {
+    process.env["VOYAGE_API_KEY"] = "k";
+    // Asked for 2 docs, got 1 → fail open.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => contextResponse([[{ index: 0, embedding: [1] }]])),
+    );
+
+    expect(await voyageContextEmbed([["a"], ["b"]])).toEqual([]);
+  });
+
+  it("returns [] when the 10s timeout fires (abort)", async () => {
+    vi.useFakeTimers();
+    process.env["VOYAGE_API_KEY"] = "k";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => {
+              reject(new DOMException("Aborted", "AbortError"));
+            });
+          }),
+      ),
+    );
+
+    const promise = voyageContextEmbed([["a"]]);
+    await vi.advanceTimersByTimeAsync(10_001);
+    expect(await promise).toEqual([]);
+  });
+});
+
+describe("voyageContextEmbed — edge cases", () => {
+  it("returns [] for an empty document list without calling fetch", async () => {
+    process.env["VOYAGE_API_KEY"] = "k";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await voyageContextEmbed([])).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns [] when every document is empty (no chunks to embed)", async () => {
+    process.env["VOYAGE_API_KEY"] = "k";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await voyageContextEmbed([[], []])).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("voyageContextEmbedQuery — single-vector convenience", () => {
+  it("embeds one query string (input_type=query) and returns its vector", async () => {
+    process.env["VOYAGE_API_KEY"] = "k";
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        body = JSON.parse(init?.body as string);
+        return contextResponse([[{ index: 0, embedding: [0.5, 0.5] }]]);
+      }),
+    );
+
+    const vec = await voyageContextEmbedQuery("how do we ground drafts");
+    expect(vec).toEqual([0.5, 0.5]);
+    expect(body["inputs"]).toEqual([["how do we ground drafts"]]);
+    expect(body["input_type"]).toBe("query");
+  });
+
+  it("fails open to [] on a blank query (no fetch) and on any error", async () => {
+    process.env["VOYAGE_API_KEY"] = "k";
+    const fetchMock = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(await voyageContextEmbedQuery("   ")).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await voyageContextEmbedQuery("real query")).toEqual([]);
+  });
+});

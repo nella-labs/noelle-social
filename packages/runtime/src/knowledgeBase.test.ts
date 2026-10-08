@@ -398,3 +398,103 @@ describe("createLocalFsKnowledgeBase — hybrid dense lane", () => {
     // BM25 still works; a dense-disjoint query just returns the BM25 hits.
     const hits = await kb.search("canary rollout uptime", 5);
     expect(hits.length).toBeGreaterThan(0);
+    expect(hits[0]!.source.filePath).toContain("ops.md");
+    kb.close();
+  });
+
+  it("degrades to BM25 order when the corpus embed fails (all null)", async () => {
+    const nullEmbedder: KbDenseEmbedder = {
+      async embedDocuments(documents) {
+        return documents.map(() => null); // every file failed to embed
+      },
+      async embedQuery(query) {
+        return topicVec(query);
+      },
+    };
+    const kb = createLocalFsKnowledgeBase({
+      dir,
+      watch: false,
+      includeDirs: ["kb"],
+      dense: { enabled: true, embedder: nullEmbedder },
+    });
+    // No dense vectors → dense ranking empty → fused == BM25.
+    const hits = await kb.search("canary rollout uptime", 5);
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits[0]!.source.filePath).toContain("ops.md");
+    // A purely-dense query now finds nothing (no lexical overlap, no vectors).
+    expect(await kb.search("AI guardrails oversight", 5)).toEqual([]);
+    kb.close();
+  });
+
+  it("applies the optional rerank-2.5 layer over the fused pool", async () => {
+    // rerank reorders the fused top: stub it to rank ops.md (doc index 1) first.
+    const ORIGINAL_KEY = process.env["VOYAGE_API_KEY"];
+    process.env["VOYAGE_API_KEY"] = "k";
+    const fetchMock = vi.fn(async (url: string) => {
+      if (String(url).includes("/rerank")) {
+        // The fused docs are passed in some order; force index 1 to the top.
+        return new Response(
+          JSON.stringify({ data: [
+            { index: 1, relevance_score: 0.9 },
+            { index: 0, relevance_score: 0.1 },
+          ] }),
+          { status: 200 },
+        );
+      }
+      return new Response("nope", { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const kb = createLocalFsKnowledgeBase({
+        dir,
+        watch: false,
+        includeDirs: ["kb"],
+        dense: { enabled: true, embedder: topicEmbedder(), rerank: true, poolSize: 10 },
+      });
+      // A query both docs partially match, so the fused pool has ≥2 entries.
+      const hits = await kb.search("canary corrigible", 8);
+      expect(hits.length).toBeGreaterThanOrEqual(2);
+      // The rerank stub was consulted.
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/rerank"))).toBe(true);
+      kb.close();
+    } finally {
+      vi.unstubAllGlobals();
+      if (ORIGINAL_KEY === undefined) delete process.env["VOYAGE_API_KEY"];
+      else process.env["VOYAGE_API_KEY"] = ORIGINAL_KEY;
+    }
+  });
+
+  it("preserves the best lexical anchor and its gate score after a partial rerank", async () => {
+    vi.stubEnv("VOYAGE_API_KEY", "fixture-key");
+    const off = createLocalFsKnowledgeBase({ dir, watch: false, includeDirs: ["kb"] });
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const { documents } = JSON.parse(String(init?.body)) as { documents: string[] };
+      return Response.json({ data: [{ index: documents.findIndex(body => body.includes("corrigible")), relevance_score: 0.9 }] });
+    };
+    const on = createLocalFsKnowledgeBase({ dir, watch: false, includeDirs: ["kb"],
+      dense: { enabled: true, embedder: topicEmbedder(), rerank: true, fetchImpl } });
+    try {
+      const query = "canary rollout overseeable";
+      const pure = await off.search(query, 2), hybrid = await on.search(query, 2);
+      expect(hybrid).toHaveLength(2);
+      expect(hybrid.some(hit => hit.source.filePath.includes("ops.md"))).toBe(true);
+      expect(Math.max(...hybrid.map(hit => hit.score))).toBe(Math.max(...pure.map(hit => hit.score)));
+    } finally { on.close(); off.close(); vi.unstubAllEnvs(); }
+  });
+
+  it("is byte-identical to pure BM25 when dense is disabled (enabled:false)", async () => {
+    const off = createLocalFsKnowledgeBase({ dir, watch: false, includeDirs: ["kb"] });
+    const explicitlyOff = createLocalFsKnowledgeBase({
+      dir,
+      watch: false,
+      includeDirs: ["kb"],
+      dense: { enabled: false, embedder: topicEmbedder() },
+    });
+    const q = "canary rollout uptime";
+    const a = (await off.search(q, 5)).map((h) => [h.source.filePath, h.score]);
+    const b = (await explicitlyOff.search(q, 5)).map((h) => [h.source.filePath, h.score]);
+    expect(b).toEqual(a);
+    off.close();
+    explicitlyOff.close();
+  });
+});
