@@ -198,3 +198,104 @@ describe("createPgBudgetAdapters.fetchCaps", () => {
 describe("budget period window", () => {
   const withEnv = async (val: string | undefined, fn: () => Promise<void> | void) => {
     const prev = process.env.NOELLE_BUDGET_PERIOD;
+    if (val === undefined) delete process.env.NOELLE_BUDGET_PERIOD;
+    else process.env.NOELLE_BUDGET_PERIOD = val;
+    try {
+      await fn();
+    } finally {
+      if (prev === undefined) delete process.env.NOELLE_BUDGET_PERIOD;
+      else process.env.NOELLE_BUDGET_PERIOD = prev;
+    }
+  };
+
+  it("defaults to month, so an unset env changes nothing", async () => {
+    await withEnv(undefined, () => {
+      expect(resolveBudgetPeriod()).toBe("month");
+    });
+  });
+
+  it("NOELLE_BUDGET_PERIOD=week selects the weekly window", async () => {
+    await withEnv("week", () => {
+      expect(resolveBudgetPeriod()).toBe("week");
+    });
+  });
+
+  it("falls back to month on an unrecognised env value", async () => {
+    // A typo in ops config must not take the workers down, and the wider
+    // window is the fail-safe direction: it never blocks work month already allowed.
+    await withEnv("fortnight", () => {
+      expect(resolveBudgetPeriod()).toBe("month");
+    });
+  });
+
+  it("an explicit option beats the env", async () => {
+    await withEnv("week", () => {
+      expect(resolveBudgetPeriod("month")).toBe("month");
+    });
+  });
+
+  it("binds the period into BOTH spend windows, as a parameter not inline text", async () => {
+    // Both layers must measure the same window; a mismatch would compare an
+    // instance's weekly spend against the org's monthly total.
+    const { sql, queries, values } = sqlCapturing([
+      { bucket_cents: 0, org_cents: 0, instance_cents: 0 },
+    ]);
+    const adapters = createPgBudgetAdapters(sql, { ...APIFY_ONLY, period: "week" });
+    await adapters.fetchSpend({ bucket: "drafter", orgId: "o", instanceId: "i" });
+    const q = queries[0]!;
+    expect(q).toContain("date_trunc(");
+    expect(q).not.toContain("'month'");
+    expect(q).not.toContain("'week'");
+    expect(values[0]!.filter((v) => v === "week")).toHaveLength(2);
+  });
+
+  it("still binds month when nothing asks for week", async () => {
+    const { sql, values } = sqlCapturing([
+      { bucket_cents: 0, org_cents: 0, instance_cents: 0 },
+    ]);
+    const adapters = createPgBudgetAdapters(sql, { ...APIFY_ONLY, period: "month" });
+    await adapters.fetchSpend({ bucket: "drafter", orgId: "o", instanceId: "i" });
+    expect(values[0]!.filter((v) => v === "month")).toHaveLength(2);
+  });
+});
+
+describe("temporary cap pause", () => {
+  const MAX = Number.MAX_SAFE_INTEGER;
+  const caps = (paused: unknown) =>
+    sqlReturning([{ instance_cap: 25_000, org_cap_sum: 50_000, paused_until: paused }]);
+
+  it("lifts every layer while the pause is in the future", async () => {
+    const future = new Date(Date.now() + 60 * 60_000);
+    const a = createPgBudgetAdapters(caps(future), APIFY_ONLY);
+    const got = await a.fetchCaps({ bucket: "drafter", orgId: "o", instanceId: "i" });
+    expect(got).toEqual({ bucket: MAX, org: MAX, instance: MAX });
+  });
+
+  it("enforces again once the pause has passed — it expires itself", async () => {
+    const past = new Date(Date.now() - 1_000);
+    const a = createPgBudgetAdapters(caps(past), APIFY_ONLY);
+    const got = await a.fetchCaps({ bucket: "drafter", orgId: "o", instanceId: "i" });
+    expect(got).toEqual({ bucket: 50_000, org: 50_000, instance: 25_000 });
+  });
+
+  it("enforces when no pause is set", async () => {
+    const a = createPgBudgetAdapters(caps(null), APIFY_ONLY);
+    const got = await a.fetchCaps({ bucket: "drafter", orgId: "o", instanceId: "i" });
+    expect(got.org).toBe(50_000);
+  });
+
+  it("enforces when the timestamp is unparseable, rather than failing open", async () => {
+    const a = createPgBudgetAdapters(caps("not a date"), APIFY_ONLY);
+    const got = await a.fetchCaps({ bucket: "drafter", orgId: "o", instanceId: "i" });
+    expect(got.org).toBe(50_000);
+  });
+
+  it("reads an absent pause through schema-safe JSON without retrying errors", async () => {
+    const { sql, queries } = sqlCapturing([{ instance_cap: 25_000, org_cap_sum: 50_000 }]);
+    const a = createPgBudgetAdapters(sql, APIFY_ONLY);
+    const got = await a.fetchCaps({ bucket: "drafter", orgId: "o", instanceId: "i" });
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toContain("to_jsonb(o)");
+    expect(got).toEqual({ bucket: 50_000, org: 50_000, instance: 25_000 });
+  });
+});
