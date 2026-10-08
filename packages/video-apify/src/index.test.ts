@@ -198,3 +198,203 @@ describe("creatorReels", () => {
     expect(clips[0]!.platform).toBe("tiktok");
   });
 
+  it("drops clips older than sinceISO + dedupes by id", async () => {
+    const h = harness(() => ({ items: [IG_SAMPLE, IG_SAMPLE] })); // IG_SAMPLE = 2026-06-01
+    const dropped = await h.client.creatorReels({ platform: "instagram", handle: "x", sinceISO: "2026-06-15T00:00:00Z" });
+    expect(dropped).toHaveLength(0);
+    const kept = await h.client.creatorReels({ platform: "instagram", handle: "x", sinceISO: "2026-05-01T00:00:00Z" });
+    expect(kept).toHaveLength(1); // deduped despite two copies
+  });
+
+  it("propagates a 402 as an ApifyError (quota surfaces, not swallowed)", async () => {
+    const h = harness(() => ({ status: 402, text: "Monthly usage hard limit exceeded" }));
+    await expect(h.client.creatorReels({ platform: "instagram", handle: "x" })).rejects.toBeInstanceOf(ApifyError);
+    await expect(h.client.creatorReels({ platform: "instagram", handle: "x" })).rejects.toMatchObject({ status: 402 });
+  });
+
+  it("requires a handle", async () => {
+    const h = harness(() => ({ items: [] }));
+    await expect(h.client.creatorReels({ platform: "instagram", handle: "" })).rejects.toBeInstanceOf(ApifyError);
+  });
+
+  it("honours actor id overrides", async () => {
+    // Return a clip so the primary wins and we don't fall through to coderx.
+    const h = harness(() => ({ items: [IG_SAMPLE] }), { instagramActorId: "me~custom-ig" });
+    await h.client.creatorReels({ platform: "instagram", handle: "x" });
+    expect(h.startUrl()).toContain("/v2/acts/me~custom-ig/");
+  });
+});
+
+describe("instagram fallback chain", () => {
+  // A coderx profile item: posts nested under latestPosts, follower count on the
+  // profile, snake_case video_view_count.
+  const CODERX_PROFILE = {
+    username: "andrescontrerasofficial",
+    followersCount: 183_000,
+    latestPosts: [
+      {
+        shortCode: "DMYDLYiRM2I",
+        url: "https://www.instagram.com/p/DMYDLYiRM2I",
+        caption: "build in public day 42",
+        productType: "clips",
+        likesCount: 3_906,
+        commentsCount: 298,
+        video_view_count: 120_000,
+        timestamp: "2026-06-20T16:03:03.000Z",
+      },
+    ],
+  };
+
+  it("falls through to coderx when the primary returns no usable clips (IG-block)", async () => {
+    // Primary 201s with an error item (the real IG-block shape) -> 0 clips.
+    const blocked = { error: "no_items", errorDescription: "Empty or private data for provided input" };
+    const h = harness((url) =>
+      url.includes(INSTAGRAM_FALLBACK_ACTOR_ID) ? { items: [CODERX_PROFILE] } : { items: [blocked] },
+    );
+    const clips = await h.client.creatorReels({ platform: "instagram", handle: "andrescontrerasofficial" });
+    expect(clips).toHaveLength(1);
+    expect(clips[0]!.id).toBe("DMYDLYiRM2I");
+    expect(clips[0]!.views).toBe(120_000); // snake_case video_view_count read
+    expect(clips[0]!.likes).toBe(3_906);
+    expect(clips[0]!.authorHandle).toBe("andrescontrerasofficial");
+    expect(clips[0]!.authorFollowerCount).toBe(183_000); // grafted from profile
+  });
+
+  it("falls through to coderx after a confirmed terminal primary actor failure", async () => {
+    const h = harness((url) =>
+      url.includes(INSTAGRAM_FALLBACK_ACTOR_ID) ? { items: [CODERX_PROFILE] } : { runStatus: "FAILED" },
+    );
+    const clips = await h.client.creatorReels({ platform: "instagram", handle: "andrescontrerasofficial" });
+    expect(clips).toHaveLength(1);
+    expect(clips[0]!.id).toBe("DMYDLYiRM2I");
+  });
+
+  it("does NOT use coderx for the hashtag/niche lane (username-only)", async () => {
+    const urls: string[] = [];
+    const h = harness((url) => {
+      urls.push(url);
+      return { items: [] };
+    });
+    await h.client.hashtagReels({ platform: "instagram", query: "#aifounders" });
+    expect(urls.every((u) => !u.includes(INSTAGRAM_FALLBACK_ACTOR_ID))).toBe(true);
+  });
+
+  it("surfaces a token-fatal error before dispatching another provider", async () => {
+    let attempts = 0;
+    const h = harness(() => { attempts++; return { status: 402, text: "Monthly usage hard limit exceeded" }; });
+    await expect(
+      h.client.creatorReels({ platform: "instagram", handle: "x" }),
+    ).rejects.toMatchObject({ status: 402 });
+    expect(attempts).toBe(1);
+  });
+});
+
+describe("hashtagReels", () => {
+  // A search/hashtag-actor item that is a PHOTO (no video fields) — must be
+  // dropped by the video-only filter so Nova never studies a still image.
+  const IG_PHOTO = {
+    id: "p-9001",
+    shortCode: "Cphoto1",
+    type: "Image",
+    caption: "carousel of quotes",
+    ownerUsername: "quotemachine",
+    likesCount: 12_000,
+    commentsCount: 80,
+    displayUrl: "https://scontent.cdninstagram.com/photo.jpg",
+    timestamp: "2026-06-02T12:00:00.000Z",
+  };
+
+  it("hits the keyword/search discovery actor first (not the blocked general scraper)", async () => {
+    const h = harness(() => ({ items: [IG_SAMPLE] }));
+    const clips = await h.client.hashtagReels({ platform: "instagram", query: "#aifounders", maxItems: 8 });
+    expect(h.startUrl()).toContain(`/v2/acts/${INSTAGRAM_SEARCH_ACTOR_ID}/`);
+    expect(h.body().search).toBe("aifounders"); // leading # stripped
+    expect(h.body().searchType).toBe("popular");
+    expect(h.body().searchLimit).toBe(8);
+    expect(clips).toHaveLength(1);
+  });
+
+  it("falls through to the hashtag actor when the search feed has no reels", async () => {
+    const urls: string[] = [];
+    const h = harness((url) => {
+      urls.push(url);
+      // search actor returns only a photo (filtered out) -> fall through.
+      if (url.includes(INSTAGRAM_SEARCH_ACTOR_ID)) return { items: [IG_PHOTO] };
+      if (url.includes(INSTAGRAM_HASHTAG_ACTOR_ID)) return { items: [IG_SAMPLE] };
+      return { items: [] };
+    });
+    const clips = await h.client.hashtagReels({ platform: "instagram", query: "aifounders" });
+    expect(urls.some((u) => u.includes(INSTAGRAM_SEARCH_ACTOR_ID))).toBe(true);
+    expect(urls.some((u) => u.includes(INSTAGRAM_HASHTAG_ACTOR_ID))).toBe(true);
+    expect(h.body().resultsType).toBe("reels");
+    expect(clips).toHaveLength(1);
+    expect(clips[0]!.id).toBe("3001");
+  });
+
+  it("drops photo items from the discovery feed (video-only)", async () => {
+    // Only the discovery actors return the photo; every actor's photo is filtered
+    // by igVideoItems, so the chain yields nothing rather than studying a still.
+    const h = harness((url) =>
+      url.includes(INSTAGRAM_SEARCH_ACTOR_ID) || url.includes(INSTAGRAM_HASHTAG_ACTOR_ID)
+        ? { items: [IG_PHOTO] }
+        : { items: [] },
+    );
+    const clips = await h.client.hashtagReels({ platform: "instagram", query: "quotes" });
+    expect(clips).toHaveLength(0);
+  });
+
+  it("falls back to the general scraper via explore/tags + reels when both discovery actors are empty", async () => {
+    const urls: string[] = [];
+    const h = harness((url) => {
+      urls.push(url);
+      if (url.includes(INSTAGRAM_SEARCH_ACTOR_ID) || url.includes(INSTAGRAM_HASHTAG_ACTOR_ID)) {
+        return { items: [] };
+      }
+      // general scraper (last hashtag resort) returns a reel
+      return { items: [IG_SAMPLE] };
+    });
+    const clips = await h.client.hashtagReels({ platform: "instagram", query: "YC Founders", maxItems: 8 });
+    // reached the general scraper, driven by the explore/tags URL (space-stripped) + reels
+    expect(h.startUrl()).toContain(`/v2/acts/${INSTAGRAM_ACTOR_ID}/`);
+    expect(h.body().directUrls).toEqual(["https://www.instagram.com/explore/tags/ycfounders/"]);
+    expect(h.body().resultsType).toBe("reels");
+    expect(clips).toHaveLength(1);
+    expect(clips[0]!.id).toBe("3001");
+  });
+
+  it("passes hashtags straight through for tiktok", async () => {
+    const h = harness(() => ({ items: [] }));
+    await h.client.hashtagReels({ platform: "tiktok", query: "#growth", maxItems: 8 });
+    expect(h.startUrl()).toContain(`/v2/acts/${TIKTOK_ACTOR_ID}/`);
+    expect(h.body().hashtags).toEqual(["growth"]);
+  });
+
+  it("requires a query", async () => {
+    const h = harness(() => ({ items: [] }));
+    await expect(h.client.hashtagReels({ platform: "tiktok", query: "" })).rejects.toBeInstanceOf(ApifyError);
+  });
+});
+
+describe("nicheCreatorReels (profile-based niche)", () => {
+  it("discovers creators by user-search, then harvests + merges each one's reels", async () => {
+    const urls: string[] = [];
+    const h = harness((url, body) => {
+      urls.push(url);
+      // user-search returns two niche accounts
+      if (url.includes(INSTAGRAM_SEARCH_ACTOR_ID) && body.searchType === "user") {
+        return { items: [{ username: "AiFounderOne" }, { username: "aifoundertwo" }] };
+      }
+      // creator harvest via the general scraper — one reel per creator, id by handle
+      if (url.includes(INSTAGRAM_ACTOR_ID)) {
+        const u = String((body.directUrls as string[] | undefined)?.[0] ?? "");
+        const id = u.includes("aifounderone") ? "r-1" : "r-2";
+        return { items: [{ ...IG_SAMPLE, id, shortCode: id }] };
+      }
+      return { items: [] };
+    });
+    const clips = await h.client.nicheCreatorReels({ platform: "instagram", query: "AI founder", maxCreators: 2 });
+    expect(urls.some((u) => u.includes(INSTAGRAM_SEARCH_ACTOR_ID))).toBe(true); // did the user-search
+    expect(clips.map((c) => c.id).sort()).toEqual(["r-1", "r-2"]); // both creators harvested + merged
+  });
+
+  it("falls back to the hashtag lane when profile discovery finds no creators", async () => {
