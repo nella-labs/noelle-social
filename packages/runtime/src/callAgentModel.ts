@@ -398,3 +398,203 @@ async function tryCodexFailover(opts: {
     isClaudeCliAuthFailure(opts.source, opts.error);
   if (!eligible) return null;
 
+  const codex = opts.deps.engines["codex-cli"];
+  if (
+    !codex ||
+    !codexFailoverEnabled() ||
+    !(await codexPotHasRoom(opts.deps, opts.args.orgId))
+  ) {
+    return null;
+  }
+
+  const target: EngineHandle = { engine: "codex-cli", model: "gpt-5" };
+  opts.log("claude unavailable, failing over to codex", {
+    primary: opts.source,
+    fallback: target,
+    error: errMsg(opts.error),
+  });
+  try {
+    return await invoke({
+      engine: target,
+      args: opts.args,
+      deps: opts.deps,
+      recorder: opts.recorder,
+      outcome: "fallback",
+      skipCapPreflight: true,
+    });
+  } catch (codexErr) {
+    if (codexErr instanceof PgOperationError) throw codexErr;
+    opts.log("codex failover failed", {
+      primary: opts.source,
+      fallback: target,
+      error: errMsg(codexErr),
+    });
+    return null;
+  }
+}
+
+/** Meter a direct backend through the same admission and settlement owner as routed calls. */
+export function createBudgetedBackend(backend: EngineBackend, options: {
+  engine: EngineKey;
+  context: Pick<CallAgentModelArgs, "orgId" | "instanceId" | "agentRole" | "worker" | "bucket">;
+  budget: BudgetDeps;
+  recorder: SpendRecorder;
+  /** A bounded acknowledgement after admission; the callback must not invoke a provider. */
+  beforeDispatch?: () => Promise<"dispatch" | "not_dispatched">;
+}): EngineBackend {
+  return {
+    async call(call) {
+      const engine = { engine: options.engine, model: call.model } as EngineHandle;
+      const result = await invoke({ engine, args: { ...options.context, system: call.system,
+        prompt: call.prompt, routing: { primary: engine } },
+        deps: { engines: { [options.engine]: backend }, budget: options.budget },
+        recorder: options.recorder, outcome: "ok", callOverride: call,
+        ...(options.beforeDispatch ? { beforeDispatch: options.beforeDispatch } : {}) });
+      return { text: result.text, usage: result.usage };
+    },
+  };
+}
+
+async function invoke(opts: {
+  engine: EngineHandle;
+  args: CallAgentModelArgs;
+  deps: CallAgentModelDeps;
+  recorder: SpendRecorder;
+  outcome: "ok" | "fallback";
+  /**
+   * Skip the cap pre-flight for this call. Set ONLY on the codex failover: the
+   * cap that sent us here measures the Claude pot, so re-checking it would
+   * refuse the very call meant to route around it. Codex spend is excluded from
+   * that cap (see CAP_EXEMPT_ENGINES_*) and is bounded today by ChatGPT's own
+   * account limits rather than by Noelle.
+   */
+  skipCapPreflight?: boolean;
+  callOverride?: Parameters<EngineBackend["call"]>[0];
+  beforeDispatch?: () => Promise<"dispatch" | "not_dispatched">;
+}): Promise<CallAgentModelResult> {
+  const backend = opts.deps.engines[opts.engine.engine];
+  if (!backend) throw new EngineNotImplementedError(opts.engine.engine);
+
+
+  const call: Parameters<EngineBackend["call"]>[0] = opts.callOverride ?? {
+    system: opts.args.system,
+    prompt: opts.args.prompt,
+    model: opts.engine.model,
+  };
+  if (!opts.callOverride && opts.args.tools) call.tools = opts.args.tools;
+  if (!opts.callOverride && opts.engine.engine === "codex-cli" && opts.args.codexReasoningEffort) {
+    call.reasoningEffort = opts.args.codexReasoningEffort;
+  }
+  // Prompt caching (default OFF). Both env reads happen ONLY here at the impure
+  // boundary; the decision helpers stay pure. When a flag is off the field is
+  // NOT set, so the request object is byte-identical to today.
+  //
+  //  - PREFIX split (NOELLE_PROMPT_CACHE_ENABLED): forward the caller-computed
+  //    prefix length so a caching-capable backend caches the stable prefix.
+  //  - WHOLE-system (NOELLE_PROMPT_CACHE_SYSTEM): cache the entire system block
+  //    for byte-stable drafter buckets.
+  // If both were on, the prefix split takes precedence in the backend (it is a
+  // strict superset — it caches a prefix and leaves the rest uncached).
+  if (
+    !opts.callOverride && process.env.NOELLE_PROMPT_CACHE_ENABLED === "1" &&
+    typeof opts.args.systemCachePrefixLen === "number"
+  ) {
+    call.systemCachePrefixLen = opts.args.systemCachePrefixLen;
+  }
+  if (!opts.callOverride && shouldCacheSystem(opts.args.bucket, process.env.NOELLE_PROMPT_CACHE_SYSTEM)) {
+    call.cacheSystem = true;
+  }
+  const deadline = bucketTimeoutMs(opts.args.bucket);
+  if (!opts.callOverride && deadline !== undefined) call.timeoutMs = deadline;
+
+  const preflightCents = opts.deps.budget.estimateCents
+    ? opts.deps.budget.estimateCents({ engine: opts.engine, system: call.system, prompt: call.prompt })
+    : estimatePreflightCents(opts.engine, call.system, call.prompt);
+  let attemptId: string | undefined;
+  try {
+    const reserve = opts.deps.budget.adapters.reserveAttempt;
+    if (reserve) {
+      const admission = await reserve({
+        orgId: opts.args.orgId, instanceId: opts.args.instanceId, agentRole: opts.args.agentRole,
+        worker: opts.args.worker, bucket: opts.args.bucket, engine: opts.engine.engine,
+        model: opts.engine.model, estimatedCents: preflightCents,
+        ...(opts.engine.engine === "codex-cli" ? { engineCapCents: Math.floor(codexCapCents()) } : {}),
+      });
+      attemptId = admission.attemptId;
+    } else if (!opts.skipCapPreflight) {
+      await assertWithinCap({ bucket: opts.args.bucket, orgId: opts.args.orgId,
+        instanceId: opts.args.instanceId, estimatedCents: preflightCents }, opts.deps.budget.adapters);
+    }
+  } catch (error) {
+    if (error instanceof BudgetExceededError) {
+      await safeRecord(opts.recorder, {
+        orgId: opts.args.orgId, instanceId: opts.args.instanceId, agentRole: opts.args.agentRole,
+        worker: opts.args.worker, engine: opts.engine.engine, model: opts.engine.model,
+        bucket: opts.args.bucket, inputTokens: 0, outputTokens: 0, cents: 0,
+        latencyMs: null, status: "budget_exceeded", costBasis: "not_dispatched", startedAt: new Date(),
+      });
+    }
+    throw error;
+  }
+
+  const startedAt = new Date();
+  if (opts.beforeDispatch) {
+    let decision: "dispatch" | "not_dispatched" | undefined;
+    let acknowledgementError: unknown;
+    try {
+      decision = await opts.beforeDispatch();
+      if (decision !== "dispatch" && decision !== "not_dispatched") {
+        throw new Error("Invalid model dispatch acknowledgement");
+      }
+    } catch (error) {
+      acknowledgementError = error;
+    }
+    if (decision !== "dispatch") {
+      const confirmed = decision === "not_dispatched";
+      await safeRecord(opts.recorder, {
+        orgId: opts.args.orgId, instanceId: opts.args.instanceId, agentRole: opts.args.agentRole,
+        worker: opts.args.worker, engine: opts.engine.engine, model: opts.engine.model,
+        bucket: opts.args.bucket, inputTokens: 0, outputTokens: 0, cents: 0, latencyMs: null,
+        status: "error", costBasis: confirmed ? "not_dispatched" : "unknown", startedAt,
+        ...(attemptId ? { attemptId } : {}),
+      });
+      if (confirmed) throw new ModelNotDispatchedError();
+      throw acknowledgementError;
+    }
+  }
+  const t0 = Date.now();
+  try {
+    const { text, usage: reportedUsage } = await backend.call(call);
+    const latencyMs = Date.now() - t0;
+    const accounting = completedCallAccounting(opts.engine, reportedUsage);
+    const usage: TokenUsage = { input_tokens: accounting.inputTokens, output_tokens: accounting.outputTokens,
+      ...(!accounting.tokenUsageReported ? { token_usage_reported: false } : {}),
+      ...(accounting.costBasis === "provider_reported" ? { cost_usd: reportedUsage.cost_usd } : {}) };
+    await safeRecord(opts.recorder, {
+      orgId: opts.args.orgId,
+      instanceId: opts.args.instanceId,
+      agentRole: opts.args.agentRole,
+      worker: opts.args.worker,
+      engine: opts.engine.engine,
+      model: opts.engine.model,
+      bucket: opts.args.bucket,
+      inputTokens: usage.input_tokens,
+      outputTokens: usage.output_tokens,
+      cents: accounting.cents,
+      costBasis: accounting.costBasis,
+      latencyMs,
+      status: "ok",
+      startedAt,
+      ...(attemptId ? { attemptId } : {}),
+    });
+    return { text, usage, engineUsed: opts.engine, outcome: opts.outcome };
+  } catch (engineErr) {
+    const latencyMs = Date.now() - t0;
+    const status: SpendStatus = isTimeout(engineErr) ? "timeout" : "error";
+    // A dispatched failure has no confirmed usage. Its estimate remains distinct
+    // from provider accounting, and the durable admission remains held.
+    const failedInputTokens = Math.ceil((opts.args.system.length + opts.args.prompt.length) / 4);
+    const accounting = failedCallAccounting(opts.engine, failedInputTokens);
+    await safeRecord(opts.recorder, {
+      orgId: opts.args.orgId,
+      instanceId: opts.args.instanceId,
