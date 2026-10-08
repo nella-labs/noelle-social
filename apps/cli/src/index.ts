@@ -398,3 +398,203 @@ async function cmdUp(args: Args): Promise<number> {
 
   ui.step("Building");
   await buildPackages(repoRoot);
+  const buildEnv = { ...process.env, ...readEnvFile(p.envFile) };
+  const { existsSync } = await import("node:fs");
+  // Both runtimes serve a prod build (`next start`), so `up` needs `next build`
+  // on first run / --build. BUILD_ID only exists after a PRODUCTION build — a
+  // leftover dev-mode .next (from the retired native `next dev` phase) doesn't
+  // count and must be rebuilt.
+  const buildId = resolve(repoRoot, "apps/app/.next/BUILD_ID");
+  const rebuiltApp = bool(args.flags, "build") || !existsSync(buildId);
+  if (rebuiltApp) {
+    ui.info("next build (first run or --build)…");
+    await run("pnpm", ["--filter", "@noelle/app", "build"], {
+      cwd: repoRoot,
+      env: buildEnv,
+      inherit: true,
+    });
+  } else {
+    ui.info("reusing existing apps/app/.next (pass --build to rebuild)");
+  }
+  await buildBackendServices({ repoRoot, workersEnabled: config.workersEnabled, env: buildEnv });
+  if (config.workersEnabled) {
+    // Enabling workers guarantees a spend cap EXISTS (and forces send/auto-send
+    // off) before any worker boots — the budget pre-check can't be skipped.
+    // It only SEEDS the cap, though: this path runs unattended on every `noelle
+    // up`, on each `noelle sync` self-heal tick, and on login, so stamping it
+    // unconditionally silently reverted any cap the operator raised in the
+    // dashboard. Changing the cap is `noelle vega enable --budget-cents N`.
+    const v = await vegaEnable({
+      dbUrl: adminUrl,
+      orgSlug: config.orgSlug,
+      budgetCapCents: config.budgetCapCents,
+      preserveExistingCap: true,
+      preservePipelineState: true,
+      log: (m) => ui.ok(m),
+    });
+    if (!v.found) ui.warn("Vega instance not found; workers will idle until it's seeded.");
+    // Auto-apply the operator brand config if present, so the drafter tailors
+    // replies + DMs to the operator's business from the first tick.
+    if (existsSync(brandFilePath(p))) {
+      try {
+        const brand = loadBrandFile(p);
+        const n = await applyBrand({ dbUrl: adminUrl, orgSlug: config.orgSlug, brand });
+        ui.ok(
+          `brand config applied (${n} instance) ${brandConfigHasContent(brand) ? "" : "(empty — generic voice)"}`,
+        );
+      } catch (err) {
+        ui.warn(`brand.json present but not applied: ${(err as Error).message}`);
+      }
+    } else {
+      ui.info(
+        "no ~/.noelle/brand.json — drafting with generic voice. Run `noelle brand init` to tailor it.",
+      );
+    }
+  }
+
+  // Re-mint the operator JWT when it's missing or expiring, BEFORE pm2 reads
+  // .env — fresh processes then pick it up for free.
+  const jwtReminted = await ensureOperatorJwtFresh({
+    envFile: p.envFile,
+    config,
+    fallbackSecret: secrets.jwtSecret,
+  });
+  if (jwtReminted) ui.ok("operator JWT re-minted (was missing or expiring)");
+
+  ui.step("Starting services (pm2)");
+  await pm2Start(repoRoot, p.ecosystem);
+  // Any explicit bring-up cancels a prior `noelle down`: the auto tick's
+  // self-heal is back in charge of keeping the stack alive.
+  rmSync(p.stackDownMarker, { force: true });
+  // Existing processes receive fresh auth/build state through the ecosystem.
+  // A failed delivery remains pending across later unchanged-code ticks.
+  await reloadOperatorSession({ envFile: p.envFile, config, repoRoot, ecosystem: p.ecosystem,
+    fallbackSecret: secrets.jwtSecret, force: rebuiltApp });
+
+  // Wait for /health then dashboard.
+  const apiOk = await waitForHttp(`http://127.0.0.1:${config.ports.apiVm}/health`, 60_000);
+  ui.info(apiOk ? "api-vm /health ok" : "api-vm /health not responding yet");
+  const appOk = await waitForHttp(`http://127.0.0.1:${config.ports.app}/`, 90_000);
+  ui.info(appOk ? "dashboard responding" : "dashboard not responding yet");
+
+  ui.plain();
+  ui.ok(`Noelle is up → http://127.0.0.1:${config.ports.app}/app/${config.orgSlug}`);
+  ui.info(
+    "`noelle status` for process health · `noelle logs` to tail · `noelle tunnel` for remote access",
+  );
+  return apiOk && appOk ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// down / status / logs / health / tunnel / doctor
+// ---------------------------------------------------------------------------
+async function cmdDown(args: Args): Promise<number> {
+  const repoRoot = findRepoRoot();
+  const purge = bool(args.flags, "purge");
+  ui.step("Stopping services");
+  // Record that this stop is deliberate BEFORE stopping anything, so an auto
+  // tick racing this command cannot read "down + no marker" and heal the
+  // stack right back up. Cleared by `noelle up` (login autostart included).
+  const p = ensureHome();
+  writeFileSync(p.stackDownMarker, `${new Date().toISOString()} noelle down\n`);
+  await pm2Stop(repoRoot, true);
+  ui.ok("pm2 processes stopped");
+  const config = loadConfig();
+  if (config?.postgres.mode === "docker") {
+    const runtime = await detectContainerRuntime();
+    if (runtime) {
+      await stopContainerPostgres(runtime, purge);
+      ui.ok(
+        purge
+          ? "Postgres container removed"
+          : "Postgres container stopped (data kept; --purge to remove)",
+      );
+    }
+  }
+  return 0;
+}
+
+async function cmdStatus(args: Args): Promise<number> {
+  const repoRoot = findRepoRoot();
+  const p = ensureHome();
+  const config = loadConfig() ?? defaultConfig();
+  const secrets = loadOrCreateSecrets(p);
+  const adminUrl = adminUrlFor(config, secrets);
+
+  const procs = await pm2Status(repoRoot);
+  let dbOk = false;
+  try {
+    await waitForPostgres(adminUrl, 3000);
+    dbOk = true;
+  } catch {
+    dbOk = false;
+  }
+  const apiOk = await probeHttp(`http://127.0.0.1:${config.ports.apiVm}/health`);
+  const appOk = await probeHttp(`http://127.0.0.1:${config.ports.app}/`);
+
+  if (bool(args.flags, "json")) {
+    console.log(
+      JSON.stringify(
+        {
+          postgres: dbOk ? "ok" : "down",
+          apiVm: apiOk ? "ok" : "down",
+          app: appOk ? "ok" : "down",
+          processes: procs,
+          workersEnabled: config.workersEnabled,
+          remoteAccess: config.remoteAccess,
+        },
+        null,
+        2,
+      ),
+    );
+    return dbOk && apiOk && appOk ? 0 : 1;
+  }
+
+  ui.step("Noelle self-host status");
+  ui.plain(`  postgres   ${dbOk ? "✓ ok" : "✗ down"}`);
+  ui.plain(`  api-vm     ${apiOk ? "✓ ok" : "✗ down"}  (:${config.ports.apiVm})`);
+  ui.plain(`  dashboard  ${appOk ? "✓ ok" : "✗ down"}  (:${config.ports.app})`);
+  ui.plain("  processes:");
+  if (procs.length === 0) ui.plain("    (none — run `noelle up`)");
+  for (const proc of procs) {
+    ui.plain(
+      `    ${proc.status === "online" ? "✓" : "✗"} ${proc.name}  ${proc.status}  ${proc.memoryMb}MB  ↺${proc.restarts}`,
+    );
+  }
+  const ra = config.remoteAccess;
+  ui.plain("  remote access:");
+  ui.plain(`    tailscale  ${ra.tailscale.enabled ? `✓ ${ra.tailscale.url ?? "(on)"}` : "· off"}`);
+  ui.plain(`    autostart  ${ra.autostart.enabled ? "✓ on (Mac login)" : "· off"}`);
+  return dbOk && apiOk && appOk ? 0 : 1;
+}
+
+async function cmdLogs(args: Args): Promise<number> {
+  const repoRoot = findRepoRoot();
+  await pm2Logs(repoRoot, args._[1]);
+  return 0;
+}
+
+async function cmdHealth(): Promise<number> {
+  const config = loadConfig() ?? defaultConfig();
+  const apiOk = await probeHttp(`http://127.0.0.1:${config.ports.apiVm}/health`);
+  const appOk = await probeHttp(`http://127.0.0.1:${config.ports.app}/`);
+  ui.plain(`api-vm ${apiOk ? "ok" : "down"} · dashboard ${appOk ? "ok" : "down"}`);
+  return apiOk && appOk ? 0 : 1;
+}
+
+async function cmdTunnel(): Promise<number> {
+  const config = loadConfig() ?? defaultConfig();
+  if (!(await cloudflaredInstalled())) {
+    ui.err(`cloudflared not found. Install it: ${installHint()}`);
+    return 1;
+  }
+  ui.step(`Opening a Cloudflare quick tunnel → http://127.0.0.1:${config.ports.app}`);
+  ui.info("Copy the printed *.trycloudflare.com URL. Ctrl-C to stop.");
+  ui.info(
+    "For a stable hostname, run a named tunnel and set NOELLE_TUNNEL_HOSTNAME, then `noelle init`.",
+  );
+  await runQuickTunnel(config.ports.app);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
