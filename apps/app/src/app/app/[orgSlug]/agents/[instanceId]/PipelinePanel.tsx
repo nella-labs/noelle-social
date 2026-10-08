@@ -598,3 +598,203 @@ function ScheduleBlock({
                 <input
                   type="text"
                   value={tz}
+                  onChange={(e) => setTz(e.target.value)}
+                  className="input"
+                  title="IANA timezone, e.g. America/Bogota"
+                  style={{ width: 150, fontSize: 11.5 }}
+                />
+              </>
+            )}
+          </div>
+
+          {/* Goal */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 13 }}>
+            <span>Each run gets me</span>
+            <input
+              type="number"
+              min={1}
+              max={500}
+              value={goal}
+              onChange={(e) => setGoal(Math.max(1, Math.min(500, Number(e.target.value) || 1)))}
+              className="input"
+              style={{ width: 64, textAlign: "center" }}
+            />
+            <span>{goalNoun}</span>
+          </div>
+
+          {/* Actions */}
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              type="button"
+              className="btn btn-sm btn-primary"
+              onClick={() => save(true)}
+              disabled={pending}
+            >
+              {busy === "schedule" ? "…" : on ? "Save schedule" : "Turn on schedule"}
+            </button>
+            {on ? (
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => save(false)}
+                disabled={pending}
+              >
+                Turn off
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function WorkerRow({
+  w,
+  now,
+  active,
+  showRun,
+  busy,
+  pending,
+  roleText,
+  onToggle,
+}: {
+  w: PipelineWorkerSnapshot;
+  now: number | null;
+  active: boolean;
+  showRun: boolean;
+  busy: string | null;
+  pending: boolean;
+  roleText: string;
+  onToggle: (enabled: boolean) => void;
+}) {
+  const s = STATE[w.state];
+  // The profiler runs while paused, so it's governed only by its own flag;
+  // the pipeline workers also dim when the instance is paused.
+  const dim = w.runsWhilePaused ? !w.enabled : !active || (!w.enabled && w.toggleable);
+  const timer =
+    w.state === "running" && w.runningSince
+      ? `running ${rel(w.runningSince, now)}`
+      : w.lastFinishedAt
+        ? `ran ${rel(w.lastFinishedAt, now)} ago`
+        : "no runs yet";
+  return (
+    <li
+      className="worker-row"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 12,
+        padding: "10px 0",
+        borderTop: "1px dashed var(--rule-soft)",
+        opacity: dim ? 0.5 : 1,
+      }}
+    >
+      <div style={{ minWidth: 130 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 13.5, fontWeight: 500 }}>{LABEL[w.kind]}</span>
+          <span className="tag" style={{ color: s.tone }}>
+            <span className={s.dot} /> {s.label}
+          </span>
+        </div>
+        <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--ink-soft)", marginTop: 2 }}>
+          {timer}
+        </div>
+        <div style={{ fontSize: 10.5, color: "var(--ink-soft)", marginTop: 2, lineHeight: 1.3 }}>
+          {roleText}
+        </div>
+        {w.lastError ? (
+          <div
+            title={w.lastError}
+            style={{
+              fontSize: 10.5,
+              color: "var(--warn)",
+              fontWeight: 500,
+              marginTop: 3,
+              lineHeight: 1.3,
+              maxWidth: 260,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            ⚠ {w.lastError}
+          </div>
+        ) : null}
+      </div>
+      <div className="worker-row-metrics" style={{ flex: 1 }}>
+        <div style={{ fontSize: 14 }}>
+          <span style={{ fontWeight: 600 }}>{fmt(w.lifetime)}</span>{" "}
+          <span style={{ color: "var(--ink-muted)" }}>{VERB[w.kind]}</span>
+        </div>
+        <div style={{ fontSize: 11.5, color: "var(--ink-muted)" }}>
+          {showRun ? <>+{fmt(w.sinceStart)} this run · </> : null}
+          {fmt(w.today)} today
+        </div>
+      </div>
+      {w.toggleable ? (
+        <button
+          type="button"
+          className={`btn btn-sm ${w.enabled ? "btn-primary" : ""}`}
+          onClick={() => onToggle(!w.enabled)}
+          disabled={pending && busy === `toggle:${w.kind}`}
+          aria-pressed={w.enabled}
+          title={active || w.runsWhilePaused ? undefined : "Pipeline is paused — start it to run this worker"}
+        >
+          {pending && busy === `toggle:${w.kind}` ? "…" : w.enabled ? "On" : "Off"}
+        </button>
+      ) : (
+        <span style={{ fontSize: 11, color: "var(--ink-soft)", fontFamily: "var(--mono)" }}>auto</span>
+      )}
+    </li>
+  );
+}
+
+// "Tailor this run" — a collapsible override for the next discovery run. Prefilled
+// from the saved default; what's set here applies to THIS run only (the worker
+// merges it over the default). Fields are agent-specific (PipelineUi.tailorFields
+// /tailorBooleans/tailorLang): X exposes search-operator filters, LinkedIn the
+// per-connection sweep's window + engagement floors.
+function TailorRun({
+  ui,
+  open,
+  onToggle,
+  nums,
+  setNum,
+  bools,
+  setBool,
+  lang,
+  setLang,
+}: {
+  ui: PipelineUi;
+  open: boolean;
+  onToggle: () => void;
+  nums: Record<string, string>;
+  setNum: (key: string, v: string) => void;
+  bools: Record<string, boolean>;
+  setBool: (key: string, v: boolean) => void;
+  lang: string;
+  setLang: (v: string) => void;
+}) {
+  const num = (f: TailorNumberField) => (
+    <label key={f.key} style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 11.5 }} title={f.title}>
+      <span style={{ color: "var(--ink-muted)" }}>{f.label}</span>
+      <input
+        type="number"
+        min={f.min}
+        max={f.max}
+        value={nums[f.key] ?? ""}
+        placeholder={f.placeholder}
+        onChange={(e) => setNum(f.key, e.target.value)}
+        className="input"
+        style={{ width: "100%", padding: "4px 8px" }}
+      />
+    </label>
+  );
+  const hasExtras = ui.tailorBooleans.length > 0 || ui.tailorLang;
+  return (
+    <div style={{ marginTop: 10 }}>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="btn btn-xs btn-ghost"
