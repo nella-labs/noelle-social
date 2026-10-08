@@ -198,3 +198,102 @@ async function addWatchlistEntry(
   const org = await ctx.resolveOrg(optStr(args, "org"));
   const agent = await resolveAgentInstance(ctx, org.orgId, args);
   const platform = reqStr(args, "platform");
+  const kind = reqStr(args, "kind");
+  const value = reqStr(args, "value");
+  assertCombo(platform, kind);
+  const objective = optStr(args, "objective") ?? null;
+  const objectiveKind = optStr(args, "objectiveKind") ?? null;
+  const minScore = optNum(args, "minScore") ?? 0;
+
+  if (platform === "x" && (kind === "handle" || kind === "keyword")) {
+    const v = kind === "handle" ? normHandle(value) : value.trim();
+    await ctx.sql`
+      insert into noelle.x_watchlist (org_id, agent_instance_id, kind, value)
+      values (${org.orgId}, ${agent.id}, ${kind}, ${v})
+      on conflict (agent_instance_id, kind, value) do nothing`;
+    return text(
+      `Watching X ${kind} **${kind === "handle" ? "@" + v : v}** for ${agent.display_name ?? agent.role}.`,
+    );
+  }
+
+  if (platform === "x" && kind === "person") {
+    const h = normHandle(value);
+    await ctx.sql`
+      insert into noelle.x_watchlist_people (org_id, agent_instance_id, handle, objective_kind, objective_note)
+      values (${org.orgId}, ${agent.id}, ${h}, ${objectiveKind}, ${objective})
+      on conflict (agent_instance_id, handle)
+      do update set objective_kind = excluded.objective_kind, objective_note = excluded.objective_note`;
+    return text(`Watching X person **@${h}** for ${agent.display_name ?? agent.role}.`);
+  }
+
+  if (platform === "linkedin") {
+    await ctx.sql`
+      insert into noelle.linkedin_watchlist (org_id, agent_instance_id, kind, value)
+      values (${org.orgId}, ${agent.id}, 'keyword', ${value.trim()})
+      on conflict (agent_instance_id, kind, value) do nothing`;
+    return text(
+      `Watching LinkedIn keyword **${value.trim()}** for ${agent.display_name ?? agent.role}.`,
+    );
+  }
+
+  // reddit subreddit — update-then-insert (no ON CONFLICT in the app)
+  const sub = normSub(value);
+  const updated = await ctx.sql<Array<{ id: string }>>`
+    update noelle.reddit_watchlist set objective = ${objective}, min_score = ${minScore}
+    where agent_instance_id = ${agent.id} and org_id = ${org.orgId} and subreddit = ${sub}
+    returning id`;
+  if (updated.length === 0) {
+    await ctx.sql`
+      insert into noelle.reddit_watchlist (org_id, agent_instance_id, subreddit, objective, min_score)
+      values (${org.orgId}, ${agent.id}, ${sub}, ${objective}, ${minScore})`;
+  }
+  return text(`Watching subreddit **r/${sub}** for ${agent.display_name ?? agent.role}.`);
+}
+
+async function removeWatchlistEntry(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("remove a watchlist entry");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const agent = await resolveAgentInstance(ctx, org.orgId, args);
+  const platform = reqStr(args, "platform");
+  const kind = reqStr(args, "kind");
+  const rowId = reqStr(args, "rowId");
+  assertCombo(platform, kind);
+
+  const table =
+    platform === "x" && kind === "person"
+      ? "x_watchlist_people"
+      : platform === "x"
+        ? "x_watchlist"
+        : platform === "linkedin"
+          ? "linkedin_watchlist"
+          : "reddit_watchlist";
+
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    delete from noelle.${ctx.sql(table)}
+    where id = ${rowId} and org_id = ${org.orgId} and agent_instance_id = ${agent.id}
+    returning id`;
+  if (rows.length === 0) throw new NoelleError(`No ${table} row ${rowId} for this agent.`);
+  return text(`Removed watchlist entry ${rowId}.`);
+}
+
+async function handle(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult | null> {
+  switch (name) {
+    case "noelle_list_watchlist":
+      return guard(() => listWatchlist(args, ctx));
+    case "noelle_add_watchlist_entry":
+      return guard(() => addWatchlistEntry(args, ctx));
+    case "noelle_remove_watchlist_entry":
+      return guard(() => removeWatchlistEntry(args, ctx));
+    default:
+      return null;
+  }
+}
+
+export const watchlistsModule: ToolModule = { tools, handle };
