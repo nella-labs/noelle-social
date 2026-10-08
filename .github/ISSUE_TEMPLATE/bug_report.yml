@@ -1,0 +1,31 @@
+name: Bug report
+description: Report a failure in a social growth workflow.
+title: "Bug: "
+body:
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Affected workflow
+      description: Include the version, installation mode and platform.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Use fictional accounts and redact private data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include sanitized errors or screenshots. Never attach credentials.
+    validations:
+      required: true
