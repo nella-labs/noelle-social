@@ -398,3 +398,171 @@ function QueueRow({ row, first }: { row: AutoSendQueueRow; first: boolean }) {
       </div>
       <span
         className="tag"
+        style={{
+          fontSize: 10,
+          alignSelf: "start",
+          justifySelf: "end",
+          color: quietHeld ? "var(--ink-muted)" : due ? "var(--accent)" : "var(--ink-muted)",
+        }}
+      >
+        {quietHeld ? "quiet hours" : due ? "firing next tick" : "scheduled"}
+      </span>
+    </div>
+  );
+}
+
+function SentList({ rows }: { rows: SentApprovalRow[] }) {
+  if (rows.length === 0) {
+    return (
+      <div
+        style={{
+          padding: "12px 0",
+          fontSize: 12.5,
+          color: "var(--ink-muted)",
+          fontFamily: "var(--mono)",
+        }}
+      >
+        No replies sent yet. Posted replies will show up here with a link
+        to the live tweet.
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column" }}>
+      {rows.map((row, i) => (
+        <SentRow key={row.approvalId} row={row} first={i === 0} />
+      ))}
+    </div>
+  );
+}
+
+function SentRow({ row, first }: { row: SentApprovalRow; first: boolean }) {
+  // Relative "Xs ago" depends on the current clock, so defer it past hydration.
+  const mounted = useMounted();
+  return (
+    <div
+      className="stack-phone"
+      style={{
+        display: "grid",
+        gridTemplateColumns: "110px 1fr 96px",
+        gap: 14,
+        alignItems: "start",
+        padding: "12px 0",
+        borderTop: first ? 0 : "1px dashed var(--rule-soft)",
+      }}
+    >
+      <div>
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11.5,
+            color: "var(--ink)",
+          }}
+        >
+          {mounted ? formatRelative(row.postedAt ?? row.decidedAt) : " "}
+        </div>
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 10,
+            color: "var(--ink-soft)",
+            marginTop: 2,
+            letterSpacing: "0.06em",
+            textTransform: "uppercase",
+          }}
+          title={SEND_METHOD[row.sendMethod].title}
+        >
+          {SEND_METHOD[row.sendMethod].label}
+        </div>
+      </div>
+      <div style={{ minWidth: 0 }}>
+        <div
+          style={{
+            fontSize: 12,
+            color: "var(--ink-muted)",
+            marginBottom: 3,
+            fontFamily: "var(--mono)",
+          }}
+        >
+          {row.authorHandle ? `@${row.authorHandle}` : "lead"} ·{" "}
+          {row.charCount ?? "?"} chars
+        </div>
+        <div
+          style={{
+            fontSize: 13,
+            color: "var(--ink-2)",
+            lineHeight: 1.45,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}
+        >
+          {row.bodyPreview ?? <em style={{ color: "var(--ink-soft)" }}>no body</em>}
+        </div>
+      </div>
+      <div style={{ justifySelf: "end", alignSelf: "start" }}>
+        {row.postUrl ? (
+          <a
+            href={row.postUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="tag tag-acc"
+            title="Open Vega's reply on X"
+            style={{
+              fontSize: 10,
+              whiteSpace: "nowrap",
+              textDecoration: "none",
+            }}
+          >
+            view reply ↗
+          </a>
+        ) : (
+          <span
+            className="tag"
+            style={{ fontSize: 10, color: "var(--ink-soft)" }}
+            title={
+              row.sendMethod === "manual_x"
+                ? "Posted by hand on X — paste the tweet link when you mark it sent to capture it"
+                : "No tweet id was captured for this send"
+            }
+          >
+            {row.sendMethod === "manual_x" ? "no link · by hand" : "no link"}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function formatDelta(sec: number): string {
+  const s = Math.max(0, sec);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s - m * 60;
+  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m - h * 60;
+  return remM > 0 ? `${h}h ${remM}m` : `${h}h`;
+}
+
+function formatClock(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleTimeString("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function formatRelative(iso: string | null): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  const diffMs = Date.now() - d.getTime();
+  const sec = Math.floor(diffMs / 1000);
+  if (sec < 60) return `${Math.max(1, sec)}s ago`;
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const days = Math.floor(h / 24);
+  return `${days}d ago`;
+}
