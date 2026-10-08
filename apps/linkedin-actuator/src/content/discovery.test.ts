@@ -598,3 +598,132 @@ describe("visible LinkedIn post extraction", () => {
       <div role="menu"><button>Save</button></div>
     </main>`);
     const offscreen = root.querySelector<HTMLElement>("#offscreen")!;
+    offscreen.getClientRects = () => [DOMRect.fromRect({ y: window.innerHeight + 100, width: 10, height: 10 })] as unknown as DOMRectList;
+    offscreen.getBoundingClientRect = () => DOMRect.fromRect({ y: window.innerHeight + 100, width: 10, height: 10 });
+    root.querySelector("#interop-outlet")!.attachShadow({ mode: "open" }).innerHTML = `<button>Other</button>`;
+    const diagnostic = readDiscoveryMenuShareUrn(root).diagnostic!;
+    expect(diagnostic).toContain("outside=1:div/menu:button/save/none");
+    expect(diagnostic).not.toContain("button/report/none");
+    expect(diagnostic).not.toContain("button/share/none");
+  });
+
+  it("finds outside menu candidates inside a different open shadow root", () => {
+    const root = mount(`<main><div id="interop-outlet"></div><div id="other-overlay"></div></main>`);
+    root.querySelector("#interop-outlet")!.attachShadow({ mode: "open" }).innerHTML =
+      `<div role="menu"><button>Other</button></div>`;
+    root.querySelector("#other-overlay")!.attachShadow({ mode: "open" }).innerHTML =
+      `<div role="menu"><button aria-label="Save Jane Doe's private post">Save</button></div>`;
+    const diagnostic = readDiscoveryMenuShareUrn(root).diagnostic!;
+    expect(diagnostic).toContain("outside=1:div/menu:button/save/none");
+    expect(diagnostic).not.toContain("outside=2");
+    expect(diagnostic).not.toContain("Jane");
+    expect(diagnostic).not.toContain("Doe");
+  });
+
+  it("excludes hidden and offscreen cards from candidate anchor shapes", () => {
+    const root = mount(`<main>
+      <div role="listitem"><button aria-label="Open control menu for post by Visible"></button>
+        <a href="/in/visible/">Visible</a></div>
+      <section style="display:none"><div role="listitem"><button aria-label="Open control menu for post by Hidden"></button>
+        <a href="/feed/update/urn:li:activity:1111111111111111111/">Hidden</a></div></section>
+      <div role="listitem" id="offscreen"><button aria-label="Open control menu for post by Offscreen"></button>
+        <a href="https://example.com/private/">Offscreen</a></div>
+      <div id="interop-outlet"></div>
+    </main>`);
+    const offscreen = root.querySelector<HTMLElement>("#offscreen")!;
+    offscreen.getClientRects = () => [DOMRect.fromRect({ y: window.innerHeight + 100, width: 10, height: 10 })] as unknown as DOMRectList;
+    offscreen.getBoundingClientRect = () => DOMRect.fromRect({ y: window.innerHeight + 100, width: 10, height: 10 });
+    root.querySelector("#interop-outlet")!.attachShadow({ mode: "open" }).innerHTML = `<button>Save</button>`;
+    const diagnostic = readDiscoveryMenuShareUrn(root).diagnostic!;
+    expect(diagnostic).toContain("cards=1;anchors=header:other");
+    expect(diagnostic).not.toContain("header:feed");
+    expect(diagnostic).not.toContain("header:external");
+  });
+
+  it("does not treat a link cited in a current post's body as that post's activity URN", () => {
+    const root = mount(`<main><div role="listitem">
+      <button aria-label="Open control menu for post by Ada Lovelace"></button>
+      <a href="/in/ada/">Ada</a>
+      <span data-testid="expandable-text-box">This reminds me of
+        <a href="/posts/grace_story-activity-7506985845665681408-abcd">Grace's post</a>.
+      </span>
+      <button aria-label="Reaction button state: no reaction"></button>
+    </div></main>`);
+    expect(harvestVisiblePosts(root)[0]).toMatchObject({ authorHandle: "ada" });
+    expect(harvestVisiblePosts(root)[0]?.urn).toBeUndefined();
+  });
+
+  it("reads singular engagement and rejects promoted cards in current markup", () => {
+    const root = mount(`<main><div role="listitem">
+      <button aria-label="Open control menu for post by Ada Lovelace"></button>
+      <a href="/in/ada/">Ada</a>
+      <span data-testid="expandable-text-box">One clear idea.</span>
+      <span>1 reaction</span><span>1 comment</span>
+      <button aria-label="Reaction button state: no reaction"></button>
+      </div><div role="listitem">
+      <button aria-label="Open control menu for post by Acme"></button>
+      <span>Promoted</span><a href="/in/acme/">Acme</a>
+      <span data-testid="expandable-text-box">Buy this product.</span>
+      <button aria-label="Reaction button state: no reaction"></button>
+    </div></main>`);
+    const posts = harvestVisiblePosts(root);
+    expect(isSponsored(root.querySelectorAll("[role=listitem]")[1]!)).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ reactionCount: 1, commentCount: 1, authorHandle: "ada" });
+  });
+
+  it("reads the September 2026 feed-header URN without including follower or comment text", () => {
+    const root = mount(`<main><div role="list">
+      <div role="listitem" id="expanded-obfuscated-card">
+        <p>Followed by Garima Kalra</p>
+        <span data-sdui-anchor-id="feed-header-urn:li:activity:7506818500620115968-0"></span>
+        <button aria-label="Open control menu for post by Dave Slutzkin"></button>
+        <a href="/in/daveslutzkin/">Dave Slutzkin</a>
+        <p>CEO at a software company</p><p>12h •</p>
+        <p componentkey="obfuscated">Your weekend task: remove stale symlinks.</p>
+        <button aria-label="Reaction button state: no reaction"></button>
+        <div><p>1h</p><p>A long comment that must not replace the post body text.</p>
+          <button aria-label="Reaction button state: no reaction 2 reactions"></button></div>
+      </div>
+    </div></main>`);
+    const posts = harvestVisiblePosts(root, new Date("2026-09-19T12:00:00Z"));
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({
+      urn: "urn:li:activity:7506818500620115968",
+      url: "https://www.linkedin.com/feed/update/urn:li:activity:7506818500620115968/",
+      authorName: "Dave Slutzkin",
+      authorHandle: "daveslutzkin",
+      text: "Your weekend task: remove stale symlinks.",
+      postedAt: "2026-09-19T00:00:00.000Z",
+    });
+  });
+
+  it("reads an obfuscated feed card with a permalink and time", () => {
+    const html = archived.replace(
+      "A normal, likeable post about reusable rockets.",
+      `A normal, likeable post about reusable rockets.
+       <a href="/posts/ronwiener_rockets-activity-7481524546924343296-abcd">View post</a>
+       <time datetime="2026-09-19T10:00:00Z">2h</time>`,
+    );
+    const posts = harvestVisiblePosts(mount(html), new Date("2026-09-19T12:00:00Z"));
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({
+      urn: "urn:li:activity:7481524546924343296",
+      authorName: "Ron Wiener",
+      authorHandle: "ronwiener",
+      postedAt: "2026-09-19T10:00:00.000Z",
+    });
+    expect(posts[0]!.text).toContain("A normal, likeable post");
+  });
+
+  it("keeps an unknown time and rejects sponsored cards or cards without an activity ID", () => {
+    const root = mount(`<main>
+      <div data-urn="urn:li:activity:7481524546924343298"><a href="/in/ada/">Ada</a><p data-testid="expandable-text-box">Useful design details</p></div>
+      <div data-urn="urn:li:activity:7481524546924343299">Promoted <p data-testid="expandable-text-box">Sales pitch</p></div>
+      <div><p data-testid="expandable-text-box">No ID</p></div>
+    </main>`);
+    const posts = harvestVisiblePosts(root, new Date("2026-09-19T12:00:00Z"));
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.postedAt).toBeUndefined();
+  });
+});

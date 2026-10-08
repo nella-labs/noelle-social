@@ -598,3 +598,74 @@ describe("planTimeline", () => {
   });
 });
 
+// A 30-min window with 90 requested actions is the case that produced the
+// "nothing happens for ~15 min, then it all fires at once" bug: a single burst
+// centered at the midpoint plus fixed multi-hour gaps that overflow the window.
+describe("planTimeline — short window pacing", () => {
+  const HALF_HOUR = 30 * 60_000;
+  // noon UTC start so the overnight curfew never interferes with these assertions
+  const noonStart = new Date("2025-01-15T12:00:00.000Z").getTime();
+  function shortPlan(seed: number) {
+    return planTimeline({
+      params: { windowHours: 0.5, targetComments: 30, targetLikes: 60 },
+      approvedDms: 0,
+      caps,
+      startMs: noonStart,
+      deepNightTaper: false,
+      rng: makeRng(seed),
+    });
+  }
+
+  it("fires the first action within 8s even in a 30-min window", () => {
+    for (let seed = 1; seed <= 5; seed++) {
+      const { actions } = shortPlan(seed);
+      expect(actions.length).toBeGreaterThan(0);
+      expect(actions[0]!.atMs).toBeLessThanOrEqual(noonStart + 8_000);
+    }
+  });
+
+  it("uses the whole window — the first half is not dead", () => {
+    // The old bug: with one burst centered at the midpoint, almost every action
+    // landed in the SECOND half. A healthy plan spreads across both halves.
+    const mid = noonStart + HALF_HOUR / 2;
+    for (let seed = 1; seed <= 5; seed++) {
+      const { actions } = shortPlan(seed);
+      const firstHalf = actions.filter((a) => a.atMs < mid).length;
+      expect(firstHalf / actions.length).toBeGreaterThanOrEqual(0.25);
+    }
+  });
+
+  it("never clusters actions at the window end", () => {
+    // Old bug: overflowed actions all clamped to exactly endMs. Now they drop.
+    const end = noonStart + HALF_HOUR;
+    for (let seed = 1; seed <= 5; seed++) {
+      const { actions } = shortPlan(seed);
+      const atEnd = actions.filter((a) => a.atMs >= end - 1).length;
+      expect(atEnd).toBeLessThanOrEqual(1);
+      for (const a of actions) expect(a.atMs).toBeLessThanOrEqual(end);
+    }
+  });
+
+  it("keeps a human minimum gap between consecutive actions", () => {
+    // 90 actions can't fit in 30 min at a human pace, so the plan holds the
+    // minimum gap and drops the overflow rather than firing every few seconds.
+    for (let seed = 1; seed <= 5; seed++) {
+      const { actions } = shortPlan(seed);
+      const gaps: number[] = [];
+      for (let i = 1; i < actions.length; i++) gaps.push(actions[i]!.atMs - actions[i - 1]!.atMs);
+      const median = gaps.slice().sort((a, b) => a - b)[Math.floor(gaps.length / 2)] ?? 0;
+      // median gap should be near the 40s human floor, not 20s (fits-count) or 200s (overflow)
+      expect(median).toBeGreaterThanOrEqual(20_000);
+    }
+  });
+
+  it("records the window-fit shortfall as a ClampNote instead of dropping it silently", () => {
+    const { actions, clamps } = shortPlan(1);
+    const placed = actions.length;
+    // ~90 requested (30c + 60l, ±20%) can't fit a 30-min window at a human pace.
+    expect(placed).toBeLessThan(70);
+    // The shortfall is reported, not silently swallowed.
+    const shortfall = clamps.reduce((n, c) => n + (c.requested - c.allowed), 0);
+    expect(shortfall).toBeGreaterThan(0);
+  });
+});
