@@ -1398,3 +1398,203 @@ async function doReplyInner(
   await cdp.moveAndClick(tabId, rectFrom(box), rng, sleep); // focus the box
   throwIfAborted(runAbort.signal); // STOP before we type anything
   const typed = sanitizeReplyBody(item.body);
+  // Remember what we put in the box. The unscoped clear (navigateTab hops, which
+  // carry no item) uses this to tell OUR leftover reply from a comment the
+  // operator is half-way through writing — new Reddit persists comment drafts,
+  // so wiping the wrong one destroys their text for good.
+  lastTypedBody = typed;
+  await cdp.typeText(tabId, typed, rng, sleep); // VERBATIM, sanitized
+  await sleep(rng.float(500, 2200)); // reread own reply before submitting (widened upper tail)
+
+  // Poll for a CLICKABLE submit instead of a single-shot locate (unifies #451's
+  // submit-readiness poll (ports #420) with #444's deadline poll + failure
+  // telemetry): the composer enables the button a beat after typing (framework
+  // editor state sync + layout), and the same thread can land on one attempt and
+  // miss on the next without this tolerance. locateReplySubmit skips a
+  // disabled/aria-disabled button (typed text hasn't registered) and a zero-rect
+  // one (a click would land at the viewport corner), so the poll simply rides
+  // those states out; the extra time is only ever spent on an attempt that would
+  // otherwise fail — a success clicks on the first pass. No keyboard-chord
+  // fallback on purpose: a chord after a late-landing click risks a double-post;
+  // the bounded confirmation probes below observe the result without another click.
+  const deadline = Date.now() + Math.round(rng.float(6000, 12000));
+  let submit: LocateResult | null = null;
+  let lastSkip: string | undefined;
+  for (;;) {
+    const r = await send<LocateResult>(tabId, { cmd: "locateReplySubmit", commentId: scope }).catch(() => null);
+    if (r?.ok && r.x != null) { submit = r; break; }
+    if (r?.skipReason) lastSkip = r.skipReason;
+    if (Date.now() >= deadline) break;
+    await sleep(rng.float(350, 650));
+  }
+  if (!submit) {
+    // Failure-path telemetry only (never costs the happy path): the composer read
+    // names the state (present/empty), diagnoseReplySubmit re-walks the locator
+    // predicates into buckets, and detail.ts folds both — plus the locator's last
+    // skipReason and the build stamp — into reply-failed:submit-not-found(...).
+    const st = await send<{ observed?: { present?: boolean; empty?: boolean } }>(
+      tabId, { cmd: "readReplyBox", commentId: scope },
+    ).catch(() => null);
+    const dg = await send<{ observed?: SubmitDiag }>(
+      tabId, { cmd: "diagnoseReplySubmit", commentId: scope },
+    ).catch(() => null);
+    return { kind: "failed", detail: submitNotFoundDetail(st?.observed, lastSkip, dg?.observed) };
+  }
+  throwIfAborted(runAbort.signal);
+  const captured = readCapturedReply(item);
+  if (!captured) return { kind: "failed", detail: "missing-original-capture" };
+  return submitRedditReply({
+    claim: () => new ActuatorApi(cfg).claimReply(captured),
+    checkStopped: () => throwIfAborted(runAbort.signal),
+    click: () => cdp.moveAndClick(tabId, rectFrom(submit!), rng, sleep),
+    verify: () => send(tabId, { cmd: "verifyReplyPosted", commentId: scope }),
+    challenge: () => send(tabId, { cmd: "detectChallenge" }),
+    sleep, delay: (min, max) => rng.float(min, max),
+    notCleared: notClearedDetail(submit.observed as SubmitObserved | undefined),
+  });
+
+}
+
+// ── Lights-out autonomy ────────────────────────────────────────────────────
+// A persistent alarm (survives service-worker suspend) checks a few times an
+// hour whether to auto-start the daily run, no manual Run click. Once started,
+// the content-script tick loop drives it as usual; a persisted day key enforces
+// one auto-start per day. Requires a logged-in reddit.com tab open (startRun
+// attaches to it); with none open the run pauses until a tab appears.
+const AUTO_START_DAY_KEY = "actuator.lastAutoStartDay";
+// Day key of the most recent challenge halt (stamped in endRun). Drives the
+// post-challenge cooldown/backoff + health safety gate below. Distinct from
+// AUTO_START_DAY_KEY so a suppressed tick never masks the once-per-day guard.
+const CHALLENGE_DAY_KEY = "actuator.lastChallengeDay";
+// Day key of the last manual STOP. A STOP must silence BOTH autonomy paths for
+// the rest of the day (the daily auto-start already stamps AUTO_START_DAY_KEY;
+// auto-drain has no daily guard, so it reads this instead).
+const STOP_DAY_KEY = "actuator.lastManualStopDay";
+// ms stamp of the last auto-drain start + the re-arm cooldown between starts.
+// The cooldown bounds the pathological loop of a drain that keeps dying with
+// items still queued (no reddit tab, reply-fail give-ups) — without it the 5-min
+// alarm would relaunch a doomed drain forever.
+const AUTO_DRAIN_MS_KEY = "actuator.lastAutoDrainMs";
+const AUTO_DRAIN_REARM_MIN = 30;
+// No-progress threshold that flags a running run as a stall CANDIDATE (while
+// drafts are loaded and comment slots are overdue). Only a candidate: recovery
+// additionally requires the stall to persist across two consecutive autonomy
+// ticks with no progress between them (confirmStall) — that is what actually
+// rules out a healthy run's large-but-legitimate gaps (scheduled-mode spacing
+// under maxWritesPerHour, or a post mid-flight while the slot still reads
+// overdue). This floor just avoids probing on short pacing gaps. Reddit's
+// drain-cooldown band reaches ~19 min, so the floor is 30 (not 20) to keep the
+// probe off normal drains entirely. Config override: cfg.stallRecoverMinutes.
+const STALL_RECOVER_MIN = 30;
+// Two-tick confirmation probe: the last stall observation (session + progress
+// marker). Recovery only acts when a run looks stalled on two consecutive
+// autonomy ticks with no progress between them (see confirmStall).
+const STALL_PROBE_KEY = "actuator.stallProbe";
+// Last build stamp a self-reload was attempted for (one attempt per stamp).
+const RELOAD_STAMP_KEY = "actuator.lastReloadStamp";
+async function ensureAutonomyAlarm(): Promise<void> {
+  if (!(await chrome.alarms.get(AUTONOMY_ALARM))) {
+    await chrome.alarms.create(AUTONOMY_ALARM, { periodInMinutes: 5 });
+  }
+}
+async function checkAutonomy(): Promise<void> {
+  if (await remoteStopped()) return; // remote STOP is authoritative — hands stay down
+  const cfg = await getConfig();
+  if (!cfg?.autonomous) return;
+  const s = await loadState();
+  const now = new Date();
+  const store = await chrome.storage.local.get(AUTO_START_DAY_KEY);
+  // Read the challenge-day stamp fail-closed: if storage throws, skip this tick
+  // rather than risk auto-starting a freshly-challenged account.
+  let lastChallengeDay: string | null;
+  try {
+    const chStore = await chrome.storage.local.get(CHALLENGE_DAY_KEY);
+    lastChallengeDay = (chStore[CHALLENGE_DAY_KEY] as string | undefined) ?? null;
+  } catch {
+    console.warn("[autonomy] challenge-day read failed; skipping auto-start");
+    return;
+  }
+  const decide = shouldAutoStart({
+    autonomous: true,
+    runActive: s?.status === "running",
+    localHour: now.getHours(),
+    startHour: cfg.autoStartHour ?? 9,
+    endHour: cfg.autoEndHour ?? 21,
+    todayKey: localDayKey(now),
+    lastAutoStartDay: (store[AUTO_START_DAY_KEY] as string | undefined) ?? null,
+    // Post-challenge backoff (default OFF via undefined/0).
+    lastChallengeDay,
+    challengeBackoffDays: cfg.autoChallengeBackoffDays ?? 0,
+  });
+  // Pending-arm gate (fail-closed): a manual start that ARMED the reply switch
+  // but died before persisting RunState leaves the durable marker behind (see
+  // setPendingArm in startRun/startDrain). While it stands, the switch may be ON
+  // without any run accounting for it — so EITHER lights-out path below (the
+  // daily auto-start OR maybeAutoDrain) would post replies under a consent flag
+  // the operator never chose to leave standing. This gate runs BEFORE the
+  // decide/auto-drain branch so it fail-closes BOTH: #452's auto-drain must not
+  // slip out under a leaked/in-flight #463 arm any more than the auto-start may.
+  // A FRESH marker ("wait") is a manual start still in flight between its arm
+  // and its saveState: never disarm under it, just skip this tick. A STALE
+  // marker ("disarm") is a leaked arm: retry the disarm (serialized, and
+  // re-classified inside the lock so a manual start that lands meanwhile is
+  // never raced back OFF) and keep refusing to auto-start/drain until it
+  // succeeds. Either way do NOT stamp AUTO_START_DAY_KEY → re-evaluates next
+  // tick. In the normal case (no marker) classifyPendingArm returns "none" and
+  // this is a no-op passthrough, so autonomy's happy path is unchanged.
+  const armAction = classifyPendingArm(await getPendingArm(), Date.now());
+  if (armAction !== "none") {
+    if (armAction === "disarm") {
+      await withSendSwitch(async () => {
+        const cur = await getPendingArm();
+        if (!cur || classifyPendingArm(cur, Date.now()) !== "disarm") return;
+        try {
+          await new ActuatorApi(cfg).enableSend(cfg.instanceId, false);
+          await clearPendingArm(cur.epoch);
+          console.warn("[autonomy] disarmed a leaked reply-switch arm from a failed manual start");
+        } catch {
+          /* still unconfirmed → the marker stays and autonomy stays blocked */
+        }
+      });
+    }
+    console.warn("[autonomy] autonomy suppressed (auto-start + auto-drain): unresolved reply-switch arm", { armAction });
+    return;
+  }
+
+  if (!decide) {
+    // A run may be live but WEDGED (running, not posting). Recover it first —
+    // shouldAutoDrain's runActive gate can't, so a wedged run would otherwise pin
+    // the actor with approvals piling up. If nothing needed recovery, fall through
+    // to lights-out inbox clearing (approvals waiting while nothing runs).
+    const recovered = await maybeRecoverStalledRun(cfg, s ?? null, now, lastChallengeDay);
+    if (!recovered) await maybeAutoDrain(cfg, s ?? null, now, lastChallengeDay);
+    return;
+  }
+
+  // Secondary safety gate: post-challenge cooldown (default 3d) + server health.
+  // Any error/non-2xx/timeout from health() collapses to null → treated as
+  // not-ok when the gate is on (default) → skip. Manual operator Run (the
+  // 'startRun' message path) never runs this gate.
+  const api = new ActuatorApi(cfg);
+  const health = await api.health().catch(() => null); // fetch fail → null → fail-closed
+  const safe = passesAutoStartSafety({
+    healthGate: cfg.healthGate ?? true,
+    healthStatus: health?.status ?? null,
+    challengeCooldownDays: cfg.challengeCooldownDays ?? 3,
+    todayKey: localDayKey(now),
+    lastChallengeDay,
+  });
+  if (!safe) {
+    console.warn("[autonomy] auto-start suppressed by safety gate", { health: health?.status ?? "unknown" });
+    return; // do NOT stamp AUTO_START_DAY_KEY → re-evaluates next tick when health recovers
+  }
+
+  // Stamp the day BEFORE starting so a mid-start crash can't double-fire today.
+  await chrome.storage.local.set({ [AUTO_START_DAY_KEY]: localDayKey(now) });
+  await startRun({
+    windowHours: cfg.autoWindowHours ?? 8,
+    targetComments: cfg.autoTargetComments ?? REDDIT_DEFAULTS.repliesPerDay,
+    targetLikes: 0, // no scheduled vote SLOTS (upvotes are idle-only); startRun re-zeroes this regardless.
+  }).catch((e) => console.warn("[autonomy] auto-start failed:", e instanceof Error ? e.message : e));
+}
+// Lights-out inbox clearing. When the operator opted in (Options → auto-drain),
