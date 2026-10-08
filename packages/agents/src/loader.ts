@@ -198,3 +198,74 @@ export function buildRegistry(args: {
     throw new RegistryLoadError(
       `manifest/class mismatch: yamlOnly=[${yamlOnly.join(", ")}] classOnly=[${classOnly.join(", ")}]`
     );
+  }
+
+  assertCapabilityUnambiguous(manifestMap.values());
+
+  const manifests: ReadonlyMap<AgentRole, AgentManifest> = manifestMap;
+  const agents: ReadonlyMap<AgentRole, AgentType> = classMap;
+
+  return {
+    manifests,
+    agents,
+    get(role: AgentRole): AgentType {
+      const agent = classMap.get(role);
+      if (agent === undefined) {
+        throw new RegistryLoadError(`no agent registered for role ${role}`);
+      }
+      return agent;
+    },
+    getManifest(role: AgentRole): AgentManifest {
+      const manifest = manifestMap.get(role);
+      if (manifest === undefined) {
+        throw new RegistryLoadError(`no manifest registered for role ${role}`);
+      }
+      return manifest;
+    },
+  };
+}
+
+export function loadRegistryFromDisk(args: {
+  registryDir?: string;
+  agentClasses: ReadonlyArray<AgentType>;
+}): Registry {
+  const registryDir =
+    args.registryDir ??
+    join(dirname(fileURLToPath(import.meta.url)), "registry");
+
+  const filenames = readdirSync(registryDir).filter((f) =>
+    f.endsWith(".yaml")
+  );
+
+  const manifestYamls = filenames.map((filename) => ({
+    filename,
+    content: readFileSync(`${registryDir}/${filename}`, "utf-8"),
+  }));
+
+  return buildRegistry({ manifestYamls, agentClasses: args.agentClasses });
+}
+
+/**
+ * Load just the parsed manifests from disk — no agent classes, no class/manifest
+ * cross-check. This is the lean entry point for the capability router: a routing
+ * consumer needs the `capability` facets, not the runnable agent classes. Still
+ * runs the ambiguity guard so a bad manifest set fails loudly, exactly like
+ * {@link buildRegistry}.
+ */
+export function loadManifestsFromDisk(registryDir?: string): AgentManifest[] {
+  const dir =
+    registryDir ?? join(dirname(fileURLToPath(import.meta.url)), "registry");
+
+  const manifests = readdirSync(dir)
+    .filter((f) => f.endsWith(".yaml"))
+    .map((filename) => {
+      try {
+        return parseManifest(readFileSync(`${dir}/${filename}`, "utf-8"));
+      } catch (err) {
+        throw new RegistryLoadError(`Failed to parse ${filename}: ${String(err)}`);
+      }
+    });
+
+  assertCapabilityUnambiguous(manifests);
+  return manifests;
+}

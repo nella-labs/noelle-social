@@ -198,3 +198,52 @@ export interface ChatApprovalSummary {
   /** X post id of the lead being replied to, when known. */
   postId?: string | null;
   /**
+   * Direct X reply link, prefilled with the drafted reply — "click to send".
+   * Built from the lead's post id + the selected draft body.
+   */
+  replyUrl?: string | null;
+}
+
+/**
+ * A lead straight off `noelle.leads` (not necessarily drafted yet). Powers
+ * the "show me the best leads" answer with real, actionable rows.
+ */
+export interface ChatLeadSummary {
+  /** Author handle, no leading @. */
+  handle: string | null;
+  /** T1/T2/T3 ranking from the classifier. */
+  tier: "T1" | "T2" | "T3" | null;
+  /** Classifier score. */
+  score: number | null;
+  /** The post being targeted. Truncate before display. */
+  postText: string;
+  /** X post id, when known. */
+  postId: string | null;
+  /** Link to view the original post. */
+  originalPostUrl: string | null;
+  /** Direct X reply-composer link for this lead. */
+  replyUrl: string | null;
+  /** Whether the drafter has already produced a draft for this lead. */
+  hasDraft: boolean;
+}
+
+export interface ChatWorkerFreshness {
+  worker:
+    | "discovery"
+    | "classifier"
+    | "drafter"
+    | "send"
+    // Nova's video pipeline workers.
+    | "harvester"
+    | "teardown"
+    | "distiller"
+    | "ideator"
+    | "scripter";
+  lastSuccessAt: string | null;
+}
+
+export interface ChatActivityEvent {
+  when: string;
+  verb: string;
+  what: string;
+}

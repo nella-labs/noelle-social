@@ -1,0 +1,55 @@
+{
+  "name": "@noelle/agents",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Social platform profile registry and capability routing for Noelle.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./src/index.ts"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js",
+      "default": "./src/types.ts"
+    },
+    "./define": {
+      "types": "./dist/define.d.ts",
+      "import": "./dist/define.js",
+      "default": "./src/define.ts"
+    },
+    "./loader": {
+      "types": "./dist/loader.d.ts",
+      "import": "./dist/loader.js",
+      "default": "./src/loader.ts"
+    },
+    "./router": {
+      "types": "./dist/router.d.ts",
+      "import": "./dist/router.js",
+      "default": "./src/router.ts"
+    },
+    "./chat": {
+      "types": "./dist/chat/index.d.ts",
+      "import": "./dist/chat/index.js",
+      "default": "./src/chat/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp -R src/registry dist/registry",
+    "lint": "echo \"lint placeholder\"",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@noelle/runtime": "workspace:*",
+    "yaml": "^2.6.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  }
+}
