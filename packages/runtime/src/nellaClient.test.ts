@@ -198,3 +198,68 @@ describe("nellaClient", () => {
 
       await client.getAnchors({ workspace: WORKSPACE, handle: "demooperator" });
 
+      const [url, init] = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls[0] as [
+        string,
+        RequestInit,
+      ];
+
+      expect(url).toContain("/api/v1/search");
+      const body = JSON.parse(init.body as string) as Record<string, unknown>;
+      expect(body).toHaveProperty("workspaceId", WORKSPACE);
+      expect((body["query"] as string).toLowerCase()).toContain("@demooperator");
+      expect(body["filters"]).toEqual({ filePattern: "vault/posts/**" });
+    });
+
+    it("maps hits to Anchors with empty recency and tags", async () => {
+      const fetchImpl = makeFetch(200, makeSearchEnvelope());
+      const client = createNellaClient({ apiKey: API_KEY, fetchImpl });
+
+      const anchors = await client.getAnchors({
+        workspace: WORKSPACE,
+        handle: "demooperator",
+      });
+
+      expect(anchors).toHaveLength(1);
+      expect(anchors[0]).toMatchObject({
+        path: "vault/posts/2025-04-12.md",
+        recency: "",
+        tags: [],
+      });
+    });
+  });
+});
+
+describe("filePathInDirs (vault-subdir scoping)", () => {
+  it("absent / empty filterDirs → no scoping (always true)", () => {
+    expect(filePathInDirs("02-brand/voice.md")).toBe(true);
+    expect(filePathInDirs("02-brand/voice.md", [])).toBe(true);
+  });
+
+  it("a prefix matches its own subtree but not a same-stem sibling", () => {
+    expect(filePathInDirs("02-brand/voice.md", ["02-brand"])).toBe(true);
+    expect(filePathInDirs("02-brand", ["02-brand"])).toBe(true); // the dir itself
+    // "02-brand" must NOT match "01-business/..." nor "02-branding/..."
+    expect(filePathInDirs("01-business/x.md", ["02-brand"])).toBe(false);
+    expect(filePathInDirs("02-branding/x.md", ["02-brand"])).toBe(false);
+  });
+
+  it("normalizes leading ./ and / and is case-insensitive", () => {
+    expect(filePathInDirs("./02-Brand/voice.md", ["02-brand"])).toBe(true);
+    expect(filePathInDirs("/02-brand/voice.md", ["02-brand"])).toBe(true);
+    expect(filePathInDirs("02-brand/voice.md", ["./02-brand/"])).toBe(true);
+    expect(filePathInDirs("02-brand/voice.md", ["/02-BRAND"])).toBe(true);
+  });
+
+  it("matches if ANY prefix in the list matches", () => {
+    expect(filePathInDirs("knowledge/api.md", ["voice", "knowledge"])).toBe(true);
+    expect(filePathInDirs("misc/api.md", ["voice", "knowledge"])).toBe(false);
+  });
+
+  it("fails open on a malformed filePath (excludes, never throws)", () => {
+    expect(filePathInDirs("", ["02-brand"])).toBe(false);
+    // @ts-expect-error — exercising the runtime guard against non-string input
+    expect(filePathInDirs(undefined, ["02-brand"])).toBe(false);
+    // A blank/garbage prefix is skipped rather than matching everything.
+    expect(filePathInDirs("02-brand/voice.md", ["", "  /  "])).toBe(false);
+  });
+});
