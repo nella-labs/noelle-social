@@ -198,3 +198,8 @@ describe.skipIf(!url)("X reply reservations (dedicated PostgreSQL)", () => {
     }
     for (const approved of [null, false, true]) {
       const [row] = await sql<{ ready: boolean | null }[]>`select ${unattendedReplyReviewSql(sql, sql`${sql.json({ verifier_meta: { pass: true, judgeOk: true }, human_review_required: true, human_send_approved: approved })}::jsonb`)} as ready`;
+      expect(row?.ready === true).toBe(approved === true);
+    }
+  });
+
+});
