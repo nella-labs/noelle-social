@@ -598,3 +598,203 @@ const actionableLinkedIn: Handler<{ Variables: { actuator: ActuatorContext } }> 
         startHour: sendWindow.startHour,
         endHour: sendWindow.endHour,
         tzOffsetMin: sendWindow.tzOffsetMin,
+      });
+      return c.json(ActionableLinkedInResponseSchema.parse({ comments: [], dms: [] }));
+    }
+  }
+
+  const rows = await sql<JoinedRow[]>`
+    select
+      a.id            as approval_id,
+      d.id            as draft_id,
+      l.id            as lead_id,
+      d.payload       as draft_payload,
+      l.payload       as lead_payload,
+      l.external_id   as lead_external_id,
+      l.author_handle as author_handle,
+      l.author_id     as author_id,
+      wp.name         as wp_name
+    from noelle.approvals a
+    join noelle.drafts d on d.id = a.draft_id
+    join noelle.leads  l on l.id = d.lead_id
+    left join noelle.linkedin_watchlist_people wp
+      on wp.agent_instance_id = a.agent_instance_id
+     and wp.fsd_profile_id = l.author_id
+    where a.agent_instance_id = ${instanceId}
+      and a.org_id = ${orgId} and l.platform = 'linkedin'
+      and ${replyApprovalContextSql(sql)}
+      and a.org_id = ${orgId}
+      and a.status = 'pending'
+    order by a.created_at desc
+    limit 500 -- TODO: paginate if a pending queue ever exceeds this
+  `;
+  // Unattended-autosend verifier precondition (P5): read the flags via process.env
+  // (matching the daily-write-cap pattern below) and pass a resolved gate into the
+  // pure buildActionable. OFF by default => gate=undefined => byte-identical to today.
+  const voiceFloor = resolveLinkedInVoiceFloor();
+  const out = buildActionable(
+    priorityOnly ? rows.filter(isPriorityReadyRow) : rows,
+    (reason, r) =>
+      console.warn("[actuator] item omitted:", reason, { approval_id: r.approval_id, draft_id: r.draft_id }),
+    { requireVerify: true, voiceFloor },
+  );
+
+  // Persistent dedup-by-link (always on): never serve a comment for a post already
+  // replied to — any session, any lead, any prior markSent outcome. Keyed on the
+  // activity URN (urn:li:activity:<id>). Claims are written BEFORE the browser
+  // clicks Comment and remain even if both mark-sent and activity logging fail.
+  // Historical sent approvals and activity rows cover sends before claims existed.
+  // Fail CLOSED: a re-comment on someone's post is the exact spam we're preventing,
+  // so on a query error serve nothing (still 200 so the extension keeps polling).
+  let deduped: ActionableLinkedInResponse = out;
+  try {
+    const repliedRows = await sql<Array<{ urn: string }>>`
+      select distinct urn from (
+        select activity_urn as urn
+          from noelle.linkedin_reply_claims
+          where org_id = ${orgId}
+        union
+        select activity_urn as urn
+          from noelle.linkedin_activity
+          where org_id = ${orgId} and type = 'comment' and activity_urn is not null
+        union
+        select noelle.linkedin_post_activity_urn(le.payload, le.external_id) as urn
+          from noelle.approvals a
+          join noelle.drafts d  on d.id = a.draft_id
+          join noelle.leads  le on le.id = a.lead_id
+          where a.org_id = ${orgId}
+            and a.status = 'sent'
+            and le.platform = 'linkedin'
+            and coalesce(d.payload->>'kind', 'reply') = 'reply'
+      ) s where urn is not null
+    `;
+    const repliedUrns = new Set(repliedRows.map((r) => r.urn));
+    // Until comment-level threading is supported, notification replies use
+    // the same post-level deduplication as other LinkedIn comments.
+    deduped = dedupeAlreadyCommented(out, repliedUrns);
+    const dropped = out.comments.length - deduped.comments.length;
+    if (dropped > 0) {
+      console.warn("[actuator] dedup-by-link: dropped already-replied posts", { org_id: orgId, dropped });
+    }
+  } catch (err) {
+    console.error("[actuator] dedup-by-link query failed; serving empty queue", err);
+    return c.json(ActionableLinkedInResponseSchema.parse({ comments: [], dms: [] }));
+  }
+
+  // Per-author daily write cap (opt-in; no-op unless NOELLE_LINKEDIN_PER_AUTHOR_DAILY_CAP
+  // is set). Runs BEFORE the global daily-write-cap trim so it strictly tightens the queue.
+  let served: ActionableLinkedInResponse = deduped;
+  const perAuthorRaw = process.env.NOELLE_LINKEDIN_PER_AUTHOR_DAILY_CAP;
+  if (perAuthorRaw != null && perAuthorRaw.trim() !== "") {
+    const parsed = Number(perAuthorRaw);
+    const cap = Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : 1; // fail-safe
+    try {
+      const writtenRows = await sql<Array<{ author_handle: string | null; author_id: string | null }>>`
+        select distinct l2.author_handle, l2.author_id
+        from noelle.linkedin_activity act
+        join noelle.approvals a2 on a2.id = act.approval_id
+        join noelle.leads     l2 on l2.id = a2.lead_id
+        where act.org_id = ${orgId}
+          and act.type in ('comment', 'dm')
+          and act.created_at >= date_trunc('day', now())
+      `;
+      const writtenHandles = new Set(writtenRows.map((r) => r.author_handle).filter((x): x is string => !!x));
+      const writtenIds = new Set(writtenRows.map((r) => r.author_id).filter((x): x is string => !!x));
+      served = capActionablePerAuthor(deduped, rows, { cap, writtenHandles, writtenIds });
+      const withheld = (deduped.comments.length + deduped.dms.length) - (served.comments.length + served.dms.length);
+      if (withheld > 0) {
+        console.warn("[actuator] per-author cap trim", { org_id: orgId, cap, withheld, served: served.comments.length + served.dms.length });
+      }
+    } catch (err) {
+      // Fail CLOSED: can't determine who was actioned today → serve nothing (still 200 so the extension keeps polling).
+      console.error("[actuator] per-author cap query failed; serving empty queue", err);
+      return c.json(ActionableLinkedInResponseSchema.parse({ comments: [], dms: [] }));
+    }
+  }
+
+  // The operator-editable browser reply cap counts comments only. DMs remain
+  // governed by their existing approval path and optional combined write cap.
+  const replyCap = resolveBrowserReplyCap("linkedin", owns[0]!.actuator_daily_reply_cap);
+  if (replyCap !== null) {
+    const [count] = await sql<Array<{ n: number }>>`
+      select count(*)::int as n from noelle.linkedin_activity
+      where org_id = ${orgId} and type = 'comment' and created_at >= date_trunc('day', now())
+    `;
+    const available = Math.max(0, replyCap - (count?.n ?? replyCap));
+    served = { ...served, comments: served.comments.slice(0, available) };
+  }
+
+  // Server-side daily write-cap backstop. Client caps are advisory (a tampered
+  // or misconfigured extension can exceed them), so refuse to serve comments/DMs
+  // beyond the org's remaining daily write budget. Likes are found in-feed, not
+  // served here, so they stay governed client-side only.
+  // Unset, blank or invalid LinkedIn daily limits retain the unlimited default.
+  // An explicit environment cap enables the daily comment-and-DM budget.
+  const capRaw = (process.env.NOELLE_LINKEDIN_DAILY_WRITE_CAP ?? "").trim();
+  const capNum = Number(capRaw);
+  const dailyCap = capRaw === "" || !Number.isFinite(capNum) ? Number.POSITIVE_INFINITY : capNum;
+  const used = dailyCap === Number.POSITIVE_INFINITY
+    ? 0
+    : (await sql<Array<{ n: number }>>`
+        select count(*)::int as n from noelle.linkedin_activity
+        where org_id = ${orgId}
+          and type in ('comment', 'dm')
+          and created_at >= date_trunc('day', now())
+      `)[0]?.n ?? 0;
+  const remaining = Math.max(0, dailyCap - used);
+  if (served.comments.length + served.dms.length > remaining) {
+    const dms = served.dms.slice(0, remaining);
+    const comments = served.comments.slice(0, Math.max(0, remaining - dms.length));
+    console.warn("[actuator] daily write-cap trim", {
+      org_id: orgId, cap: dailyCap, used,
+      served: comments.length + dms.length,
+      withheld: served.comments.length + served.dms.length - (comments.length + dms.length),
+    });
+    return c.json(ActionableLinkedInResponseSchema.parse({ comments, dms }));
+  }
+  return c.json(ActionableLinkedInResponseSchema.parse(served));
+};
+actuator.get("/api/actionable-linkedin", actionableLinkedIn);
+actuator.get("/api/actuator/priority-ready", actionableLinkedIn);
+
+// Reserve a post before clicking LinkedIn's Comment submit button. The saved
+// lead URL is the only source for the URN; the request body is ignored. The
+// unique (org_id, activity_urn) key makes a lost acknowledgment permanent and
+// prevents a later run from posting the same comment again.
+actuator.use("/api/actuator/claim-comment/:id", requireActuatorToken);
+
+actuator.post("/api/actuator/claim-comment/:id", async (c) => {
+  const { orgId } = c.get("actuator");
+  const approvalId = c.req.param("id");
+  const sql = noelleDb();
+  try {
+    const rows = await sql<Array<JoinedRow & {
+      status: string;
+      reply_send_enabled: boolean;
+      auto_send_enabled: boolean;
+      actuator_daily_reply_cap: number | null;
+      cap_instance_id: string;
+    }>>`
+      select a.id as approval_id, a.status, d.id as draft_id, l.id as lead_id,
+             d.payload as draft_payload, l.payload as lead_payload,
+             l.external_id as lead_external_id, l.author_handle, l.author_id,
+             null::text as wp_name,
+             ai.reply_send_enabled, ai.auto_send_enabled, ai.actuator_daily_reply_cap,
+             ai.id as cap_instance_id
+      from noelle.approvals a
+      join noelle.agent_instances ai on ai.id = a.agent_instance_id
+      join noelle.drafts d on d.id = a.draft_id
+      join noelle.leads l on l.id = d.lead_id and l.id = a.lead_id
+      where a.id = ${approvalId} and a.org_id = ${orgId}
+        and ai.org_id = ${orgId} and d.org_id = ${orgId}
+        and l.org_id = ${orgId} and l.platform = 'linkedin'
+        and ai.role = 'linkedin_intern' and ${replyApprovalContextSql(sql)}
+      limit 1
+    `;
+    const row = rows[0];
+    const voiceFloor = resolveLinkedInVoiceFloor();
+    if (!row || row.status !== "pending" ||
+        (row.reply_send_enabled !== true && row.auto_send_enabled !== true)) {
+      return c.json({ claimed: false, reason: "not-eligible" });
+    }
+    const comment = buildActionable([row], undefined, { requireVerify: true, voiceFloor }).comments[0];
