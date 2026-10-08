@@ -198,3 +198,72 @@ export async function pm2RestartFromEcosystem(
 ): Promise<void> {
   await pm2(repoRoot, ["restart", ecosystemPath, "--only", name, "--update-env"]);
 }
+
+export async function pm2Stop(repoRoot: string, remove: boolean): Promise<void> {
+  const targets = (await pm2Status(repoRoot)).filter((process) => ownsProcess(process, repoRoot)).map((process) => process.name);
+  if (targets.length) await pm2(repoRoot, [remove ? "delete" : "stop", ...targets]);
+}
+
+export async function pm2Logs(repoRoot: string, service?: string): Promise<void> {
+  const args = ["logs", "--lines", "80"];
+  if (service) args.splice(1, 0, service);
+  await run("pnpm", [...PM2_BASE, ...args], { cwd: repoRoot, inherit: true, allowFailure: true });
+}
+
+/**
+ * One-shot log dump for a single pm2 app (`--nostream`): print the last N lines
+ * and return, rather than tailing forever like `pm2Logs`. Backs `noelle bridge
+ * logs` / `noelle doctor logs`. No-op-safe (allowFailure) if the app isn't
+ * registered yet.
+ */
+export async function pm2LogsOnce(repoRoot: string, name: string, lines: number): Promise<void> {
+  await run("pnpm", [...PM2_BASE, "logs", name, "--lines", String(lines), "--nostream"], {
+    cwd: repoRoot,
+    inherit: true,
+    allowFailure: true,
+  });
+}
+
+export interface Pm2Process {
+  name: string;
+  status: string;
+  restarts: number;
+  cpu: number;
+  memoryMb: number;
+  cwd?: string;
+}
+
+function ownsProcess(process: Pm2Process, repoRoot: string): boolean {
+  if (!MANAGED_PROCESS_NAMES.has(process.name) || !process.cwd) return false;
+  const path = relative(resolve(repoRoot), resolve(process.cwd));
+  return path === "" || (!isAbsolute(path) && path.startsWith("apps/") && !path.split("/").includes(".."));
+}
+
+export function pm2DeployRestartTargets(procs: Pm2Process[], repoRoot: string): string[] {
+  return procs.filter((process) => process.status !== "stopped" && ownsProcess(process, repoRoot)).map((process) => process.name);
+}
+
+/** Parse `pm2 jlist` into a tidy status array; [] if pm2 has no processes. */
+export async function pm2Status(repoRoot: string): Promise<Pm2Process[]> {
+  const r = await pm2(repoRoot, ["jlist"], true);
+  if (r.code !== 0) throw new Error("Process manager status query failed");
+  try {
+    const list = JSON.parse(r.stdout) as Array<{
+      name?: string;
+      pm2_env?: { status?: string; restart_time?: number; pm_cwd?: string };
+      monit?: { cpu?: number; memory?: number };
+    }>;
+    if (!Array.isArray(list) || list.some((p) => !p || typeof p.name !== "string" || !p.name.trim()))
+      throw new Error("Invalid process manager status receipt");
+    return list.map((p) => ({
+      name: p.name ?? "?",
+      status: p.pm2_env?.status ?? "unknown",
+      cwd: typeof p.pm2_env?.pm_cwd === "string" ? p.pm2_env.pm_cwd : undefined,
+      restarts: p.pm2_env?.restart_time ?? 0,
+      cpu: p.monit?.cpu ?? 0,
+      memoryMb: Math.round((p.monit?.memory ?? 0) / (1024 * 1024)),
+    }));
+  } catch {
+    throw new Error("Invalid process manager status receipt");
+  }
+}
