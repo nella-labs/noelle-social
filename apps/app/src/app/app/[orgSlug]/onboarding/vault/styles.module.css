@@ -1,0 +1,100 @@
+/*
+ * The voice wizard, on the design system.
+ *
+ * This module used to reference `--rust`, `--cream`, `--ink-line`, `--font-sans`
+ * and `--font-serif` — none of which globals.css defines. Every rule fell through
+ * to its hardcoded hex fallback, so the wizard rendered in a slightly different
+ * rust and cream than the rest of the app and ignored [data-theme="dark"]
+ * entirely. The tokens below are the real ones.
+ */
+
+.shell {
+  max-width: 720px;
+  margin: 4rem auto;
+  padding: 0 1.5rem;
+  font-family: var(--body, "Inter", system-ui, sans-serif);
+  color: var(--ink);
+}
+
+.header { margin-bottom: 2.5rem; }
+.eyebrow {
+  text-transform: lowercase;
+  letter-spacing: 0.1em;
+  font-size: 0.75rem;
+  color: var(--accent);
+  margin: 0 0 0.5rem 0;
+}
+.title {
+  font-family: var(--display, "Instrument Serif", Georgia, serif);
+  font-size: 2.25rem;
+  line-height: 1.15;
+  margin: 0 0 0.75rem 0;
+  font-weight: 400;
+}
+.title em {
+  font-style: italic;
+  color: var(--accent);
+}
+.progress {
+  font-size: 0.875rem;
+  color: var(--ink-muted);
+  margin: 0;
+}
+
+.form { display: flex; flex-direction: column; gap: 1.5rem; }
+.field { display: flex; flex-direction: column; gap: 0.4rem; }
+.label {
+  font-weight: 500;
+  font-size: 0.95rem;
+}
+.hint {
+  font-size: 0.8rem;
+  color: var(--ink-muted);
+}
+.input,
+.textarea {
+  border: 1px solid var(--rule);
+  background: var(--paper);
+  border-radius: 6px;
+  padding: 0.65rem 0.8rem;
+  font: inherit;
+  color: inherit;
+}
+.input:focus-visible,
+.textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.textarea { min-height: 4rem; resize: vertical; }
+.error { color: var(--danger); font-size: 0.8rem; }
+
+.actions { display: flex; gap: 1rem; align-items: center; margin-top: 1rem; }
+/* `color: var(--paper)`, not the `#fff` that global .btn-accent hardcodes: in the
+   dark theme --accent is a light rust, and white-on-light-rust is unreadable. */
+.primary {
+  background: var(--accent);
+  color: var(--paper);
+  border: none;
+  padding: 0.7rem 1.2rem;
+  border-radius: 6px;
+  font: inherit;
+  cursor: pointer;
+}
+.primary:disabled { opacity: 0.6; cursor: default; }
+.skip {
+  background: none;
+  border: none;
+  color: var(--ink-muted);
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0.5rem;
+  font: inherit;
+}
+
+/* Wizard footers put the primary action last; on a phone it must not slide
+   off-screen. Matches the global .action-bar-phone behaviour. */
+@media (max-width: 768px) {
+  .shell { margin: 2rem auto; }
+  .actions { flex-direction: column-reverse; align-items: stretch; }
+  .actions > * { width: 100%; }
+}
