@@ -198,3 +198,57 @@ async function readDraftGraphSpecs(
 /**
  * Drop one visual (graph_spec) from a draft by its index in the stored array.
  * Index is the ORIGINAL graph_specs position (the Build panel keys Remove on it),
+ * so removable + non-renderable specs stay aligned.
+ */
+export async function removeDraftVisual(input: { orgSlug: string; draftId: string; index: number }) {
+  const auth = await authorizeNova(input.orgSlug);
+  if (auth.kind !== "ok") return { ok: false as const, error: auth.kind };
+  const specs = await readDraftGraphSpecs(input.draftId, auth.instanceId, auth.orgId);
+  if (input.index < 0 || input.index >= specs.length) return { ok: false as const, error: "out_of_range" as const };
+  const next = specs.filter((_, i) => i !== input.index);
+  const rows = await sql<{ id: string }[]>`update noelle.video_drafts set graph_specs = ${sql.json(next as never)}, updated_at = now()
+    where id = ${input.draftId} and agent_instance_id = ${auth.instanceId} and org_id = ${auth.orgId} returning id`;
+  return confirmUpdate(rows);
+}
+
+/**
+ * Refine one visual in place — title + brand colour. Stored on the loose
+ * graph_spec object (title overwrites; brandColor is an extra field the Build
+ * panel reads after coercion), so no contract/migration change is needed.
+ */
+export async function updateDraftVisual(input: {
+  orgSlug: string;
+  draftId: string;
+  index: number;
+  title?: string;
+  brandColor?: string;
+}) {
+  const auth = await authorizeNova(input.orgSlug);
+  if (auth.kind !== "ok") return { ok: false as const, error: auth.kind };
+  const specs = await readDraftGraphSpecs(input.draftId, auth.instanceId, auth.orgId);
+  if (input.index < 0 || input.index >= specs.length) return { ok: false as const, error: "out_of_range" as const };
+  const title = input.title?.trim().slice(0, 120);
+  const brandColor = input.brandColor?.trim().slice(0, 32);
+  specs[input.index] = {
+    ...specs[input.index],
+    ...(title !== undefined ? { title } : {}),
+    ...(brandColor ? { brandColor } : {}),
+  };
+  const rows = await sql<{ id: string }[]>`update noelle.video_drafts set graph_specs = ${sql.json(specs as never)}, updated_at = now()
+    where id = ${input.draftId} and agent_instance_id = ${auth.instanceId} and org_id = ${auth.orgId} returning id`;
+  return confirmUpdate(rows);
+}
+
+export async function dismissStudioItem(input: { orgSlug: string; target: "idea" | "draft"; id: string }) {
+  const auth = await authorizeNova(input.orgSlug);
+  if (auth.kind !== "ok") return { ok: false as const, error: auth.kind };
+  let rows: { id: string }[];
+  if (input.target === "idea") {
+    rows = await sql<{ id: string }[]>`update noelle.video_ideas set status = 'dismissed', updated_at = now()
+      where id = ${input.id} and agent_instance_id = ${auth.instanceId} and org_id = ${auth.orgId} returning id`;
+  } else {
+    rows = await sql<{ id: string }[]>`update noelle.video_drafts set status = 'dismissed', updated_at = now()
+      where id = ${input.id} and agent_instance_id = ${auth.instanceId} and org_id = ${auth.orgId} returning id`;
+  }
+  return confirmUpdate(rows);
+}
