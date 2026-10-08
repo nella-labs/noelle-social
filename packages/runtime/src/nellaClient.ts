@@ -198,3 +198,37 @@ export function createNellaClient(opts: NellaClientOptions): NellaClient {
         score: r.score,
         filePath: r.chunk.filePath,
         startLine: r.chunk.startLine,
+        endLine: r.chunk.endLine,
+        highlights: r.highlights ?? [],
+      }));
+      const scoped = hits.filter((h) => filePathInDirs(h.filePath, filterDirs));
+      return scoped.slice(0, topK);
+    },
+
+    async getAnchors({ workspace, handle, limit = 20 }) {
+      const hits = await client.searchContext({
+        workspace,
+        query: `posts by @${handle} recent voice samples`,
+        topK: limit,
+        filters: { filePattern: "vault/posts/**" },
+      });
+      return hits.map((h) => ({
+        path: h.path,
+        content: h.snippet,
+        recency: "",
+        tags: [],
+      }));
+    },
+
+    async ready() {
+      try {
+        const { response } = await fetchBoundedHttpResponse(`${baseUrl}/ready`, { method: "GET" }, { fetchImpl, timeoutMs });
+        return response.ok;
+      } catch {
+        return false;
+      }
+    },
+  };
+
+  return client;
+}
