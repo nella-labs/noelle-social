@@ -198,3 +198,203 @@ describe("LinkedIn actor observations API", () => {
         { url, text: "Only an opaque author ID", authorId: "A123" },
         { url, text: "Blank handle", authorHandle: "   " },
       ] }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: 0, duplicates: 0, invalid: 3 });
+    expect(db.writes).toHaveLength(0);
+    expect(db.notices()).toBe(0);
+  });
+
+  const anonymous = { fingerprint: "opaque-card-A", text: "A substantive post about scaling a small team", authorHandle: "ada", reactionCount: 55, commentCount: 8 };
+  const observation = (app: Hono, items: unknown[]) => app.request("/api/actuator/observations", {
+    method: "POST", headers: { authorization: "Bearer actor-test", "content-type": "application/json" },
+    body: JSON.stringify({ instanceId, items }),
+  });
+  const identityGet = (app: Hono, id = instanceId, fingerprints?: string[]) => app.request(`/api/actuator/discovery-identities?instanceId=${id}${fingerprints ? `&fingerprints=${encodeURIComponent(JSON.stringify(fingerprints))}` : ""}`, {
+    headers: { authorization: "Bearer actor-test" },
+  });
+  const identityPost = (app: Hono, leadId: string, urn: string, id = instanceId) => app.request("/api/actuator/discovery-identities", {
+    method: "POST", headers: { authorization: "Bearer actor-test", "content-type": "application/json" },
+    body: JSON.stringify({ instanceId: id, leadId, fingerprint: anonymous.fingerprint, urn }),
+  });
+  const shortLinkPost = (app: Hono, leadId: string, shortUrl: string, id = instanceId) => app.request("/api/actuator/discovery-identities", {
+    method: "POST", headers: { authorization: "Bearer actor-test", "content-type": "application/json" },
+    body: JSON.stringify({ instanceId: id, leadId, fingerprint: anonymous.fingerprint, shortUrl }),
+  });
+  const discoveryTarget = (app: Hono, id = instanceId) => app.request(`/api/actuator/discovery-target?instanceId=${id}`, {
+    headers: { authorization: "Bearer actor-test" },
+  });
+
+  it("revisits a qualified author's profile once, then durably cools that author for four hours", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    await observation(app, [anonymous, { ...anonymous, fingerprint: "other-post", text: "Another useful post" }]);
+    for (const row of db.rows.values()) db.qualify(row.externalId);
+    expect(await (await discoveryTarget(app)).json()).toEqual({
+      target: { kind: "profile", id: "ada", url: "https://www.linkedin.com/in/ada/recent-activity/all/" },
+    });
+    expect(db.revisitWrites()).toBe(2);
+    expect([...db.rows.values()].every((row) => typeof row.payload.identity_revisit_at === "string")).toBe(true);
+    expect(db.targetQueries[0]?.query).toContain("org_id = ? and agent_instance_id = ?");
+    expect(db.targetQueries[0]?.query).toContain("payload->'classifier'->>'provider' = 'jev'");
+    expect(await (await discoveryTarget(app)).json()).toEqual({ target: null });
+    expect(db.revisitWrites()).toBe(2);
+  });
+
+  it("rotates to another qualified author instead of repeating the cooled profile", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    await observation(app, [anonymous, { ...anonymous, authorHandle: "bea", fingerprint: "bea-post" }]);
+    for (const row of db.rows.values()) db.qualify(row.externalId);
+    expect(await (await discoveryTarget(app)).json()).toEqual({
+      target: { kind: "profile", id: "ada", url: "https://www.linkedin.com/in/ada/recent-activity/all/" },
+    });
+    expect(await (await discoveryTarget(app)).json()).toEqual({
+      target: { kind: "profile", id: "bea", url: "https://www.linkedin.com/in/bea/recent-activity/all/" },
+    });
+    expect(db.revisitWrites()).toBe(2);
+  });
+
+  it("never routes an unsafe or non-Jev pending author and tenant-checks target requests", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    await observation(app, [
+      { ...anonymous, authorHandle: "../feed", fingerprint: "unsafe" },
+      { ...anonymous, authorHandle: "legacy", fingerprint: "non-jev" },
+    ]);
+    const leads = [...db.rows.values()];
+    for (const row of leads) db.qualify(row.externalId);
+    leads[1]!.payload.classifier = { provider: "legacy" };
+    expect((await discoveryTarget(app, otherId)).status).toBe(403);
+    expect(await (await discoveryTarget(app)).json()).toEqual({ target: null });
+    expect(db.revisitWrites()).toBe(0);
+  });
+
+  it("stages visible content without a permalink and only requests identity after Jev qualification", async () => {
+    const db = fakeDb();
+    __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    expect(await (await observation(app, [anonymous, anonymous])).json()).toEqual({ accepted: 1, duplicates: 1, invalid: 0 });
+    const [row] = [...db.rows.values()];
+    expect(row).toEqual(expect.objectContaining({ externalId: expect.stringMatching(/^browser:[a-f0-9]{64}$/), status: "observed" }));
+    expect(row?.payload).toEqual(expect.objectContaining({ fingerprint: anonymous.fingerprint, reactionCount: 55, commentCount: 8 }));
+    expect(row?.payload).not.toHaveProperty("url");
+    expect(await (await identityGet(app)).json()).toEqual({ items: [], processing: 0 });
+    expect(await (await identityGet(app, instanceId, [anonymous.fingerprint])).json())
+      .toEqual({ items: [], processing: 1 });
+    db.qualify(row!.externalId);
+    expect(await (await identityGet(app)).json()).toEqual({ items: [{ leadId: row!.id, fingerprint: anonymous.fingerprint }], processing: 0 });
+  });
+
+  it("returns a visible qualified card even when 25 newer pending cards fill the global backlog", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    const cards = Array.from({ length: 26 }, (_, index) => ({ ...anonymous, fingerprint: `visible-card-${index}` }));
+    await observation(app, cards);
+    for (const row of db.rows.values()) db.qualify(row.externalId);
+    const oldest = cards[0]!;
+    const response = await identityGet(app, instanceId, [oldest.fingerprint]);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ items: [{ leadId: [...db.rows.values()][0]!.id, fingerprint: oldest.fingerprint }], processing: 0 });
+  });
+
+  it("rejects malformed visible fingerprint filters before querying pending leads", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    const response = await identityGet(app, instanceId, Array.from({ length: 51 }, (_, index) => `v1-${index}`));
+    expect(response.status).toBe(400);
+    expect(db.rows.size).toBe(0);
+  });
+
+  it("resolves an embed share only after Jev qualification, then wakes drafting", async () => {
+    const db = fakeDb();
+    __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    await observation(app, [anonymous]);
+    const [row] = [...db.rows.values()];
+    const fetchMock = vi.fn(async () => new Response('<link rel="canonical" href="https://www.linkedin.com/feed/update/urn:li:activity:7506985845665681408">', { status: 200, headers: { "content-type": "text/html" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await identityPost(app, row!.id, "urn:li:share:7506985844398911488")).status).toBe(409);
+    expect(fetchMock).not.toHaveBeenCalled();
+    db.qualify(row!.externalId);
+    const response = await identityPost(app, row!.id, "urn:li:share:7506985844398911488");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ resolved: true, duplicate: false });
+    expect(fetchMock).toHaveBeenCalledWith("https://www.linkedin.com/embed/feed/update/urn:li:share:7506985844398911488?collapsed=1", expect.objectContaining({ redirect: "error", signal: expect.any(AbortSignal) }));
+    expect(row).toEqual(expect.objectContaining({ externalId: "7506985845665681408", status: "classified" }));
+    expect(row?.payload).toEqual(expect.objectContaining({ urn: "urn:li:activity:7506985845665681408", url: "https://www.linkedin.com/feed/update/urn:li:activity:7506985845665681408/" }));
+    expect(db.notices()).toBe(2); // observation + priority drafter wake
+  });
+
+  it("resolves a copied short link only after Jev qualification and stores the metadata activity", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    await observation(app, [anonymous]);
+    const [row] = [...db.rows.values()];
+    const shortUrl = "https://lnkd.in/p/testToken_123";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 302, headers: {
+        location: "https://www.linkedin.com/posts/ada_topic-ugcPost-7506038810200215553-abc",
+      } }))
+      .mockResolvedValueOnce(new Response('<meta property="lnkd:url" content="https://www.linkedin.com/feed/update/urn:li:activity:7506038962675675138">', {
+        status: 200, headers: { "content-type": "text/html" },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await shortLinkPost(app, row!.id, shortUrl)).status).toBe(409);
+    expect(fetchMock).not.toHaveBeenCalled();
+    db.qualify(row!.externalId);
+    const response = await shortLinkPost(app, row!.id, shortUrl);
+    expect(await response.json()).toEqual({ resolved: true, duplicate: false });
+    expect(row).toEqual(expect.objectContaining({ externalId: "7506038962675675138", status: "classified" }));
+    expect(row?.payload).toEqual(expect.objectContaining({
+      urn: "urn:li:activity:7506038962675675138",
+      url: "https://www.linkedin.com/feed/update/urn:li:activity:7506038962675675138/",
+    }));
+    expect(db.notices()).toBe(2);
+  });
+
+  it("rejects malformed short links without fetching and retains a qualified lead on metadata failure", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    await observation(app, [anonymous]);
+    const [row] = [...db.rows.values()]; db.qualify(row!.externalId);
+    const fetchMock = vi.fn(); vi.stubGlobal("fetch", fetchMock);
+    expect((await shortLinkPost(app, row!.id, "https://lnkd.in.evil.test/p/token")).status).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 302, headers: {
+      location: "https://www.linkedin.com/posts/ada_topic-ugcPost-7506038810200215553-abc",
+    } })).mockResolvedValueOnce(new Response("<html>No activity metadata</html>", {
+      status: 200, headers: { "content-type": "text/html" },
+    }));
+    expect((await shortLinkPost(app, row!.id, "https://lnkd.in/p/testToken_123")).status).toBe(503);
+    expect(row?.status).toBe("identity_pending");
+    expect(db.notices()).toBe(1);
+  });
+
+  it("retains the qualified candidate when the public embed is unavailable", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    await observation(app, [anonymous]);
+    const [row] = [...db.rows.values()]; db.qualify(row!.externalId);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
+    const failed = await identityPost(app, row!.id, "urn:li:share:7506985844398911488");
+    expect(failed.status).toBe(503);
+    expect(row?.status).toBe("identity_pending");
+    expect(await (await identityGet(app)).json()).toEqual({ items: [{ leadId: row!.id, fingerprint: anonymous.fingerprint }], processing: 0 });
+  });
+
+  it("suppresses a duplicate activity after its anonymous card qualified", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    await observation(app, [{ ...anonymous, fingerprint: "other-card", urn: "urn:li:activity:7506985845665681408" }, anonymous]);
+    const row = [...db.rows.values()].find((value) => value.externalId.startsWith("browser:"))!;
+    db.qualify(row.externalId);
+    const fetchMock = vi.fn(); vi.stubGlobal("fetch", fetchMock);
+    const response = await identityPost(app, row.id, "urn:li:activity:7506985845665681408");
+    expect(await response.json()).toEqual({ resolved: false, duplicate: true });
+    expect(row.status).toBe("skipped");
+    expect(db.notices()).toBe(1); // no draft wake for a duplicate
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts a direct activity identity without visiting the embed", async () => {
