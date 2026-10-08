@@ -998,3 +998,203 @@ async function tickOnce() {
         recordReplyHold(s, action, item);
         s.lastEvent = "reply outcome unknown — held without retry";
         await saveIfCurrent(s);
+        events.push({ type: "skip", reason: `reply-unknown:${outcome.detail}`, at,
+          approval_id: item.approvalId, ...(postIdFrom(item.url) ? { post_id: postIdFrom(item.url)! } : {}) });
+      } else if (outcome.kind === "removed") {
+        // The target thread can NEVER take this reply — the post is gone
+        // (removed/deleted/unavailable), its comments are locked, or it is
+        // archived. doReply never opened the composer. Skip it as a TERMINAL
+        // outcome: consume the slot, remember the draft so replenish can't
+        // re-queue this dead post this session (do NOT unshift it back), and do
+        // NOT defer/retry or markSent. The cause-specific reason rides into the
+        // skip event AND the server-side skip below.
+        events.push(recordRemovedSkip(s, action, item, at, outcome.reason));
+        s.lastEvent = `skipped ${outcome.reason} — left it, next`;
+        // Also mark it skipped SERVER-SIDE so the queue stops re-serving this
+        // permalink on every FUTURE run. The local drop only lasts the session;
+        // the approval otherwise stays 'pending' forever (markSent never fires
+        // for a thread that can't take the reply), so each new run re-navigates
+        // to it and drops it again. Best-effort: a failure just means it's
+        // re-served next session, same as before.
+        //
+        // GATED on `durable`: markSkipped irreversibly flips a human-approved
+        // pending approval to 'skipped', so it requires POSITIVE removal/lock
+        // evidence (removed attr, thing-deleted, matched phrase, locked/archived
+        // signal). A non-durable outcome ('post-unavailable' — the post shell
+        // merely absent, which transient 5xx/CDN interstitials also produce)
+        // stays a session-local drop that self-heals next run.
+        if (outcome.durable) await api.markSkipped(item.approvalId, outcome.reason).catch(() => {});
+        // LEAVE the dead post's page — ALWAYS (not just drain). Otherwise the
+        // inter-action ambient browsing and the next tick sit on the removed
+        // post's page ("browsing" stuck on a gone thread). Return to the feed so
+        // idle activity + the next action land on real content.
+        await navigateTab(tabId, REDDIT_FEED_URL, rng).catch(() => {});
+      } else {
+        // Transient failure. Two changes from the old `unshift` (retry at the
+        // FRONT, forever): (1) name the failing stage in the skip reason + attach
+        // the thread's t3 post id, so reddit_activity says WHY and on WHICH
+        // thread — the old bare `reply-failed` was undiagnosable; (2) cap
+        // per-draft retries and re-queue at the BACK, so one thread the composer/
+        // submit can't handle (or a live throttle) can no longer be retried every
+        // slot and starve every other pending draft. "removed" stays exempt from
+        // the counter — it is already terminal above.
+        const { tries, giveUp } = retryDecision(item.tries ?? 0);
+        item.tries = tries;
+        const stage = outcome.detail ? `:${outcome.detail}` : "";
+        const skip: RedditActivityEvent = {
+          type: "skip",
+          reason: giveUp ? `reply-failed:gave-up-after-${tries}${stage}` : `reply-failed${stage}`,
+          at,
+        };
+        const pid = postIdFromUrl(item.url);
+        if (pid) skip.post_id = pid;
+        if (giveUp) {
+          // Drop the draft for this session (mark done locally, do NOT markSent —
+          // nothing posted) so it stops monopolizing reply slots. The approval
+          // stays 'pending'; a later session re-serves it fresh.
+          s.doneDraftIds.push(item.draftId);
+          action.executed = true;
+        } else {
+          s.commentPool.push(item); // BACK of the queue — let healthy drafts go first
+          const d = deferLater(action, now, windowEndMs, rng);
+          action.atMs = d.atMs;
+        }
+        events.push(skip);
+      }
+    }
+  } catch (e) {
+    // A STOP that unwound an in-flight action surfaces as AbortError — log it as a
+    // clean "stopped" skip, not a scary error string (and don't page the doctor).
+    const reason = isAbortError(e) ? "stopped" : `err:${(e instanceof Error ? e.message : String(e)).slice(0, 80)}`;
+    events.push({ type: "skip", reason, at });
+    // Mirror real errors (not clean stops) to the Chrome Bridge sink so the doctor
+    // can see selector drift / attach failures without DevTools open (observability only).
+    if (!isAbortError(e)) sinkLog("error", "tick action failed", { reason });
+  }
+
+  // Surface the outcome to the panel (DevTools can't be open during a run).
+  const last = events[events.length - 1];
+  if (last) {
+    s.lastEvent =
+      last.type === "reply" ? `replied (${s.done.comments}/${s.targets.comments})`
+      : last.reason === "post-removed" ? "skipped removed post — next"
+      : last.reason === "post-unavailable" ? "skipped unavailable page — next"
+      : last.reason === "comments-locked" ? "skipped locked thread — next"
+      : last.reason === "post-archived" ? "skipped archived post — next"
+      : `skip: ${last.reason ?? "?"}`;
+  }
+
+  // Drain auto-continue: before ending a finished drain, try to append another
+  // batch for any approvals still in the inbox, so one Drain clears it all.
+  if (s.mode === "drain" && s.actions.every((a) => a.executed)) {
+    const extended = await maybeExtendDrain(s, cfg, api, now, rng); // appends non-executed slots when work remains
+    // Persistent drain: an empty inbox does NOT end the run. Keep it alive and
+    // watching (roll the window, arm the next watch-poll) so a reply approved
+    // later goes out with no re-click. Only STOP, a challenge halt, or the batch
+    // ceiling (drainShouldKeepWaiting=false) end a drain now.
+    if (!extended && drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0)) {
+      s.windowHours = (now - s.startMs) / 3600_000 + DRAIN_WATCH_WINDOW_H;
+      s.lastDrainWatchMs = now;
+      s.lastEvent = "inbox clear — watching for new approvals (no re-click needed)";
+    }
+  }
+
+  // A caught-up persistent drain stays "running" (watching); every other finished
+  // run goes idle and is ended below.
+  if (s.actions.every((a) => a.executed) && !drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0)) {
+    s.status = "idle";
+  }
+  // Persist only if we're still the live run. A STOP or a superseding Run that
+  // landed mid-tick bumped the epoch, so saveIfCurrent drops this write instead
+  // of resurrecting a run that was already stopped/replaced.
+  const saved = await saveIfCurrent(s);
+  await api.logActivity(s.sessionId, events).catch(() => {});
+  if (saved && s.status === "idle") await endRun("idle");
+}
+
+// The outcome of one reply attempt:
+//   "ok"      → positively-confirmed reply posted (markSent + count).
+//   "removed" → the target thread can NEVER take this reply: the post is GONE
+//               (removed/deleted/unavailable), its comments are LOCKED, or it is
+//               ARCHIVED. SKIP it WITHOUT replying and do NOT retry — never open
+//               the composer. `reason` names the cause (post-removed |
+//               post-unavailable | comments-locked | post-archived) for the skip
+//               event + markSkipped. `durable` says whether the cause was
+//               POSITIVELY confirmed (removed attr / matched phrase / locked or
+//               archived signal) — only then may the tick markSkipped the
+//               approval server-side; 'post-unavailable' (shell absent, could be
+//               a transient interstitial) is durable:false → session-local only.
+//   "failed"  → a known preparation miss before reservation; capped safe retry.
+//   "unknown" → a reservation may exist or submit may have happened. Retain the
+//               thread and draft locally, without success metrics or replay.
+type ReplyOutcome =
+  | { kind: "ok" }
+  | { kind: "removed"; reason: string; durable: boolean }
+  | { kind: "unknown"; detail: string }
+  | { kind: "failed"; detail?: string };
+
+// Post one approved reply via trusted CDP input: navigate → (challenge gate) →
+// (removed-post gate) → open the composer → type → submit → CONFIRM the composer
+// cleared. Handles the new-Reddit collapsed composer (must be clicked to expand the
+// 0×0 editable) and the old-Reddit always-visible textarea, and both target types
+// (reply under the POST vs under a specific COMMENT — the latter scoped by commentId
+// end to end). Preparation misses return "failed". After reservation, missing or
+// unreadable confirmation returns "unknown" and is held. Returns "removed" when the target
+// thread is gone — a distinct, no-retry SKIP that never types into a dead post.
+/**
+ * The reply body this run most recently typed into a composer. The unscoped
+ * clear (navigateTab hops, which carry no item) compares against it to tell OUR
+ * leftover reply from a comment the operator is writing — new Reddit persists
+ * comment drafts, so the difference is between discarding our own dead text and
+ * destroying theirs. Undefined until the run types something, which is exactly
+ * when there is nothing of ours to clear.
+ */
+let lastTypedBody: string | undefined;
+
+/**
+ * Empty the reply box and confirm it, so the next navigation cannot raise a
+ * `beforeunload` dialog.
+ *
+ * Reddit registers a `beforeunload` handler while the composer holds un-sent
+ * text. The actuator's next `chrome.tabs.update` — the hop to the next thread,
+ * or the return to the feed — then navigates away from that dirty box and
+ * Chromium raises "Leave site? Changes you made may not be saved." The dialog
+ * blocks the renderer, freezes the content script's tick loop, and wedges the
+ * run until a human clicks it. It cannot be answered over CDP either: handling
+ * `beforeunload` via Page.handleJavaScriptDialog is broken upstream
+ * (puppeteer/puppeteer#9871), so removing the TRIGGER is the only fix.
+ *
+ * Never throws — it runs on paths that already decided the draft's fate.
+ */
+async function clearComposer(tabId: number, item: RedditPoolItem | undefined, rng: ReturnType<typeof makeRng>): Promise<void> {
+  // Two modes, because the two callers know different things.
+  //
+  //  - doReply's own failure path passes the item, so the clear is SCOPED to the
+  //    composer it typed into. That is the precise thing to empty.
+  //  - navigateTab has no item — it clears before hops that were never part of a
+  //    reply. There the question is not "where would a reply be typed" but
+  //    "which box on this page is holding text", and those have different
+  //    answers: unscoped, locateReplyBox returns the first VISIBLE editable,
+  //    which on new Reddit is the page-level "Add a comment" POST composer.
+  //    Collapsed it is 0x0 and skipped, but once the operator has expanded it an
+  //    empty post box outranks a reply composer that still holds text — the
+  //    emptiness check would read the wrong box, report nothing to clear, and
+  //    the navigation would raise the dialog anyway. locateDirtyReplyBox asks
+  //    the question that has only one answer.
+  const scope = item?.commentId;
+  const cleared = await runClearComposer(
+    item
+      ? {
+        focusBox: async () => {
+          const box = await send<LocateResult>(tabId, { cmd: "locateReplyBox", commentId: scope }).catch(() => null);
+          if (!box?.ok || box.x == null) return false;
+          await cdp.moveAndClick(tabId, rectFrom(box), rng, sleep);
+          return true;
+        },
+        clearKeys: () => cdp.clearFocusedEditor(tabId, sleep),
+        isEmpty: async () => {
+          const st = await send<{ observed?: { present?: boolean; empty?: boolean } }>(
+            tabId, { cmd: "readReplyBox", commentId: scope },
+          ).catch(() => null);
+          if (!st) return false;
+          return st.observed?.present === false || st.observed?.empty === true;
