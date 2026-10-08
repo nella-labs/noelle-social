@@ -1,0 +1,200 @@
+# Notifications actor — part 2 of the reply system
+
+How Vega and Lyra answer the people who answer *them*. Read this with
+`docs/reply-actuation-strategy.md` (how a reply reaches the platform at all) and
+`docs/x-actuator-plan.md` / `docs/linkedin-actuator.md` (the extensions).
+
+## The gap this closes
+
+Part 1 opens conversations: the interns find a stranger's post, draft a reply,
+and the actuator posts it. Then that person replies back — and nothing happens.
+The notifications tab fills up and every thread dies on our side, which is the
+worst shape a reply account can have. The second turn is where a reply becomes
+a relationship.
+
+Part 2 is an actor that reads the notifications page, finds the people who
+replied to us, and puts them back through the normal drafting pipeline.
+
+## The panel: discovery first, older modes available
+
+Both extensions use the same compact panel. **Discover + reply automatically**
+and **Stop actor** are visible; the three older start modes below are inside
+the collapsed **Other modes** section. The old `Run` button and the
+`Window / Comments / Likes` inputs are gone — the scheduled-run path is still
+in the code and still used by the lights-out autonomy auto-start. The panel
+shows active reply leads and errors instead of an activity console.
+
+| Button | Command | What it is |
+|---|---|---|
+| **Auto** | `startFullAuto` | Persistent unattended drain. Posts every approved reply, watches for new ones, holds posts overnight (1am–9am). |
+| **Manual Auto** | `startDrain` | The same persistent drain with **no** overnight curfew — you chose the hour. |
+| **Auto notifications** | `startNotifications` | An unattended drain **plus** the notifications sweep. |
+| **STOP** | `stopRun` | The one off switch. Clears the standing intent. |
+
+## Why "Auto notifications" is a drain
+
+This is the load-bearing decision. A sweep-only run would harvest the
+replies-to-us, hand them to the intern, and then never post the drafts —
+because the thing that posts approvals is the drain, and starting a
+notifications run would have superseded it.
+
+So `startNotifications()` is `startDrain({ manual: true, curfew: true,
+notifications: true })`. One click runs the whole loop:
+
+```
+sweep the notifications page
+  → POST /api/actuator/inbound-reply   (the extension's only write; it writes to noelle, never to the platform)
+  → noelle.leads (status='classified', priority=true, payload.source='notification')
+  → the intern drafter picks it up with full voice grounding
+  → noelle.approvals
+  → GET /api/actionable-x | /api/actionable-linkedin
+  → the SAME live run posts it in-thread
+```
+
+The persistent drain already re-checks the server queue every ~75s with no
+re-click, so the drafts the sweep causes get picked up by the run that caused
+them, minutes later.
+
+Implementation note: it is a **flag** on `RunState` (`notifications: true`), not
+a third `mode`. Every existing `mode === "drain"` predicate
+(`shouldExtendDrain`, `drainShouldKeepWaiting`, `inQuietDrainGap`) therefore
+keeps working untouched. The flag also rides on `DRAIN_INTENT_KEY`, so a
+notifications run that dies to a reload or SW-death resumes as a notifications
+run rather than silently downgrading to a plain drain.
+
+## The sweep
+
+It hooks the tick's **idle branch** — where the run currently chooses between an
+idle-like and an ambient browse while waiting for its next slot. Every ~10–20
+minutes (jittered) a notifications run spends one of those waits reading its
+notifications instead. Checking your mentions *is* ambient behavior, so this
+adds no new behavioral surface.
+
+The sweep is **not** gated on the write curfew. Harvesting is read-only, and
+having overnight replies drafted and ready to post at 9am beats waking up to a
+cold queue. What the curfew holds is the posting, and that gate is in the tick.
+
+### X (`x.com/notifications/mentions`)
+
+1. Navigate, dwell, scroll a pass or two.
+2. `harvestNotifications` reads every tweet cell.
+3. Keep only cells whose **"Replying to …" context names our own handle** —
+   that is what separates a reply from a bare @mention or a quote post. Our own
+   handle is read from the logged-in page (account switcher, then the profile
+   nav link), with an Options `selfHandle` as a fallback.
+4. Drop anything **older than 12 hours** (see below), then drop ids in the local
+   seen-ring, cap at 3 per sweep.
+5. Open each survivor's permalink and read the **ancestor chain** — the thread
+   root and the last thing *we* said. This is what lets the drafter answer the
+   person instead of cold-replying to a fragment.
+
+   **How the focal tweet is located, and why it isn't by id.** On a permalink
+   page X renders the focal tweet's timestamp *without* a self-permalink anchor
+   — you are already on its page — so its id cannot be read from the DOM at all.
+   The ancestors and the replies below it keep theirs. So the focal tweet is
+   identified by the **absence** of an id, not by matching the id we navigated
+   to (which can never resolve). This is documented in the repo's own captured
+   fixture, `tests/fixtures/status-page.html`, and the first implementation got
+   it wrong: matching on id meant `harvestThread` returned `[]` for every real
+   conversation, and with rule 6 below the sweep would have ingested nothing,
+   ever. `tests/fixtures/thread-page.html` now locks the real shape.
+6. **Drop anything whose thread it couldn't read.** Two reasons: a context-less
+   item drafts a cold reply to a fragment, and — less obviously — the turn cap's
+   conversation key is `root:<id>` when the thread reads and `author:<handle>`
+   when it doesn't, so filing one would key the same conversation two ways
+   across sweeps and let it run to 2× the cap. Nothing is marked seen, so the
+   next sweep retries it for free.
+7. POST, return to the feed.
+
+### LinkedIn (`linkedin.com/notifications/`)
+
+Same shape, but the classification signal is LinkedIn's **own** machine-readable
+`highlightedUpdateType` param on the card's headline link —
+`REPLIED_TO_YOUR_COMMENT` and `MENTIONED_YOU_IN_THIS` are replies;
+`REACTED_TO_YOUR_COMMENT`, `COMMENT_VIEWS`, `REACTED_TO_COMMENT_MENTIONING_YOU`
+and `TOPIC_TRENDING_CONVERSATION_IN_YOUR_NETWORK` are not. Headline prose is the
+fallback for cards that carry no type. There is no per-item navigation: the card
+already contains their comment, the quoted original post, the commenter's
+profile id, and every urn we need. A card with no readable comment text is
+dropped rather than filed as a textless lead.
+
+## The 12-hour recency window
+
+Only notifications inside the configured 12-hour recency window are eligible.
+
+The seen-ring answers a different question — *have I already handled this?* — and
+on its own it is not enough. It is per-install and starts **empty**, so a fresh
+profile's first sweep would treat the oldest thing on the page as brand new.
+Both platforms keep days of notifications there. Answering a two-day-old comment
+is necro-engagement: the thread has moved on, and a reply arriving that late
+reads as a bot working through a backlog rather than a person in a conversation.
+
+Both gates now apply, recency first. `MAX_AGE_MINUTES = 720`, boundary
+inclusive.
+
+**The window is enforced in THREE places, and they must agree.** The client's
+window is a politeness filter; the **server's is the real gate**, since the
+claim RPCs decide what may be drafted and sent regardless of what any browser
+harvested. This drifted on day one: the actuators shipped one number while the
+server's claim RPC shipped another from a parallel session, the server silently
+won, and the operator's setting appeared to do nothing with no error anywhere.
+
+`packages/runtime/src/notificationWindow.ts` (`NOTIFICATION_MAX_AGE_HOURS`) is
+now the single source of truth. Two places necessarily hold a copy — the Chrome
+extensions (a content script cannot import a workspace package) and the SQL
+migrations (a migration is frozen and cannot import) — so
+`tests/notification-window-parity.test.ts` in **both** actuators reads the
+constant and the newest `notification_window_Nh.sql` off disk and fails if
+either has drifted. Changing the window means: edit the constant, add a
+migration, done — the tests will tell you if you missed one.
+
+**Why twelve.** Six was the first cut and it worked, but it does not survive a
+night: a reply posted at 1am has aged out by the time the first morning sweep
+runs, and the sweep is deliberately exempt from the write curfew precisely so
+overnight replies are drafted and waiting in the morning. Nine covered a normal
+night; twelve covers it with room to spare, and is still far short of
+"answering yesterday".
+
+**Where the age comes from differs by platform, and that's the whole
+complication.**
+
+| | Source | Shape |
+|---|---|---|
+| X | `<time datetime>` on the cell | ISO 8601 — parsed directly |
+| LinkedIn | `.nt-card__time-ago` | rendered-for-humans text: `6h`, `1d`, `3mo` |
+
+LinkedIn exposes no machine-readable timestamp anywhere on the card, so
+`ageMinutesFromText` parses what the card says. Two details are load-bearing:
+
+- **`mo` is matched before `m`.** Otherwise `3mo` reads as three minutes and a
+  quarter-old notification sails through the window looking fresh.
+- **Every rule is anchored at both ends.** Start-anchoring alone is not a style
+  choice, it is a correctness bug: `/^(\d+)\s*s/` reads the Spanish `3 sem`
+  (three *weeks*) as three seconds, and `/^(\d+)\s*m/` reads `1 mes` (one
+  *month*) as one minute. Both land at "just now", so a months-old thread would
+  be answered. The card harvest is language-independent — it keys on
+  `highlightedUpdateType`, not on prose — so the sweep really does run on a
+  non-English UI even though the rest of the actuator's selectors are English.
+  Anchored, every unrecognised form is `null`, i.e. skip.
+- **The lookup is class-agnostic**, like everything else in that file. If
+  LinkedIn renames `nt-card__time-ago`, `cardAgeMinutes` falls back to a
+  structural scan — but that fallback has to be careful in two ways, because a
+  degradation that invents a *fresh* age is worse than no fallback at all. It
+  skips the human-written subtrees (a reply reading `5 min` is an ordinary
+  thing for somebody to say, and must never become the card's age) and takes the
+  **last** match rather than the first, since the timestamp renders after the
+  comment body on a real card.
+- **Only the innermost cards are harvested.** At `cardsIn`'s bare `article`/`li`
+  fallback levels, a wrapper element also "contains a notification link" — it
+  contains all of them. Harvested, that wrapper is a chimera: one card's
+  identity with another card's timestamp, which then dedups the real card away
+  by `external_id`. A stale reply wearing a fresh card's age is precisely what
+  this window exists to prevent.
+
+**LinkedIn floor-rounds, so its window is `[12h, 13h)` in practice.** A card
+reading `12h` is at least 720 minutes old and at most 779; the boundary is
+inclusive, so we admit it. X compares exact ISO minutes and is a hard 720. The
+two platforms do not mean quite the same thing by "6 hours" and cannot be made
+to — LinkedIn does not publish a precise timestamp anywhere on the card.
+
+**An unreadable age is treated as out-of-window.** We cannot prove it is recent,
