@@ -198,3 +198,58 @@ test("a deduplicated no-op does not claim a targeting change", async () => {
 
 test("mixed-platform proposals remain visible but cannot invoke the write action", async () => {
   await render({ agentRole: "reddit-intern", agentId: "reddit-intern" });
+  await startTurn({ text: "Review these targets", proposal: { ...proposal, addSubreddits: ["saas"], removeSubreddits: [] } });
+  expect(host.textContent).toContain("@example"); expect(host.textContent).toContain("r/saas");
+  expect(button("Apply").disabled).toBe(true);
+  await click("Apply"); expect(actions.targeting).not.toHaveBeenCalled();
+});
+
+test("a success response missing committed counts leaves the proposal pending", async () => {
+  await render(); await startTurn({ text: "Review this target", proposal });
+  actions.targeting.mockResolvedValue({ ok: true }); await click("Apply");
+  expect(host.textContent).not.toContain("Change applied");
+  expect(host.textContent).toContain("Couldn't apply that change");
+  expect(button("Apply").disabled).toBe(false);
+});
+
+test("vault Apply sends only the persisted message identifier and acknowledges confirmed success", async () => {
+  actions.vault.mockResolvedValue({ ok: true, path: edit.path });
+  await render({ agentRole: "cmo" });
+  await startTurn({ text: "Review it", vaultEdit: edit, vaultEditReceipt: receipt });
+  await click("Apply to vault");
+  expect(actions.vault).toHaveBeenCalledWith({ orgSlug: defaults.orgSlug, instanceId: defaults.instanceId, messageId: receipt.messageId });
+  expect(host.textContent).toContain("Written to your vault");
+});
+test("an unbased vault edit offers one explicit refresh through the existing chat request", async () => {
+  await render({ agentRole: "cmo" });
+  await startTurn({ text: "Review it", vaultEdit: edit, vaultEditReceipt: { ...receipt, eligible: false, refreshReason: "partial" } });
+  expect(button("Apply to vault").disabled).toBe(true);
+  await act(async () => { const refresh = button("Refresh file"); refresh.click(); refresh.click(); });
+  expect(posts()).toHaveLength(2);
+  expect(posts()[1]?.body).toMatchObject({ vaultPath: edit.path });
+  expect(actions.vault).not.toHaveBeenCalled();
+  expect(button("Send ↵").disabled).toBe(true);
+});
+test("a stale-source rejection requires refresh and never acknowledges a write", async () => {
+  actions.vault.mockResolvedValue({ ok: false, error: "conflict" });
+  await render({ agentRole: "cmo" });
+  await startTurn({ text: "Review it", vaultEdit: edit, vaultEditReceipt: receipt });
+  await click("Apply to vault");
+  expect(host.textContent).toContain("changed since this proposal");
+  expect(host.textContent).not.toContain("Written to your vault");
+  expect(button("Apply to vault").disabled).toBe(true);
+  expect(button("Refresh file").disabled).toBe(false);
+});
+test("the vault card permits review of the complete candidate beyond the old preview cutoff", async () => {
+  await render({ agentRole: "cmo" });
+  await startTurn({ text: "Review it", vaultEdit: { ...edit, content: "x".repeat(700) + "END OF COMPLETE FILE" }, vaultEditReceipt: receipt });
+  expect(host.querySelector("pre")?.textContent).toContain("END OF COMPLETE FILE");
+});
+test("Retry preserves an explicit file refresh and its complete-source request", async () => {
+  await render({ agentRole: "cmo" });
+  await startTurn({ text: "Review it", vaultEdit: edit, vaultEditReceipt: { ...receipt, eligible: false, refreshReason: "partial" } });
+  await click("Refresh file");
+  await reply(posts().at(-1)!, { error: "model_error" }, 502);
+  await click("Retry");
+  expect(posts().at(-1)?.body).toMatchObject({ vaultPath: edit.path });
+});
