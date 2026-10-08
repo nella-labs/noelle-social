@@ -598,3 +598,144 @@ describe("authoredComments", () => {
   it("enforces the sinceISO floor precisely client-side", async () => {
     const h = harness(() => ({ items: [SAMPLE_AUTHORED_COMMENT] })); // comment is 2026-06-15
     const dropped = await h.client.authoredComments({
+      publicId: "satyanadella",
+      sinceISO: "2026-06-16T00:00:00Z",
+    });
+    expect(dropped).toHaveLength(0);
+    const kept = await h.client.authoredComments({
+      publicId: "satyanadella",
+      sinceISO: "2026-06-01T00:00:00Z",
+    });
+    expect(kept).toHaveLength(1);
+  });
+
+  it("dedupes by id and caps at maxComments", async () => {
+    const h = harness(() => ({
+      items: [
+        SAMPLE_AUTHORED_COMMENT,
+        SAMPLE_AUTHORED_COMMENT,
+        { ...SAMPLE_AUTHORED_COMMENT, id: "c2", commentary: "second authored comment" },
+      ],
+    }));
+    const comments = await h.client.authoredComments({ publicId: "satyanadella", maxComments: 1 });
+    expect(comments).toHaveLength(1);
+  });
+
+  it("requires profileUrl or publicId", async () => {
+    const h = harness(() => ({ items: [] }));
+    await expect(h.client.authoredComments({})).rejects.toBeInstanceOf(ApifyError);
+  });
+
+  it("throws ApifyError on a non-2xx actor run (quota surfaces)", async () => {
+    const h = harness(() => ({ status: 402, text: "Monthly usage hard limit exceeded" }));
+    await expect(
+      h.client.authoredComments({ publicId: "satyanadella" }),
+    ).rejects.toBeInstanceOf(ApifyError);
+  });
+});
+
+
+describe("checkApifyToken", () => {
+  it("returns alive + parsed budget on a 200 (data.current/limits shape)", async () => {
+    let calledUrl = "";
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      calledUrl = input.toString();
+      return new Response(
+        JSON.stringify({
+          data: {
+            plan: "PERSONAL",
+            current: { monthlyUsageUsd: 3.5 },
+            limits: { maxMonthlyUsageUsd: 5 },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const h = await checkApifyToken("apify_api_good", { fetchImpl });
+    expect(h.alive).toBe(true);
+    expect(h.httpStatus).toBe(200);
+    expect(h.monthlyUsageUsd).toBe(3.5);
+    expect(h.maxMonthlyUsageUsd).toBe(5);
+    expect(h.remainingUsd).toBe(1.5);
+    expect(h.plan).toBe("PERSONAL");
+    expect(calledUrl).toContain("/v2/users/me/limits");
+    expect(calledUrl).toContain("token=apify_api_good");
+  });
+
+  it("reads the flat data.monthlyUsage* fallback shape", async () => {
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify({ data: { monthlyUsageUsd: 8, maxMonthlyUsageUsd: 10 } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const h = await checkApifyToken("t", { fetchImpl });
+    expect(h.alive).toBe(true);
+    expect(h.remainingUsd).toBe(2);
+  });
+
+  it("is alive even when no budget fields are present (omits them)", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ data: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const h = await checkApifyToken("t", { fetchImpl });
+    expect(h.alive).toBe(true);
+    expect(h.monthlyUsageUsd).toBeUndefined();
+    expect(h.remainingUsd).toBeUndefined();
+  });
+
+  it("returns not-alive with httpStatus 401 on a genuinely bad/banned token", async () => {
+    const fetchImpl = (async () =>
+      new Response("token-not-found", { status: 401 })) as unknown as typeof fetch;
+    const h = await checkApifyToken("apify_api_dead", { fetchImpl });
+    expect(h.alive).toBe(false);
+    expect(h.httpStatus).toBe(401);
+    expect(h.error).toContain("HTTP 401");
+  });
+
+  it("returns not-alive with httpStatus 0 + error on a network failure", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("getaddrinfo ENOTFOUND api.apify.com");
+    }) as unknown as typeof fetch;
+    const h = await checkApifyToken("t", { fetchImpl });
+    expect(h.alive).toBe(false);
+    expect(h.httpStatus).toBe(0);
+    expect(h.error).toContain("request failed");
+  });
+});
+
+describe("runActorSync real cost capture (drainLastRunUsd)", () => {
+  it("captures the run's real usageTotalUsd and drains it (reset to null on re-read)", async () => {
+    const h = harness(() => ({ items: [SAMPLE], usageTotalUsd: 0.37 }));
+    await h.client.profilePosts({ publicId: "kaia-tham", maxPosts: 5 });
+    expect(h.client.drainLastRunUsd?.()).toBe(0.37);
+    // Drained: a second read (no new run) is null → caller falls back to estimate.
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("is null when the run object reports no usage", async () => {
+    const h = harness(() => ({ items: [SAMPLE] })); // no usageTotalUsd
+    await h.client.profilePosts({ publicId: "kaia-tham" });
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("polls a still-running run to completion, then returns its items + cost", async () => {
+    const h = harness(() => ({ items: [SAMPLE], usageTotalUsd: 0.02, runStatus: "RUNNING" }));
+    const posts = await h.client.profilePosts({ publicId: "kaia-tham" });
+    expect(posts).toHaveLength(1);
+    expect(h.client.drainLastRunUsd?.()).toBe(0.02);
+  });
+
+  it("throws (and records no cost) when the run finishes not-SUCCEEDED", async () => {
+    const h = harness(() => ({ items: [SAMPLE], runStatus: "FAILED" }));
+    await expect(h.client.profilePosts({ publicId: "kaia-tham" })).rejects.toBeInstanceOf(ApifyError);
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("surfaces a token-fatal status on the run start so the rotator can retire it", async () => {
+    const h = harness(() => ({ status: 403, text: "Monthly usage hard limit exceeded" }));
+    await expect(h.client.profilePosts({ publicId: "kaia-tham" })).rejects.toMatchObject({ status: 403 });
+  });
+});
