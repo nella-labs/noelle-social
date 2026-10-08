@@ -198,3 +198,179 @@ test("a rejected script save remains dirty and reviewable", async () => {
     orgSlug: "workspace",
     draftId: "draft-a",
     script: "Local script",
+  });
+  expect(saves().length).toBeGreaterThan(0);
+});
+test("failed beat persistence prevents marking the draft ready", async () => {
+  await render();
+  await change(host.querySelectorAll("textarea")[0], "Local beat");
+  seam.beats.mockResolvedValue({ ok: false, error: "not_found" });
+  await click("Mark ready to film");
+  expect(seam.ready).not.toHaveBeenCalled();
+  expect(saves().length).toBeGreaterThan(0);
+});
+test("a late save receipt cannot clean edits typed during that save", async () => {
+  await render();
+  await change(host.querySelectorAll("textarea")[1], "First local script");
+  const held = deferred({ ok: true });
+  seam.script.mockReturnValue(held.promise);
+  const button = saves()[0];
+  await act(async () => button.click());
+  await change(host.querySelectorAll("textarea")[1], "Newer local script");
+  await act(async () => held.resolve({ ok: true }));
+
+  expect(values()).toContain("Newer local script");
+  expect(seam.script.mock.calls[0][0].script).toBe("First local script");
+  expect(saves().length).toBeGreaterThan(0);
+});
+test("a prior draft's late save cannot clean the newly opened draft", async () => {
+  const second = draft({
+    id: "draft-b",
+    idea_id: "idea-b",
+    idea_hook: "Second hook",
+    script: "Second script",
+  });
+  await render([draft(), second]);
+  await change(host.querySelectorAll("textarea")[1], "First local script");
+  const held = deferred({ ok: true });
+  seam.script.mockReturnValue(held.promise);
+  await act(async () => saves()[0].click());
+  const card = [...host.querySelectorAll("button")].find((node) =>
+    node.textContent?.includes("Second hook"),
+  )!;
+  await act(async () => card.click());
+  await change(host.querySelectorAll("textarea")[1], "Second local script");
+  await act(async () => held.resolve({ ok: true }));
+
+  expect(seam.script.mock.calls[0][0].draftId).toBe("draft-a");
+  expect(values()).toContain("Second local script");
+  expect(saves().length).toBeGreaterThan(0);
+});
+test("clean same-ID refresh adopts current saved data", async () => {
+  await render();
+  await render([
+    draft({
+      final_script: "Current saved script",
+      structure: [{ tStart: 0, tEnd: 2, purpose: "hook", line: "Current saved beat" }],
+    }),
+  ]);
+  expect(values()).toEqual(["Current saved beat", "Current saved script"]);
+  expect(saves()).toHaveLength(0);
+});
+test("opening a different draft uses that draft's saved buffer", async () => {
+  const second = draft({
+    id: "draft-b",
+    idea_id: "idea-b",
+    idea_hook: "Second hook",
+    script: "Second script",
+  });
+  await render([draft(), second]);
+  await change(host.querySelectorAll("textarea")[1], "First local script");
+  const card = [...host.querySelectorAll("button")].find((node) =>
+    node.textContent?.includes("Second hook"),
+  )!;
+  await act(async () => card.click());
+  expect(values()).toEqual(["Original beat", "Second script"]);
+  expect(saves()).toHaveLength(0);
+});
+test("a confirmed save sends the current draft and clears its matching buffer", async () => {
+  await render();
+  await change(host.querySelectorAll("textarea")[1], "Local script");
+  await click("Save");
+  expect(seam.script).toHaveBeenCalledWith({
+    orgSlug: "workspace",
+    draftId: "draft-a",
+    script: "Local script",
+  });
+  expect(saves()).toHaveLength(0);
+});
+
+async function mount() {
+  await render();
+  await click("Talk to Nova →");
+}
+test("out-of-range and identical edits report a no-op without dirtying the editor", async () => {
+  await mount();
+  let result: boolean | undefined;
+  await act(async () => {
+    result = seam.apply!({ beats: [{ index: 8, line: "Detached beat" }], summary: "Rewrite" });
+  });
+  expect(result).toBe(false);
+  expect([...host.querySelectorAll("button")].filter((b) => b.textContent === "Save")).toHaveLength(
+    0,
+  );
+  await act(async () => {
+    result = seam.apply!({ fullScript: "Original script", summary: "Same script" });
+  });
+  expect(result).toBe(false);
+  expect([...host.querySelectorAll("button")].filter((b) => b.textContent === "Save")).toHaveLength(
+    0,
+  );
+  await act(async () => {
+    result = seam.apply!({
+      beats: [
+        { index: 0, line: "Valid change" },
+        { index: 8, line: "Detached change" },
+      ],
+      fullScript: "Detached rewrite",
+      summary: "Invalid partial edit",
+    });
+  });
+  expect(result).toBe(false);
+  expect([...host.querySelectorAll("textarea")].map((input) => input.value)).toContain(
+    "Original script",
+  );
+});
+test("applicable beat and full-script edits acknowledge actual local changes", async () => {
+  await mount();
+  let result: boolean | undefined;
+  await act(async () => {
+    result = seam.apply!({
+      beats: [{ index: 0, line: "Updated line" }],
+      fullScript: "Updated script",
+      summary: "Rewrite",
+    });
+  });
+  expect(result).toBe(true);
+  const values = [...host.querySelectorAll("textarea")].map((input) => input.value);
+  expect(values).toContain("Updated line");
+  expect(values).toContain("Updated script");
+  expect(
+    [...host.querySelectorAll("button")].filter((b) => b.textContent === "Save").length,
+  ).toBeGreaterThan(0);
+});
+
+test("only the confirmed field is cleaned when another field fails", async () => {
+  await render();
+  await change(host.querySelectorAll("textarea")[0], "Saved beat");
+  await change(host.querySelectorAll("textarea")[1], "Unsaved script");
+  seam.script.mockResolvedValue({ ok: false, error: "not_found" });
+  await click("Save");
+  expect(saves().length).toBeGreaterThan(0);
+  seam.script.mockResolvedValue({ ok: true });
+  await click("Save");
+  expect(seam.beats).toHaveBeenCalledTimes(1);
+  expect(seam.script).toHaveBeenCalledTimes(2);
+  expect(saves()).toHaveLength(0);
+});
+test("dirty storyboard metadata stays attached to its lines across refresh", async () => {
+  await render();
+  await change(host.querySelectorAll("textarea")[0], "Local beat");
+  await render([
+    draft({ structure: [{ tStart: 10, tEnd: 20, purpose: "new timing", line: "Server beat" }] }),
+  ]);
+  await click("Save");
+  expect(seam.beats).toHaveBeenCalledWith({
+    orgSlug: "workspace",
+    draftId: "draft-a",
+    structure: [{ tStart: 0, tEnd: 2, purpose: "hook", line: "Local beat" }],
+  });
+});
+test("transport failure keeps the edit retryable and displays uncertainty", async () => {
+  await render();
+  await change(host.querySelectorAll("textarea")[1], "Local script");
+  seam.script.mockRejectedValue(new Error("transport failed"));
+  await click("Save");
+  expect(saves().length).toBeGreaterThan(0);
+  expect(host.textContent).toContain("Could not confirm");
+});
