@@ -1,0 +1,31 @@
+{
+  "name": "@noelle/x-client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "description": "X (twitter.com) HTTP client wrapper used by both apps/x-intern workers and apps/api-vm. Wraps @steipete/bird's TwitterClient and normalises errors into XAuthError / XRateLimitError / XError.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./src/index.ts"
+    }
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@noelle/runtime": "workspace:*",
+    "@steipete/bird": "^0.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  }
+}
