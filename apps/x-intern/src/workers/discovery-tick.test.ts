@@ -798,3 +798,203 @@ describe("runDiscoveryTick", () => {
       const userTweets = vi.fn().mockResolvedValue(res([]));
       const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
       await runDiscoveryTick({
+        log,
+        // 168h is the schema maximum; 720 was silently rejected, so the old
+        // version of this test only exercised the NO-window branch.
+        instance: { id: "i", org_id: "o", discovery_config: { timeWindowHours: 168 } },
+        watchlist: { handles: [], keywords: [] },
+        watchlistPeople: [
+          { handle: "patio11", addedAt: new Date(Date.now() - 2 * 3_600_000).toISOString() },
+        ],
+        xClient: { userTweets, searchTimeline: vi.fn().mockResolvedValue(res([])) } as never,
+        upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+        rateBucket: { tryTake: () => true },
+      });
+      // Must be the added_at (2h ago), not the 168h window.
+      const since = (userTweets.mock.calls[0]![0] as { sinceISO?: string }).sinceISO!;
+      const ageHours = (Date.now() - new Date(since).getTime()) / 3_600_000;
+      expect(ageHours).toBeLessThan(3);
+      expect(ageHours).toBeGreaterThan(1);
+    });
+
+    it("does NOT narrow a DUAL-ROLE handle (targeting + watchlist) to added_at", async () => {
+      // discovery-tick deliberately keeps a dual-role handle's pre-added_at posts
+      // as normal non-priority leads; narrowing its fetch would cut exactly that
+      // targeting coverage.
+      const userTweets = vi.fn().mockResolvedValue(res([]));
+      const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+      await runDiscoveryTick({
+        log,
+        instance: { id: "i", org_id: "o", discovery_config: { timeWindowHours: 168 } },
+        watchlist: { handles: ["patio11"], keywords: [] }, // also a targeting handle
+        watchlistPeople: [
+          { handle: "patio11", addedAt: new Date(Date.now() - 2 * 3_600_000).toISOString() },
+        ],
+        xClient: { userTweets, searchTimeline: vi.fn().mockResolvedValue(res([])) } as never,
+        upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+        rateBucket: { tryTake: () => true },
+      });
+      const since = (userTweets.mock.calls[0]![0] as { sinceISO?: string }).sinceISO!;
+      const ageHours = (Date.now() - new Date(since).getTime()) / 3_600_000;
+      expect(ageHours).toBeGreaterThan(100); // the full window, not the 2h added_at
+    });
+
+    it("keeps the plain window for a targeting handle with no added_at", async () => {
+      const userTweets = vi.fn().mockResolvedValue(res([]));
+      const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+      await runDiscoveryTick({
+        log,
+        instance: { id: "i", org_id: "o", discovery_config: { timeWindowHours: 24 } },
+        watchlist: { handles: ["someone"], keywords: [] },
+        watchlistPeople: [],
+        xClient: { userTweets, searchTimeline: vi.fn().mockResolvedValue(res([])) } as never,
+        upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+        rateBucket: { tryTake: () => true },
+      });
+      const arg = userTweets.mock.calls[0]![0] as { sinceISO?: string };
+      // Still a real 24h window, not widened or dropped.
+      expect(arg.sinceISO).toBeTruthy();
+      expect(arg.sinceISO).not.toBe("2026-05-29T00:00:00.000Z");
+    });
+
+    it("STILL applies the floor to a stranger from the keyword lane", async () => {
+      // The floor must keep doing its job where it belongs: trawling strangers.
+      const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+      const xClient = {
+        userTweets: vi.fn().mockResolvedValue(res([])),
+        searchTimeline: vi.fn().mockResolvedValue(
+          res([
+            tweet({
+              id: "10",
+              likes: 2,
+              created_at: "2026-05-29T12:00:00.000Z",
+              author: { handle: "a-stranger", id: "s", followers: 900 },
+            }),
+          ]),
+        ),
+      };
+      const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+      await runDiscoveryTick({
+        log,
+        instance: { id: "i", org_id: "o", discovery_config: { minFaves: 50 } },
+        watchlist: { handles: [], keywords: ["agents"] },
+        watchlistPeople: [],
+        xClient: xClient as never,
+        upsertLead: upsert,
+        rateBucket: { tryTake: () => true },
+      });
+      expect(upsert).not.toHaveBeenCalled();
+    });
+
+    it("does NOT apply the floor to a watchlist person's low-engagement post", async () => {
+      const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+      const xClient = {
+        userTweets: vi.fn().mockResolvedValue(
+          res([
+            tweet({
+              id: "9",
+              likes: 2,
+              created_at: "2026-05-29T12:00:00.000Z",
+              author: { handle: "patio11", id: "p", followers: 9 },
+            }),
+          ]),
+        ),
+        searchTimeline: vi.fn().mockResolvedValue(res([])),
+      };
+      const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+      await runDiscoveryTick({
+        log,
+        instance: { id: "i", org_id: "o", discovery_config: { minFaves: 50 } },
+        watchlist: { handles: [], keywords: [] },
+        watchlistPeople: [{ handle: "patio11", addedAt: "2026-05-29T00:00:00.000Z" }],
+        xClient: xClient as never,
+        upsertLead: upsert,
+        rateBucket: { tryTake: () => true },
+      });
+      // A 2-like post from a HAND-PICKED person is ingested (as a priority lead)
+      // even though minFaves is 50.
+      expect(upsert).toHaveBeenCalledTimes(1);
+      expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ priority: true }));
+    });
+  });
+});
+
+const { createRepollGate } = await import("@noelle/runtime/repoll-cooldown");
+const { createSourceCursorRegistry } = await import("../lib/source-cursor.js");
+
+describe("watch-lane repoll gate (per-handle cooldown)", () => {
+  const log = () => ({ info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() }) as never;
+  const tweet = (id: string, handle: string) => ({
+    id,
+    text: `post ${id}`,
+    created_at: "2026-07-01T00:00:00.000Z",
+    author: { handle, id: `${handle}-id`, followers: 10 },
+    url: `https://x.com/${handle}/status/${id}`,
+  });
+  const person = { handle: "jane", addedAt: "2026-06-01T00:00:00.000Z" };
+  const baseArgs = (xClient: unknown, upsert: unknown) => ({
+    log: log(),
+    instance: { id: "i", org_id: "o" } as never,
+    watchlist: { handles: [], keywords: [] },
+    watchlistPeople: [person],
+    xClient: xClient as never,
+    upsertLead: upsert as never,
+    rateBucket: { tryTake: () => true },
+  });
+
+  it("no gate passed ⇒ old behaviour: the person is polled every tick", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = { userTweets: vi.fn().mockResolvedValue(res([tweet("1", "jane")])), searchTimeline: vi.fn().mockResolvedValue(res([])) };
+    await runDiscoveryTick(baseArgs(xClient, upsert));
+    await runDiscoveryTick(baseArgs(xClient, upsert));
+    expect(xClient.userTweets).toHaveBeenCalledTimes(2);
+  });
+
+  it("a watch person inside the window is skipped; polled again once it elapses", async () => {
+    let now = 0;
+    const gate = createRepollGate(3600_000, () => now);
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = { userTweets: vi.fn().mockResolvedValue(res([tweet("1", "jane")])), searchTimeline: vi.fn().mockResolvedValue(res([])) };
+    await runDiscoveryTick({ ...baseArgs(xClient, upsert), repollGate: gate });
+    await runDiscoveryTick({ ...baseArgs(xClient, upsert), repollGate: gate });
+    expect(xClient.userTweets).toHaveBeenCalledTimes(1); // second tick cooled down
+    now = 3600_000;
+    await runDiscoveryTick({ ...baseArgs(xClient, upsert), repollGate: gate });
+    expect(xClient.userTweets).toHaveBeenCalledTimes(2);
+  });
+
+  it("a throwing fetch is stamped too (cools down instead of re-hammering)", async () => {
+    const gate = createRepollGate(3600_000, () => 0);
+    const upsert = vi.fn();
+    const xClient = { userTweets: vi.fn().mockRejectedValue(new Error("apify down")), searchTimeline: vi.fn().mockResolvedValue(res([])) };
+    await runDiscoveryTick({ ...baseArgs(xClient, upsert), repollGate: gate });
+    await runDiscoveryTick({ ...baseArgs(xClient, upsert), repollGate: gate });
+    expect(xClient.userTweets).toHaveBeenCalledTimes(1);
+  });
+
+  it("an empty rate bucket does NOT stamp (the handle retries next tick)", async () => {
+    const gate = createRepollGate(3600_000, () => 0);
+    const upsert = vi.fn();
+    const xClient = { userTweets: vi.fn().mockResolvedValue(res([])), searchTimeline: vi.fn().mockResolvedValue(res([])) };
+    await runDiscoveryTick({ ...baseArgs(xClient, upsert), repollGate: gate, rateBucket: { tryTake: () => false } });
+    expect(xClient.userTweets).not.toHaveBeenCalled();
+    await runDiscoveryTick({ ...baseArgs(xClient, upsert), repollGate: gate });
+    expect(xClient.userTweets).toHaveBeenCalledTimes(1); // still due — no stamp happened
+  });
+
+  it("a dual-role handle (targeting + watchlist person) is never gated when the keyword lane is on", async () => {
+    const gate = createRepollGate(3600_000, () => 0);
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = { userTweets: vi.fn().mockResolvedValue(res([tweet("1", "jane")])), searchTimeline: vi.fn().mockResolvedValue(res([])) };
+    const args = { ...baseArgs(xClient, upsert), watchlist: { handles: ["jane"], keywords: [] }, repollGate: gate };
+    await runDiscoveryTick(args);
+    await runDiscoveryTick(args);
+    expect(xClient.userTweets).toHaveBeenCalledTimes(2); // targeting coverage untouched
+  });
+
+  it("in watchlist-only mode a dual-role handle IS gated (the poll is purely watch-lane)", async () => {
+    const gate = createRepollGate(3600_000, () => 0);
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = { userTweets: vi.fn().mockResolvedValue(res([tweet("1", "jane")])), searchTimeline: vi.fn().mockResolvedValue(res([])) };
+    const args = { ...baseArgs(xClient, upsert), watchlist: { handles: ["jane"], keywords: [] }, repollGate: gate, watchlistOnly: true };
+    await runDiscoveryTick(args);
