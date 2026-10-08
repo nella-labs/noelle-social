@@ -398,3 +398,203 @@ export function renderBatchedLightUserPrompt(leads: BatchedLightLeadInput[]): st
       const rp = l.recentPhrasings
         .slice(0, 12)
         .map((b, i) => `[${i + 1}] ${b.length > 160 ? `${b.slice(0, 157)}…` : b}`);
+      parts.push(
+        "recent_phrasings (do NOT reuse these openers or phrasings feed-wide):",
+        rp.join("\n"),
+      );
+    }
+    if (l.registerBlock) parts.push(l.registerBlock);
+    else if (l.shapeBlock) parts.push(l.shapeBlock);
+    if (l.openingMoveBlock) parts.push(l.openingMoveBlock);
+    if (l.genzBlock) parts.push(l.genzBlock);
+    if (l.styleBlock) parts.push(l.styleBlock);
+    return parts.join("\n");
+  });
+  return [
+    `${leads.length} posts to reply to. Draft one short comment per post, returned as a JSON array [{id, reply}] in the same order.`,
+    "",
+    ...blocks.flatMap((b) => [b, ""]),
+    `Return a JSON array with exactly ${leads.length} entries, one per post above, in the same order. Each entry: {"id":"…","reply":"…"}.`,
+  ].join("\n");
+}
+
+/**
+ * Compose the LinkedIn drafter system prompt for a given agent instance.
+ *
+ * When the operator has set a brand_config, prepend the rendered OPERATOR BRAND
+ * block above the brand-agnostic SYSTEM_LINKEDIN_BASE. When brand_config is
+ * empty, use SYSTEM_LINKEDIN_BASE without identity or product facts.
+ *
+ * The operator objective, the per-person directive (built from the person's
+ * profile + objective), and (when the Account Feeder is on + a selection was
+ * made) the per-lead STYLE block are appended after, steering angle/emphasis/form
+ * without overriding the voice/format rules. `style` is omitted (null/undefined)
+ * for every path today, so the prompt is byte-identical until the feeder is on.
+ */
+/**
+ * Char length of the STATIC system prefix produced by buildDrafterSystem — the
+ * unchanging base (SYSTEM_LINKEDIN_BASE, or renderBrandBlock+SYSTEM_LINKEDIN_BASE)
+ * that sits before the per-lead mission/person/style/pattern suffix. This value
+ * is a valid cache breakpoint: it is a byte-exact prefix of buildDrafterSystem's
+ * output (buildDrafterSystem joins the base parts and the suffix parts with the
+ * SAME "\n" separator, so the base always prefixes the full string). Pure +
+ * deterministic. Passed as systemCachePrefixLen so the Bedrock/Anthropic
+ * backends cache the base and never re-bill it across the initial draft + every
+ * verify-driven regenerate (no-op until NOELLE_PROMPT_CACHE_ENABLED=1).
+ */
+export function drafterSystemCachePrefixLen(brand?: BrandConfig | null, browserReply = false): number {
+  if (browserReply) return [renderBrowserReplyBrand(brand), "", SYSTEM_LINKEDIN_BROWSER_REPLY].join("\n").length;
+  const useBrand = brand != null && brandConfigHasContent(brand);
+  const prefix = useBrand
+    ? [renderBrandBlock(brand), "", SYSTEM_LINKEDIN_BASE].join("\n")
+    : SYSTEM_LINKEDIN_BASE;
+  return prefix.length;
+}
+
+export function buildDrafterSystem(
+  objective?: string | null,
+  personDirective?: string | null,
+  brand?: BrandConfig | null,
+  style?: StyleForPrompt | null,
+  postRegister?: PostRegister,
+  patternRules?: PatternRuleForPrompt[] | null,
+  faithful?: boolean,
+  /**
+   * The operator's approved replies paired with the posts they answered.
+   * Layered last among the voice blocks: the frozen style examples teach
+   * shape, these teach the move. Empty ⇒ no push ⇒ byte-identical prompt.
+   */
+  voiceExemplars?: ReadonlyArray<VoiceExemplar>,
+  browserReply = false,
+): string {
+  const mission = browserReply ? null : objective?.trim();
+  const person = browserReply ? null : personDirective?.trim();
+  const useSentReplyVoice = browserReply && Boolean(voiceExemplars?.length);
+  const styleBlock = style ? renderStyleBlock(style, postRegister, faithful && !useSentReplyVoice) : "";
+  const patternBlock = patternRules?.length ? renderPatternRulesBlock(patternRules) : "";
+  const useBrand = brand != null && brandConfigHasContent(brand);
+  const parts = browserReply
+    ? [renderBrowserReplyBrand(brand), "", SYSTEM_LINKEDIN_BROWSER_REPLY]
+    : useBrand ? [renderBrandBlock(brand), "", SYSTEM_LINKEDIN_BASE] : [SYSTEM_LINKEDIN_BASE];
+  const baseLen = parts.length;
+  if (mission) {
+    parts.push(
+      "",
+      "OPERATOR MISSION (set by the operator for this agent)",
+      `The operator framed this agent's job as: "${mission}"`,
+      "Let that mission steer which angle leads and what you emphasise. When a post clearly relates to the mission, lean into it. It does NOT override anything above: keep the voice, the NEVER-DO list, and the strict JSON output shape exactly as specified. Never fabricate a connection to the mission — if a post doesn't relate, write the best honest peer comment anyway.",
+    );
+  }
+  if (person) {
+    parts.push(
+      "",
+      "PER-PERSON CONTEXT (who you're commenting to, and how to engage them)",
+      person,
+      "Apply this to both the comments and the DM. It steers tone and intent only — keep the voice, the NEVER-DO list, and the strict JSON output shape exactly as specified.",
+    );
+  }
+  // STYLE block sits AFTER the per-person context (§2.10) — it shapes FORM, which
+  // is the last thing layered on before the model writes.
+  if (styleBlock) {
+    parts.push("", styleBlock);
+  }
+  // Pattern-breaker rules sit LAST — the final constraint layered before the
+  // model writes, so "don't repeat yourself" is the freshest instruction.
+  if (patternBlock) {
+    parts.push("", patternBlock);
+  }
+  // The operator's real POST -> REPLY pairs, last among the voice layers.
+  const exemplarBlock = voiceExemplars?.length ? renderVoiceExemplars(voiceExemplars) : "";
+  if (!browserReply && !useBrand && parts.length === baseLen && !exemplarBlock) return SYSTEM_LINKEDIN_BASE;
+  if (exemplarBlock) parts.push(exemplarBlock);
+  if (browserReply) {
+    const shape = useSentReplyVoice ? browserReplyShape(style, faithful) : "";
+    if (shape) parts.push("", shape);
+    if (exemplarBlock) parts.push("", BROWSER_REPLY_OPERATOR_VOICE);
+    parts.push("", BROWSER_REPLY_GROUNDING);
+  }
+
+  return parts.join("\n");
+}
+
+// ---- LIGHT (short supportive) drafter ------------------------------------
+// The quality classifier routes lower-scoring-but-still-worthwhile posts (wins,
+// launches, milestones, "I shipped / joined / started / raised" posts) to a
+// LIGHT reply: ONE short, warm, specific congrats/encouragement. No three
+// angles, no DM, no pitch — just a genuine peer reaction. This is the variant
+// the drafter uses when classifier_label='light'.
+export const SYSTEM_LINKEDIN_LIGHT = `You are drafting ONE short, supportive LinkedIn comment for an operator engaging the configured audience as a peer.
+
+${WRITING_STRUCTURE_GUIDANCE}
+
+This post is a win, launch, milestone, or "I shipped / joined / started / raised" moment. It does NOT call for a heavy, value-adding reply — it calls for a brief, warm, genuine reaction from a peer who is happy for them. Think "love this, congrats" but specific to what they actually did, in the operator's own voice.
+
+WHAT TO WRITE
+- Exactly ONE comment. 1 to 2 sentences. Short — unless THIS REPLY'S ASSIGNED SHAPE appears below, either inside a STYLE block or as its own block; then the assigned shape's length and sentence count win, and it may legitimately ask for more than two sentences.
+- Warm and specific: name the actual thing they shipped/joined/launched so it doesn't read as a canned "congrats". One concrete detail from their post is enough.
+- A peer's genuine reaction or light encouragement. A forward-looking hope is allowed when useful, but do not infer earlier struggles, company maturity, working practices or future business impact from a milestone. The detail already in the post is enough to make a warm reply specific.
+
+ASSIGNED REGISTER (when present)
+A block labelled "ASSIGNED REGISTER FOR THIS REPLY" may appear below the post. When it does, it OVERRIDES the default length and energy of this comment — follow it exactly, including ALL-CAPS, exclamations, very short fragments (even a 3-7 word one-liner), and slang/jerga when the register calls for them. It does NOT relax any NEVER DO rule below (still no pitch, no em dashes, no corporate verbs, no echoing the post, the emoji allowlist).
+
+${GENZ_MARKER_RULE}
+
+${EMOJI_RULE}
+
+${NO_COMMITMENTS_RULE}
+
+${ANTI_AI_RULES}
+
+${NO_HOUSE_SKELETON_RULE}
+
+${NO_PERIODS_RULE}
+
+NEVER DO
+- Do NOT pitch. No product mention, no link, no CTA. This is celebration, not outreach.
+- Do NOT invent personal history — no made-up anecdotes, ages, or "I did this too" stories you weren't given. A genuine short reaction needs no fabricated backstory.
+- Do NOT manufacture a fake-conversion arc or self-diminish to flatter ("I used to do it wrong, now I do it your way"). Celebrate their win on its own terms; don't invent a story about changing your own mind.
+- Em dashes (—, –, ―, --). Use commas, parentheses, or periods.
+- Any emoji outside 💀 😭 😛, and even those only when the post itself uses emoji.
+- Portable generic praise and hollow engagement-bait ("This. 👏", "Couldn't agree more", "Great post!", "So well said", "Thanks for sharing", "Congrats! 🎉" alone) stay banned. A short spoken acknowledgement is allowed only when the same thought gives a post-specific reason or referent. If it could sit under another post unchanged, cut it.
+- Corporate verbs: unlock, empower, leverage, streamline, delight, supercharge, revolutionize, seamless, synergy, cutting-edge, next-generation.
+- "to be honest" / "honestly" as a reflexive hedge-opener (starting a comment with it, or leaning on it every line). A single natural "honestly" or "tbh" as texture is fine — but never as a throat-clearing opener or a verbal tic; when it's just hedging, cut it and say the thing directly.
+- Echoing the post back at them ("love how you said…", quoting their words). They can see their own post.
+- Vague referential filler / lazy reactions (operator ban): pointing back at the post instead of naming the thing — "the part where/of…", "the stuff" / "or the stuff", "something of the post/their take" — and the "this slaps" / "slaps" reaction tic. Say the specific thing you actually mean.
+- Reaction clichés + insight-bait + fake-curiosity: "hits different", "this hits", "hits home/hard", "lands well", "the gap between X is where most…", "curious to hear how it lands", "would love to hear how this plays out". Say something plain and specific instead.
+- Choppy "sentence. sentence. sentence." staccato. Glue clauses with connectors (and, but, so, because) — one warm line, not stacked fragments.
+- The word "babysit" / "hand-holding" as buzzwords.
+- Multiple comments, multiple angles, or a DM. Exactly ONE comment — short by default, or exactly the length an ASSIGNED SHAPE block asks for when one is present.
+
+OUTPUT FORMAT — STRICT JSON, NO MARKDOWN FENCES, NO PREAMBLE
+The very first character of your response MUST be \`{\` and the last \`}\`. Output exactly:
+
+  {"drafts":[{"angle":"empathetic","body":"…","char_count":N}]}
+
+Exactly ONE draft with angle "empathetic". \`char_count\` must equal the actual length of \`body\`. Do NOT include a \`dm\`. Do NOT output a "skip" — the upstream gate already decided this lead is worth a reply.`;
+
+/**
+ * Compose the LIGHT (short supportive) drafter system prompt. Reuses the
+ * operator brand persona (so the reply still sounds like the operator) but with
+ * the celebrate-don't-pitch discipline of SYSTEM_LINKEDIN_LIGHT. The operator
+ * objective + per-person directive are appended for tone/voice steering only;
+ * they never re-enable the pitch.
+ */
+export function buildLightDrafterSystem(
+  objective?: string | null,
+  personDirective?: string | null,
+  brand?: BrandConfig | null,
+  style?: StyleForPrompt | null,
+  postRegister?: PostRegister,
+  patternRules?: PatternRuleForPrompt[] | null,
+  faithful?: boolean,
+  browserReply = false,
+  voiceExemplars?: ReadonlyArray<VoiceExemplar>,
+): string {
+  const mission = browserReply ? null : objective?.trim();
+  const person = browserReply ? null : personDirective?.trim();
+  const useSentReplyVoice = browserReply && Boolean(voiceExemplars?.length);
+  const styleBlock = style ? renderStyleBlock(style, postRegister, faithful && !useSentReplyVoice) : "";
+  const patternBlock = patternRules?.length ? renderPatternRulesBlock(patternRules) : "";
+  const useBrand = brand != null && brandConfigHasContent(brand);
+  // When the operator has a brand, prepend WHO they are (persona/voice) but keep
+  // the light, no-pitch instructions authoritative. We deliberately do NOT pass
