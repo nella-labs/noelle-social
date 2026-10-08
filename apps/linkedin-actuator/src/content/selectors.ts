@@ -598,3 +598,150 @@ export function hasComments(post: Element): boolean {
 }
 
 export function findMessageCompose(root: ParentNode): HTMLElement | null {
+  return (
+    root.querySelector<HTMLElement>(".msg-form div[role='textbox'][contenteditable='true']") ??
+    root.querySelector<HTMLElement>(".msg-form [contenteditable='true']")
+  );
+}
+
+/**
+ * The current text in the message compose box, trimmed (same zero-width strip as
+ * commentBoxText). null when there is no compose box at all.
+ *
+ * Exists so the message composer can be cleared the way the comment box is —
+ * emptiness checked FIRST, so an already-empty box costs one read and is never
+ * clicked or typed into. Without it the clear is blind, and `.msg-form` matches
+ * the persistent messaging overlay present on EVERY LinkedIn page: a blind pass
+ * on every navigation would click into (and wipe) an operator's own half-typed
+ * DM. It also gives doDm the send confirmation it otherwise has no way to make.
+ */
+export function messageComposeText(root: ParentNode): string | null {
+  const box = findMessageCompose(root);
+  if (!box) return null;
+  return normalizeEditorText(box.textContent ?? "");
+}
+
+export function findMessageSend(root: ParentNode): HTMLElement | null {
+  return (
+    root.querySelector<HTMLElement>(".msg-form button[aria-label*='Send' i]") ??
+    root.querySelector<HTMLElement>(".msg-form button[type='submit']")
+  );
+}
+
+/** Returns the "…more" / "see more" post-text expander button, or null. */
+export function findSeeMore(post: Element): HTMLElement | null {
+  // Primary: stable BEM class
+  const primary = post.querySelector<HTMLElement>(
+    "button.feed-shared-inline-show-more-text__see-more-less-toggle"
+  );
+  if (primary) return primary;
+
+  // Fallback: text-match on any button inside the post
+  for (const btn of Array.from(post.querySelectorAll<HTMLElement>("button"))) {
+    const txt = (btn.textContent ?? "").trim();
+    if (
+      (/(\.\.\.|…)?\s*see more$/i.test(txt) || /^\s*…?more$/i.test(txt)) &&
+      !/see less/i.test(txt)
+    ) {
+      return btn;
+    }
+  }
+  return null;
+}
+
+/** Returns the trimmed post body text, excluding actor / social-action subtrees. */
+export function postText(post: Element): string {
+  // Primary: stable container class
+  const primary = post.querySelector<HTMLElement>(".update-components-text");
+  if (primary) return (primary.textContent ?? "").trim();
+
+  // Fallback: clone post, strip actor + action-bar subtrees, take longest visible block
+  const clone = post.cloneNode(true) as Element;
+  for (const sel of [
+    ".update-components-actor",
+    ".feed-shared-social-action-bar",
+    ".comments-comment-box",
+    ".social-details-social-activity",
+  ]) {
+    clone.querySelectorAll(sel).forEach((el) => el.remove());
+  }
+
+  // Walk direct block-ish children and pick the longest text chunk
+  let longest = "";
+  for (const child of Array.from(clone.children)) {
+    const t = (child.textContent ?? "").trim();
+    if (t.length > longest.length) longest = t;
+  }
+  return longest;
+}
+
+/** Word count of the post body text. */
+export function wordCount(post: Element): number {
+  return postText(post).split(/\s+/).filter(Boolean).length;
+}
+
+/** True if the post contains an image or video element. */
+export function hasMedia(post: Element): boolean {
+  return (
+    post.querySelector(
+      ".update-components-image, [data-media-urn], video, .update-components-linkedin-video"
+    ) !== null
+  );
+}
+
+/** True if the post body is collapsed (a "see more" toggle is present). */
+export function isTruncated(post: Element): boolean {
+  return findSeeMore(post) !== null;
+}
+
+/**
+ * True when the page is LinkedIn's unavailable/deleted-post state (the permalink
+ * shows "This post cannot be displayed" / "no longer available" and will never
+ * render a composer). The actuator uses this to DROP a comment/DM whose target
+ * no longer exists instead of retrying the dead permalink on every slot. Matched
+ * on specific short phrases so an ordinary post quoting these words won't trip it.
+ */
+export function isPostUnavailable(root: ParentNode): boolean {
+  const el = root instanceof Element ? root : (root as Document).body ?? null;
+  const text = (el?.textContent ?? "").replace(/\s+/g, " ");
+  return [
+    /this post can'?t be displayed/i,
+    /this post cannot be displayed/i,
+    /this post (is )?no longer available/i,
+    /this content (isn'?t|is not) available/i,
+    /this page doesn'?t exist/i,
+  ].some((re) => re.test(text));
+}
+
+/**
+ * True when the post's author has restricted who can comment and this account
+ * isn't eligible — LinkedIn shows "Only connections can comment on this post. You
+ * can still react or share it." (or "…only people <name> follows…") IN PLACE of
+ * the composer, so no comment box ever renders. Permanent for this account, so the
+ * actuator DROPS the draft (and marks it skipped server-side) instead of hunting
+ * for a composer that will never exist and burning the retry budget on
+ * `box-not-found`. Matched on the restriction phrasing + its companion
+ * "react or share" line so an ordinary post quoting these words won't trip it.
+ */
+export function isCommentRestricted(root: ParentNode): boolean {
+  const el = root instanceof Element ? root : (root as Document).body ?? null;
+  const text = (el?.textContent ?? "").replace(/\s+/g, " ");
+  return [
+    /only\b[^.]{0,80}?\bcan comment on this post/i,
+    /you can still react or share/i,
+    /comment(?:ing)? (?:has|have) been (?:limited|restricted|turned off|disabled)/i,
+    /comments (?:are|have been) (?:limited|restricted|turned off|disabled)/i,
+  ].some((re) => re.test(text));
+}
+
+export function findChallenge(root: ParentNode): boolean {
+  // A REAL LinkedIn bot-challenge REDIRECTS the page to /checkpoint/ — that is the
+  // one signal that is both reliable and false-positive-free. Every DOM/text scan
+  // we tried (body text, class="*challenge*", captcha iframes, checkpoint forms)
+  // matched innocent feed content or hidden LinkedIn markup and HALTED valid runs.
+  // So: the checkpoint URL, plus the actual captcha vendors' iframes (arkose /
+  // funcaptcha only ever load during a genuine challenge). Nothing else.
+  const path = (typeof location !== "undefined" && location.pathname) || "";
+  if (/\/checkpoint\//i.test(path)) return true;
+  return root.querySelector("iframe[src*='arkoselabs' i], iframe[src*='funcaptcha' i]") !== null;
+}
