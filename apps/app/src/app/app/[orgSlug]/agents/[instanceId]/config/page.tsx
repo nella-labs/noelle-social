@@ -398,3 +398,203 @@ export default async function AgentConfigPage({
               stage="0.0.1"
             />
           </CfgSection>
+
+          <CfgSection
+            id="byo-keys"
+            title="Bring your own key"
+            sub="Use your own provider API keys instead of Noelle's pool. Calls billed to your account skip Noelle's spend recorder. This card persists in the next release — adding keys today is not yet possible."
+          >
+            <ByoKeysGrid disabled />
+          </CfgSection>
+
+          <CfgSection
+            id="budget"
+            title="Budget cap"
+            sub="Hard cap enforced before each model call by the three-layer pre-flight check."
+          >
+            <CfgRow
+              label="Monthly cap"
+              hint={`Total spend allowed for this agent per calendar month. Minimum $${BUDGET_MIN_CENTS / 100}.`}
+            >
+              <BudgetCapField
+                defaultCents={capCents}
+                minCents={BUDGET_MIN_CENTS}
+                maxCents={BUDGET_MAX_CENTS}
+                stepCents={BUDGET_STEP_CENTS}
+                disabled={!canEdit}
+              />
+              {!canEdit ? (
+                <div style={{ fontSize: 11.5, color: "var(--ink-muted)", marginTop: 6 }}>
+                  Only workspace admins can change the cap.
+                </div>
+              ) : null}
+            </CfgRow>
+            <CfgRow
+              label="Spent this month"
+              hint="Live spend recorded against this cap. The agent stops calling models for the rest of the month once spend reaches the cap."
+            >
+              <span style={{ fontFamily: "var(--mono)", fontSize: 13 }}>
+                {spentCents === null ? "Unavailable" : formatCents(spentCents)} / {formatCents(capCents)}
+                <span style={{ color: "var(--ink-muted)" }}> · {budgetUsedPct}% used</span>
+              </span>
+            </CfgRow>
+          </CfgSection>
+
+          <CfgSection
+            id="auto-send"
+            title="Auto-send"
+            sub={
+              isRedditIntern
+                ? "When on, the Reddit actuator auto-sends approved replies — posting from your logged-in reddit.com tab. A reply in the approvals queue IS the approval; Skip it to stop it. Send pacing (spacing, per-hour cap, warm-up, curfew) lives in the actuator, not here."
+                : "When on, Vega picks the longest of the three angles, schedules it for delayed delivery, and posts to X without waiting for your approval. The other two angles are skipped automatically so they don't clutter the inbox. The send worker holds the post until target time, then fires through the same path your manual Send click uses."
+            }
+          >
+            <CfgRow
+              label="Auto-send mode"
+              hint={
+                isRedditIntern
+                  ? "Off (default): replies wait in the approvals queue. On: the Reddit actuator posts approved replies automatically."
+                  : "Off (default): three angles land in the inbox for human review. On: Vega ships replies on the schedule below."
+              }
+            >
+              <SwitchField
+                name="autoSendEnabled"
+                defaultChecked={autoSendEnabled}
+                disabled={!canEdit}
+              />
+            </CfgRow>
+            {/* The delay/rate knobs below drive the X send WORKER's delayed
+                delivery. Orion has no send worker — the Reddit actuator posts and
+                paces itself (see docs/reddit-actuator.md) — so they don't apply. */}
+            {!isRedditIntern && (
+              <>
+                <CfgRow
+                  label="Earliest delay"
+                  hint="Minimum wall-clock wait between drafter creation and X post. 120s = 1 min base + 1 min jitter; bumping this padds out the cadence."
+                >
+                  <RangeWithLabel
+                    name="autoSendMinDelaySec"
+                    min={30}
+                    max={1800}
+                    step={30}
+                    defaultValue={autoSendMinDelay}
+                    disabled={!canEdit}
+                    format="duration"
+                  />
+                </CfgRow>
+                <CfgRow
+                  label="Latest delay"
+                  hint="Upper bound on the wait. Each reply rolls uniform(earliest, latest) then scales 0.5×–1.5× by the prior body's length so a long reply pads the next; a short reply doesn't."
+                >
+                  <RangeWithLabel
+                    name="autoSendMaxDelaySec"
+                    min={60}
+                    max={3600}
+                    step={30}
+                    defaultValue={autoSendMaxDelay}
+                    disabled={!canEdit}
+                    format="duration"
+                  />
+                </CfgRow>
+                <CfgRow
+                  label="Max per hour"
+                  hint="Rate brake. When the trailing-hour auto-send count hits this number, the send worker leaves due rows for the next tick instead of bursting them out."
+                >
+                  <StepperField
+                    name="autoSendMaxPerHour"
+                    min={1}
+                    max={30}
+                    step={1}
+                    defaultValue={autoSendMaxPerHour}
+                    disabled={!canEdit}
+                    unitLabel="/hr"
+                  />
+                </CfgRow>
+              </>
+            )}
+          </CfgSection>
+
+          <CfgSection
+            id="dms"
+            title="Direct messages"
+            sub="When on, the drafter auto-drafts a cold-outreach DM alongside each reply (queued for approval — never auto-sent). Off by default: replies only, which keeps the approval queue focused on comments."
+          >
+            <CfgRow
+              label="Auto-draft DMs"
+              hint="Off (default): the drafter generates replies only. On: a DM draft is added per qualifying lead. You still send every DM by hand."
+            >
+              <SwitchField
+                name="dmAutodraft"
+                defaultChecked={dmAutodraftEnabled}
+                disabled={!canEdit}
+              />
+            </CfgRow>
+            {isLinkedinIntern ? (
+              <CfgRow
+                label="Intro DMs"
+                hint="Off (default): no intro DMs. On: Lyra drafts ONE warm relationship intro DM per profiled connection, ever (no pitch — queued for approval, never auto-sent). Never runs during a goal-run."
+              >
+                <SwitchField
+                  name="linkedinIntroDm"
+                  defaultChecked={introDmEnabled}
+                  disabled={!canEdit}
+                />
+              </CfgRow>
+            ) : null}
+          </CfgSection>
+
+          {isXIntern || isLinkedinIntern || isRedditIntern ? (
+            <CfgSection
+              id="classifier"
+              title="Classifier filter"
+              sub={`How strict the intern is about which posts are worth a reply. The classifier scores each post 0–100 for reply-worthiness; posts at or above the threshold get drafted, below it are skipped (or get a short note). Lower = looser (more drafts, lower precision). Blank = the default (${isXIntern ? 50 : 75}).`}
+            >
+              <CfgRow
+                label="Quality threshold (0–100)"
+                hint={`A post scoring at or above this becomes a draft. Blank = ${isXIntern ? 50 : 75} (platform default). Try lowering it to loosen the filter when the approval queue is thin.`}
+              >
+                <DiscNumInput
+                  name="classifierThreshold"
+                  defaultValue={classifierThreshold}
+                  disabled={!canEdit}
+                  placeholder={isXIntern ? "50" : "75"}
+                  min={0}
+                  max={100}
+                />
+              </CfgRow>
+            </CfgSection>
+          ) : null}
+
+          {isXIntern ? (
+            <CfgSection
+              id="discovery"
+              title="Discovery"
+              sub="The default for which posts discovery pulls each run. Override per-run from the agent's Pipeline panel (Start all → Tailor this run). Engagement, post-type, and language filters apply to keyword search only; the time window + posts-per-source apply to handle polling too."
+            >
+              <CfgRow
+                label="Posts from the last (hours)"
+                hint="Only ingest posts newer than this many hours. Blank = no window (any age). Applies to both watched handles and keyword search."
+              >
+                <DiscNumInput name="discWindowHours" defaultValue={disc.timeWindowHours ?? null} disabled={!canEdit} placeholder="No window" min={1} max={168} />
+              </CfgRow>
+              <CfgRow
+                label="Posts per source"
+                hint="How many tweets to pull per watched handle / keyword each tick. Blank = 20 (the default). Range 5–100."
+              >
+                <DiscNumInput name="discPostsPerSource" defaultValue={disc.postsPerSource ?? null} disabled={!canEdit} placeholder="20" min={5} max={100} />
+              </CfgRow>
+              <CfgRow
+                label="Min likes (keyword search)"
+                hint="Drop keyword-search posts below this like count (X min_faves:). Blank = no floor. Doesn't affect watched handles."
+              >
+                <DiscNumInput name="discMinFaves" defaultValue={disc.minFaves ?? null} disabled={!canEdit} placeholder="No floor" min={0} max={1000000} />
+              </CfgRow>
+              <CfgRow
+                label="Min replies (keyword search)"
+                hint="Drop keyword-search posts below this reply count (X min_replies:). Blank = no floor."
+              >
+                <DiscNumInput name="discMinReplies" defaultValue={disc.minReplies ?? null} disabled={!canEdit} placeholder="No floor" min={0} max={1000000} />
+              </CfgRow>
+              <CfgRow
+                label="Exclude retweets (keyword search)"
+                hint="Drop native retweets from keyword search (X -filter:nativeretweets)."
