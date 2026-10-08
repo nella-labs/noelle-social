@@ -198,3 +198,59 @@ async function status(args: Record<string, unknown>, ctx: NoelleContext): Promis
   // Cached monthly accounting is separate from current admission pressure.
   const spendRows = await ctx.sql<Array<{ bucket: string; cents: string }>>`
     select bucket, coalesce(sum(cents), 0)::bigint as cents
+    from noelle.org_spend_month where org_id = ${org.orgId} and month = ${currentMonthIso()}
+    group by bucket`;
+  const [cap] = await ctx.sql<Array<{ cents: number }>>`
+    select coalesce(sum(budget_cap_cents), 0)::int as cents from noelle.agent_instances where org_id = ${org.orgId}
+      and role = any(${[...SOCIAL_AGENT_ROLES]}::text[]) and status <> 'retired'`;
+
+  const lanes = (a: (typeof agents)[number]) =>
+    [
+      a.discovery_enabled ? "disc" : null,
+      a.classifier_enabled ? "class" : null,
+      a.drafter_enabled ? "draft" : null,
+      a.send_enabled ? "send" : null,
+    ]
+      .filter(Boolean)
+      .join("+") || "—";
+
+  const agentTable = mdTable(
+    ["role", "name", "status", "lanes", "Friendly DMs"],
+    agents.map((a) => [a.role, a.display_name ?? "—", a.status, lanes(a), a.friendly_dms_enabled ? "on" : "off"]),
+  );
+
+  const body = [
+    `## ${org.name} — status`,
+    "",
+    "**Pending approvals**",
+    mdTable(["platform", "reply threads", "DMs"], pending.map((p) => [p.platform, p.replies, p.dms])),
+    `- **messages marked sent (30d):** ${sent?.n ?? 0}`,
+    `- **leads today:** ${leadsToday?.n ?? 0}`,
+    ...cachedAccountingLines(spendRows, cap?.cents ?? 0),
+    "",
+    `### Agents (${agents.length})`,
+    agentTable,
+  ].join("\n");
+  return text(body);
+}
+
+async function handle(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult | null> {
+  switch (name) {
+    case "noelle_list_orgs":
+      return guard(() => listOrgs(ctx));
+    case "noelle_get_org":
+      return guard(() => getOrg(args, ctx));
+    case "noelle_status":
+      return guard(() => status(args, ctx));
+    case "noelle_budget_holds":
+      return guard(() => budgetHolds(args, ctx));
+    default:
+      return null;
+  }
+}
+
+export const orgsModule: ToolModule = { tools, handle };

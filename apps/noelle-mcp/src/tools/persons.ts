@@ -198,3 +198,146 @@ async function addPerson(args: Record<string, unknown>, ctx: NoelleContext): Pro
   }
 
   const personId = await ctx.sql.begin(async (tx) => {
+    await tx`set local lock_timeout='5s'`;
+    await tx`set local statement_timeout='10s'`;
+    await tx`set local idle_in_transaction_session_timeout='20s'`;
+    const [created] = await tx<Array<{ id: string }>>`
+      insert into noelle.persons (org_id, display_name, notes)
+      values (${org.orgId}, ${displayName}, ${notes ?? null})
+      returning id`;
+    if (!created) throw new NoelleError("Failed to create person.");
+    if (platform) {
+      await tx`
+        insert into noelle.person_social_accounts (org_id, person_id, platform, handle, url)
+        values (${org.orgId}, ${created.id}, ${platform}, ${handle ?? null}, ${url ?? null})`;
+    }
+    return created.id;
+  });
+  const accountNote = platform ? ` with ${platform} account ${handle ? `@${handle}` : url}` : "";
+
+  return text(`Added **${displayName}**${accountNote} to ${org.name}. id=${personId}`);
+}
+
+async function updatePerson(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("update a person");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const personId = reqStr(args, "personId");
+  const displayName = optStr(args, "displayName");
+  const notes = optStr(args, "notes");
+
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    update noelle.persons
+    set display_name = coalesce(${displayName ?? null}, display_name),
+        notes = coalesce(${notes ?? null}, notes),
+        updated_at = now()
+    where id = ${personId} and org_id = ${org.orgId}
+    returning id`;
+  if (!rows[0]) throw new NoelleError(`Person ${personId} not found in ${org.name}.`);
+  return text(`Updated person ${personId} in ${org.name}.`);
+}
+
+async function deletePerson(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("delete a person");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const personId = reqStr(args, "personId");
+  const confirm = optBool(args, "confirm") ?? false;
+  if (!confirm) {
+    return text(
+      `Refusing to delete without confirm:true. This will permanently delete person ${personId} and cascade-delete all of its social accounts.`,
+    );
+  }
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    delete from noelle.persons where id = ${personId} and org_id = ${org.orgId} returning id`;
+  if (!rows[0]) throw new NoelleError(`Person ${personId} not found in ${org.name}.`);
+  return text(`Deleted person ${personId} (and its social accounts) from ${org.name}.`);
+}
+
+async function addSocialAccount(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("add a social account");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const personId = reqStr(args, "personId");
+  const platform = reqStr(args, "platform");
+  assertPlatform(platform);
+  const handle = optStr(args, "handle");
+  const url = optStr(args, "url");
+  if (!handle && !url) {
+    throw new NoelleError("A social account needs a handle or a url (or both).");
+  }
+
+  if (handle) {
+    const existing = await ctx.sql<Array<{ id: string }>>`
+      select id from noelle.person_social_accounts
+      where org_id = ${org.orgId} and platform = ${platform} and lower(handle) = lower(${handle})
+      limit 1`;
+    const found = existing[0];
+    if (found) {
+      await ctx.sql`
+        update noelle.person_social_accounts
+        set url = coalesce(${url ?? null}, url), person_id = ${personId}
+        where id = ${found.id} and org_id = ${org.orgId}`;
+      return text(
+        `Re-linked existing ${platform} @${handle} to person ${personId}. account id=${found.id}`,
+      );
+    }
+  }
+
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    insert into noelle.person_social_accounts (org_id, person_id, platform, handle, url)
+    values (${org.orgId}, ${personId}, ${platform}, ${handle ?? null}, ${url ?? null})
+    returning id`;
+  const acc = rows[0];
+  if (!acc) throw new NoelleError("Failed to add social account.");
+  return text(
+    `Added ${platform} ${handle ? `@${handle}` : url} to person ${personId}. account id=${acc.id}`,
+  );
+}
+
+async function removeSocialAccount(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("remove a social account");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const accountId = reqStr(args, "accountId");
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    delete from noelle.person_social_accounts
+    where id = ${accountId} and org_id = ${org.orgId} returning id`;
+  if (!rows[0]) throw new NoelleError(`Social account ${accountId} not found in ${org.name}.`);
+  return text(`Removed social account ${accountId} from ${org.name}.`);
+}
+
+async function handle(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult | null> {
+  switch (name) {
+    case "noelle_list_persons":
+      return guard(() => listPersons(args, ctx));
+    case "noelle_get_person":
+      return guard(() => getPerson(args, ctx));
+    case "noelle_add_person":
+      return guard(() => addPerson(args, ctx));
+    case "noelle_update_person":
+      return guard(() => updatePerson(args, ctx));
+    case "noelle_delete_person":
+      return guard(() => deletePerson(args, ctx));
+    case "noelle_add_social_account":
+      return guard(() => addSocialAccount(args, ctx));
+    case "noelle_remove_social_account":
+      return guard(() => removeSocialAccount(args, ctx));
+    default:
+      return null;
+  }
+}
+
+export const personsModule: ToolModule = { tools, handle };
