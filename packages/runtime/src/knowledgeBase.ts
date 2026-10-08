@@ -398,3 +398,203 @@ async function hybridSearch(
 
   // --- BM25 lane: keep each hit's score (for the gate) + highlights (snippet).
   const bm25 = built.index.search(query, pool);
+  const bm25Ranking: number[] = [];
+  const bm25Score = new Map<number, number>();
+  const bm25Highlights = new Map<number, ReadonlyArray<string>>();
+  for (const r of bm25) {
+    const i = built.chunkPos.get(r.chunk);
+    if (i === undefined) continue;
+    bm25Ranking.push(i);
+    bm25Score.set(i, r.score);
+    bm25Highlights.set(i, r.highlights);
+  }
+
+  // --- Dense lane: embed the query, cosine-rank the corpus. Fail-open to none.
+  let denseRanking: number[] = [];
+  try {
+    const queryVec = await dense.embedder.embedQuery(query);
+    if (queryVec.length > 0) {
+      denseRanking = built.dense.search(queryVec, pool).map((d) => d.index);
+    }
+  } catch {
+    denseRanking = [];
+  }
+
+  // --- Fuse for order (RRF cares only about rank, not score scale).
+  let order = rrfFuse([bm25Ranking, denseRanking], { k: dense.rrfK });
+  if (order.length === 0) return [];
+
+  // --- Optional rerank-2.5 over the fused top pool (reorders only).
+  if (dense.rerank && order.length > 1) {
+    try {
+      const top = order.slice(0, pool);
+      const documents = top.map((i) => built.chunks[i]?.body ?? "");
+      const reranked = await voyageRerank(
+        query,
+        documents,
+        dense.fetchImpl ? { fetchImpl: dense.fetchImpl } : {},
+      );
+      const reorderedTop: number[] = [];
+      for (const index of completeVoyageOrder(reranked.map(r => r.index), top.length)) {
+        const idx = top[index];
+        if (idx !== undefined) reorderedTop.push(idx);
+      }
+      if (reorderedTop.length > 0) order = [...reorderedTop, ...order.slice(top.length)];
+    } catch {
+      // keep the fused order
+    }
+  }
+
+  // --- Dir filter, then the gate-safety guard, then project to KbHits.
+  const filtered = order.filter((i) => {
+    const c = built.chunks[i];
+    return c !== undefined && filePathInDirs(c.filePath, filterDirs);
+  });
+  ensureTopBm25InWindow(filtered, bm25Score, topK);
+
+  const hits: KbHit[] = [];
+  for (const i of filtered) {
+    const chunk = built.chunks[i];
+    if (!chunk) continue;
+    hits.push(toKbHit(chunk, bm25Score.get(i) ?? 0, bm25Highlights.get(i) ?? []));
+    if (hits.length >= topK) break;
+  }
+  return hits;
+}
+
+// ---------------------------------------------------------------------------
+// Local filesystem backend (self-host default)
+// ---------------------------------------------------------------------------
+
+export interface LocalFsKnowledgeBaseOptions {
+  /** Directory of markdown (scanned recursively). */
+  dir: string;
+  /**
+   * Restrict indexing to these vault-root-relative subdirs — the curated voice
+   * base, e.g. ["noelle-voice", "content/voice-anchors", "02-brand"]. Each is
+   * scanned recursively. When unset/empty the whole `dir` is indexed (the
+   * default — backward compatible). This is the ONLY lever that fixes WHICH
+   * anchor wins: it keeps polluted dirs (content/replies, content/dms — whose
+   * `## Original` quote blocks embed earnings reports + leaked system prompts)
+   * out of the index entirely. filePaths stay relative to `dir` either way.
+   */
+  includeDirs?: string[];
+  /** TTL backstop ceiling for the in-memory index; default 15 min. */
+  cacheTtlMs?: number;
+  /** Enable fs.watch live reindex (default true; disable in tests). */
+  watch?: boolean;
+  /** Debounce window for coalescing watch events (default 1500ms). */
+  debounceMs?: number;
+  /**
+   * Opt-in hybrid dense lane (Voyage `voyage-context-4` ⊕ BM25). Omit to take
+   * the env defaults — so an agent enables it with `NOELLE_KB_DENSE=1` and no
+   * code change. When the lane resolves disabled (the default), search is the
+   * unchanged pure-BM25 path.
+   */
+  dense?: KbDenseOptions;
+}
+
+interface BuiltIndex {
+  index: ChunkIndex;
+  /** Flat chunk list, aligned to the BM25 doc ids and the dense vectors. */
+  chunks: MarkdownChunk[];
+  /** chunk object → its flat index, to map a BM25 result back to an id. */
+  chunkPos: Map<MarkdownChunk, number>;
+  /** The dense index, or null when the dense lane is off / its embed failed. */
+  dense: DenseIndex | null;
+  builtAt: number;
+  /** A cheap signature of the corpus (file count + newest mtime) for change detection. */
+  signature: string;
+}
+
+/**
+ * Parse a comma-separated NOELLE_VOICE_DIRS env value into an includeDirs[].
+ * Returns [] when blank/unset (the KB then indexes the whole vault). Keeping the
+ * parse here means both interns share one definition of how the env maps to scope.
+ */
+export function parseIncludeDirs(csv?: string | null): string[] {
+  if (!csv) return [];
+  return csv
+    .split(",")
+    .map((d) => d.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The directories to scan: the curated includeDirs joined onto `baseDir` when
+ * set, else `baseDir` itself. Blank/whitespace entries are dropped.
+ */
+function scanRoots(baseDir: string, includeDirs?: string[]): string[] {
+  const dirs = (includeDirs ?? []).map((d) => d.trim()).filter(Boolean);
+  if (dirs.length === 0) return [baseDir];
+  return dirs.map((d) => join(baseDir, d));
+}
+
+async function walkMarkdown(root: string): Promise<string[]> {
+  const out: string[] = [];
+  async function rec(dir: string): Promise<void> {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith(".")) continue;
+      const full = join(dir, e.name);
+      if (e.isDirectory()) await rec(full);
+      else if (e.isFile() && e.name.endsWith(".md")) out.push(full);
+    }
+  }
+  await rec(root);
+  return out;
+}
+
+/** file count + max mtime — changes when any md file is added/edited/removed. */
+async function corpusSignature(paths: string[]): Promise<string> {
+  let maxMtime = 0;
+  for (const p of paths) {
+    try {
+      const s = await stat(p);
+      if (s.mtimeMs > maxMtime) maxMtime = s.mtimeMs;
+    } catch {
+      // racing deletion — ignore
+    }
+  }
+  return `${paths.length}:${maxMtime}`;
+}
+
+/**
+ * A local-markdown KnowledgeBase. Ingestion is live: an fs.watch on `dir`
+ * marks the index dirty (debounced) so a freshly-dropped file is searchable
+ * within seconds; a per-search corpus-signature check is the watch fallback;
+ * the TTL is the final backstop. No restart needed to pick up new info.
+ */
+export function createLocalFsKnowledgeBase(
+  opts: LocalFsKnowledgeBaseOptions,
+): KnowledgeBase & { close(): void } {
+  const ttl = opts.cacheTtlMs ?? DEFAULT_TTL_MS;
+  const useWatch = opts.watch ?? true;
+  const debounceMs = opts.debounceMs ?? 1500;
+  // Resolve the dense lane once. `null` ⇒ the unchanged pure-BM25 path.
+  const denseCfg = resolveKbDense(opts.dense);
+
+  // Scan only the curated voice subtrees when includeDirs is set, else the whole
+  // vault. Watch the same roots so edits to excluded (polluted) dirs don't bust
+  // the cache, and so watching never trips on a path outside the index.
+  const roots = scanRoots(opts.dir, opts.includeDirs);
+  let warnedEmptyScope = false;
+
+  let built: BuiltIndex | null = null;
+  let dirty = true;
+  const watchers: FSWatcher[] = [];
+  let debounceTimer: NodeJS.Timeout | null = null;
+
+  if (useWatch) {
+    for (const root of roots) {
+      try {
+        const w = watch(root, { recursive: true }, (_event, filename) => {
+          if (filename && !String(filename).endsWith(".md")) return;
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => {
+            dirty = true;
