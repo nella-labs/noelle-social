@@ -798,3 +798,203 @@ export default async function AgentConfigPage({
               label="Route to inbox on cap"
               hint="When a draft is blocked by the monthly cap, record the event into noelle.budget_escalations."
             >
+              <SwitchField
+                name="escalateOnCap"
+                defaultChecked={escalateOnCap}
+                disabled={!canEdit}
+              />
+            </CfgRow>
+            <CfgRow
+              label="Pause on repeated 5xx"
+              hint="If the backend returns three consecutive 5xx errors within 10 minutes, flip the agent to paused."
+            >
+              <SwitchField
+                name="pauseOn5xx"
+                defaultChecked={pauseOn5xx}
+                disabled={!canEdit}
+              />
+            </CfgRow>
+            <CfgRow
+              label="Defer DMs after reply"
+              hint="On: sending a reply auto-parks that lead's DM onto the person's Contacts page (send it by hand once they reply on X). Off (default): the DM stays in the inbox; park it per-lead with 'Wait for reply'."
+            >
+              <SwitchField
+                name="autoDeferDms"
+                defaultChecked={autoDeferDms}
+                disabled={!canEdit}
+              />
+            </CfgRow>
+          </CfgSection>
+
+          <SaveBar
+            canEdit={canEdit}
+            helpClean={saveHelpCopy}
+            helpDirty="Unsaved changes — workers will pick these up on the next tick once you save."
+          />
+        </div>
+      </form>
+    </>
+  );
+}
+
+function CfgSection({
+  id,
+  title,
+  sub,
+  children,
+}: {
+  id?: string;
+  title: string;
+  sub?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section id={id} className="card" style={{ padding: "24px 26px" }}>
+      <div style={{ marginBottom: 16 }}>
+        <h3
+          className="serif"
+          style={{ margin: 0, fontSize: 22, fontWeight: 400, letterSpacing: "-0.01em" }}
+        >
+          {title}
+        </h3>
+        {sub ? (
+          <div
+            style={{
+              color: "var(--ink-muted)",
+              fontSize: 12.5,
+              marginTop: 4,
+              maxWidth: "60ch",
+            }}
+          >
+            {sub}
+          </div>
+        ) : null}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>{children}</div>
+    </section>
+  );
+}
+
+function CfgRow({
+  label,
+  hint,
+  full,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  full?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className="stack-phone"
+      style={{
+        display: "grid",
+        gridTemplateColumns: full ? "1fr" : "200px 1fr",
+        gap: full ? 8 : 24,
+        alignItems: "start",
+        padding: "10px 0",
+        borderTop: "1px dashed var(--rule-soft)",
+      }}
+    >
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 500 }}>{label}</div>
+        {hint ? (
+          <div
+            style={{
+              fontSize: 12,
+              color: "var(--ink-muted)",
+              marginTop: 3,
+              lineHeight: 1.45,
+            }}
+          >
+            {hint}
+          </div>
+        ) : null}
+      </div>
+      <div>{children}</div>
+    </div>
+  );
+}
+
+/**
+ * One worker in the routing pipeline. When `children` is omitted, the card
+ * renders a "no LLM call" chip — used for discovery and send. Pickers go in
+ * children when the worker actually calls an LLM.
+ */
+function WorkerCard({
+  label,
+  role,
+  stage,
+  children,
+}: {
+  label: string;
+  role: string;
+  stage: string;
+  children?: React.ReactNode;
+}) {
+  const hasPickers = !!children;
+  return (
+    <div
+      style={{
+        padding: "14px 16px",
+        background: "var(--paper)",
+        boxShadow: "0 0 0 0.5px var(--rule)",
+        borderRadius: 10,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          gap: 10,
+          flexWrap: "wrap",
+        }}
+      >
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            letterSpacing: "0.1em",
+            textTransform: "uppercase",
+            color: "var(--ink)",
+          }}
+        >
+          {label}
+        </div>
+        <span
+          className="tag"
+          style={{ fontSize: 10, color: "var(--ink-muted)" }}
+        >
+          {stage}
+        </span>
+        {!hasPickers ? (
+          <span
+            className="tag"
+            style={{ fontSize: 10, color: "var(--ink-soft)" }}
+          >
+            no LLM call
+          </span>
+        ) : null}
+      </div>
+      <div
+        style={{
+          fontSize: 12.5,
+          color: "var(--ink-muted)",
+          marginTop: 4,
+          lineHeight: 1.45,
+        }}
+      >
+        {role}
+      </div>
+      {hasPickers ? <div style={{ marginTop: 12 }}>{children}</div> : null}
+    </div>
+  );
+}
+
+/**
+ * Inline price strip for the selected handles. Reads the catalog so users
+ * see, at the moment of picking, what they're committing to per million
+ * tokens — the same numbers the spend recorder will bill them at.
+ */
