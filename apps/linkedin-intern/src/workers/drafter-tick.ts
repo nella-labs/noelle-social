@@ -1398,3 +1398,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
       // leads in the last 14 days versus 17 notification ones.
       const isNotification = (payload as { source?: string }).source === "notification";
       const replyRequest = substantialReplyRequest ?? readReplyRequest(payload as Record<string, unknown>);
+      const topAnchorScore = anchors.length === 0 ? 0 : Math.max(...anchors.map((a) => a.score));
+      // Browser observations passed Jev's strict qualification already. A
+      // missing curated voice folder must not make that lead disappear here.
+      if (!replyRequest && !isNotification && !browserObserved && replyKind === "substantial" && topAnchorScore < relevanceThreshold) {
+        log.info(
+          { leadId: lead.id, topAnchorScore, relevanceThreshold },
+          "drafter skipped substantial lead below relevance threshold",
+        );
+        await markStatus({
+          leadId: lead.id,
+          status: "skipped",
+          meta: {
+            skip_reason: `below-relevance-threshold (score=${topAnchorScore.toFixed(3)} < ${relevanceThreshold})`,
+            top_anchor_score: topAnchorScore,
+            relevance_threshold: relevanceThreshold,
+          },
+        });
+        continue;
+      }
+
+      // Second, KNOWLEDGE retrieval pass: scoped to product/positioning vault
+      // dirs, so the drafter can ground factual claims about the offer instead of
+      // inventing them from model priors. Skipped entirely when no knowledge dirs
+      // are configured (managed/live default). Fail-open to no knowledge.
+      const knowledge =
+        payload.source !== "extension_observed" && knowledgeDirs && knowledgeDirs.length && knowledgeTopK > 0
+          ? await retrieveAnchors(kb, postText, {
+              topK: knowledgeTopK,
+              filterDirs: knowledgeDirs,
+              rerank: rerankGrounding,
+            }).catch((err) => {
+                log.warn(
+                  { err: (err as Error).message },
+                  "knowledge retrieval failed; drafting without product knowledge",
+                );
+                return [];
+              })
+          : [];
+      const knowledgeAnchors = knowledge.map((k) => k.snippet);
+
+      // Optional visual context falls back to empty on ordinary failure.
+      // Denied model admission propagates to the existing budget defer policy.
+      const imageCaption = await captionImages({
+        imageUrls: payload.images ?? [],
+        postText,
+        ...(captionFn ? { captionFn } : {}),
+      });
+
+      // The lead's author key: author_id is the fsd profile id, author_handle is
+      // the public_id (vanity slug). Use both to find the person's profile + objective.
+      const fsd = lead.author_id ?? "";
+      const publicIdKey = (payload.authorPublicId ?? lead.author_handle ?? "").trim().toLowerCase();
+      // fsd first; fall back to the slug because keyword-lane leads carry no
+      // author_id at all, so an fsd-only lookup can never find their profile.
+      const profile =
+        (fsd ? profilesByFsd.get(fsd) : undefined) ??
+        (publicIdKey ? profilesByFsd.get(publicIdKey) : undefined);
+      const personObj = publicIdKey ? objectivesByPublicId.get(publicIdKey) : undefined;
+      const personDirective = buildPersonDirective(payload, profile, personObj);
+
+      // Account Feeder STYLE: sample a few high-performing human exemplars for
+      // THIS lead (performance-weighted × fit, controlled variety) from the
+      // once-per-tick pool. Null when style is off / the pool is empty / anything
+      // errors (selectStyleExemplars is itself fail-open) → no STYLE block, the
+      // lead drafts exactly as today. Comments only — the DM is untouched.
+      const postRegister = detectPostRegister(postText, lead.classifier_label);
+      // Faithful multi-voice: when more than one voice is pinned, restrict THIS
+      // lead's exemplar pool to the ONE voice picked for it (rotating across the
+      // feed via pickFaithfulVoice) so the reply sounds like a single real writer,
+      // not a blend. A single pinned voice needs no filter; a chosen voice with no
+      // corpus fails open to the full pool.
+      const styleCandidatesForLead =
+        styleFaithful && faithfulVoices.length > 1
+          ? (() => {
+              const chosen = pickFaithfulVoice(faithfulVoices, postText, faithfulVoiceWeights);
+              const filtered = styleCandidates.filter((c) => c.account_handle === chosen);
+              return filtered.length ? filtered : styleCandidates; // fail-open if chosen voice has no corpus
+            })()
+          : styleCandidates;
+      const styleForLead: StyleForPrompt | null = style?.enabled
+        ? await selectStyleExemplars(postText, styleCandidatesForLead, styleProfiles, {
+            enabled: true,
+            config: style.config,
+            // Faithful mode: pass undefined so the selector uses the legacy fit×perf
+            // path (the pinned voice's characteristic/high-performing posts are
+            // selected instead of being cheer-penalized on a "neutral" post).
+            postRegister: styleFaithful ? undefined : postRegister,
+            ...(style.dense !== undefined ? { dense: style.dense } : {}),
+            ...(style.rng ? { rng: style.rng } : {}),
+          })
+        : null;
+
+      // Model tiering is reaction-based ONLY: Opus is reserved for genuinely
+      // high-engagement posts (decideOpus on likes/comments). Watchlist/priority
+      // leads no longer force Opus — a routine connection reply drafts on the
+      // default (Sonnet) model, which is ~6x cheaper for no measurable quality
+      // loss. A high-engagement watchlist post still upgrades via decideOpus.
+      const engagement = leadEngagement(payload);
+      const decision = decideOpus({
+        likes: engagement.likes,
+        comments: engagement.comments,
+        commentBait: lead.comment_bait ?? false,
+        likesThreshold: opusLikesThreshold,
+        commentsThreshold: opusCommentsThreshold,
+      });
+      const useSmartest = decision.useOpus;
+      const routing: ModelRouting = useSmartest
+        ? opusOverrideRouting(baseRouting, opusModel)
+        : baseRouting;
+      log.info(
+        {
+          leadId: lead.id,
+          priority: lead.priority,
+          likes: decision.likes,
+          comments: decision.comments,
+          comment_bait: decision.commentBait,
+          useOpus: useSmartest,
+          opus_reason: decision.useOpus ? "high_engagement" : null,
+          model: routing.primary.model,
+        },
+        useSmartest
+          ? "drafter using Opus for high-engagement lead"
+          : "drafter using default model for lead",
+      );
+
+      // Comment-energy: read the existing comments on the post so the draft can
+      // match the room and avoid echoing the crowd. Gated on a known comment
+      // count (no point paying to read an empty section) and fail-open. Records
+      // each paid attempt through the caller's metered fetch.
+      const commentDigest = await fetchCommentDigest({
+        lead,
+        payload: { url: payload.url, comments: engagement.comments },
+        fetchPostComments,
+        maxComments: commentFetchMax,
+        minCount: commentFetchMinCount,
+        log,
+      });
+
+      // Form-variant rotation (same contract as the light path): the assigned
+      // SHAPE owns length/structure for this lead's comments, and the register +
+      // opening-move blocks are suppressed so the prompt carries ONE shape
+      // instruction. Fires on every lead — see the light path above for why the
+      // old `styleFaithful && styleForLead` gate is what flattened the feed.
+      // TONE-FIRST lane (mirrors Vega's, apps/x-intern/.../drafter-tick.ts): on a
+      // CELEBRATION post, mirroring the ENERGY beats varying the form, so the
+      // register (HYPE, "LETS GOOO") wins that lead and no shape is assigned.
+      // Exception: when the operator PINNED a voice, the shape renders inside
+      // the faithful style block and replaces its fixed hook-then-line recipe —
+      // dropping it there would hand the recipe back, which is the thing the
+      // rotation exists to kill. Everything else (the neutral, analytical bulk
+      // of the feed, i.e. every substantial lead) gets a shape.
+      const toneFirst = postRegister === "celebration" && !(styleFaithful && styleForLead);
+      // Same tone-first split as the light path above: half the celebrations
+      // take a celebration-safe shape rather than leaving the whole lane in one
+      // length band.
+      const toneFirstShape =
+        toneFirst && variety?.enabled
+          ? (variety.rng ?? Math.random)() < TONE_FIRST_SHAPE_SHARE
+          : false;
+      const formVariant =
+        variety?.enabled && (!toneFirst || toneFirstShape)
+          ? (variety.formVariantRotation ?? formVariantRotation).next(variety.rng, [
+              ...(toneFirstShape ? shapesExcludedForEnergy("celebration") : []),
+              ...(browserObserved ? BROWSER_OBSERVED_EXCLUDED_VARIANT_IDS : []),
+              // The substantial prompt asks for one draft PER ANGLE in a single
+              // call and ONE shape governs all of them, so a shape that
+              // prescribes a STANCE ("agree in four words or fewer")
+              // contradicts the contrarian angle sitting beside it.
+              //
+              // TIER-AWARE, matching Orion's: T3 is ["empathetic"], a
+              // single-draft prompt with nothing to contradict. Excluding
+              // unconditionally made AGREE_EXTEND unreachable on every T3 lead
+              // for no reason, and left the two siblings disagreeing.
+              ...((TIER_ANGLES[lead.tier ?? "T3"]?.length ?? 1) > 1 ? STANCE_SHAPE_IDS : []),
+            ])
+          : undefined;
+      const shapeInStyleBlock = Boolean(formVariant && styleFaithful && styleForLead);
+      if (formVariant && shapeInStyleBlock && styleForLead) {
+        styleForLead.formVariant = { id: formVariant.id, directive: formVariant.directive };
+      }
+      const shapeBlock =
+        formVariant && !shapeInStyleBlock ? renderAssignedShapeBlock(formVariant) : undefined;
+
+      // Voice variety: assign this lead a random register and inject it into the
+      // COMMENT-drafting prompt, so comments vary across the feed. Off (or omitted)
+      // → undefined, byte-identical to today. The DM is untouched. Applies to both
+      // the substantial and light comment paths.
+      const registerBlock =
+        variety?.enabled && !formVariant
+          ? renderRegisterBlock(pickRegisterForPost(postRegister, variety.rng))
+          : undefined;
+
+      // Voice variety, part two: assign a random OPENING MOVE (how the comment
+      // starts) so openings don't all converge on the same lead-in. Same flag /
+      // rng as the register; off → undefined. Comments only, DM untouched.
+      const openingMoveBlock =
+        variety?.enabled && !formVariant
+          ? renderOpeningMoveBlock(pickOpeningMove(variety.rng))
+          : undefined;
+
