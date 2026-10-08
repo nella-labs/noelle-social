@@ -1798,3 +1798,203 @@ describe("runDrafterTick — verifier (grounded-drafting)", () => {
       postOutbound,
       markStatus,
       verify: { enabled: true, retries: 0, voiceFloor: 0.8, makeCalls: () => [judge] },
+    });
+    expect(n).toBe(1);
+    expect(judge).toHaveBeenCalledTimes(4);
+    const outbound = postOutbound.mock.calls[0]![0];
+    expect(outbound.verifierMeta.scores.voice).toBe(0.3);
+    expect(outbound.drafts.map((draft: { angle: string }) => draft.angle)).toEqual(["empathetic", "contrarian"]);
+    expect(outbound.drafts.every((draft: { verifierMeta: { pass: boolean; scores: { voice: number } } }) =>
+      draft.verifierMeta.pass && draft.verifierMeta.scores.voice >= 0.8)).toBe(true);
+    expect(markStatus).not.toHaveBeenCalledWith(expect.objectContaining({
+      status: "skipped", meta: expect.objectContaining({ skip_reason: "low-voice" }),
+    }));
+  });
+
+  it("reviews a sole reply without the companion DM before applying its voice floor", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    runner.draft.mockResolvedValue({
+      text: JSON.stringify({ drafts: [fullSubstantial.drafts[0]], dm: fullSubstantial.dm }),
+      engine: "bedrock", model: "m",
+    });
+    const judge = vi.fn().mockResolvedValueOnce(verdict(false)).mockResolvedValueOnce(verdict(true));
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o", dm_autodraft_enabled: true } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 0, voiceFloor: 0.8, makeCalls: () => [judge] },
+    });
+    expect(n).toBe(1);
+    expect(judge).toHaveBeenCalledTimes(2);
+    const drafts = postOutbound.mock.calls[0]![0].drafts;
+    expect(drafts.filter((draft: { kind: string }) => draft.kind === "reply")).toEqual([
+      expect.objectContaining({ verifierMeta: expect.objectContaining({ pass: true, judgeOk: true, scores: expect.objectContaining({ voice: 0.9 }) }) }),
+    ]);
+    expect(drafts.filter((draft: { kind: string }) => draft.kind === "dm")).toHaveLength(1);
+    expect(drafts.find((draft: { kind: string }) => draft.kind === "dm")!.verifierMeta).toBeUndefined();
+  });
+
+  it("skips cold outbound when every final reply is below the floor, including a companion DM", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValue(verdict(false));
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o", dm_autodraft_enabled: true } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 0, voiceFloor: 0.8, makeCalls: () => [judge] },
+    });
+    expect(n).toBe(0);
+    expect(judge).toHaveBeenCalledTimes(4);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({
+      status: "skipped", meta: expect.objectContaining({ skip_reason: "low-voice" }),
+    }));
+  });
+
+  it("regenerates with the critique on a failing verdict, keeps the improved draft", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValueOnce(verdict(false)).mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(2); // initial + 1 regenerate
+    expect((runner.draft.mock.calls[1]![0] as { prompt: string }).prompt).toContain("REVIEW FEEDBACK");
+    const meta = postOutbound.mock.calls[0]![0].verifierMeta;
+    expect(meta.pass).toBe(true);
+    expect(meta.attempts).toBe(1);
+  });
+
+  it.each(["substantial", "light"] as const)("keeps browser %s verification on Codex-primary routing and uses Opus only for the final rewrite", async (replyKind) => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    if (replyKind === "light") {
+      runner.draft.mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" });
+    }
+    const judge = vi.fn().mockResolvedValue(verdict(false));
+    const makeCalls = vi.fn(() => [judge]);
+    const sourcePost = "If someone sees seven posts, they may warm up; separately, one prospect viewed my profile.";
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({
+        tier: "T3",
+        classifier_label: replyKind,
+        payload: { ...leadPayload, source: "extension_observed", text: sourcePost },
+      })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      opusModel: "claude-opus-4-6",
+      verify: { enabled: true, retries: 2, voiceFloor: 0.8, makeCalls },
+    });
+    expect(makeCalls).toHaveBeenCalledWith(false);
+    expect(runner.draft.mock.calls.map((call) => (call[0] as { routing: { primary: { model: string } } }).routing.primary.model))
+      .toEqual(["claude-sonnet-4-6", "claude-sonnet-4-6", "claude-opus-4-6"]);
+    expect(runner.draft.mock.calls.every((call) => !("directRouting" in call[0]))).toBe(true);
+    const finalCall = runner.draft.mock.calls[2]![0] as { prompt: string; system: string };
+    const firstRepair = runner.draft.mock.calls[1]![0] as { prompt: string };
+    expect(finalCall.prompt).toContain(sourcePost);
+    expect(finalCall.prompt).toContain("REVIEW FEEDBACK");
+    expect(finalCall.prompt).toContain("name a concrete detail");
+    expect(firstRepair.prompt).not.toContain("FINAL BROWSER REPAIR");
+    expect(finalCall.prompt).toContain("FINAL BROWSER REPAIR");
+    expect(finalCall.prompt).toMatch(/one compact comment.*natural.*rhythm/i);
+    expect(finalCall.prompt).not.toMatch(/two short, independent lines/i);
+    expect(finalCall.prompt).not.toMatch(/avoid `, so`|avoid `, because`/i);
+    expect(finalCall.prompt).toMatch(/learned.*pattern rules.*still apply/i);
+    expect(finalCall.prompt).toMatch(/antithesis/i);
+    expect(finalCall.prompt).toMatch(/source.*specific/i);
+    expect(finalCall.prompt).toMatch(/learned.*rules/i);
+    expect(finalCall.prompt).toContain("NO FULL STOPS");
+    expect(finalCall.system).toContain("never import their personal experience");
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({
+      status: "skipped", meta: expect.objectContaining({ skip_reason: "low-voice" }),
+    }));
+  });
+
+  it("keeps a legacy lead's final rejected rewrite on its original writer", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValue(verdict(false));
+    const makeCalls = vi.fn(() => [judge]);
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3", payload: { ...leadPayload, source: "apify" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls },
+    });
+    expect(makeCalls.mock.calls).toEqual([[false]]);
+    expect(runner.draft.mock.calls.map((call) => (call[0] as { routing: { primary: { model: string } } }).routing.primary.model))
+      .toEqual(["claude-sonnet-4-6", "claude-sonnet-4-6", "claude-sonnet-4-6"]);
+    expect(runner.draft.mock.calls.every((call) => !("directRouting" in call[0]))).toBe(true);
+    expect((runner.draft.mock.calls[2]![0] as { prompt: string }).prompt).not.toContain("FINAL BROWSER REPAIR");
+  });
+
+  it("does not escalate a browser rewrite that passes before the final retry", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValueOnce(verdict(false)).mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3", payload: { ...leadPayload, source: "extension_observed" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(runner.draft.mock.calls.map((call) => (call[0] as { routing: { primary: { model: string } } }).routing.primary.model))
+      .toEqual(["claude-sonnet-4-6", "claude-sonnet-4-6"]);
+  });
+
+  it.each(["substantial", "light"] as const)("keeps the ordinary fallback on an already-Opus browser %s final rewrite", async (replyKind) => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    if (replyKind === "light") runner.draft.mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" });
+    const judge = vi.fn().mockResolvedValue(verdict(false));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({
+        tier: "T3",
+        classifier_label: replyKind,
+        payload: { ...leadPayload, source: "extension_observed", reactionCount: 104 },
+      })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      opusLikesThreshold: 80,
+      verify: { enabled: true, retries: 1, voiceFloor: 0.8, makeCalls: () => [judge] },
+    });
+    const routes = runner.draft.mock.calls.map((call) => (call[0] as { routing: { primary: { model: string }; fallback?: { model: string } } }).routing);
+    expect(routes.map((route) => route.primary.model)).toEqual(["claude-opus-4-6", "claude-opus-4-6"]);
+    expect(routes[1]?.fallback?.model).toBe("claude-sonnet-4-6");
