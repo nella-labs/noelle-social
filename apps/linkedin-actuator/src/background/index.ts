@@ -198,3 +198,203 @@ async function activateStart(run: PendingStart): Promise<number | null> {
   if (epoch === null) return null;
   if (!(await runIfCurrent(epoch, async () => {
     runAbort.abort();
+    runAbort = run.controller;
+    needsRunRestore = false;
+  }))) { run.controller.abort(); return null; }
+  return epoch;
+}
+async function startIsCurrent(run: PendingStart, epoch: number): Promise<boolean> {
+  const current = await currentEpoch();
+  return !run.controller.signal.aborted && runAbort === run.controller && epoch === current;
+}
+async function finishStart(state: RunState, run: PendingStart): Promise<number | null> {
+  if (!(await startIsCurrent(run, state.epoch)) || !(await saveIfCurrent(state))) return null;
+  if (state.tabId != null && await startIsCurrent(run, state.epoch)) {
+    await cdp.attach(state.tabId).catch(() => {});
+    if (!(await startIsCurrent(run, state.epoch))) {
+      // Only initiate cleanup for a stopped controller still owned here.
+      if (runAbort === run.controller && run.controller.signal.aborted) await cdp.detach(state.tabId).catch(() => {});
+      return null;
+    }
+  }
+  if (!(await runIfCurrent(state.epoch, async () => {
+    if (run.controller.signal.aborted) return;
+    await chrome.alarms.create(ALARM, { periodInMinutes: 0.5 });
+    if (run.controller.signal.aborted) return;
+    for (const ms of [3500, 8000, 15000, 22000]) setTimeout(() => void tick(), ms);
+  }))) return null;
+  if (!(await startIsCurrent(run, state.epoch))) return null;
+  ensurePriorityLoop();
+  return state.epoch;
+}
+function reserveStop(): Promise<number> {
+  runAbort.abort();
+  return bumpEpoch();
+}
+
+async function startRun(
+  params: { windowHours: number; targetComments: number; targetLikes: number },
+  opts?: { manual?: boolean; curfew?: boolean; expectedEpoch?: number },
+  run = reserveStart(opts?.expectedEpoch),
+): Promise<number | null> {
+  const epoch = await activateStart(run);
+  if (epoch === null) return null;
+  const cfg = await getConfig();
+  if (!cfg) throw new Error("not configured");
+  if (!(await startIsCurrent(run, epoch))) return null;
+  if (opts?.manual) await withSendSwitch(() => enableSendForManualRun(run, epoch));
+  if (!(await startIsCurrent(run, epoch))) return null;
+  const api = new ActuatorApi(cfg);
+  const queue = await api.fetchQueue();
+  if (!(await startIsCurrent(run, epoch))) return null;
+  const rng = makeRng((Date.now() & 0xffffffff) >>> 0);
+  const startMs = Date.now();
+
+  // Session persona + warm-up window: drawn once at run start and held for the
+  // whole session (the "session-level entropy" that prevents a repeated
+  // signature). persona.wpm threads into every reading-dwell call below.
+  const persona = makeSessionPersona((Date.now() & 0xffffffff) >>> 0);
+  // Warm-up suppresses writes for the first N ms (arrive/read before acting). Cap
+  // it at 10% of the window so a short run isn't dominated by warm-up — a 30-min
+  // window warms up ≤3 min, not the full ~4 min a long run would.
+  const warmupSuppressMs = Math.min(
+    warmupSuppressWritesMs(rng),
+    Math.round(params.windowHours * 3600_000 * 0.1),
+  );
+
+  // Multi-day warm-up: a newly-automated identity ramps to full volume over ~4
+  // weeks. Persist the automation start once (first run), then scale the daily
+  // caps by the ramp multiplier so early sessions run lighter.
+  const startStore = await chrome.storage.local.get("actuator.automationStartMs");
+  let automationStartMs = startStore["actuator.automationStartMs"] as number | undefined;
+  if (typeof automationStartMs !== "number") {
+    automationStartMs = startMs;
+    if (!(await runIfCurrent(epoch, () => chrome.storage.local.set({ "actuator.automationStartMs": automationStartMs })))) return null;
+  }
+  const warm = warmupCapMultiplier(automationStartMs, startMs);
+  const effectiveCaps = {
+    likes: Math.max(1, Math.round(cfg.caps.likes * warm)),
+    comments: Math.round(cfg.caps.comments * warm),
+    dms: Math.round(cfg.caps.dms * warm),
+  };
+
+  const { actions: planned } = planTimeline({
+    params, approvedDms: queue.dms.length, caps: effectiveCaps, startMs,
+    deepNightTaper: cfg.deepNightTaper, maxWritesPerHour: cfg.maxWritesPerHour ?? 8, rng,
+  });
+  const actions: SlotAction[] = planned.map((a) => ({ kind: a.kind, atMs: a.atMs, executed: false }));
+
+  // Pin the actuated tab for the whole run: every tick reuses it while it stays
+  // open (tickOnce passes s.tabId to findLinkedInTab), so a profile tab that
+  // merely sorts first can't hijack the loop.
+  const tabId = await findLinkedInTab();
+  const state: RunState = {
+    sessionId: crypto.randomUUID(), epoch, startMs, windowHours: params.windowHours, actions,
+    persona, warmupSuppressMs, tabId: tabId ?? undefined, curfewEnabled: opts?.curfew === true,
+    targets: {
+      likes: actions.filter((a) => a.kind === "like").length,
+      comments: actions.filter((a) => a.kind === "comment").length,
+      dms: actions.filter((a) => a.kind === "dm").length,
+    },
+    done: { likes: 0, comments: 0, dms: 0 },
+    commentPool: queue.comments.map((c) => ({
+      approvalId: c.approval_id,
+      draftId: c.draft_id,
+      body: c.body,
+      url: c.target.url,
+      // Carried through so doComment knows to THREAD rather than add a
+      // top-level comment. api-vm only sets these for notification leads.
+      commentUrn: c.target.comment_urn ?? null,
+      commentAuthorName: c.target.comment_author_name ?? null,
+    })),
+    dmPool: queue.dms.map((d) => ({ approvalId: d.approval_id, draftId: d.draft_id, body: d.body, url: d.target.url })),
+    doneDraftIds: [], lastPollMs: startMs, status: "running",
+  };
+  return finishStart(state, run);
+}
+
+// Drain mode: post ALL approved replies a short gap apart (default 1–3 min),
+// each gap shaped by a randomly drawn pattern — likes scattered/bunched/
+// clustered, or a like-free cooldown — plus ambient browsing (see the
+// GAP_PATTERNS table in ../lib/scheduler.ts). Reuses the whole tick engine —
+// it just builds a drain schedule and flags the run as mode:"drain"
+// (which makes each reply return to the feed so the gap browses the feed).
+async function startDrain(opts?: { manual?: boolean; curfew?: boolean; notifications?: boolean; expectedEpoch?: number },
+  run = reserveStart(opts?.expectedEpoch),
+): Promise<number | null> {
+  const epoch = await activateStart(run);
+  if (epoch === null) return null;
+  const cfg = await getConfig();
+  if (!cfg) throw new Error("not configured");
+  if (!(await startIsCurrent(run, epoch))) return null;
+  if (opts?.manual) await withSendSwitch(() => enableSendForManualRun(run, epoch));
+  if (!(await startIsCurrent(run, epoch))) return null;
+  const api = new ActuatorApi(cfg);
+  const queue = await api.fetchQueue();
+  if (!(await startIsCurrent(run, epoch))) return null;
+  const rng = makeRng((Date.now() & 0xffffffff) >>> 0);
+  const startMs = Date.now();
+  const persona = makeSessionPersona((Date.now() & 0xffffffff) >>> 0);
+  // Per-session drain temperament, drawn from its OWN seed (not the plan rng) so
+  // the plan stream is untouched. Persisted on RunState so every auto-continue
+  // round shares the same mood (see maybeExtendDrain).
+  const drainStyle = pickDrainArchetype(makeRng((Date.now() ^ 0x9e3779b1) >>> 0));
+
+  const nComments = queue.comments.length;
+  // drainStyle is exactly the archetype-shaped subset of DrainOpts, so spread it
+  // in — one source of truth for which fields the temperament controls.
+  const planned = planDrainTimeline({ approvedComments: nComments, startMs, rng, ...drainStyle });
+  const actions: SlotAction[] = planned.map((a) => ({ kind: a.kind, atMs: a.atMs, executed: false }));
+  const lastAt = actions.reduce((m, a) => Math.max(m, a.atMs), startMs);
+  const windowHours = (lastAt - startMs) / 3600_000 + 0.15; // pad so the last slot fits
+
+  const tabId = await findLinkedInTab(); // pin for the run (reused via s.tabId in tickOnce)
+  const state: RunState = {
+    sessionId: crypto.randomUUID(), epoch, startMs, windowHours, actions,
+    persona, drainStyle, warmupSuppressMs: 0, mode: "drain", manualDrain: opts?.manual === true, curfewEnabled: opts?.curfew === true, notifications: opts?.notifications === true, tabId: tabId ?? undefined,
+    targets: {
+      likes: actions.filter((a) => a.kind === "like").length,
+      comments: nComments,
+      dms: 0,
+    },
+    done: { likes: 0, comments: 0, dms: 0 },
+    commentPool: queue.comments.map((c) => ({
+      approvalId: c.approval_id,
+      draftId: c.draft_id,
+      body: c.body,
+      url: c.target.url,
+      // Carried through so doComment knows to THREAD rather than add a
+      // top-level comment. api-vm only sets these for notification leads.
+      commentUrn: c.target.comment_urn ?? null,
+      commentAuthorName: c.target.comment_author_name ?? null,
+    })),
+    dmPool: [],
+    doneDraftIds: [], lastPollMs: startMs, status: "running",
+  };
+  return finishStart(state, run);
+}
+
+// The operator explicitly clicking Run/Drain in the extension IS the consent to
+// post, so auto-enable the master reply switch (reply_send_enabled) for this
+// instance — approved replies then flow to the queue without the operator ever
+// having to flip a dashboard toggle. Called from startRun/startDrain only when
+// `opts.manual` (i.e. the manual message handler), never from the unattended
+// auto-start path (checkAutonomy calls startRun with no manual flag), so the
+// global panic-stop kill switch (which sets reply_send_enabled=false on every
+// intern) stays authoritative for lights-out runs. Best-effort: a failure — e.g.
+// an older api-vm without this endpoint — is logged, not fatal, so Run still
+// proceeds against whatever the flag already is.
+async function enableSendForManualRun(run: PendingStart, epoch: number): Promise<void> {
+  const cfg = await getConfig();
+  if (!cfg || !(await startIsCurrent(run, epoch))) return;
+  try {
+    await new ActuatorApi(cfg).enableSend(cfg.instanceId, true);
+  } catch (e) {
+    console.warn("[actuator] could not auto-enable sending:", e instanceof Error ? e.message : e);
+  }
+}
+
+async function endRun(status: RunState["status"], terminal = reserveStop()): Promise<number> {
+  const term = await terminal;
+  // Abort immediately when STOP is reserved, then recheck the owned controller
+  // after the epoch write: a start may have activated while that write waited.
