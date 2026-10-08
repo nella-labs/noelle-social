@@ -198,3 +198,203 @@ async function main() {
           kb = sharedKb;
         } else {
           let nellaKey = "";
+          await readyCache.ensure(inst.org_id, "drafter", async () => {
+            nellaKey = await secrets.getForOrg(inst.org_id, "nella-api-key");
+          });
+          if (!nellaKey) nellaKey = await secrets.getForOrg(inst.org_id, "nella-api-key");
+          kb = knowledgeBaseFromNella(createNellaClient({ apiKey: nellaKey, baseUrl: env.NELLA_BASE_URL }), kbWorkspace);
+        }
+
+        // Vision caption: when a lead carries post images, caption them so the
+        // text-only drafter can react to the visual. BYO Gemini key first; on the
+        // self-host Lima VM fall back to Vertex ADC. Transport failures return
+        // empty context; budget denial stops drafting for this tick.
+        let captionFn: CaptionFn | undefined;
+        const metering = { context: { orgId: inst.org_id, instanceId: inst.id, agentRole: "reddit_intern" as const,
+          worker: "drafter", bucket: "vision_caption" }, budget, recorder };
+        try {
+          const geminiKey = await secrets.getForOrg(inst.org_id, "gemini-api-key");
+          if (geminiKey) captionFn = createGeminiCaptionFn({ apiKey: geminiKey, metering });
+        } catch (err) {
+          if (!(err instanceof SecretAccessError) || !/NOT_FOUND/.test(err.message)) {
+            log.warn({ org_id: inst.org_id, err: (err as Error).message }, "gemini key lookup for vision failed; captions disabled");
+          }
+        }
+        if (!captionFn && env.NOELLE_VERTEX_ENABLED) {
+          captionFn = createVertexCaptionFn({
+            metering,
+            project: env.GCP_PROJECT,
+            location: env.VERTEX_LOCATION,
+          });
+          log.info({ project: env.GCP_PROJECT, location: env.VERTEX_LOCATION }, "vision captions via Vertex ADC (no gemini key)");
+        }
+
+        // All Reddit leads are subreddit posts (priority=false) — claim the oldest
+        // classified batch. There is no second priority lane.
+        const leads = await claimLeadsForDrafting(sql, { agentInstanceId: inst.id, batch: 5 });
+          // The operator's real POST -> REPLY pairs, once per tick. Noelle already
+          // had this data and used it only as an avoid-list.
+          const voiceExemplars = await getVoiceExemplars(sql, {
+            agentInstanceId: inst.id,
+            limit: VOICE_EXEMPLAR_COUNT,
+          });
+        const n = await runDrafterTick({
+          voiceExemplars,
+          log,
+          instance: inst,
+          claimedLeads: leads,
+          patternRules,
+          runner,
+          kb,
+          postOutbound,
+          markStatus: (a) => markLeadStatus(sql, a),
+          relevanceThreshold: env.DRAFTER_RELEVANCE_THRESHOLD,
+          // Daily volume rules: ≤ N substantial + ≤ M light posts drafted/day.
+          dailySubstantialCap: env.REDDIT_DAILY_SUBSTANTIAL_CAP,
+          dailyLightCap: env.REDDIT_DAILY_LIGHT_CAP,
+          // Skip (don't draft) leads whose post is older than this. 0 = OFF.
+          maxPostAgeHours: env.REDDIT_MAX_POST_AGE_HOURS,
+          bus,
+          draftedTodayByKind: (replyKind) =>
+            countDraftedTodayByKind(sql, { agentInstanceId: inst.id, replyKind }),
+          sql,
+          // Score-based Opus tiering: high-engagement source posts get the stronger
+          // model. Engagement is reused from Apify (payload), no API call.
+          opusScoreThreshold: env.REDDIT_OPUS_SCORE,
+          opusCommentsThreshold: env.REDDIT_OPUS_COMMENTS,
+          opusModel: env.NOELLE_DRAFTER_OPUS_MODEL,
+          // ── Grounded-drafting (all default OFF until the operator sets env). ──
+          voiceDirs: parseIncludeDirs(env.NOELLE_VOICE_DIRS),
+          knowledgeDirs: parseIncludeDirs(env.NOELLE_KNOWLEDGE_DIRS),
+          knowledgeTopK: env.NOELLE_DRAFTER_KNOWLEDGE_TOPK,
+          captionFn,
+          // Post-draft verifier + regenerate loop (gated on NOELLE_DRAFTER_VERIFY).
+          verify: env.NOELLE_DRAFTER_VERIFY
+            ? {
+                enabled: true,
+                retries: env.NOELLE_DRAFTER_VERIFY_RETRIES,
+                voiceFloor: env.NOELLE_DRAFTER_VOICE_FLOOR,
+                // Judge runs on Haiku (judgeRouting) — it scores, it doesn't write.
+                makeCalls: (): VerifierCall[] => {
+                  const judge: VerifierCall = (system, prompt) =>
+                    runner
+                      .draft({
+                        bucket: "drafter-verify",
+                        routing: judgeRouting(),
+                        orgId: inst.org_id,
+                        instanceId: inst.id,
+                        worker: "drafter",
+                        agentRole: "reddit_intern",
+                        system,
+                        prompt,
+                      })
+                      .then((r) => r.text);
+                  return [judge];
+                },
+              }
+            : undefined,
+          // Voice variety: per-lead random register injected into the comment prompt.
+          variety: { enabled: env.NOELLE_DRAFTER_VARIETY },
+          // Post-energy mirroring (NOELLE_DRAFTER_ENERGY; default off → byte-identical).
+          // On → energy-aware register + a "POST ENERGY" hint so a joke gets a joke,
+          // a vent gets commiseration, never philosophy on a shitpost.
+          energy: { enabled: env.NOELLE_DRAFTER_ENERGY },
+          // Sibling-comment "read the room" fetch (NOELLE_DRAFTER_COMMENT_ENERGY; off →
+          // byte-identical). Reddit reads the FREE public .json endpoint (no token, no
+          // Apify spend); fetchRedditPostComments is fail-open by construction.
+          ...(env.NOELLE_DRAFTER_COMMENT_ENERGY
+            ? {
+                fetchSiblingComments: async (lead: LeadRow): Promise<SiblingComment[]> => {
+                  const comments = await fetchRedditPostComments({
+                    postId: lead.external_id,
+                    limit: env.NOELLE_DRAFTER_COMMENT_MAX,
+                  });
+                  return comments.map((c) => ({ text: c.body, author: c.author, score: c.score }));
+                },
+              }
+            : {}),
+          // Per-author memory: inject the replies already sent/queued to this
+          // post's author so the comment doesn't repeat a take Orion already made.
+          getPriorReplies: (a) =>
+            getRecentRepliesToAuthor(sql, { ...a, agentInstanceId: inst.id }),
+          priorRepliesTopK: env.REDDIT_DRAFTER_SENT_TOPK,
+          // Global avoid-list: Orion's recent replies across the whole feed.
+          getRecentPhrasings: (a) =>
+            getRecentReplyPhrasings(sql, { ...a, agentInstanceId: inst.id }),
+          recentPhrasingsTopK: env.REDDIT_DRAFTER_RECENT_PHRASINGS_TOPK,
+          // SECURITY: fence the UNTRUSTED Reddit post text, image caption, and
+          // top-comments digest (default ON for Reddit).
+          fenceUntrusted: env.NOELLE_DRAFTER_FENCE,
+          // Deterministic comment targeting: reply to the most-upvoted comment when
+          // it clears the score floor (default ON).
+          commentTargeting: {
+            enabled: env.REDDIT_COMMENT_TARGETING,
+            minScore: env.REDDIT_COMMENT_TARGET_MIN_SCORE,
+          },
+        });
+
+        // ── Pattern Breaker (default OFF: REDDIT_PATTERN_BREAKER). ────────────
+        // Drain the AI-refine queue every tick (cheap; no-op when empty), and
+        // re-audit the operator's last-N sent replies at most once per interval.
+        // Both fail-soft: any error is logged and the drafter tick still succeeds.
+        if (env.REDDIT_PATTERN_BREAKER) {
+          try {
+            await runPatternRefineTick({
+              log,
+              instance: inst,
+              runner,
+              bus,
+              loadQueue: () => loadRefiningAlerts(sql, {
+                orgId: inst.org_id,
+                agentInstanceId: inst.id,
+                role: "reddit_intern",
+              }),
+              claim: (item) => claimRefinement(sql, {
+                orgId: inst.org_id,
+                agentInstanceId: inst.id,
+                role: "reddit_intern",
+              }, item),
+              applyRefined: (a) => applyRefinedRule(sql, {
+                orgId: inst.org_id,
+                agentInstanceId: inst.id,
+                role: "reddit_intern",
+              }, { ...a, decidedBy: "pattern-breaker" }),
+            });
+            const last = lastPatternAnalysisAt.get(inst.id) ?? 0;
+            if (Date.now() - last >= env.PATTERN_BREAKER_INTERVAL_MS) {
+              lastPatternAnalysisAt.set(inst.id, Date.now());
+              await runPatternBreakerTick({
+                log,
+                instance: inst,
+                runner,
+                bus,
+                minFrequency: env.PATTERN_BREAKER_MIN_FREQUENCY,
+                minRatio: env.PATTERN_BREAKER_MIN_RATIO,
+                loadCorpus: () => loadRecentPosts(sql, {
+                  orgId: inst.org_id,
+                  agentInstanceId: inst.id,
+                  role: "reddit_intern",
+                }, env.PATTERN_BREAKER_MAX_POSTS),
+                loadExistingLabels: () => loadActiveRuleLabels(sql, {
+                  orgId: inst.org_id,
+                  agentInstanceId: inst.id,
+                  role: "reddit_intern",
+                }),
+                persist: (finding, windowSize, corpus) =>
+                  persistPattern(sql, {
+                    orgId: inst.org_id,
+                    agentInstanceId: inst.id,
+                    role: "reddit_intern",
+                    finding,
+                    windowSize,
+                    corpus,
+                  }),
+              });
+            }
+          } catch (err) {
+            log.warn({ instance: inst.id, err: (err as Error).message }, "pattern breaker pass failed (non-fatal)");
+          }
+        }
+
+        await run.finish({ status: "ok", rowsProcessed: n });
+      } catch (err) {
