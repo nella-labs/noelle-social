@@ -198,3 +198,30 @@ export async function verifyScript(
 
   const scores: ScriptScores = {
     voice: judged ? judged.voice : 0,
+    grounding: judged ? judged.grounding : 0,
+    relevance: judged ? judged.relevance : 0,
+    format: format.score,
+  };
+  const reasons = [
+    ...(judged?.reasons ?? []),
+    ...format.reasons,
+    ...(judgeFailed ? ["verifier judge unavailable — review failed"] : []),
+  ];
+  const pass =
+    scores.voice >= voiceFloor &&
+    scores.grounding >= threshold &&
+    scores.relevance >= threshold &&
+    scores.format >= threshold;
+  const fixParts: string[] = [];
+  if (format.reasons.length) fixParts.push(`Hard rule violations you MUST fix: ${format.reasons.join("; ")}.`);
+  if (judged?.fix) fixParts.push(judged.fix);
+  const fix = fixParts.length ? fixParts.join(" ") : null;
+  return { pass, scores, reasons, fix, judge: judgeSource };
+}
+
+/** Mean of the four dimension scores — used by the worker to keep the best of N
+ * attempts when the regenerate loop exhausts its retries without a clean pass. */
+export function verdictScore(v: { scores: ScriptScores }): number {
+  const s = v.scores;
+  return (s.voice + s.grounding + s.relevance + s.format) / 4;
+}
