@@ -998,3 +998,203 @@ export function findAmbientComments(
 // ── Challenge / throttle detection ───────────────────────────────────────────
 
 export interface ChallengeResult {
+  challenge: boolean;
+  kind?: "jschallenge" | "verify" | "throttle";
+}
+
+/**
+ * Classify any interstitial the session hit. HARD challenges (challenge:true →
+ * the run halts): the "you're doing that too much" throttle and human-
+ * verification / lock walls. The transient JS-challenge (Reddit's ~1s auto-
+ * solving `just a moment` / `reputation-recaptcha` gate) is NOT a hard challenge —
+ * it returns challenge:false with kind:"jschallenge" so the caller just waits and
+ * retries next tick.
+ *
+ * SAFETY: the throttle/verify text probe is scoped to alert/error/status regions
+ * (plus the whole body only when the page has NO real post/comment content — a
+ * bare interstitial). It never scans arbitrary post or comment bodies, so a post
+ * that merely quotes "you're doing that too much" can't false-trip a halt.
+ *
+ * STRUCTURAL signals (checked FIRST, ports #406): evidence that cannot occur
+ * organically in post/comment content — a captcha-VENDOR iframe or a
+ * verification/block interstitial route — halts even when the wall's prose
+ * doesn't match the text probes (different wording, different language). Kept to
+ * exact vendor hostnames: a bare `src*='captcha'` would match an embedded ad
+ * iframe with "captcha" in a query param and false-halt a healthy run.
+ */
+export function detectChallenge(root: ParentNode, opts: { url?: string; title?: string } = {}): ChallengeResult {
+  const url = (opts.url ?? "").toLowerCase();
+  const title = (opts.title ?? "").toLowerCase();
+
+  // Structural hard-challenge evidence, text-independent. Reddit serves hCaptcha
+  // / Google reCAPTCHA (never Arkose) — but the transient `reputation-recaptcha`
+  // auto-solving gate may itself embed an invisible reCAPTCHA vendor iframe, so a
+  // vendor iframe INSIDE that element stays a soft jschallenge (waited out below),
+  // never a halt.
+  const vendorIframes = Array.from(
+    root.querySelectorAll("iframe[src*='hcaptcha.com' i], iframe[src*='google.com/recaptcha' i]"),
+  );
+  if (vendorIframes.some((f) => f.closest("reputation-recaptcha") === null)) {
+    return { challenge: true, kind: "verify" };
+  }
+  // A verification/block interstitial REDIRECTS off the thread. The path check is
+  // anchored to the START of the pathname — organic content lives under /r/…,
+  // /user/…, so a post slug containing "blocked" (/r/x/comments/id/blocked_by_y/)
+  // can never trip it.
+  try {
+    const path = new URL(opts.url ?? "").pathname.toLowerCase();
+    if (/^\/(blocked|verification|account\/verification)(\/|$)/.test(path)) {
+      return { challenge: true, kind: "verify" };
+    }
+  } catch {
+    /* no/unparseable url — structural URL probe skipped */
+  }
+
+  const hasRealContent =
+    root.querySelector("shreddit-post, shreddit-comment, .thing.link, .thing.comment, .commentarea") !== null;
+
+  const alertNodes = Array.from(
+    root.querySelectorAll('[role="alert"], faceplate-toast, .error, .status, .ratelimit, .interstitial, .md-error'),
+  );
+  let probe = alertNodes.map((n) => n.textContent ?? "").join(" ");
+  if (!hasRealContent) probe += " " + (root.textContent ?? "").slice(0, 2000);
+  probe = probe.toLowerCase();
+
+  if (/you'?re doing that too much|doing that too much|try again in \d+\s*(second|minute)/.test(probe)) {
+    return { challenge: true, kind: "throttle" };
+  }
+  if (
+    /human verification|verify (that )?you('?re| are)( a)? human|are you (a )?(human|robot)|complete the security check|unusual (traffic|activity)|your account has been (suspended|locked|banned)/.test(
+      probe,
+    )
+  ) {
+    return { challenge: true, kind: "verify" };
+  }
+
+  const jsChallenge =
+    /js_challenge=1|solution=|jsc_orig/.test(url) ||
+    title.includes("just a moment") ||
+    root.querySelector("reputation-recaptcha") !== null;
+  if (jsChallenge) return { challenge: false, kind: "jschallenge" };
+
+  return { challenge: false };
+}
+
+// ── Post availability (removed / deleted / 404 / private-or-banned) ───────────
+
+export interface PostAvailability {
+  /** True when the target post is GONE (removed/deleted/404/private-or-banned community). */
+  unavailable: boolean;
+  /** A short machine reason (the matched signal) for logging; absent when available. */
+  reason?: string;
+  /**
+   * True ONLY on POSITIVE removal evidence: a removed/deleted indicator attribute,
+   * old Reddit's `.thing.link.deleted`, or a matched removal phrase. Falsy for
+   * `post-absent` (the post shell simply missing) — that state ALSO fires on
+   * transient 5xx / "something went wrong" interstitials, CDN error pages, and
+   * old-Reddit age gates where the content script runs fine, so callers must NOT
+   * take a DURABLE action (server-side markSkipped) on it; only a session-local
+   * drop is safe (self-heals next run).
+   */
+  positive?: boolean;
+}
+
+// Removal / unavailable phrases (lowercase, straight apostrophes). A match of any
+// of these inside the POST region — NEVER the comment tree — means the target post
+// is gone. Ordered most-specific first so the logged reason is the informative one.
+const REMOVAL_PHRASES = [
+  "removed by reddit's filters",
+  "removed by the moderators",
+  "removed by reddit",
+  "sorry, this post was removed",
+  "this post has been removed",
+  "this post was removed",
+  "this post was deleted",
+  "page not found",
+  "this community is private",
+  "this community has been banned",
+] as const;
+
+// "[removed]"/"[deleted]" are Reddit's LITERAL whole-field markers (a removed
+// selfpost's body renders as exactly "[removed]"). They are deliberately NOT in
+// REMOVAL_PHRASES: as substrings they false-positive on a healthy post that
+// merely QUOTES them ("why do I see [deleted] everywhere?") — and a positive
+// here now feeds a DURABLE server-side skip. Matched only as the ENTIRE trimmed
+// title/body field via bracketToken().
+const BRACKET_TOKEN_RE = /^\[(removed|deleted)\]$/;
+
+/** `"[removed]"`/`"[deleted]"` when the WHOLE trimmed field is that marker, else null. */
+function bracketToken(field: string): string | null {
+  const m = BRACKET_TOKEN_RE.exec(normalizeText(field.trim()));
+  return m ? m[0] : null;
+}
+
+// Normalize typographic apostrophes to straight so "Reddit's filters" matches
+// whether the UI renders a straight (') or curly (’) apostrophe, then lowercase.
+function normalizeText(s: string): string {
+  return s.replace(/[‘’ʼ]/g, "'").toLowerCase();
+}
+
+/** The first removal/unavailable phrase found in `probe`, or null. */
+function matchRemovalPhrase(probe: string): string | null {
+  const t = normalizeText(probe);
+  for (const p of REMOVAL_PHRASES) if (t.includes(p)) return p;
+  return null;
+}
+
+// A removed/deleted indicator ATTRIBUTE on a shreddit-post shell, if Reddit sets
+// one. Conservative: an attribute present with a non-empty, non-"false" value.
+function newPostRemovedAttr(post: Element): boolean {
+  for (const name of ["removed", "is-removed", "deleted", "is-deleted", "removed-by", "removed-by-category"]) {
+    const v = post.getAttribute(name);
+    if (v !== null && v.trim() !== "" && v.trim().toLowerCase() !== "false") return true;
+  }
+  return false;
+}
+
+/**
+ * Is the target post UNAVAILABLE (removed by filters/mods, deleted, 404, or a
+ * private/banned community) — i.e. must the actuator SKIP it without replying?
+ *
+ * READ-ONLY, page-content-as-DATA (textContent/attributes only, never innerHTML).
+ * The text scan is scoped to the POST region, NEVER the comment tree: a legitimately
+ * deleted *comment* in a healthy thread renders "[deleted]"/"[removed]" and must not
+ * false-trip a post-removed skip (mirrors detectChallenge's content scoping).
+ *
+ * New Reddit: unavailable when the shreddit-post shell is absent (404 /
+ * interstitial), carries a removed/deleted indicator attribute, or the post
+ * region's text contains a removal/unavailable phrase. The broad main-column scan
+ * widens ONLY when the page has no comments (a bare interstitial), so a deleted
+ * comment in a live thread can never trip it.
+ *
+ * Old Reddit: unavailable on `.thing.link.deleted`, an `.error`/"page not found"
+ * page, a `[removed]`/`[deleted]` post title/body, or the post thing being absent.
+ *
+ * `positive` distinguishes CONFIRMED removal (attr/class/matched phrase — safe to
+ * act on durably) from mere shell absence (`post-absent` — also produced by
+ * transient error interstitials, so session-local handling only).
+ */
+export function isPostUnavailable(root: ParentNode, flavor: RedditFlavor): PostAvailability {
+  return flavor === "old" ? oldPostUnavailable(root) : newPostUnavailable(root);
+}
+
+function newPostUnavailable(root: ParentNode): PostAvailability {
+  const post = findPost(root, "new"); // shreddit-post
+  if (post) {
+    if (newPostRemovedAttr(post)) return { unavailable: true, reason: "removed-attr", positive: true };
+    // A whole-field "[removed]"/"[deleted]" marker (never a quoted substring).
+    const tok = bracketToken(postTitle(post, "new")) ?? bracketToken(postBody(post, "new"));
+    if (tok) return { unavailable: true, reason: tok, positive: true };
+  }
+
+  // Scope the phrase scan: the post block ALWAYS (its textContent excludes the
+  // comment tree). Widen to the main content column ONLY when there are no
+  // comments on the page (a bare removal interstitial), never when a comment tree
+  // is present — that keeps a deleted comment from false-tripping.
+  const hasComments = root.querySelector("shreddit-comment, shreddit-comment-tree") !== null;
+  let probe = post?.textContent ?? "";
+  if (!hasComments) {
+    const main = root.querySelector('main, #main-content, [role="main"]');
+    probe += " " + ((main?.textContent ?? root.textContent) ?? "").slice(0, 4000);
+  }
+  const reason = matchRemovalPhrase(probe);
