@@ -198,3 +198,31 @@ describe("chunkMarkdown — size cap", () => {
     const sectionChunks = chunks.filter((c) =>
       c.headingPath.length === 2 && c.headingPath[1] === "Section",
     );
+    expect(sectionChunks.length).toBeGreaterThan(1);
+  });
+
+  it("preserves line numbers when a section is paragraph-split", () => {
+    const paragraph = "lorem ".repeat(200); // ~1200 chars
+    const body = [
+      "# Title", // line 1
+      "## Section", // line 2
+      paragraph, // line 3
+      "", // line 4
+      paragraph, // line 5
+      "", // line 6
+      paragraph, // line 7
+    ].join("\n");
+    const chunks = chunkMarkdown("demooperator/x.md", body);
+    const split = chunks.filter((c) => c.headingPath.includes("Section"));
+    // The first sub-chunk must start at line 2 (the ## line). The last
+    // must end at line 7. Sub-chunks must form a non-overlapping cover.
+    expect(split[0]?.startLine).toBe(2);
+    expect(split[split.length - 1]?.endLine).toBe(7);
+    for (let i = 1; i < split.length; i++) {
+      const prev = split[i - 1];
+      const cur = split[i];
+      if (!prev || !cur) continue;
+      expect(cur.startLine).toBeGreaterThan(prev.endLine);
+    }
+  });
+});
