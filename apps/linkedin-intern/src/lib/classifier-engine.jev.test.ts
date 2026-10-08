@@ -198,3 +198,14 @@ describe("LinkedIn Jev qualification", () => {
     const classify = createClassifier({
       backend: { call } as never,
       vipScout: true,
+      evaluateBoolean: evaluateBoolean as never,
+      evaluateChoice: vi.fn().mockResolvedValue({
+        kind: "choice", choice: "skip",
+        probabilities: { substantial: 0.03, light: 0.03, skip: 0.94 }, provider: "jev",
+      }) as never,
+    });
+    expect(await classify.classifyObserved(post)).toMatchObject({ reply_kind: "skip", provider: "jev" });
+    expect(evaluateBoolean).not.toHaveBeenCalled();
+    expect(call).not.toHaveBeenCalled();
+  });
+});
