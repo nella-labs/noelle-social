@@ -398,3 +398,203 @@ export interface RunDrafterTickArgs {
      */
     genzMarkerRotation?: {
       next: (rng?: () => number, energy?: string | null) => GenZMarker | null;
+    };
+    /**
+     * Share of leads offered a gen-z marker. Defaults to
+     * genzMarkerRateFromEnv() (22%, `NOELLE_GENZ_MARKERS=0` to disable). The
+     * RATE is the design: overdoing the slang reads as more machine-written,
+     * not less.
+     */
+    genzMarkerRate?: number;
+  };
+  /**
+   * Per-person "what you already said" memory. When set, the tick fetches the
+   * reply bodies Lyra already SENT or QUEUED for THIS post's author and injects
+   * them into the comment prompt with a "do not repeat these" instruction, so the
+   * drafter stops re-saying the same take every time a connection posts. The
+   * worker wires this to prior-replies-db.getRecentRepliesToAuthor; omit it
+   * (tests, or topK 0) and drafting proceeds with no prior-reply context.
+   * Applies to the substantial + light comment paths only (DMs are untouched).
+   */
+  getPriorReplies?: (args: {
+    authorHandle: string | null;
+    authorId?: string | null;
+    excludeLeadId?: string | null;
+    limit: number;
+  }) => Promise<string[]>;
+  /** How many prior replies-per-person to inject (LINKEDIN_DRAFTER_SENT_TOPK). Default 3. */
+  priorRepliesTopK?: number;
+  /**
+   * Global "phrasings you've reached for lately" memory. When set, the tick
+   * fetches Lyra's most recent reply bodies across the WHOLE feed (all authors)
+   * ONCE per tick and (a) injects them into the comment prompt as an AVOID list
+   * and (b) passes them to the verifier as `recentReplies` so a draft too alike a
+   * recent one regenerates — the openers, shapes, and phrasings vary feed-wide,
+   * not just per person. The worker wires this to
+   * prior-replies-db.getRecentReplyPhrasings; omit it (tests, or topK 0) and
+   * drafting proceeds with no global phrasing context.
+   */
+  getRecentPhrasings?: (args: {
+    excludeLeadId?: string | null;
+    limit: number;
+  }) => Promise<string[]>;
+  /** How many recent reply bodies to use for the avoid-list + diversity check (LINKEDIN_DRAFTER_RECENT_PHRASINGS_TOPK). Default 20. */
+  recentPhrasingsTopK?: number;
+  /**
+   * Tiered multi-lead batching for LIGHT leads (F6b, default OFF — gated on
+   * NOELLE_DRAFTER_BATCH via `batch.enabled`). When enabled AND the instance's
+   * account_feeder_config.batchLightLeads is true (default), light leads that are
+   * NOT Opus-eligible (and not subject to the verifier) are grouped into a SINGLE
+   * batched drafter call per tick, cutting LLM cost for the cheap lane. Each lead
+   * carries its OWN post text, OWN per-lead STYLE block, OWN anchors/knowledge.
+   * The model returns a JSON array; Zod validates it; on ANY parse failure /
+   * count mismatch / id mismatch / model error → fall back to per-lead single
+   * calls for that group (today's behaviour). No lead is ever dropped or
+   * cross-wired. High-value (Opus-eligible, watchlist-priority) leads always use
+   * single calls. When batch.enabled is false (default) behaviour is
+   * byte-identical to today (one-lead-one-call). Injected for testability.
+   */
+  batch?: {
+    /** Master on/off (NOELLE_DRAFTER_BATCH). Default OFF. */
+    enabled: boolean;
+    /**
+     * Whether the instance's account_feeder_config permits batch light leads.
+     * Mirrors AccountFeederConfig.batchLightLeads (default true). Only used
+     * when batch.enabled is true.
+     */
+    batchLightLeads?: boolean;
+  };
+  /**
+   * Account Feeder STYLE injection (F6, default OFF — gated on NOELLE_DRAFTER_STYLE
+   * via `style.enabled`). When enabled, the tick loads the style-exemplar
+   * candidate pool + ultra profiles ONCE (via the injected loaders) and, per
+   * lead, samples a few high-performing human exemplars (performance-weighted ×
+   * fit, controlled variety; see lib/style-select.ts) into the drafter SYSTEM
+   * prompt so comments imitate the FORM of real writers. Fail-open throughout:
+   * a loader error, an empty pool, or any selection error ⇒ no STYLE block, the
+   * lead drafts exactly as today. Applies to the substantial + light COMMENT
+   * paths only (the DM / intro-DM / DM-request paths are untouched). Injected so
+   * the worker owns the DB reads + flags and the tick stays unit-testable.
+   */
+  style?: {
+    enabled: boolean;
+    /** Load the candidate pool (kind='comment') once per tick. */
+    loadPool: () => Promise<StyleExemplarRow[]>;
+    /** Load the instance's ultra profiles once per tick (style notes source). */
+    loadUltraProfiles: () => Promise<UltraProfileRow[]>;
+    /** The instance's account_feeder_config jsonb (selection knobs). */
+    config?: unknown;
+    /** Use the F4b dense/hybrid ranker (NOELLE_DRAFTER_DENSE). Default false. */
+    dense?: boolean;
+    /** Injectable PRNG for deterministic variety in tests. */
+    rng?: () => number;
+    /**
+     * When true (operator pinned a voice), write faithfully in that voice: no
+     * register de-hype, adopt-the-voice STYLE block.
+     */
+    faithful?: boolean;
+    /**
+     * The faithful-voice handle list (from readFaithfulVoices). When it holds MORE
+     * than one voice, the tick picks ONE per lead deterministically (rotating
+     * across the feed) and restricts that lead's exemplar pool to it, so each reply
+     * sounds like a single real writer. A single voice needs no per-lead filter.
+     */
+    faithfulVoices?: string[];
+    /**
+     * Optional per-voice weights parallel to faithfulVoices (from
+     * readFaithfulVoiceWeights). When present, the per-lead voice draw is biased
+     * by these proportions (e.g. 60/40) instead of uniform. undefined ⇒ uniform.
+     */
+    faithfulVoiceWeights?: number[];
+  };
+}
+
+const DEFAULT_RELEVANCE_THRESHOLD = 6;
+
+export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> {
+  const {
+    log,
+    instance,
+    claimedLeads,
+    runner,
+    kb,
+    postOutbound,
+    markStatus,
+    relevanceThreshold = DEFAULT_RELEVANCE_THRESHOLD,
+    dailySubstantialCap = Number.MAX_SAFE_INTEGER,
+    dailyLightCap = Number.MAX_SAFE_INTEGER,
+    draftedTodayByKind,
+    sql,
+    opusLikesThreshold = Number.MAX_SAFE_INTEGER,
+    opusCommentsThreshold = Number.MAX_SAFE_INTEGER,
+    opusModel,
+    fetchPostComments,
+    commentFetchMax = 40,
+    commentFetchMinCount = 2,
+    bus,
+    voiceDirs,
+    knowledgeDirs,
+    knowledgeTopK = 4,
+    rerankGrounding = false,
+    verify,
+    captionFn,
+    variety,
+    getPriorReplies,
+    priorRepliesTopK = 3,
+    getRecentPhrasings,
+    recentPhrasingsTopK = 20,
+    style,
+    batch,
+  } = args;
+  let processed = 0;
+  const browserVoiceDirs = (voiceDirs ?? []).filter((dir) => BROWSER_VOICE_DIRS.has(dir));
+
+  // Faithful-voice mode: the operator PINNED a style source. When set, the tick
+  // (a) skips the register-based cheer penalty in exemplar selection (so the
+  // pinned voice's characteristic/high-performing posts are picked, not their
+  // blandest) and (b) renders the adopt-the-voice STYLE block. Off (default) ⇒
+  // the legacy blend path, byte-identical to before.
+  const styleFaithful = style?.faithful === true;
+  // The pinned voice list. When it holds >1 voice, each lead gets ONE of them
+  // (rotating across the feed) so a single reply is faithfully one writer. Empty
+  // or single-element ⇒ no per-lead voice filter (the whole faithful pool is used).
+  const faithfulVoices = style?.faithfulVoices ?? [];
+  const faithfulVoiceWeights = style?.faithfulVoiceWeights;
+
+  // Global "what you've said lately" memory — fetched ONCE per tick (it spans all
+  // authors, not this lead), injected as an avoid-list so openers/phrasings vary
+  // across the whole feed. Fail-open to [].
+  const recentPhrasings = getRecentPhrasings
+    ? await getRecentPhrasings({ limit: recentPhrasingsTopK }).catch(() => [])
+    : [];
+
+  // Account Feeder STYLE pool + ultra profiles — loaded ONCE per tick (they're
+  // instance-scoped, not per-lead) and reused across every claimed lead (spec §8
+  // "retrieve once per tick"). Skipped entirely when style is off; fail-open to
+  // empty arrays so a loader error just disables the STYLE block for this tick.
+  const styleCandidates: StyleExemplarRow[] = style?.enabled
+    ? await style.loadPool().catch((err) => {
+        log.warn({ err: (err as Error).message }, "style pool load failed; drafting without style");
+        return [];
+      })
+    : [];
+  const styleProfiles: UltraProfileRow[] =
+    style?.enabled && styleCandidates.length
+      ? await style.loadUltraProfiles().catch((err) => {
+          log.warn({ err: (err as Error).message }, "ultra-profile load failed; style notes omitted");
+          return [];
+        })
+      : [];
+
+  // Base routing for this instance (default or per-instance override). A
+  // high-engagement lead overrides this to Opus per lead; everyone else uses it.
+  const baseRouting = linkedinInternRouting(instance);
+  // Derive final browser-repair routing from the ordinary instance writer, not
+  // a high-engagement route that may already have Opus as its primary.
+  const opusRepairRouting = opusOverrideRouting(baseRouting, opusModel);
+
+  // Operator brand config (persona/product/pitch/styles), parsed once per tick.
+  const brand = parseBrandConfig(instance.brand_config);
+
+  // Per-watchlist-person profiles + objectives, fetched once per tick.
+  const profilesByFsd: Map<string, WatchlistProfileRow> = sql
