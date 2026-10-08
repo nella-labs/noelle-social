@@ -398,3 +398,203 @@ async function endRun(status: RunState["status"], terminal = reserveStop()): Pro
 // left, or sending disabled server-side) returns false → the drain ends;
 // replies that keep failing hit the per-draft retry cap → doneDraftIds →
 // filtered out of the next fetch → remaining reaches 0.
+async function maybeExtendDrain(
+  s: RunState, cfg: ActuatorConfig, api: ActuatorApi, now: number, rng: ReturnType<typeof makeRng>,
+): Promise<boolean> {
+  if (s.mode !== "drain") return false;
+  const q = await api.fetchQueue().catch(() => null);
+  if (!q) return false;
+  const done = new Set(s.doneDraftIds);
+  s.commentPool = mergePool(
+    s.commentPool,
+    q.comments.map((c) => ({ approvalId: c.approval_id, draftId: c.draft_id, body: c.body, url: c.target.url })),
+    done,
+  );
+  s.lastPollMs = now; // this fetch counts as a poll; don't double-fetch next tick
+  const remaining = s.commentPool.length;
+  if (!shouldExtendDrain(s.mode, s.drainRounds ?? 0, remaining)) return false;
+
+  // Plan a fresh drain batch for the remaining replies, starting shortly from
+  // now, and splice it onto the timeline. The existing comment-slot executor
+  // shifts these off s.commentPool exactly as it did the first batch.
+  // Carry the SAME persisted session temperament so every round keeps one coherent
+  // mood (old states without drainStyle fall back to today's defaults via `?? {}`).
+  // shortBandProb stays MIN-combined with the operator cfg knob (placed after the
+  // spread → wins) so a round never drains faster than min(cfg, default).
+  const style = s.drainStyle;
+  const planned = planDrainTimeline({
+    approvedComments: remaining, startMs: now, rng,
+    ...(style ?? {}),
+    shortBandProb: style ? Math.min(cfg.drainShortBandProb ?? 0.55, style.shortBandProb) : cfg.drainShortBandProb,
+  });
+  const newLast = planned.reduce((m, a) => Math.max(m, a.atMs), now);
+  for (const a of planned) s.actions.push({ kind: a.kind, atMs: a.atMs, executed: false });
+  s.windowHours = (newLast - s.startMs) / 3600_000 + 0.15; // extend so the new tail fits
+  s.targets.comments += remaining;
+  s.targets.likes += planned.filter((a) => a.kind === "like").length;
+  s.drainRounds = (s.drainRounds ?? 0) + 1;
+  s.lastEvent = `draining more — ${remaining} left in inbox (round ${s.drainRounds})`;
+  return true;
+}
+
+async function maybeReplenish(s: RunState, api: ActuatorApi, now: number, rng: ReturnType<typeof makeRng>) {
+  if (now - s.lastPollMs < POLL_MS * rng.float(0.8, 1.6)) return;
+  s.lastPollMs = now;
+  const q = await api.fetchQueue().catch(() => null);
+  if (!q) return;
+  const done = new Set(s.doneDraftIds);
+  s.commentPool = mergePool(s.commentPool, q.comments.map((c) => ({ approvalId: c.approval_id, draftId: c.draft_id, body: c.body, url: c.target.url })), done);
+  s.dmPool = mergePool(s.dmPool, q.dms.map((d) => ({ approvalId: d.approval_id, draftId: d.draft_id, body: d.body, url: d.target.url })), done);
+}
+
+// Ambient read-actions (expand "Show more" / open a tweet's replies to read) are
+// paced by a rolling cooldown so they cluster like real reading instead of
+// firing on every ~4s idle tick. Base gap × a 1–2 jitter ⇒ roughly one every
+// 20–40s at most; many attempts also find nothing in view and downgrade to a
+// scroll, so the real rate is lower. Read-only + non-counted against targets.
+// Tightened (was 30s×1–2.5) so the actor actively clicks "Show more" while waiting.
+const AMBIENT_READ_MIN_GAP_MS = 20_000;
+
+// Minimum spacing between idle-likes (a like slipped into the wait between
+// scheduled actions), so waiting-gap likes are paced like a human rather than
+// fired every ~4s tick. The like scan itself is several seconds, so this also
+// keeps a like-less feed from being hammered.
+// Quiet re-tune (port of Lyra #497): raised 45s -> 5 min. Idle-likes are
+// budget-bounded either way, so this does not change VOLUME; it spreads the same
+// likes over more wall clock, the direction docs/x-account-safety.md asks for.
+// On X this constant did strictly more work than on LinkedIn because it governed
+// Run/auto AND every non-cooldown drain gap; the drain half is now gated off
+// entirely at the call site below.
+const IDLE_LIKE_MIN_GAP_MS = 300_000;
+
+// One ambient browse: pick a behavior (read-actions gated by cooldown + config
+// kill switch, default ON) and run it. Advances the cooldown anchor only on an
+// action that actually happened, so a downgraded-to-scroll attempt doesn't burn
+// the gap. Mutates `s` in place; the caller persists it.
+async function pendingObservations(): Promise<Map<string, VisibleTweet>> {
+  const stored = await chrome.storage.local.get(PENDING_OBSERVATIONS_KEY).catch(() => ({})) as Record<string, unknown>;
+  const previous = Array.isArray(stored[PENDING_OBSERVATIONS_KEY])
+    ? stored[PENDING_OBSERVATIONS_KEY] as VisibleTweet[] : [];
+  return new Map(previous.filter((v) => v && typeof v.tweetId === "string").map((v) => [v.tweetId, v]));
+}
+
+async function wakeDiscoveryRead(): Promise<void> {
+  await chrome.storage.session.set({ [LAST_DISCOVERY_READ_KEY]: 0 });
+}
+
+async function submitPendingObservations(api: ActuatorApi, pending: Map<string, VisibleTweet>, budget: { remaining: number }): Promise<number | null> {
+  const batch = observationBatch([...pending.values()], budget.remaining);
+  if (batch.length === 0 || stopped() || !(await browserDiscoveryEnabled())) return null;
+  // Persist before the HTTP request. A failed or ambiguous submission keeps
+  // its reservation and the durable batch for the next paced read.
+  await chrome.storage.local.set({ [PENDING_OBSERVATIONS_KEY]: [...pending.values()] });
+  if (stopped()) return null;
+  try {
+    const accepted = await submitObservationBatch(batch, budget, (items) => api.postObservations(items));
+    for (const item of batch) { pending.delete(item.tweetId); observedTweetIds.add(item.tweetId); }
+    if (observedTweetIds.size > 2000) observedTweetIds.clear();
+    await chrome.storage.local.set({ [PENDING_OBSERVATIONS_KEY]: [...pending.values()] });
+    return accepted;
+  } catch (error) {
+    console.warn("[x-discovery] observations retained for retry", error);
+    return null;
+  }
+}
+
+async function observeVisibleTweets(tabId: number, api: ActuatorApi, budget: { remaining: number }): Promise<{ visible: number; accepted: number } | void> {
+  if (budget.remaining <= 0 || stopped() || !(await browserDiscoveryEnabled())) return;
+  const harvest = await send<{ ok: boolean; items?: VisibleTweet[] }>(tabId, { cmd: "harvestVisibleTweets" }).catch(() => null);
+  if (!harvest?.ok) return;
+  const visibleCount = harvest?.items?.length ?? 0;
+  const pending = await pendingObservations();
+  for (const item of harvest?.items ?? []) {
+    if (!observedTweetIds.has(item.tweetId) && (pending.has(item.tweetId) || pending.size < MAX_PENDING_OBSERVATIONS)) {
+      pending.set(item.tweetId, item);
+    }
+  }
+  const accepted = pending.size > 0 ? await submitPendingObservations(api, pending, budget) : 0;
+  if (accepted === null) return;
+  return { visible: visibleCount, accepted };
+}
+
+async function ambientBrowse(
+  s: RunState,
+  cfg: ActuatorConfig,
+  tabId: number,
+  rng: ReturnType<typeof makeRng>,
+  now: number,
+): Promise<"browsed" | "waiting" | "full" | "unavailable" | "buffered"> {
+  const api = new ActuatorApi(cfg);
+  const discovery = await browserDiscoveryEnabled();
+  let budget = { remaining: 0 };
+  let lastTargetMs: number | null = null;
+  let pendingTarget: unknown = null;
+  if (discovery) {
+    const lastReadStore = await chrome.storage.session.get([
+      LAST_DISCOVERY_READ_KEY, LAST_DISCOVERY_TARGET_KEY, PENDING_DISCOVERY_TARGET_KEY,
+    ]).catch(() => null) as Record<string, unknown> | null;
+    if (!lastReadStore) {
+      console.warn("[x-discovery] target cache read failed");
+      return "unavailable";
+    }
+    const lastRead = Number(lastReadStore[LAST_DISCOVERY_READ_KEY] ?? 0);
+    const storedTargetMs = lastReadStore[LAST_DISCOVERY_TARGET_KEY];
+    if (typeof storedTargetMs === "number" && Number.isFinite(storedTargetMs)) lastTargetMs = storedTargetMs;
+    pendingTarget = lastReadStore[PENDING_DISCOVERY_TARGET_KEY] ?? null;
+    // A full buffer or outage also consumes this read opportunity: no repeated
+    // capacity request or continuous scroll on the actor's ~4s idle ticks.
+    if (discoveryBrowseDecision({ enabled: true, lastReadMs: lastRead, nowMs: now, available: 1 }) === "waiting") return "waiting";
+    await chrome.storage.session.set({ [LAST_DISCOVERY_READ_KEY]: now });
+    const capacity = await api.fetchDiscoveryCapacity().catch(() => null);
+    if (stopped() || s.epoch !== (await currentEpoch())) return "waiting";
+    const decision = discoveryBrowseDecision({ enabled: true, lastReadMs: lastRead, nowMs: now, available: capacity?.available ?? null });
+    if (decision !== "browse") return decision;
+    budget = { remaining: capacity!.available };
+    const pending = await pendingObservations();
+    if (pending.size > 0) {
+      await submitPendingObservations(api, pending, budget);
+      return "buffered";
+    }
+  }
+  // Ambient browsing is feed behavior: a reply parks the tab on a /status/
+  // permalink (and a mis-landed click can navigate anywhere), so re-assert
+  // /home first or the "browsing" dwells idle on whatever page the last write
+  // left behind.
+  await ensureOnFeed(tabId, rng);
+  if (stopped() || s.epoch !== (await currentEpoch())) return "waiting";
+  const readEnabled = cfg.ambientReadActions !== false; // undefined ⇒ ON
+  const sinceRead = now - (s.lastAmbientReadMs ?? 0);
+  const readActionsAllowed = readEnabled && sinceRead > AMBIENT_READ_MIN_GAP_MS * rng.float(1, 2.6);
+  // Purposeful watched-profile/keyword reads use the same pinned X tab. Give
+  // them their own share of eligible discovery reads; idle choices stay on feed.
+  const navigationTarget = discovery ? await discoveryNavigationTarget({
+    nowMs: now,
+    lastSelectedMs: lastTargetMs,
+    randomRoll: rng.next(),
+    cachedTarget: pendingTarget,
+    fetchTarget: () => api.fetchDiscoveryTarget().catch(() => {
+      console.warn("[x-discovery] target fetch failed");
+      return null;
+    }),
+    cacheTarget: (target) => chrome.storage.session.set({ [PENDING_DISCOVERY_TARGET_KEY]: target }),
+    discardCachedTarget: () => chrome.storage.session.set({ [PENDING_DISCOVERY_TARGET_KEY]: null }),
+    onCacheFailure: () => console.warn("[x-discovery] target cache write failed"),
+  }) : null;
+  const kind = navigationTarget ? "navigate" : chooseAmbient(rng, { readActionsAllowed });
+  if (stopped() || s.epoch !== (await currentEpoch())) return "waiting";
+  const did = await runAmbient(tabId, kind, {
+    cdp, click: (id, rect) => actorClick(id, rect, rng), rng, sleep, send, wpm: s.persona.wpm,
+    navigate: (id, url) => navigateTab(id, url, rng, async () => !stopped() && s.epoch === (await currentEpoch())),
+    ...(navigationTarget ? {
+      navigationTarget,
+      emptySearchFallbackTarget: emptySearchFallbackUrl(navigationTarget) ?? undefined,
+      canReadMore: async () => budget.remaining > 0 && !stopped() && s.epoch === (await currentEpoch()),
+      onPageRead: (id: number) => observeVisibleTweets(id, api, budget).catch((e) => {
+        console.warn("[x-discovery] target read failed", e);
+      }),
+    } : {}),
+  }).catch(() => null);
+  if (discovery) {
+    await stampCompletedDiscoveryTarget({
+      outcome: did,
+      targetUrl: navigationTarget,
