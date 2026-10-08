@@ -198,3 +198,203 @@ export const VideoCtaSchema = z.object({
   present: z.boolean(),
   text: z.string().optional(),
   placement: z.enum(["start", "mid", "end", "none"]).default("none"),
+});
+export type VideoCta = z.infer<typeof VideoCtaSchema>;
+
+export const VideoSoundSchema = z.object({
+  musicId: z.string().optional(),
+  trackName: z.string().optional(),
+  energy: z.enum(["low", "medium", "high"]).optional(),
+  /** Is this a trending audio at pull time? */
+  trending: z.boolean().optional(),
+  /** Are cuts synced to the beat? */
+  beatSynced: z.boolean().optional(),
+});
+export type VideoSound = z.infer<typeof VideoSoundSchema>;
+
+// The canonical teardown record (Synthesist output, Auditor-verified).
+export const VideoTeardownSchema = z.object({
+  hook: VideoHookSchema,
+  beats: z.array(VideoBeatSchema).default([]),
+  transitions: z.array(VideoTransitionSchema).default([]),
+  onscreen: z.array(VideoOnscreenSchema).default([]),
+  pacing: VideoPacingSchema,
+  cta: VideoCtaSchema,
+  sound: VideoSoundSchema,
+  /** Grounded hypothesis for why this clip retained + performed. */
+  whyItWorked: z.string(),
+  /** Full timestamped transcript (faster-whisper). */
+  transcript: z.string().optional(),
+});
+export type VideoTeardown = z.infer<typeof VideoTeardownSchema>;
+
+// ---------------------------------------------------------------------------
+// Ultra profile — the distilled Video Brand Guide (Curator output), aggregated
+// per creator / per niche / "my account". Stored as the jsonb distillation on
+// noelle.video_ultra_profiles (alongside scalar avg-metric columns).
+// ---------------------------------------------------------------------------
+export const VideoStructureTemplateSchema = z.object({
+  name: z.string(),
+  beats: z.array(z.string()),
+  /** The actual hook line of the best-performing clip with this structure. */
+  example: z.string().optional(),
+  /** Views of that example clip (so the UI can show what this structure pulls). */
+  views: z.number().optional(),
+});
+export type VideoStructureTemplate = z.infer<typeof VideoStructureTemplateSchema>;
+
+export const VideoUltraProfileSchema = z.object({
+  /**
+   * Recurring hook moves, strongest-first. Each carries a representative line,
+   * why it stops the scroll, and the views of the clip it came from — so the
+   * Brand Guide can show a concrete example, not just the hook category.
+   */
+  hookLibrary: z
+    .array(
+      z.object({
+        type: VideoHookTypeSchema,
+        example: z.string(),
+        /** Why this hook stops the scroll (from the clip's teardown). */
+        reason: z.string().optional(),
+        /** Views of the clip this example came from. */
+        views: z.number().optional(),
+      }),
+    )
+    .default([]),
+  /** The transition moves this creator/niche reaches for. */
+  transitionVocabulary: z.array(VideoTransitionTypeSchema).default([]),
+  /** Typical pacing fingerprint (any subset of the pacing fields). */
+  pacingFingerprint: VideoPacingSchema.partial().optional(),
+  /** Reusable structure templates distilled from the corpus. */
+  structureTemplates: z.array(VideoStructureTemplateSchema).default([]),
+  /** Sound/music patterns (trending-audio reliance, energy bands, beat-sync). */
+  soundPatterns: z.array(z.string()).default([]),
+  /** Real CTA lines pulled from top clips (strongest-first), e.g. "follow for part 2". */
+  ctaExamples: z.array(z.string()).default([]),
+  /** Prose: what consistently performs for this creator/niche/account. */
+  whatPerforms: z.string().optional(),
+});
+export type VideoUltraProfile = z.infer<typeof VideoUltraProfileSchema>;
+
+// ---------------------------------------------------------------------------
+// Studio output status enums (mirror posts.ts). The generated idea/draft wire
+// shapes land with the studio's api-vm routes in a later phase.
+// ---------------------------------------------------------------------------
+export const VideoIdeaStatusSchema = z.enum([
+  "proposed",
+  "approved",
+  "drafting",
+  "drafted",
+  "ready",
+  "published",
+  "dismissed",
+]);
+export type VideoIdeaStatus = z.infer<typeof VideoIdeaStatusSchema>;
+
+export const VideoDraftStatusSchema = z.enum([
+  "draft",
+  "ready",
+  "published",
+  "dismissed",
+]);
+export type VideoDraftStatus = z.infer<typeof VideoDraftStatusSchema>;
+
+// ── Studio generation (W4): ideas + drafts ────────────────────────────────
+// The "Generate ideas" / weekly-batch trigger, stored in
+// agent_instances.video_ideation_request (NULL = no pending run).
+export const VideoIdeationRequestSchema = z
+  .object({
+    mode: z.enum(["single", "batch"]).default("single"),
+    count: z.number().int().min(1).max(10).default(5),
+    weekStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    requestedAt: z.string().optional(),
+  })
+  .strict();
+export type VideoIdeationRequest = z.infer<typeof VideoIdeationRequestSchema>;
+
+// One generated idea card (the ideator output → noelle.video_ideas).
+export const VideoIdeaInSchema = z.object({
+  hook: z.string().min(1).max(600),
+  concept: z.string().max(1200).nullable().optional(),
+  angle: z.string().max(60).nullable().optional(),
+  pillar: z.string().max(120).nullable().optional(),
+  inspirationClipIds: z.array(z.string()).max(12).default([]),
+  suggestedDay: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+});
+export type VideoIdeaIn = z.infer<typeof VideoIdeaInSchema>;
+
+export const VideoIdeasOutSchema = z.object({ ideas: z.array(VideoIdeaInSchema).max(10) });
+export type VideoIdeasOut = z.infer<typeof VideoIdeasOutSchema>;
+
+// Operator-authored idea (the studio "write your own").
+export const ManualVideoIdeaInSchema = z.object({
+  hook: z.string().min(1).max(3000),
+  concept: z.string().max(1200).nullable().optional(),
+  suggestedDay: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+});
+export type ManualVideoIdeaIn = z.infer<typeof ManualVideoIdeaInSchema>;
+
+// The scripter's structured output (→ noelle.video_drafts).
+export const VideoStructureBeatSchema = z.object({
+  tStart: z.number().nonnegative(),
+  tEnd: z.number().nonnegative(),
+  purpose: z.string(),
+  line: z.string(),
+});
+export type VideoStructureBeat = z.infer<typeof VideoStructureBeatSchema>;
+
+export const VideoSoundSuggestionSchema = z.object({
+  name: z.string(),
+  reason: z.string().optional(),
+  trending: z.boolean().optional(),
+});
+export const VideoTransitionSuggestionSchema = z.object({
+  at: z.string(),
+  type: VideoTransitionTypeSchema,
+});
+export const VideoGraphSpecSchema = z.object({
+  kind: z.enum(["bar", "line", "time_series", "stat", "lower_third", "kinetic_text", "other"]),
+  title: z.string().optional(),
+  data: z.unknown().optional(),
+  note: z.string().optional(),
+  /** The second this overlay appears on screen — places it on its beat in the storyboard. */
+  tStart: z.number().nonnegative().optional(),
+});
+
+export const VideoScriptOutputSchema = z.object({
+  hook: z.string(),
+  structure: z.array(VideoStructureBeatSchema).default([]),
+  script: z.string(),
+  transitions: z.array(VideoTransitionSuggestionSchema).default([]),
+  sounds: z.array(VideoSoundSuggestionSchema).default([]),
+  graphSpecs: z.array(VideoGraphSpecSchema).default([]),
+});
+export type VideoScriptOutput = z.infer<typeof VideoScriptOutputSchema>;
+
+// ── Recording brief (W6 "briefer"): the media-intern prep artifact ─────────
+// A phone-readable brief Nova generates for an operator-APPROVED draft (status
+// 'ready'), realizing the never-deployed Paperclip media-intern capability
+// inside the live Nova pipeline. The LLM returns this STRUCTURED shape via the
+// JsonFn seam; a deterministic renderer builds the markdown and counts the Forge
+// follow-ups (never an LLM-authored integer). See brief-generate.ts.
+
+/** One timed shot in the shot list ("0-3s: open on the laptop, medium shot"). */
+export const RecordingShotSchema = z.object({
+  tStart: z.number().nonnegative(),
+  tEnd: z.number().nonnegative(),
+  description: z.string(),
+});
+export type RecordingShot = z.infer<typeof RecordingShotSchema>;
+
+/**
+ * One on-the-day note. `forgeWouldHelp` flags a note where a Forge asset (an
+ * overlay, a generated image, a chart) would strengthen the shot — the flags are
+ * summed into `forge_followups` deterministically by the tick (NOT by the model),
+ * the forward hook a later Forge skill consumes. This spec ships the signal only.
+ */
+export const OnTheDayNoteSchema = z.object({
+  note: z.string(),
+  forgeWouldHelp: z.boolean().default(false),
+});
+export type OnTheDayNote = z.infer<typeof OnTheDayNoteSchema>;
+
