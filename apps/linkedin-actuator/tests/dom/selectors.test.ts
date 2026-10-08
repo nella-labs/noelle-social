@@ -198,3 +198,203 @@ describe("content-detection selectors", () => {
     const post = findFeedPosts(root)[0]!;
     expect(wordCount(post)).toBeLessThan(10);
   });
+
+  it("hasMedia is true on a post containing an image", () => {
+    const root = mount(fx("media-post.html"));
+    const post = findFeedPosts(root)[0]!;
+    expect(hasMedia(post)).toBe(true);
+  });
+
+  it("hasMedia is false on a plain feed post with no image or video", () => {
+    const root = mount(fx("feed-post.html"));
+    const post = findFeedPosts(root)[0]!;
+    expect(hasMedia(post)).toBe(false);
+  });
+
+  it("isTruncated is true on a long post with a see-more toggle", () => {
+    const root = mount(fx("long-post.html"));
+    const post = findFeedPosts(root)[0]!;
+    expect(isTruncated(post)).toBe(true);
+  });
+
+  it("isTruncated is false on a plain feed post", () => {
+    const root = mount(fx("feed-post.html"));
+    const post = findFeedPosts(root)[0]!;
+    expect(isTruncated(post)).toBe(false);
+  });
+});
+
+describe("comments-open selector", () => {
+  it("prefers the social-counts 'N comments' button on a post with a discussion", () => {
+    const root = mount(fx("commented-post.html"));
+    const post = findFeedPosts(root)[0]!;
+    const btn = findCommentsToggle(post);
+    expect(btn).not.toBeNull();
+    expect(btn!.getAttribute("aria-label")).toMatch(/\d+\s+comments/i);
+    expect(hasComments(post)).toBe(true);
+  });
+
+  it("falls back to the action-bar Comment button when there is no count row", () => {
+    const root = mount(fx("feed-post.html"));
+    const post = findFeedPosts(root)[0]!;
+    const btn = findCommentsToggle(post);
+    expect(btn).not.toBeNull();
+    expect(btn!.getAttribute("aria-label")).toMatch(/^Comment/i);
+    expect(hasComments(post)).toBe(true);
+  });
+
+  it("never treats the composer 'Post comment' submit as a read affordance", () => {
+    const root = mount(
+      "<div class='feed-shared-update-v2' data-urn='urn:li:activity:1'>" +
+        "<button aria-label='Post comment' type='button'>Post</button>" +
+        "</div>",
+    );
+    const post = findFeedPosts(root)[0]!;
+    // starts-with 'Comment' (not contains) keeps 'Post comment' out.
+    expect(findCommentsToggle(post)).toBeNull();
+  });
+
+  it("returns null / false when no comments affordance exists", () => {
+    const root = mount("<div class='feed-shared-update-v2'>no actions</div>");
+    const post = findFeedPosts(root)[0] ?? root.firstElementChild!;
+    expect(findCommentsToggle(post)).toBeNull();
+    expect(hasComments(post)).toBe(false);
+  });
+});
+
+describe("isPostUnavailable (deleted/unavailable post permalink)", () => {
+  it("is TRUE on the 'This post cannot be displayed' page", () => {
+    expect(isPostUnavailable(mount(fx("post-unavailable.html")))).toBe(true);
+  });
+
+  it("is TRUE on the 'no longer available' variant", () => {
+    expect(isPostUnavailable(mount("<main><h2>This post is no longer available</h2></main>"))).toBe(true);
+  });
+
+  it("is FALSE on a normal feed post (no false positive)", () => {
+    expect(isPostUnavailable(mount(fx("feed-post.html")))).toBe(false);
+  });
+
+  it("is FALSE on a post that merely talks about displaying posts", () => {
+    expect(
+      isPostUnavailable(mount("<div class='feed-shared-update-v2'>Here's how to display a post on your profile.</div>")),
+    ).toBe(false);
+  });
+});
+
+describe("isCommentRestricted (comments limited to connections)", () => {
+  it("is TRUE on the 'Only connections can comment on this post' banner", () => {
+    expect(isCommentRestricted(mount(fx("comment-restricted.html")))).toBe(true);
+  });
+
+  it("is TRUE on the 'only people <name> follows can comment' variant", () => {
+    expect(
+      isCommentRestricted(mount("<main><p>Only people Jane Doe follows can comment on this post.</p></main>")),
+    ).toBe(true);
+  });
+
+  it("is TRUE on a 'commenting has been turned off' variant", () => {
+    expect(
+      isCommentRestricted(mount("<main><p>Commenting has been turned off for this post.</p></main>")),
+    ).toBe(true);
+  });
+
+  it("is FALSE on a normal feed post with an open composer (no false positive)", () => {
+    expect(isCommentRestricted(mount(fx("feed-post.html")))).toBe(false);
+    expect(isCommentRestricted(mount(fx("comment-box.html")))).toBe(false);
+  });
+
+  it("is FALSE on a post that merely uses the word 'comment'", () => {
+    expect(
+      isCommentRestricted(mount("<main><p>Drop a comment on this post if you agree!</p></main>")),
+    ).toBe(false);
+  });
+});
+
+describe("findChallenge (tight — no false positives on normal content)", () => {
+  it("is FALSE on ordinary content that mentions verify/security/unusual activity", () => {
+    // Regression: the old text/class substring scan halted valid runs on posts
+    // and comments that merely used these words.
+    expect(
+      findChallenge(mount("<article>Please verify your identity — a security check about unusual activity in job apps</article>")),
+    ).toBe(false);
+  });
+
+  it("is FALSE on a normal feed post", () => {
+    expect(findChallenge(mount("<div class='feed-shared-update-v2'>a normal post</div>"))).toBe(false);
+  });
+
+  it("is TRUE on a real captcha vendor iframe (arkose)", () => {
+    expect(findChallenge(mount("<iframe src='https://x.arkoselabs.com/fc'></iframe>"))).toBe(true);
+  });
+
+  it("is FALSE on an ad iframe that merely contains 'captcha' in the src", () => {
+    // The old generic iframe[src*='captcha'] scan risked false positives; the
+    // tightened check only trusts the actual challenge vendors.
+    expect(findChallenge(mount("<iframe src='https://ads.example.com/nocaptcha-banner'></iframe>"))).toBe(false);
+  });
+
+  it("is TRUE on a /checkpoint/ URL", () => {
+    history.pushState({}, "", "/checkpoint/challenge/verify");
+    try {
+      expect(findChallenge(mount("<div>anything</div>"))).toBe(true);
+    } finally {
+      history.pushState({}, "", "/");
+    }
+  });
+});
+
+describe("findCommentSubmit", () => {
+  it("finds the BEM submit button (with a state suffix)", () => {
+    expect(
+      findCommentSubmit(mount("<button class='comments-comment-box__submit-button--cr'>Comment</button>")),
+    ).not.toBeNull();
+  });
+
+  it("finds the composer's primary button, not the action-bar Comment toggle", () => {
+    const btn = findCommentSubmit(
+      mount(
+        "<div class='feed-shared-social-action-bar'><button aria-label=\"Comment on Jane's post\">Comment</button></div>" +
+          "<div class='comments-comment-box'><button class='artdeco-button artdeco-button--primary'>Comment</button></div>",
+      ),
+    );
+    expect(btn).not.toBeNull();
+    expect(btn!.className).toContain("artdeco-button--primary");
+  });
+
+  it("returns null when there is no composer", () => {
+    expect(findCommentSubmit(mount("<div>nothing</div>"))).toBeNull();
+  });
+
+  it("finds the #420-era bare 'Comment' button (no primary class) inside the legacy composer", () => {
+    // An era of the legacy UI where the live submit was a plain enabled button
+    // with text exactly 'Comment' — NOT primary-styled — next to the box.
+    const btn = findCommentSubmit(
+      mount(
+        "<div class='feed-shared-social-action-bar'><button type='button' aria-label=\"Comment on Jane Doe's post\">Comment</button></div>" +
+          "<div class='comments-comment-box'>" +
+          "<div role='textbox' contenteditable='true'></div>" +
+          "<button type='button' class='qjkzvz'>Comment</button>" +
+          "</div>",
+      ),
+    );
+    expect(btn).not.toBeNull();
+    expect(btn!.className).toBe("qjkzvz");
+  });
+
+  it("returns null for a DISABLED BEM submit (the poll must wait, not click a no-op)", () => {
+    // The old pass-0 returned the BEM button unconditionally; clicking a
+    // disabled submit silently no-ops and burns the attempt.
+    expect(
+      findCommentSubmit(
+        mount(
+          "<div class='comments-comment-box'>" +
+            "<div role='textbox' contenteditable='true'>draft text</div>" +
+            "<button class='comments-comment-box__submit-button' disabled type='button' aria-label='Post comment'>Post</button>" +
+            "</div>",
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  it("never returns a thread Reply button when the real submit is absent", () => {
