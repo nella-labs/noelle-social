@@ -198,3 +198,111 @@ export async function setFeederSourceNote(input: z.infer<typeof SetNoteInput>) {
  * a harmless no-op (the timestamp just moves forward); the UI disables the button
  * in that window anyway.
  */
+export async function requestFeederRun(input: z.infer<typeof RunInput>) {
+  const parsed = RunInput.parse(input);
+  const auth = await authorizeLinkedInInstance(parsed.orgSlug, parsed.instanceId);
+  if (auth.kind !== "ok")
+    return { ok: false as const, error: { code: auth.kind, message: auth.kind } };
+
+  const rows = await sql<{ id: string }[]>`
+    update noelle.agent_instances
+    set account_feeder_run_requested_at = now(), updated_at = now()
+    where id = ${parsed.instanceId}
+      and org_id = ${auth.org.id}
+      and role = 'linkedin_intern'
+    returning id
+  `;
+  if (rows.length === 0)
+    return { ok: false as const, error: { code: "not_found", message: "Agent instance not found." } };
+  revalidateFeeder();
+  return { ok: true as const };
+}
+
+const PinStyleInput = z.object({
+  orgSlug: z.string().min(1),
+  instanceId: z.string().uuid(),
+  /** A source account's handle to pin, or "" / null to clear the pin (Automatic). */
+  handle: z.string().trim().max(200).nullable(),
+});
+
+/**
+ * Pin (or clear) the instance's style source — the "write in this exact person's
+ * style" lever. Writes account_feeder_config.pinnedStyleHandle; the drafter (post
+ * + reply lanes) then grounds its STYLE block in ONLY that account's real posts.
+ * A pin is validated to be one of THIS instance's sources so we never write a
+ * dangling handle. Clearing (empty handle) removes the key → back to Automatic.
+ * Applies on the drafter's next tick (no restart).
+ */
+export async function setPinnedStyle(input: z.infer<typeof PinStyleInput>) {
+  const parsed = PinStyleInput.parse(input);
+  const auth = await authorizeLinkedInInstance(parsed.orgSlug, parsed.instanceId);
+  if (auth.kind !== "ok")
+    return { ok: false as const, error: { code: auth.kind, message: auth.kind } };
+
+  const handle = parsed.handle?.trim() || null;
+  if (handle) {
+    // Defense-in-depth: only pin a handle that is actually one of this instance's
+    // style sources (the picker only offers real ones, but never trust the client).
+    const src = await sql<{ handle: string }[]>`
+      select handle from noelle.account_feeder_sources
+      where agent_instance_id = ${parsed.instanceId} and lower(handle) = lower(${handle})
+      limit 1
+    `;
+    if (src.length === 0)
+      return { ok: false as const, error: { code: "not_found", message: "Unknown style source." } };
+    await sql`
+      update noelle.agent_instances
+      set account_feeder_config =
+        coalesce(account_feeder_config, '{}'::jsonb)
+        || jsonb_build_object('pinnedStyleHandle', ${src[0]!.handle}::text),
+        updated_at = now()
+      where id = ${parsed.instanceId} and org_id = ${auth.org.id} and role = 'linkedin_intern'
+    `;
+  } else {
+    await sql`
+      update noelle.agent_instances
+      set account_feeder_config = account_feeder_config - 'pinnedStyleHandle', updated_at = now()
+      where id = ${parsed.instanceId} and org_id = ${auth.org.id} and role = 'linkedin_intern'
+    `;
+  }
+  revalidateFeeder();
+  // The picker lives on the content detail + board; refresh those too.
+  revalidatePath("/app/[orgSlug]/content/[ideaId]", "page");
+  revalidatePath("/app/[orgSlug]/content", "page");
+  return { ok: true as const, pinnedStyleHandle: handle };
+}
+
+const StyleKindsInput = z.object({
+  orgSlug: z.string().min(1),
+  instanceId: z.string().uuid(),
+  /** Which corpus kinds shape the drafter's FORM. Non-empty; deduped below. */
+  kinds: z.array(z.enum(["post", "comment"])).min(1),
+});
+
+/**
+ * Set which corpus kinds shape the reply drafter's FORM
+ * (account_feeder_config.styleExemplarKinds). Default is POSTS ONLY — a source's
+ * original posts are their considered voice; their comments are often sloppy. The
+ * operator can fold comments back in ("Posts + comments"). Writes the jsonb key on
+ * the instance; the drafter reads it per tick (no restart). Order is normalised to
+ * post-before-comment so the stored value is stable regardless of click order.
+ */
+export async function setStyleExemplarKinds(input: z.infer<typeof StyleKindsInput>) {
+  const parsed = StyleKindsInput.parse(input);
+  const auth = await authorizeLinkedInInstance(parsed.orgSlug, parsed.instanceId);
+  if (auth.kind !== "ok")
+    return { ok: false as const, error: { code: auth.kind, message: auth.kind } };
+
+  const rank = { post: 0, comment: 1 } as const;
+  const kinds = [...new Set(parsed.kinds)].sort((a, b) => rank[a] - rank[b]);
+  await sql`
+    update noelle.agent_instances
+    set account_feeder_config =
+      coalesce(account_feeder_config, '{}'::jsonb)
+      || jsonb_build_object('styleExemplarKinds', ${sql.json(kinds)}::jsonb),
+      updated_at = now()
+    where id = ${parsed.instanceId} and org_id = ${auth.org.id} and role = 'linkedin_intern'
+  `;
+  revalidateFeeder();
+  return { ok: true as const, styleExemplarKinds: kinds };
+}
