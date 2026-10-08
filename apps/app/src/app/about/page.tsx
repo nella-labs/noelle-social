@@ -35,7 +35,7 @@ export default function AboutPage() {
           <h1>Grow a presence.<br /><em>Build real connections.</em></h1>
           <p>Noelle brings engagement, content, audience relationships, and measured results into one workspace. Keep your voice and publishing decisions in your hands.</p>
           <div className={styles.actions}>
-            <a href={`${PUBLIC_PRODUCT.source}/blob/HEAD/docs/self-host.md`} className="btn btn-primary">Run your own workspace <ArrowUpRight size={15} aria-hidden /></a>
+            <a href={PUBLIC_PRODUCT.links.selfHost} className="btn btn-primary">Run your own workspace <ArrowUpRight size={15} aria-hidden /></a>
             <a href={PUBLIC_PRODUCT.source} className="btn">Explore the repository <ArrowUpRight size={15} aria-hidden /></a>
           </div>
           <div className={styles.channels} aria-label="Social workflows"><span>X</span><span>LinkedIn</span><span>Reddit</span><span>Video content</span></div>
@@ -46,10 +46,7 @@ export default function AboutPage() {
         <section className={styles.community}>
           <div><span className={styles.kicker}>MAKE IT YOURS</span><h2>A workspace you can use,<br />understand, and improve.</h2><p>Self-host Noelle, adapt the workflows, report an issue, or contribute a focused change. The source is available under Apache 2.0.</p></div>
           <nav aria-label="Project resources">
-            <a href={`${PUBLIC_PRODUCT.source}/blob/HEAD/docs/product.md`}>Product guide <ArrowUpRight size={15} aria-hidden /></a>
-            <a href={`${PUBLIC_PRODUCT.source}/blob/HEAD/docs/architecture.md`}>Technical description <ArrowUpRight size={15} aria-hidden /></a>
-            <a href={`${PUBLIC_PRODUCT.source}/blob/HEAD/CONTRIBUTING.md`}>Contribute <ArrowUpRight size={15} aria-hidden /></a>
-            <a href={`${PUBLIC_PRODUCT.source}/blob/HEAD/docs/faq.md`}>Common questions <ArrowUpRight size={15} aria-hidden /></a>
+            {PUBLIC_PRODUCT.guides.map((guide) => <a href={guide.href} key={guide.href}>{guide.label} <ArrowUpRight size={15} aria-hidden /></a>)}
             <Link href="/">Open an existing workspace <ArrowUpRight size={15} aria-hidden /></Link>
           </nav>
         </section>
