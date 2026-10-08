@@ -198,3 +198,26 @@ export function OnboardingClient({ local }: { local: boolean }) {
                 </div>
 
                 <Button type="submit" variant="primary" disabled={creating}>
+                  {creating ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                      Creating…
+                    </>
+                  ) : (
+                    "Create workspace"
+                  )}
+                </Button>
+
+                {createState.error ? (
+                  <p role="alert" className="text-xs text-danger-500">
+                    {createState.error}
+                  </p>
+                ) : null}
+              </form>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    </main>
+  );
+}

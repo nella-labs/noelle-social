@@ -198,3 +198,30 @@ export async function getStudioBoard(instanceId: string): Promise<StudioBoard> {
 
   // One round trip resolves every inspiration clip referenced across the board;
   // we then hydrate each idea/draft, preserving inspiration_clip_ids ordering.
+  const allIds = [
+    ...ideas.flatMap((i) => i.inspiration_clip_ids),
+    ...drafts.flatMap((d) => d.inspiration_clip_ids),
+  ];
+  const [clips, topClips] = await Promise.all([
+    getInspirationClips(instanceId, allIds),
+    listTopInspirationClips(instanceId, 4),
+  ]);
+  const hydrate = (clipIds: string[]): { clips: InspirationClip[]; fallback: boolean } => {
+    const own = clipIds.map((id) => clips.get(id)).filter((c): c is InspirationClip => Boolean(c));
+    // No own resolvable refs → show Nova's top harvested reels so the metrics never vanish.
+    return own.length > 0 ? { clips: own, fallback: false } : { clips: topClips, fallback: true };
+  };
+
+  for (const idea of ideas) {
+    const h = hydrate(idea.inspiration_clip_ids);
+    idea.inspiration = h.clips;
+    idea.inspirationIsFallback = h.fallback;
+  }
+  for (const draft of drafts) {
+    const h = hydrate(draft.inspiration_clip_ids);
+    draft.inspiration = h.clips;
+    draft.inspirationIsFallback = h.fallback;
+  }
+
+  return { ideas, drafts };
+}
