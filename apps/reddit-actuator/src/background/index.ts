@@ -598,3 +598,203 @@ async function maybeReplenish(s: RunState, api: ActuatorApi, now: number, rng: R
 // Ambient read-actions (expand "…more" / open a post's comments to read) are
 // paced by a rolling cooldown so they cluster like real reading instead of
 // firing on every ~4s idle tick. Base gap × a 1–2 jitter ⇒ roughly one every
+// 20–40s at most; many attempts also find nothing in view and downgrade to a
+// scroll, so the real rate is lower. Read-only + non-counted against targets.
+// Tightened (was 30s×1–2.5) so the actor actively clicks "…more" while waiting.
+const AMBIENT_READ_MIN_GAP_MS = 20_000;
+
+// One ambient browse: pick a behavior (read-actions gated by cooldown + config
+// kill switch, default ON) and run it. Advances the cooldown anchor only on an
+// action that actually happened, so a downgraded-to-scroll attempt doesn't burn
+// the gap. Mutates `s` in place; the caller persists it.
+async function ambientBrowse(
+  s: RunState,
+  cfg: ActuatorConfig,
+  tabId: number,
+  rng: ReturnType<typeof makeRng>,
+  now: number,
+): Promise<void> {
+  // The idle browse must happen on a feed. This path used to have NO feed guard,
+  // so once a scheduled reply (or a mis-landed click) left the tab on a thread
+  // permalink or /user page, ambient ticks scrolled/expanded THAT page forever —
+  // the loop looked busy while idling on the wrong surface. Re-assert the feed
+  // first (shared guard, also used by the idle-upvote path).
+  await ensureOnFeed(tabId, rng);
+  const readEnabled = cfg.ambientReadActions !== false; // undefined ⇒ ON
+  const sinceRead = now - (s.lastAmbientReadMs ?? 0);
+  const readActionsAllowed = readEnabled && sinceRead > AMBIENT_READ_MIN_GAP_MS * rng.float(1, 2.6);
+  const kind = chooseAmbient(rng, { readActionsAllowed });
+  const did = await runAmbient(tabId, kind, {
+    cdp, rng, sleep, send, wpm: s.persona.wpm,
+    navigate: (id, url) => navigateTab(id, url, rng),
+  }).catch(() => null);
+  if (did === "expand" || did === "comments") s.lastAmbientReadMs = now;
+}
+
+// ── Idle-upvotes (operator opt-in; UPVOTE-ONLY) ──────────────────────────────
+// Rolling window over which the ≤10-upvotes hard cap is enforced.
+const REDDIT_UPVOTE_WINDOW_MS = 15 * 60_000;
+
+/**
+ * May an idle-UPVOTE fire now? Thin wrapper over the pure canUpvoteNow gate:
+ *   cfg.upvotesEnabled !== false                               (operator opt-in; DEFAULT ON)
+ *   && upvotes in the last 15 min < (cfg.upvotesPer15Min ?? 10)  (rolling hard cap)
+ *   && (now - lastUpvote/attempt) > REDDIT_DEFAULTS.upvoteMinGapMs (~60s min-gap,
+ *      anchored on the ATTEMPT too — the locateUpvote scan is costly, so a
+ *      like-less feed is not re-scanned every ~4s tick)
+ * UPVOTE-ONLY — this only ever authorizes an upvote; there is no downvote path.
+ */
+function canUpvote(s: RunState, cfg: ActuatorConfig, now: number): boolean {
+  return canUpvoteNow({
+    enabled: cfg.upvotesEnabled !== false,
+    inCurfew: isWriteCurfew(now),
+    upvoteAtMs: s.upvoteAtMs,
+    now,
+    cap: cfg.upvotesPer15Min ?? REDDIT_DEFAULTS.upvotesPer15Min,
+    windowMs: REDDIT_UPVOTE_WINDOW_MS,
+    // Suppress idle-upvotes inside a QUIET drain gap the timing archetype left long
+    // (a cooldown-band or long-break gap). Drain only — scheduled runs plan no long
+    // "stepped away" gaps to protect. Mirrors LinkedIn's shouldIdleLike inQuietGap.
+    inQuietGap: s.mode === "drain" && inQuietDrainGap(s.actions, now),
+    // Jitter ×1–1.8 so upvotes don't recur on one metronomic ~60s beat, drawn
+    // ONCE at run start (RunState.upvoteGapJitter) — a per-tick redraw would
+    // bias the effective gap toward the floor (the gate passes on the first low
+    // draw). The multiplier is ≥1: the 60s floor is a safety bound and is never
+    // lowered; a pre-upgrade state (undefined) falls back to the floor itself.
+    minGapMs: REDDIT_DEFAULTS.upvoteMinGapMs * (s.upvoteGapJitter ?? 1),
+    lastAttemptMs: s.lastUpvoteAttemptMs,
+  });
+}
+
+/**
+ * Re-assert a feed before an idle-UPVOTE (ports LinkedIn #410's navigate-to-feed
+ * guard). After a scheduled-mode reply the tab parks on the just-replied thread's
+ * /comments/ permalink, where locateUpvote would scan that page and target the
+ * just-replied post's own upvote button — exactly the systematic reply+upvote
+ * pairing fingerprint the actuator must never produce (see the reply-only stance
+ * in api.ts). Mirrors the drain-mode return-to-feed: navigate to the feed (old
+ * Reddit when the operator opted into preferOldReddit), wait for load, then a
+ * short hydration sleep so the first cards have rects. Conservative + best-effort:
+ * only a known /comments/ URL triggers the nav, and any failure just falls through
+ * — a missed upvote degrades to ambient browse, never an error loop.
+ */
+async function ensureOnFeedForUpvote(
+  tabId: number,
+  cfg: ActuatorConfig,
+  rng: ReturnType<typeof makeRng>,
+): Promise<void> {
+  const cur = await chrome.tabs.get(tabId).catch(() => null);
+  if (!cur?.url || !/\/comments\//.test(cur.url)) return;
+  const feed = cfg.preferOldReddit === true ? "https://old.reddit.com/" : REDDIT_FEED_URL;
+  await navigateTab(tabId, feed, rng).catch(() => {});
+  await waitTabComplete(tabId);
+  await sleep(rng.float(900, 2600)); // let the first cards hydrate
+}
+
+/**
+ * Upvote ONE feed post like a human: locate a post NOT already upvoted on the feed
+ * (locateUpvote) and land a trusted CDP click on its upvote button. Mirrors the
+ * LinkedIn likeAFeedPost shape, INCLUDING the read-before-act dwell: the located
+ * post's wordCount/hasMedia drive decideStop → readingDwellMs | glanceMs, so an
+ * upvote follows a human read (a stop-and-read or a quick glance), not a flat beat.
+ * UPVOTE-ONLY — locateUpvote returns only the upvote button; there is deliberately
+ * NO downvote path. Returns whether an upvote landed plus the observed post
+ * id/subreddit; the caller records the timestamp + logs {type:"upvote"}.
+ */
+async function doUpvote(
+  tabId: number,
+  rng: ReturnType<typeof makeRng>,
+  wpm: number,
+): Promise<{ ok: boolean; post_id?: string; subreddit?: string }> {
+  // An idle-upvote must run ON a feed — off the feed, locateUpvote still matches
+  // the odd shreddit-post card (a /user profile, a thread permalink), so the
+  // upvote lands on the wrong surface. Pull the tab back first (shared guard,
+  // also used by the ambient browse). Best-effort — a failed nav just falls
+  // through to the locate below.
+  await ensureOnFeed(tabId, rng);
+  const loc = await send<LocateResult>(tabId, { cmd: "locateUpvote" }).catch(() => null);
+  if (!loc?.ok || loc.x == null) return { ok: false };
+  // Read the post like a human BEFORE upvoting: a stop-and-read dwell proportional
+  // to its length, or a quick glance when scrolling past (decideStop). Replaces the
+  // flat 400–2000ms beat with the LinkedIn read-before-like pattern. Uses the
+  // abortable `sleep` (from stage B) so a STOP mid-read collapses the dwell and the
+  // upvote is never landed.
+  const wc = typeof loc.observed?.wordCount === "number" ? loc.observed.wordCount : 0;
+  const media = loc.observed?.hasMedia === true;
+  const stop = decideStop(rng, wc, { hasMedia: media });
+  await sleep(stop ? readingDwellMs(rng, wc, { hasMedia: media }, wpm) : glanceMs(rng));
+  // Re-locate immediately before clicking. The rect captured before the read
+  // goes STALE: Reddit's infinite scroll inserts/lazy-loads cards above it and
+  // shifts the vote column — so the pre-read coordinates can land in the post
+  // BODY, which opens the permalink (off-feed) AND misses the upvote. Click a
+  // freshly-measured rect; fall back to the pre-read one only on a miss.
+  let clickLoc: LocateResult = loc;
+  const fresh = await send<LocateResult>(tabId, { cmd: "locateUpvote" }).catch(() => null);
+  if (fresh?.ok && fresh.x != null) clickLoc = fresh;
+  throwIfAborted(runAbort.signal); // STOP during the read/re-locate → don't land the upvote
+  await cdp.moveAndClick(tabId, rectFrom(clickLoc), rng, sleep);
+  const post_id = typeof clickLoc.observed?.post_id === "string" ? clickLoc.observed.post_id : undefined;
+  const subreddit = typeof clickLoc.observed?.subreddit === "string" ? clickLoc.observed.subreddit : undefined;
+  return { ok: true, post_id, subreddit };
+}
+
+// Live-browser deps for engageWithVariety (src/background/engage.ts — the
+// orchestration is a plain function over these primitives so its
+// fall-back-to-upvote + Escape-dismiss discipline is unit-tested; only this
+// wiring touches chrome.* / CDP). The plain-upvote path (and every save
+// fall-back) is the SAME doUpvote used by the upvote-only path, so a save
+// consumes no extra velocity — the caller's canUpvote gate is the single budget.
+function engageDeps(tabId: number, rng: ReturnType<typeof makeRng>, wpm: number): EngageDeps {
+  return {
+    upvote: () => doUpvote(tabId, rng, wpm),
+    // Re-assert the feed before scanning for a saveable post (mirrors doUpvote's
+    // own first line) so a save never lands on a /user profile or permalink card.
+    locateSave: async () => {
+      await ensureOnFeed(tabId, rng);
+      return send<EngageLocate>(tabId, { cmd: "locateSave" });
+    },
+    locateSaveItem: () => send<EngageLocate>(tabId, { cmd: "locateSaveInMenu" }),
+    click: (rect) => cdp.moveAndClick(tabId, rect, rng, sleep),
+    dismissMenu: () => cdp.pressEscape(tabId),
+    sleep,
+  };
+}
+
+// Serialize ticks so the content-script-driven loop can't overlap with the
+// alarm-driven one (overlap would double-read/write state).
+let ticking = false;
+async function tick() {
+  if (ticking) return;
+  ticking = true;
+  try {
+    await tickOnce();
+  } finally {
+    ticking = false;
+  }
+}
+
+async function tickOnce() {
+  const s = await loadState();
+  const cfg = await getConfig();
+  if (!s || !cfg || s.status !== "running") return;
+  // Stale-run guard: if a newer run started or STOP fired since this state was
+  // written, our epoch is no longer current — bail without acting or saving so a
+  // superseded/stopped run can't spring back to life.
+  const myEpoch = s.epoch ?? 0;
+  if (myEpoch !== (await currentEpoch())) return;
+  const now = Date.now();
+  if (!withinWindow(s.startMs, s.windowHours, now)) {
+    // A persistent drain never times out on its window — roll it forward and keep
+    // ticking so it can watch for new approvals. Every other run ends here.
+    if (drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0)) {
+      s.windowHours = (now - s.startMs) / 3600_000 + DRAIN_WATCH_WINDOW_H;
+    } else {
+      await endRun("idle");
+      return;
+    }
+  }
+
+  const tabId = await findRedditTab(s.tabId);
+  if (tabId == null) return; // no tab → pause; resume next tick
+  if (s.tabId !== tabId) s.tabId = tabId; // pin (or re-pin after the old tab closed)
+  await cdp.attach(tabId).catch(() => {}); // idempotent; re-attach if a detach happened
