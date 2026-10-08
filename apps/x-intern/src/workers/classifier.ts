@@ -398,3 +398,53 @@ async function main() {
         const outcomes = await batchMap(
           prepared,
           ({ lead, eligibility }) =>
+            classifyOneLead({
+              sql,
+              classifier: pre.has(lead.id) ? { classify: async () => pre.get(lead.id)! } : classifier,
+              eligibility,
+              notifier,
+              inst,
+              lead,
+              log,
+              bus,
+              ...(vipDmRunner ? { runner: vipDmRunner } : {}),
+            }),
+          { concurrency },
+        );
+        const rejectedClaims = claimed.filter((_, index) => {
+          const outcome = outcomes[index]!;
+          return !outcome.ok && isBudgetAdmissionError(outcome.error);
+        });
+        if (rejectedClaims.length) {
+          await releaseClassificationClaims(sql, {
+            orgId: inst.org_id,
+            agentInstanceId: inst.id,
+            claims: rejectedClaims,
+          });
+        }
+        let n = 0;
+        for (const outcome of outcomes) {
+          if (outcome.ok) {
+            n += 1;
+          } else {
+            log.error(
+              { err: (outcome.error as Error)?.message },
+              "classify lead failed (fail-open)",
+            );
+          }
+        }
+        await run.finish({ status: "ok", rowsProcessed: n + observedProcessed });
+      } catch (err) {
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+    sleep: wake.sleep,
+  });
+}
+
+main().catch((err) => {
+  console.error("classifier fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
