@@ -1998,3 +1998,203 @@ async function draftSubstantial(args: DraftCommonArgs & { tier: "T1" | "T2" | "T
   const repliesToReview = <T extends { angle: "empathetic" | "technical" | "contrarian"; body: string }>(drafts: T[]): T[] => {
     const selected = singleReply
       ? drafts.filter((draft) => allowedAngles.includes(draft.angle)).slice(0, 1)
+      : allowedAngles.flatMap((angle) => {
+          const draft = drafts.find((row) => row.angle === angle);
+          return draft ? [draft] : [];
+        });
+    // buildOutbound applies this policy again. It is idempotent, so the judge
+    // sees exactly the body that the outbound route will queue.
+    return applyReplyEmojiPolicy(selected, postText);
+  };
+
+  const prompt = renderSubstantialPrompt({
+    postText,
+    authorName: payload.authorName ?? null,
+    publicId: payload.authorPublicId ?? lead.author_handle,
+    anchors: voiceReferences.writerAnchors,
+    knowledgeAnchors,
+    imageCaption,
+    commentDigest,
+    allowedAngles,
+    wantDm,
+    singleReply,
+    registerBlock,
+    shapeBlock,
+    shapeAssigned,
+    openingMoveBlock,
+    genzBlock,
+    priorReplies,
+    recentPhrasings,
+    ...(replyRequest?.instructions ? { operatorInstructions: replyRequest.instructions } : {}),
+    // Notification leads carry the thread the sweep captured (the post it
+    // started from and our own last turn). Undefined for every other lane, so
+    // the cold-outbound prompt is byte-identical to before.
+    conversationBlock:
+      (payload as { source?: string }).source === "notification"
+        ? (renderConversationBlock(
+            (payload as { conversation?: ConversationBrief }).conversation,
+            payload.authorName ?? lead.author_handle ?? "them",
+            { fence: true },
+          ) ?? undefined)
+        : undefined,
+  });
+  const draftArgs = {
+    bucket: "drafter-codex",
+    routing,
+    orgId: instance.org_id,
+    instanceId: instance.id,
+    worker: "drafter" as const,
+    agentRole: "linkedin_intern" as const,
+    system: buildDrafterSystem(
+      instance.objective,
+      personDirective,
+      brand,
+      style,
+      postRegister,
+      args.patternRules,
+      faithful,
+      args.voiceExemplars,
+      singleReply,
+    ),
+    // Cache the static system prefix (base persona/rules) so it is not re-billed
+    // on the initial draft OR any verify-driven regenerate. No-op until
+    // NOELLE_PROMPT_CACHE_ENABLED=1 + a caching-capable backend. Rides along on
+    // every `{ ...draftArgs, prompt }` spread below.
+    systemCachePrefixLen: drafterSystemCachePrefixLen(brand, singleReply),
+  };
+  const res = await runner.draft({ ...draftArgs, prompt });
+  const parsed = SubstantialOutput.safeParse(safeJsonParse(res.text));
+  if (!parsed.success) {
+    log.error({ leadId: lead.id, raw: res.text.slice(0, 200) }, "drafter output schema fail");
+    await markStatus({ leadId: lead.id, status: "errored", meta: { error: "schema" } });
+    return false;
+  }
+  if ("skip" in parsed.data) {
+    log.info({ leadId: lead.id, skip_reason: parsed.data.skip }, "drafter skipped substantial lead");
+    await markStatus({
+      leadId: lead.id,
+      status: replyRequest ? "errored" : "skipped",
+      meta: {
+        skip_reason: parsed.data.skip, engine: res.engine, model: res.model,
+        ...(replyRequest ? { reply_request_key: replyRequest.requestKey, error: "reply_request_model_skip" } : {}),
+      },
+    });
+    return false;
+  }
+  const prepare = (data: typeof parsed.data): typeof parsed.data => ({
+    drafts: repliesToReview(data.drafts),
+    ...(wantDm && data.dm ? { dm: data.dm } : {}),
+  });
+  let draftsData = prepare(parsed.data);
+  if (!draftsData.drafts.length) {
+    const noAllowedAngle = singleReply || !parsed.data.drafts.some((draft) => allowedAngles.includes(draft.angle));
+    await markStatus({ leadId: lead.id, status: noAllowedAngle ? "errored" : "skipped",
+      meta: noAllowedAngle ? { error: "no_in_tier_angle" } : { reason: "empty-after-emoji-policy" } });
+    return false;
+  }
+
+  // Post-draft VERIFIER (+ regenerate). Off by default; grades the comments (and
+  // DM) against the grounding context, regenerating with the critique on a fail.
+  let selectedWriter: DraftWriter = { engine: res.engine, model: res.model };
+  let verifierMeta: OutboundIn["verifierMeta"] = null;
+  let replyVerifyContext: VerifyContext | null = null;
+  let reviewContext: OutboundIn["drafts"][number]["reviewContext"];
+  let replyVerifyCalls: VerifierCall[] = [];
+  if (verify?.enabled) {
+    const ctx: VerifyContext = {
+      platform: "linkedin",
+      postText,
+      authorHandle: payload.authorPublicId ?? lead.author_handle,
+      voiceAnchors: voiceReferences.reviewAnchors,
+      knowledgeAnchors,
+      personProfile: singleReply ? null : personDirective ?? null,
+      dynamicBannedPatterns: args.patternRules,
+      priorRepliesToPerson: args.priorReplies,
+      // Feed-wide diversity: the same recent replies the drafter avoid-list uses,
+      // now ENFORCED — a draft too alike a recent reply regenerates with a
+      // different shape, so the last ~20 replies stay varied.
+      recentReplies: args.recentPhrasings,
+      // Let the judge grade whether the reply engages an image-driven post.
+      ...(imageCaption ? { imageCaption } : {}),
+      // No charLimit — LinkedIn has no hard reply cap; only flag em-dash/choppiness.
+    };
+    reviewContext = OutboundFactualContextSchema.parse({ version: 1, ...ctx });
+    const calls = verify.makeCalls(lead.priority ?? false);
+    replyVerifyContext = ctx;
+    replyVerifyCalls = calls;
+    const toDrafts = (d: typeof draftsData): DraftToVerify[] => {
+      const rows: DraftToVerify[] = d.drafts.map((x) => ({ kind: "reply" as const, angle: x.angle, body: x.body }));
+      if (wantDm && d.dm) rows.push({ kind: "dm" as const, angle: null, body: d.dm.body });
+      return rows;
+    };
+    const { best, bestWriter, meta } = await runVerifyLoop({
+      initial: draftsData,
+      initialWriter: selectedWriter,
+      toDrafts,
+      regenerate: async (fixPrompt, useOpus) => {
+        const r = await runner.draft({ ...draftArgs, routing: useOpus ? args.opusRepairRouting : routing, prompt: fixPrompt });
+        const p = SubstantialOutput.safeParse(safeJsonParse(r.text));
+        if (!p.success || "skip" in p.data) return null;
+        const draft = prepare(p.data);
+        return draft.drafts.length ? { draft, writer: { engine: r.engine, model: r.model } } : null;
+      },
+      basePrompt: prompt,
+      ctx,
+      calls,
+      retries: verify.retries,
+      leadId: lead.id,
+      traceSource: payload.source,
+      traceRedactions: [postText, payload.authorName ?? "", payload.authorPublicId ?? lead.author_handle ?? ""],
+      log,
+    });
+    draftsData = best;
+    selectedWriter = bestWriter;
+    verifierMeta = meta;
+  }
+
+  // Conversation and requested replies remain visible to the human even if
+  // their final angle scores below the voice floor. A low aggregate score may
+  // come from a sibling reply or DM, so the floor is applied after exact-body
+  // reviews, below.
+  const isConversationReply = (payload as { source?: string }).source === "notification";
+
+  // Candidates were already selected and cleaned before their set review.
+  const replyRows = draftsData.drafts.map((draft) => ({
+    id: randomUUID(), kind: "reply" as const, angle: draft.angle,
+    body: draft.body, charCount: [...draft.body].length,
+  }));
+
+  // DM only for T1, AND only when auto-DM is enabled (0036_dm_autodraft_enabled,
+  // default false). Replies-only unless the operator opts in. Fewer DMs than
+  // Vega by design.
+  const dmVoice = wantDm && draftsData.dm && (instance.dm_autodraft_enabled ?? false)
+    ? await refineDmVoice({
+        body: stripDisallowedEmoji(stripEmDashes(draftsData.dm.body)),
+        regenerate: async (feedback) => {
+          const result = await runner.draft({ ...draftArgs, prompt: `${prompt}\n\n${feedback}` });
+          const parsedDm = SubstantialOutput.safeParse(safeJsonParse(result.text));
+          return parsedDm.success && !("skip" in parsedDm.data) && parsedDm.data.dm
+            ? stripDisallowedEmoji(stripEmDashes(parsedDm.data.dm.body)) : null;
+        },
+      }) : null;
+  const dmRow =
+    dmVoice?.body
+    ? {
+        id: randomUUID(),
+        kind: "dm" as const,
+        angle: null,
+        body: dmVoice.body,
+        charCount: [...dmVoice.body].length,
+        dmVoiceCheck: { pass: true, attempts: dmVoice.attempts, reasons: dmVoice.reasons },
+      }
+    : null;
+
+  // COMMITMENT GUARD (@noelle/runtime/commitment-guard). Lyra must never promise
+  // anything on the operator's behalf — a call, an intro, a deadline, a yes.
+  // The model is told not to (NO_COMMITMENTS_RULE in the system prompt); this is
+  // the backstop for when it does anyway, because the failure is a public
+  // promise the operator has to honour or walk back. The DM is dropped on its
+  // own so a committing DM cannot take otherwise-good comments with it.
+  const safeReplyRows = replyRows.filter((r) => !makesCommitment(r.body));
+  for (const r of replyRows) {
+    if (makesCommitment(r.body)) {
