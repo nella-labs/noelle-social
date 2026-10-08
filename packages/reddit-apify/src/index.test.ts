@@ -198,3 +198,203 @@ describe("normalizeRedditPost", () => {
     expect(normalizeRedditPost("nope")).toBeNull();
   });
 
+  it("coalesces images (preview + gallery) and top comments sorted by score desc, sliced", () => {
+    const p = normalizeRedditPost(MEDIA_SAMPLE, { commentsPerPost: 2 })!;
+    // Images: preview string first, then each gallery {url}, deduped + http-only.
+    expect(p.images).toEqual([
+      "https://preview.redd.it/abc.png",
+      "https://i.redd.it/g1.jpg",
+      "https://i.redd.it/g2.jpg",
+    ]);
+    // Top comments: empty-body dropped, sorted desc, sliced to commentsPerPost=2,
+    // t1_ stripped, object author resolved, permalink made canonical.
+    expect(p.topComments).toHaveLength(2);
+    expect(p.topComments!.map((c) => c.id)).toEqual(["c2", "c3"]);
+    expect(p.topComments![0]).toMatchObject({ id: "c2", score: 120, author: "b" });
+    expect(p.topComments![0]!.permalink).toBe(
+      "https://www.reddit.com/r/SaaS/comments/img99/mrr_chart/c2/",
+    );
+  });
+
+  it("defaults to 8 top comments and omits images/topComments when the post has neither", () => {
+    // MEDIA_SAMPLE has 3 non-empty comments; default cap (8) keeps all 3.
+    expect(normalizeRedditPost(MEDIA_SAMPLE)!.topComments).toHaveLength(3);
+    // A plain self post → no media, no comments → both keys omitted (never []).
+    const plain = normalizeRedditPost(SAMPLE)!;
+    expect("images" in plain).toBe(false);
+    expect("topComments" in plain).toBe(false);
+  });
+
+  it("salvages an image URL from the post url when it points at an image", () => {
+    const p = normalizeRedditPost({ ...SAMPLE, url: "https://i.redd.it/xyz.jpg", permalink: "/r/SaaS/c/x/y/" })!;
+    expect(p.images).toEqual(["https://i.redd.it/xyz.jpg"]);
+  });
+});
+
+describe("subredditPosts", () => {
+  it("omitting commentsPerPost fetches posts only — comments are opt-in (cost guard)", async () => {
+    const h = harness(() => ({ items: [SAMPLE] }));
+    const posts = await h.client.subredditPosts({ subreddit: "SaaS" });
+    expect(h.startUrl()).toContain(`/v2/acts/${SUBREDDIT_POSTS_ACTOR_ID}/runs`);
+    expect(h.startUrl()).toContain("token=apify_api_test");
+    expect(h.body().mode).toBe("subreddit");
+    expect(h.body().subreddit).toBe("SaaS");
+    expect(h.body().sort).toBe("new"); // default
+    expect(h.body().timeRange).toBe("day"); // default
+    expect(h.body().maxItems).toBe(50); // default
+    expect(h.body().postType).toBe("all");
+    // No commentsPerPost passed ⇒ comments OFF, so a consumer that ignores comments
+    // never pays the ~5× comment-scrape cost.
+    expect(h.body().includeComments).toBe(false);
+    expect(h.body().commentsPerPost).toBe(0);
+    expect(h.body().commentSort).toBe("top");
+    expect(h.body().includeNsfw).toBe(false);
+    expect((h.body().proxyConfiguration as { apifyProxyGroups?: string[] }).apifyProxyGroups).toEqual([
+      "RESIDENTIAL",
+    ]);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.id).toBe("1abc23");
+    expect(posts[0]!.author.username).toBe("indie_hacker_42");
+  });
+
+  it("passes commentsPerPost through to the actor input", async () => {
+    const h = harness(() => ({ items: [SAMPLE] }));
+    await h.client.subredditPosts({ subreddit: "SaaS", commentsPerPost: 15 });
+    expect(h.body().commentsPerPost).toBe(15);
+    expect(h.body().includeComments).toBe(true); // opt-in flips on when comments are requested
+  });
+
+  it("groups standalone comment items (dataType/type='comment') under their parent post", async () => {
+    // Post item carries no nested comments; two standalone comment rows reference
+    // it by link_id (t3_) and by bare postId respectively, out of score order.
+    const postItem = { ...SAMPLE };
+    const c1 = {
+      dataType: "comment",
+      id: "t1_x1",
+      body: "standalone lower",
+      score: 9,
+      author: "z",
+      link_id: "t3_1abc23",
+      permalink: "/r/SaaS/comments/1abc23/x/x1/",
+    };
+    const c2 = { type: "comment", id: "t1_x2", body: "standalone higher", score: 88, author: "y", postId: "1abc23" };
+    const h = harness(() => ({ items: [postItem, c1, c2] }));
+    const posts = await h.client.subredditPosts({ subreddit: "SaaS", commentsPerPost: 5 });
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.topComments!.map((c) => c.id)).toEqual(["x2", "x1"]); // score desc
+    expect(posts[0]!.topComments![0]!.author).toBe("y");
+  });
+
+  it("filters out posts older than sinceISO", async () => {
+    const h = harness(() => ({ items: [SAMPLE] })); // SAMPLE is 2025-05-28
+    const dropped = await h.client.subredditPosts({ subreddit: "SaaS", sinceISO: "2025-06-01T00:00:00Z" });
+    expect(dropped).toHaveLength(0);
+    const kept = await h.client.subredditPosts({ subreddit: "SaaS", sinceISO: "2025-05-01T00:00:00Z" });
+    expect(kept).toHaveLength(1);
+  });
+
+  it("propagates a 402 as an ApifyError with status===402 (quota surfaces)", async () => {
+    const h = harness(() => ({ status: 402, text: "Monthly usage hard limit exceeded" }));
+    await expect(h.client.subredditPosts({ subreddit: "SaaS" })).rejects.toBeInstanceOf(ApifyError);
+    await expect(h.client.subredditPosts({ subreddit: "SaaS" })).rejects.toMatchObject({ status: 402 });
+  });
+
+  it("requires a subreddit", async () => {
+    const h = harness(() => ({ items: [] }));
+    await expect(h.client.subredditPosts({ subreddit: "" })).rejects.toBeInstanceOf(ApifyError);
+  });
+});
+
+// --- fetchRedditPostComments (the free public .json read) ---------------------
+// This source spends NO Apify budget and supplies no id/permalink — it's the
+// "read the room" sibling-comment fetch, not a comment-targeting source.
+
+describe("fetchRedditPostComments", () => {
+  // Reddit's comments endpoint returns a two-element array: [postListing,
+  // commentListing]; the comments live under [1].data.children as {kind,data} nodes.
+  function listing(children: Array<{ kind: string; data: Record<string, unknown> }>) {
+    return [
+      { kind: "Listing", data: { children: [] } }, // post listing (ignored)
+      { kind: "Listing", data: { children } }, // comment listing
+    ];
+  }
+
+  // A fetch that records requested URLs and replies with `payload` (JSON) at `status`.
+  function recordingFetch(payload: unknown, status = 200) {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      calls.push(input.toString());
+      return new Response(JSON.stringify(payload), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    return { fetchImpl, calls };
+  }
+
+  it("parses the two-element listing, drops deleted/removed/stickied/AutoModerator, sorts by score desc", async () => {
+    const { fetchImpl, calls } = recordingFetch(
+      listing([
+        { kind: "t1", data: { author: "alice", body: "a middling take", score: 40 } },
+        { kind: "t1", data: { author: "bob", body: "the top take", score: 120 } },
+        { kind: "t1", data: { author: "carol", body: "[deleted]", score: 999 } }, // deleted body → drop
+        { kind: "t1", data: { author: "dave", body: "[removed]", score: 999 } }, // removed body → drop
+        { kind: "t1", data: { author: "mods", body: "the rules", score: 999, stickied: true } }, // pinned → drop
+        { kind: "t1", data: { author: "AutoModerator", body: "beep boop", score: 999 } }, // automod → drop
+        { kind: "t1", data: { author: "[deleted]", body: "ghost", score: 999 } }, // deleted author → drop
+        { kind: "more", data: { count: 12 } }, // "more" node, not a comment → drop
+        { kind: "t1", data: { author: "erin", body: "a quiet take", score: 5 } },
+      ]),
+    );
+    const comments = await fetchRedditPostComments({ postId: "t3_abc123", sort: "top", fetchImpl });
+
+    // Only the three real comments survive, ranked by score desc, authors "u/"-prefixed.
+    expect(comments).toEqual([
+      { author: "u/bob", body: "the top take", score: 120 },
+      { author: "u/alice", body: "a middling take", score: 40 },
+      { author: "u/erin", body: "a quiet take", score: 5 },
+    ]);
+    // The free .json source supplies no id/permalink (so these can't be actuated).
+    expect(comments[0]).not.toHaveProperty("id");
+    expect(comments[0]).not.toHaveProperty("permalink");
+    // Hits the free public endpoint with the t3_ prefix stripped.
+    expect(calls[0]).toContain("/comments/abc123.json");
+    expect(calls[0]).toContain("sort=top");
+    expect(calls[0]).toContain("depth=1");
+  });
+
+  it("caps the result at `limit`, keeping the highest-scored", async () => {
+    const { fetchImpl } = recordingFetch(
+      listing(
+        Array.from({ length: 20 }, (_, i) => ({
+          kind: "t1",
+          data: { author: `u${i}`, body: `c${i}`, score: i },
+        })),
+      ),
+    );
+    const comments = await fetchRedditPostComments({ postId: "abc123", limit: 3, fetchImpl });
+    expect(comments).toHaveLength(3);
+    expect(comments.map((c) => c.score)).toEqual([19, 18, 17]);
+  });
+
+  it("fails open (returns []) on non-200, a bad shape, or a blank postId", async () => {
+    // 429 / 403 / 404 → [] (fail open, drafting proceeds with no room context)
+    expect(
+      await fetchRedditPostComments({ postId: "abc", fetchImpl: recordingFetch({}, 429).fetchImpl }),
+    ).toEqual([]);
+    // Single-element body (not the [post, comments] pair) → []
+    expect(
+      await fetchRedditPostComments({ postId: "abc", fetchImpl: recordingFetch([{ data: {} }]).fetchImpl }),
+    ).toEqual([]);
+    // Blank postId → [] with no fetch at all.
+    const spy = recordingFetch(listing([]));
+    expect(await fetchRedditPostComments({ postId: "   ", fetchImpl: spy.fetchImpl })).toEqual([]);
+    expect(spy.calls).toHaveLength(0);
+  });
+});
+
+describe("runActorSync real cost capture (drainLastRunUsd)", () => {
+  it("captures the run's real usageTotalUsd and drains it (reset to null on re-read)", async () => {
+    const h = harness(() => ({ items: [SAMPLE], usageTotalUsd: 0.37 }));
+    await h.client.subredditPosts({ subreddit: "SaaS" });
+    expect(h.client.drainLastRunUsd?.()).toBe(0.37);
