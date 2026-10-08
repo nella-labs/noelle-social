@@ -198,3 +198,31 @@ export async function getWatchlistProfiles(
       handle: string;
       summary: string | null;
       topics: unknown;
+      tone: string | null;
+      engagement_notes: string | null;
+    }[]
+  >`
+    select p.handle, p.summary, p.topics, p.tone, p.engagement_notes
+    from noelle.x_watchlist_profiles p
+    join noelle.agent_instances owner on owner.id=p.agent_instance_id and owner.org_id=p.org_id
+    where p.agent_instance_id = ${instanceId} and owner.role='x_intern' and p.summary is not null
+  `;
+  const map = new Map<string, WatchlistProfileRow>();
+  for (const r of rows) {
+    const key = r.handle.trim().toLowerCase().replace(/^@/, "");
+    map.set(key, {
+      handle: r.handle,
+      summary: r.summary,
+      topics: Array.isArray(r.topics) ? (r.topics as string[]) : [],
+      tone: r.tone,
+      engagementNotes: r.engagement_notes,
+    });
+  }
+  return map;
+}
+
+function profileWriteOwnerSql(sql: Sql, args: { orgId: string; agentInstanceId: string }) {
+  return sql`select id, org_id from noelle.agent_instances
+    where id=${args.agentInstanceId} and org_id=${args.orgId} and role='x_intern'
+    for no key update`;
+}

@@ -398,3 +398,175 @@ async function main() {
                   { instance: inst.id, err: (err as Error).message },
                   "follower feeder failed (ignored)",
                 );
+              }
+            }
+          }
+        }
+
+        // PERSON-FIRST lane. The ICP gate decides who is worth keeping; the
+        // candidates it kept on earlier ticks get their timelines polled now.
+        // Gated on icp_config being set — with no "right person" test this would
+        // just be an expensive way to poll strangers. Fail-open throughout: a
+        // failure here must never stop the watch/keyword lanes.
+        const personLaneOn =
+          env.X_PERSON_LANE_ENABLED && !watchlistOnly && icpGateConfigured(icpGate);
+        const discoveredHandles = personLaneOn
+          ? (
+              await listPeopleToPoll(sql, {
+                agentInstanceId: inst.id,
+                limit: env.X_PERSON_POLL_PER_TICK,
+                cooldownHours: env.X_PERSON_POLL_COOLDOWN_HOURS,
+              })
+            ).map((p) => p.handle)
+          : [];
+        // In watchlist-only mode the keyword lane is off, so only the watched
+        // people matter; otherwise any of handles/keywords/people is enough.
+        const nothingToPoll = watchlistOnly
+          ? people.length === 0
+          : wl.handles.length === 0 && wl.keywords.length === 0 && people.length === 0;
+        if (nothingToPoll) {
+          log.info({ instance: inst.id, watchlistOnly }, "nothing to poll this tick");
+          await run.finish({ status: "ok", rowsProcessed: 0 });
+          return;
+        }
+        // Split the work across the shards. Round-robin keeps each slice
+        // balanced and, critically, puts every source in EXACTLY ONE slice, so
+        // two shards can never poll the same handle/keyword concurrently.
+        const nShards = shardHandles.length;
+        const handleSlices = shardRoundRobin(wl.handles, nShards);
+        const keywordSlices = shardRoundRobin(wl.keywords, nShards);
+        const peopleSlices = shardRoundRobin(people, nShards);
+        // Person-first candidates are partitioned the same way, so two shards
+        // can never poll the SAME candidate concurrently — the same disjointness
+        // property that makes the token split safe.
+        const candidateSlices = shardRoundRobin(discoveredHandles, nShards);
+
+        // The tick budget is WALL-CLOCK for the whole tick, so every shard gets
+        // the same budget and they burn it in parallel rather than in series —
+        // that is precisely the throughput win. The rate bucket is shared (it
+        // paces the account, not the token) and its takes are safe under
+        // concurrency because the event loop is single-threaded.
+        const shardResults = await runWithConcurrency(shardHandles, nShards, async (i) => {
+          const handle = shardHandles[i]!;
+          // Stagger the FIRST request of each shard so N tokens don't all egress
+          // at the same instant from one box. Only the starts are spread; the
+          // shards still overlap.
+          const delay = shardStaggerDelayMs(i, env.X_DISCOVERY_SHARD_STAGGER_MS);
+          if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+          return runDiscoveryTick({
+            log,
+            instance: inst,
+            watchlist: { handles: handleSlices[i] ?? [], keywords: keywordSlices[i] ?? [] },
+            watchlistPeople: peopleSlices[i] ?? [],
+            xClient: handle.client,
+            rateBucket: bucket,
+            apifyReplyLeadsEnabled: env.X_APIFY_REPLY_LEADS,
+            upsertLead: (a) => upsertDiscoveredLead(sql, a),
+            bus,
+            watchlistOnly,
+            recorder,
+            credentialId: handle.credentialId,
+            repollGate: repollGateFor(inst.id),
+            // Person-first lane. Retention (recordDiscoveredPerson) runs on
+            // EVERY shard because each sees different authors and the upsert is
+            // idempotent; only the POLL list is partitioned.
+            ...(personLaneOn
+              ? {
+                  discoveredHandles: candidateSlices[i] ?? [],
+                  icpGate,
+                  onPersonPolled: (h: string) =>
+                    markPersonPolled(sql, { agentInstanceId: inst.id, handle: h }),
+                  recordDiscoveredPerson: (p: {
+                    handle: string;
+                    authorId: string | null;
+                    displayName: string | null;
+                    bio: string | null;
+                  }) =>
+                    upsertDiscoveredPerson(sql, {
+                      orgId: inst.org_id,
+                      agentInstanceId: inst.id,
+                      source: "keyword_author",
+                      ...p,
+                    }),
+                }
+              : {}),
+            // Hard wall-clock cap so a pool of slow/queued free-tier tokens can't
+            // make one tick run for 10+ minutes (deferred sources retry next tick).
+            budgetMs: env.X_DISCOVERY_TICK_BUDGET_MS,
+            // Each shard walks its OWN ring, so it needs its own cursor —
+            // sharing one would make shard N resume at shard 0's offset and
+            // re-poll the wrong sources. Single-shard keeps the original key so
+            // an existing cursor is not orphaned on upgrade.
+            sourceCursor: sourceCursors.for(
+              inst.id,
+              watchlistOnly ? "watchlist" : "full",
+              nShards > 1 ? i : undefined,
+            ),
+          });
+        });
+
+        // A shard raises "all exhausted" when ITS OWN tokens are spent. The pool
+        // is only genuinely dead when EVERY shard says so — otherwise the other
+        // shards did real work and this is just a thin slice, which must not
+        // page the operator or fail the run.
+        const exhausted = shardResults.filter(
+          (r) => r.status === "rejected" && r.reason instanceof AllApifyTokensExhaustedError,
+        );
+        const otherFailure = shardResults.find(
+          (r) => r.status === "rejected" && !(r.reason instanceof AllApifyTokensExhaustedError),
+        );
+        if (otherFailure && otherFailure.status === "rejected") throw otherFailure.reason;
+        if (exhausted.length === nShards && exhausted[0]?.status === "rejected") {
+          throw exhausted[0].reason;
+        }
+        const inserted = shardResults.reduce(
+          (sum, r) => sum + (r.status === "fulfilled" ? r.value : 0),
+          0,
+        );
+        if (exhausted.length > 0) {
+          log.warn(
+            { instance: inst.id, exhaustedShards: exhausted.length, shards: nShards, inserted },
+            "some apify shards are exhausted; the rest still polled",
+          );
+        }
+        await run.finish({ status: "ok", rowsProcessed: inserted });
+        // A clean tick ends the outage episode, so the next one pages again.
+        apifyExhaustedNotified = false;
+      } catch (err) {
+        // Every Apify token spent → record the error (surfaces on the dashboard)
+        // but don't rethrow: rethrowing crash-loops the worker, and rotating
+        // wouldn't help until a token's billing cycle resets.
+        if (err instanceof AllApifyTokensExhaustedError) {
+          log.error({ org_id: inst.org_id, tokens: err.tokenCount }, "all apify tokens exhausted");
+          await run.finish({ status: "error", errorMessage: err.message });
+          // PAGE THE OPERATOR. A dead pool is silent otherwise: discovery stops
+          // finding leads, the drafter runs dry, and the approvals queue drains
+          // to zero with nothing in the UI saying why. #494 was exactly this —
+          // discovery dead ~25h before anyone noticed. Best-effort; a failed
+          // notification must never mask the underlying error.
+          const firstOfEpisode = !apifyExhaustedNotified;
+          apifyExhaustedNotified = true;
+          if (firstOfEpisode)
+            await notifier
+              .notify({
+                orgId: inst.org_id,
+                title: "Vega: Apify pool exhausted",
+                message: `All ${err.tokenCount} Apify tokens are spent or rate-limited. X discovery is STOPPED until a token frees up, so no new leads and the approvals queue will drain to empty.`,
+              })
+              .catch((e) =>
+                log.warn({ err: (e as Error).message }, "apify-exhausted alert failed to send"),
+              );
+          return;
+        }
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+  });
+}
+
+main().catch((err) => {
+  console.error("discovery fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
