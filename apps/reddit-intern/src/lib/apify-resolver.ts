@@ -198,3 +198,32 @@ export function createApifyPoolResolver(
   const handleFor = (cand: RotatingTokenCandidate, totalCount: number, orgId: string): ApifyHandle => ({
     client: createRotatingApifyClient({
       candidates: [cand],
+      totalCount,
+      buildClient,
+      onTokenFatal: (id, status, token) => {
+        void handleTokenFatal(deps, id, status, token, orgId);
+      },
+      onRecovered: (id) => void clearApifyTokenExhausted(deps.sql, id).catch(() => {}),
+      log: deps.log,
+    }),
+    credentialId: cand.credentialId,
+  });
+
+  return async (orgId: string): Promise<ApifyHandle[]> => {
+    const dbTokens = await listApifyTokens(deps.sql, orgId).catch(() => []);
+
+    if (dbTokens.length === 0) {
+      const envToken = await deps.secrets.get(deps.apifyTokenSecretId).catch(() => null);
+      if (!envToken) {
+        deps.log.warn({ orgId }, "no apify token (no active connection + no env fallback); skipping apify fetch");
+        return [];
+      }
+      return [handleFor({ credentialId: null, token: envToken, wasExhausted: false }, 1, orgId)];
+    }
+
+    const available = dbTokens.filter((t) => t.available);
+    return available.map((t) =>
+      handleFor({ credentialId: t.credentialId, token: t.token, wasExhausted: t.wasExhausted }, dbTokens.length, orgId),
+    );
+  };
+}
