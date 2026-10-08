@@ -198,3 +198,164 @@ function runClaude(env: Env, prompt: string): Promise<string | null> {
 
 function buildPrompt(fresh: ProbeResult[], logs: unknown[]): string {
   const faults = fresh.map((p) => ({ target: p.target, check: p.check, reason: p.reason, metrics: p.metrics }));
+  return [
+    "You are the diagnosis stage of an automated ops watchdog (the Noelle actuator-doctor).",
+    "The watchdog matches probe failures against known 'signatures' and remediates on a fixed ladder.",
+    "A fault below matched NO known signature. Propose ONE new signature so the watchdog can handle it next time.",
+    "",
+    "Return ONLY a single JSON object (no prose, no code fences) with these fields:",
+    "  id: kebab-case slug, title: string, description: string,",
+    "  match: array of clauses, each { target, check, ok:false, reasonIncludes?: string, metric?: string, op?: one of gt|gte|lt|lte|eq|ne, value?: number|string|boolean },",
+    "  ladder: ordered array from EXACTLY these actions: reload_extension, reconnect_bridge, restart_worker, engage_kill_switch, page_human,",
+    "  maxPerHour: integer 1..3, confidence: number 0..1.",
+    "Rules: every match clause MUST use one of the (target,check) pairs from the fault below and MUST assert ok:false.",
+    "Prefer the least disruptive remediation that could plausibly fix THIS fault; ALWAYS end the ladder with page_human.",
+    "engage_kill_switch STOPS the actuator from sending (it is a safe brake) — use it only when continuing to send would be harmful.",
+    "If you cannot propose a sound signature, reply with the single word INSUFFICIENT.",
+    "",
+    "FAULT (unmatched probes this tick):",
+    JSON.stringify(faults, null, 2),
+    "",
+    "RECENT LOGS for the affected source (most recent last, may be empty):",
+    JSON.stringify(logs.slice(-40), null, 2),
+  ].join("\n");
+}
+
+// Pull the first balanced {...} JSON object out of arbitrary model output.
+// Exported for tests (pure).
+export function extractJsonObject(text: string): unknown | null {
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, i + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+const SAFE_ACTIONS = new Set([
+  "reload_extension",
+  "reconnect_bridge",
+  "restart_worker",
+  "engage_kill_switch",
+  "page_human",
+]);
+
+// Validate + clamp an LLM proposal into a safe learned Signature, or null.
+// Exported for tests (pure): this is the guardrail between an LLM proposal and
+// the live remediation store, so it is the most important thing to unit-test.
+export function sanitizeLearnedSignature(
+  proposal: unknown,
+  fresh: ProbeResult[],
+  store: SignatureStore,
+  nowIso: string,
+): Signature | null {
+  if (typeof proposal !== "object" || proposal === null) return null;
+  const raw = proposal as Record<string, unknown>;
+
+  // The (target,check) surface the model is allowed to reference.
+  const allowedPairs = new Set(fresh.map((p) => `${p.target}:${p.check}`));
+
+  const ladderIn = Array.isArray(raw.ladder)
+    ? raw.ladder.filter((a): a is string => typeof a === "string" && SAFE_ACTIONS.has(a))
+    : [];
+
+  const candidate = {
+    id: typeof raw.id === "string" ? raw.id : "",
+    title: typeof raw.title === "string" ? raw.title : "learned fault",
+    description: typeof raw.description === "string" ? raw.description : "auto-learned by escalation",
+    match: Array.isArray(raw.match) ? raw.match : [],
+    ladder: ladderIn,
+    maxPerHour: clampInt(raw.maxPerHour, 1, 3, 2),
+    timesSeen: 0,
+    timesResolved: 0,
+    lastSeen: null,
+    origin: "learned" as const,
+    confidence: clampNum(raw.confidence, 0, 0.5, 0.3),
+    learnedFrom: nowIso,
+  };
+
+  // Force the ladder to end in page_human (always loop a human in) and be non-empty.
+  if (candidate.ladder.length === 0) candidate.ladder = ["page_human"];
+  if (candidate.ladder[candidate.ladder.length - 1] !== "page_human") candidate.ladder.push("page_human");
+
+  const parsed = SignatureSchema.safeParse(candidate);
+  if (!parsed.success) return null;
+  const sig = parsed.data;
+
+  // Reject if any clause references a (target,check) outside the actual fault —
+  // prevents a hallucinated signature from matching unrelated probes. Also force
+  // every clause to assert ok:false (a failure), never ok:true.
+  if (sig.match.length === 0) return null;
+  for (const clause of sig.match) {
+    if (!allowedPairs.has(`${clause.target}:${clause.check}`)) return null;
+    if (clause.ok !== false) clause.ok = false;
+  }
+
+  // Ensure a unique id (never clobber an existing signature).
+  const existing = new Set(store.signatures.map((s) => s.id));
+  let id = kebab(sig.id) || `learned-${sig.match[0]!.target}-${sig.match[0]!.check}`;
+  if (existing.has(id)) id = `${id}-${nowIso.slice(0, 19).replace(/[:T]/g, "")}`;
+  sig.id = id;
+
+  return sig;
+}
+
+function escalationIncident(
+  target: DoctorTarget,
+  fresh: ProbeResult[],
+  nowIso: string,
+  signatureId: string | null,
+  note: string,
+): Incident {
+  return {
+    id: `${nowIso}::escalate::${target}`,
+    at: nowIso,
+    target,
+    signatureId,
+    summary: `escalation on ${target}: ${note}`,
+    probes: fresh.filter((p) => p.target === target),
+    actionTaken: "none",
+    actionOk: null,
+    verifiedAt: null,
+    resolved: false,
+    escalated: true,
+    notes: note,
+  };
+}
+
+function clampInt(v: unknown, lo: number, hi: number, dflt: number): number {
+  const n = typeof v === "number" ? Math.round(v) : dflt;
+  return Math.max(lo, Math.min(hi, Number.isFinite(n) ? n : dflt));
+}
+function clampNum(v: unknown, lo: number, hi: number, dflt: number): number {
+  const n = typeof v === "number" ? v : dflt;
+  return Math.max(lo, Math.min(hi, Number.isFinite(n) ? n : dflt));
+}
+function kebab(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+}
