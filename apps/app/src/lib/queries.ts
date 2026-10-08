@@ -3398,3 +3398,203 @@ export async function getPipelineSnapshot(instanceId: string): Promise<PipelineS
       toggleable: true,
       runsWhilePaused: kind === "profiler",
       state: s?.state ?? "idle",
+      lifetime: counts[kind].lifetime,
+      today: counts[kind].today,
+      sinceStart: counts[kind].sinceStart,
+      lastFinishedAt: s?.lastFinishedAt ?? null,
+      runningSince: s?.runningSince ?? null,
+      lastError: s?.lastError ?? null,
+    };
+  });
+  // The always-on Watchlist lane has no worker_runs of its own — discovery /
+  // classifier / drafter produce its replies — so mirror the drafter's freshness
+  // and report the watched-people reply count. runsWhilePaused so it doesn't dim
+  // when the keyword pipeline is paused (it's still working).
+  {
+    const ws = enabledByKind.watchlist;
+    const ds = stateByKind.get("drafter");
+    workers.push({
+      kind: "watchlist",
+      enabled: ws,
+      toggleable: true,
+      runsWhilePaused: true,
+      state: ws ? ds?.state ?? "idle" : "disabled",
+      lifetime: counts.watchlist.lifetime,
+      today: counts.watchlist.today,
+      sinceStart: counts.watchlist.sinceStart,
+      lastFinishedAt: ds?.lastFinishedAt ?? null,
+      runningSince: ds?.runningSince ?? null,
+      // Synthetic lane (no worker_runs of its own); the real workers surface their
+      // own failures on their rows, so this convenience row never shows an error.
+      lastError: null,
+    });
+  }
+
+  return {
+    status: inst.status as string,
+    pipelineStartedAt: inst.pipeline_started_at,
+    leadsReady: appr?.leads_ready ?? 0,
+    leadsReadyLastRun: inst.goal_started_at ? appr?.leads_ready_run ?? 0 : null,
+    lastRunStartedAt: inst.goal_started_at,
+    goal: {
+      target: inst.goal_target,
+      startedAt: inst.goal_started_at,
+      produced: inst.goal_started_at ? appr?.produced ?? 0 : 0,
+      // "currently waiting" matches the inbox + cap: distinct reply leads.
+      ready: appr?.leads_ready ?? 0,
+    },
+    discoveryConfig: parseDiscoveryConfig(inst.discovery_config),
+    schedule: pipelineSchedule(inst),
+    workers,
+  };
+}
+
+// LinkedIn intern (Lyra) is draft-only — no send worker. Her four stages match
+// Vega's minus 'send': discovery → classifier → drafter (+ profiler).
+const LINKEDIN_WORKERS: VegaWorkerKind[] = [
+  "discovery",
+  "classifier",
+  "drafter",
+  "profiler",
+];
+
+/**
+ * Pipeline snapshot for the LinkedIn intern (Lyra) — the draft-only sibling of
+ * getPipelineSnapshot. Same shape so it feeds the SAME <PipelinePanel> +
+ * <LeadsReadyCard>, with three differences:
+ *   1. NO 'send' worker (Lyra never posts to LinkedIn) — the funnel ends at the
+ *      drafter, and "ready / produced" counts pending approvals only (no sent).
+ *   2. The profiler count comes from noelle.linkedin_watchlist_profiles (the
+ *      LinkedIn analogue of x_watchlist_profiles), keyed by fsd_profile_id.
+ *   3. Lead/draft/approval COUNTS are scoped to this instance AND
+ *      platform='linkedin' — accurate even if a future row shares the instance.
+ *
+ * Tenancy: getAgentInstance asserts org membership before any read.
+ *
+ * Worker-freshness limitation: noelle.worker_runs has only a `worker` (kind)
+ * column — no agent_instance_id / org_id / platform discriminator — and Lyra's
+ * workers (apps/linkedin-intern) record the SAME kinds ('discovery',
+ * 'classifier', 'drafter', 'profiler') as Vega's. So the "ran Xm ago" / running
+ * state per stage is derived GLOBALLY per-kind via listVegaWorkerStatus and, on
+ * a host running both interns, may reflect Vega's most-recent run for the same
+ * kind. The COUNTS above are always correctly scoped to LinkedIn; only the
+ * freshness timestamps are best-effort until worker_runs carries an instance id.
+ */
+export async function getLinkedInPipelineSnapshot(
+  instanceId: string,
+): Promise<PipelineSnapshot | null> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return null;
+  const since = inst.pipeline_started_at ?? "1970-01-01T00:00:00Z";
+  const goalStart = inst.goal_started_at ?? "1970-01-01T00:00:00Z";
+
+  const [leads] = await readSql<
+    Array<{ disc_life: number; disc_today: number; disc_since: number; cls_life: number; cls_today: number; cls_since: number }>
+  >`
+    select
+      count(*)::int as disc_life,
+      count(*) filter (where created_at >= date_trunc('day', now()))::int as disc_today,
+      count(*) filter (where created_at >= ${since})::int as disc_since,
+      count(*) filter (where classifier_label is not null)::int as cls_life,
+      count(*) filter (where classifier_label is not null and created_at >= date_trunc('day', now()))::int as cls_today,
+      count(*) filter (where classifier_label is not null and created_at >= ${since})::int as cls_since
+    from noelle.leads
+    where agent_instance_id = ${inst.id} and platform = 'linkedin'
+      and coalesce(nullif(payload->>'post_kind', ''), payload->>'postKind', '') not in ('intro_dm', 'relationship_dm')
+      and external_id not like '%:intro%'
+  `;
+  const [drafts] = await readSql<Array<{ life: number; today: number; since: number }>>`
+    select
+      count(distinct l.id)::int as life,
+      count(distinct l.id) filter (where d.synced_at >= date_trunc('day', now()))::int as today,
+      count(distinct l.id) filter (where d.synced_at >= ${since})::int as since
+    from noelle.drafts d join noelle.leads l on l.id = d.lead_id
+    where l.agent_instance_id = ${inst.id} and l.platform = 'linkedin'
+      and coalesce(d.payload->>'kind', 'reply') = 'reply'
+      and coalesce(nullif(l.payload->>'post_kind', ''), l.payload->>'postKind', '') not in ('intro_dm', 'relationship_dm')
+      and l.external_id not like '%:intro%'
+  `;
+  // Reply approvals only; the browser actor may mark replies sent. Count each
+  // post once even when its lead has multiple reply angles or a companion DM.
+  const [appr] = await readSql<
+    Array<{
+      leads_ready: number;
+      leads_ready_run: number;
+      produced: number;
+    }>
+  >`
+    select
+      count(distinct a.lead_id) filter (where a.status = 'pending')::int as leads_ready,
+      count(distinct a.lead_id) filter (where a.status = 'pending' and a.created_at >= ${goalStart})::int as leads_ready_run,
+      count(distinct a.lead_id) filter (where a.created_at >= ${goalStart})::int as produced
+    from noelle.approvals a
+    join noelle.drafts d on d.id = a.draft_id and d.lead_id = a.lead_id
+    join noelle.leads l on l.id = a.lead_id
+    where a.agent_instance_id = ${inst.id} and l.platform = 'linkedin'
+      and coalesce(d.payload->>'kind', 'reply') = 'reply'
+      and coalesce(nullif(l.payload->>'post_kind', ''), l.payload->>'postKind', '') not in ('intro_dm', 'relationship_dm')
+      and l.external_id not like '%:intro%'
+  `;
+  const [profiles] = await readSql<Array<{ life: number; today: number; since: number }>>`
+    select
+      count(*) filter (where summary is not null)::int as life,
+      count(*) filter (where summary is not null and generated_at >= date_trunc('day', now()))::int as today,
+      count(*) filter (where summary is not null and generated_at >= ${since})::int as since
+    from noelle.linkedin_watchlist_profiles where agent_instance_id = ${inst.id}
+  `;
+  // Watchlist lane "produced" count = distinct watched-connection posts that got a
+  // reply draft (one per post). Unlike Vega, Lyra inserts every lead priority=false
+  // (the classifier scores each post), and Lyra is watchlist-only — every lead is
+  // already a watched-connection post — so there is NO priority filter here; the
+  // count is simply Lyra's distinct non-DM reply-drafts.
+  const [wdrafts] = await readSql<Array<{ life: number; today: number; since: number }>>`
+    select
+      count(distinct l.id)::int as life,
+      count(distinct l.id) filter (where d.synced_at >= date_trunc('day', now()))::int as today,
+      count(distinct l.id) filter (where d.synced_at >= ${since})::int as since
+    from noelle.drafts d join noelle.leads l on l.id = d.lead_id
+    where l.agent_instance_id = ${inst.id} and l.platform = 'linkedin'
+      and coalesce(d.payload->>'kind','reply') = 'reply'
+      and coalesce(nullif(l.payload->>'post_kind', ''), l.payload->>'postKind', '') not in ('intro_dm', 'relationship_dm')
+      and l.external_id not like '%:intro%'
+  `;
+
+  // Best-effort per-kind freshness (global worker_runs — see the doc comment).
+  const states = await listVegaWorkerStatus({
+    discovery: inst.discovery_enabled,
+    classifier: inst.classifier_enabled,
+    drafter: inst.drafter_enabled,
+    profiler: inst.profiler_enabled,
+  });
+  const stateByKind = new Map(states.map((s) => [s.kind, s] as const));
+
+  const counts: Record<VegaWorkerKind, { lifetime: number; today: number; sinceStart: number }> = {
+    discovery: { lifetime: leads?.disc_life ?? 0, today: leads?.disc_today ?? 0, sinceStart: leads?.disc_since ?? 0 },
+    classifier: { lifetime: leads?.cls_life ?? 0, today: leads?.cls_today ?? 0, sinceStart: leads?.cls_since ?? 0 },
+    drafter: { lifetime: drafts?.life ?? 0, today: drafts?.today ?? 0, sinceStart: drafts?.since ?? 0 },
+    send: { lifetime: 0, today: 0, sinceStart: 0 },
+    profiler: { lifetime: profiles?.life ?? 0, today: profiles?.today ?? 0, sinceStart: profiles?.since ?? 0 },
+    watchlist: { lifetime: wdrafts?.life ?? 0, today: wdrafts?.today ?? 0, sinceStart: wdrafts?.since ?? 0 },
+  };
+  const enabledByKind: Record<VegaWorkerKind, boolean> = {
+    discovery: inst.discovery_enabled,
+    classifier: inst.classifier_enabled,
+    drafter: inst.drafter_enabled,
+    send: inst.send_enabled,
+    profiler: inst.profiler_enabled,
+    watchlist: inst.watchlist_enabled ?? true,
+  };
+
+  // Only the four LinkedIn stages — 'send' is intentionally omitted from the
+  // funnel so the panel never renders a Send row for Lyra.
+  const workers: PipelineWorkerSnapshot[] = LINKEDIN_WORKERS.map((kind) => {
+    const s = stateByKind.get(kind);
+    return {
+      kind,
+      enabled: enabledByKind[kind],
+      toggleable: true,
+      runsWhilePaused: kind === "profiler",
+      state: s?.state ?? "idle",
+      lifetime: counts[kind].lifetime,
+      today: counts[kind].today,
+      sinceStart: counts[kind].sinceStart,
