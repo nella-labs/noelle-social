@@ -4198,3 +4198,203 @@ export async function getLinkedInApprovalDetail(
   return { primary, replies, dm, instanceId: h.agent_instance_id, vipSignal };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Reddit intern (Orion) — reply pipeline; approved replies auto-sent by the actuator.
+//
+//   - agent_instances.role = 'reddit_intern'
+//   - leads.platform = 'reddit'
+//   - drafts.payload.kind = 'reply' (Reddit is replies-only; no DM lane)
+//
+// Orion has no send WORKER — the Reddit actuator (browser extension) posts the
+// approved replies automatically. The approvals UI these readers feed treats a
+// pending reply as approved (auto-sent; Skip to veto). The watched
+// targets are SUBREDDITS (noelle.reddit_watchlist), not people — so there is no
+// per-person profile join; thread/subreddit/author come straight off the lead
+// payload (mirrors the X lead payload shape: text + author_handle + url).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The org's Reddit intern instance, if one is provisioned. Tenancy via assertMember. */
+export const getRedditInternInstance = cache(async (
+  orgId: string,
+): Promise<NoelleAgentInstance | null> => {
+  const userId = await getRequiredUserId();
+  await assertMember(orgId, userId);
+  const rows = await readSql<NoelleAgentInstance[]>`
+    select * from noelle.agent_instances
+    where org_id = ${orgId} and role = 'reddit_intern'
+    limit 1
+  `;
+  return rows[0] ?? null;
+});
+
+/** Count of subreddits on the Reddit intern's watchlist (its whole targeting model). */
+export async function countRedditWatchlistSubreddits(
+  instanceId: string,
+): Promise<number> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return 0;
+  const rows = await readSql<Array<{ n: number }>>`
+    select count(*)::int as n
+    from noelle.reddit_watchlist
+    where agent_instance_id = ${inst.id} and org_id = ${inst.org_id}
+  `;
+  return rows[0]?.n ?? 0;
+}
+
+/** A subreddit on the Reddit intern's watchlist, for the dashboard editor. */
+export interface RedditWatchlistRow {
+  id: string;
+  subreddit: string;
+  objective: string | null;
+  min_score: number | null;
+  added_at: string;
+}
+
+/** Every subreddit on the Reddit intern's watchlist (its whole targeting model). */
+export async function getRedditWatchlistForInstance(
+  instanceId: string,
+): Promise<RedditWatchlistRow[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+  const rows = await readSql<RedditWatchlistRow[]>`
+    select id, subreddit, objective, min_score, added_at
+    from noelle.reddit_watchlist
+    where agent_instance_id = ${inst.id} and org_id = ${inst.org_id}
+    order by added_at asc
+  `;
+  return [...rows];
+}
+
+/** Count of pending REPLY approvals for the Reddit intern instance (per-lead). */
+export async function countPendingRedditApprovals(
+  instanceId: string,
+): Promise<number> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return 0;
+  const rows = await readSql<Array<{ n: number }>>`
+    select count(distinct l.id)::int as n
+    from noelle.approvals a
+    join noelle.drafts d on d.id = a.draft_id
+    join noelle.leads  l on l.id = d.lead_id
+    where a.agent_instance_id = ${inst.id}
+      and a.status = 'pending'
+      and l.platform = 'reddit'
+      and coalesce(d.payload->>'kind', 'reply') = 'reply'
+  `;
+  return rows[0]?.n ?? 0;
+}
+
+/**
+ * Total pending approvals across ALL of an org's agents — Vega (X), Lyra (LinkedIn),
+ * and Orion (Reddit) — counted per reply-lead. This is the number the nav-rail badge
+ * shows, and it MUST equal the sum of the per-agent tab badges on the Approvals page.
+ *
+ * It reuses the exact per-agent count functions (resolving each agent's instance the
+ * same way the Approvals page does), so the badge can't drift from the tabs. The old
+ * nav code passed `org.id` straight into the instance-keyed LinkedIn counter — which
+ * looked up an agent instance by org id, found none, and returned 0 — and omitted
+ * Reddit entirely, so the badge under-reported (it showed only Vega's count while the
+ * tabs summed higher).
+ */
+export async function countPendingApprovalsAcrossAgents(orgId: string): Promise<number> {
+  const [xPending, linkedinInst, redditInst] = await Promise.all([
+    countPendingApprovalsForOrg(orgId).catch(() => 0),
+    getLinkedInInternInstance(orgId).catch(() => null),
+    getRedditInternInstance(orgId).catch(() => null),
+  ]);
+  const [linkedinPending, redditPending] = await Promise.all([
+    linkedinInst ? countPendingLinkedInApprovals(linkedinInst.id).catch(() => 0) : 0,
+    redditInst ? countPendingRedditApprovals(redditInst.id).catch(() => 0) : 0,
+  ]);
+  return xPending + linkedinPending + redditPending;
+}
+
+/** One Reddit approval, flattened for the inbox + detail surfaces. */
+export interface RedditApprovalView {
+  approvalId: string;
+  status: string;
+  createdAt: string;
+  /** Reddit author (u/<handle>), from the lead payload. */
+  authorHandle: string | null;
+  /** Subreddit the thread lives in (r/<subreddit>). */
+  subreddit: string | null;
+  /** Thread title, when discovery captured it. */
+  threadTitle: string | null;
+  /** Thread body / selftext. */
+  postText: string | null;
+  /** Permalink to the Reddit thread. */
+  postUrl: string | null;
+  /** The thread's own creation time (ISO), when captured. */
+  postedAt: string | null;
+  /** Resolved reply body (edited_body → body). */
+  body: string | null;
+}
+
+interface RedditJoinedRow {
+  approval_id: string;
+  status: string;
+  created_at: string;
+  draft_payload: unknown;
+  lead_payload: unknown;
+  lead_author_handle: string | null;
+}
+
+function toRedditApprovalView(r: RedditJoinedRow): RedditApprovalView {
+  const dp = draftPayload({ payload: r.draft_payload } as NoelleDraft);
+  const lf = redditLeadFields(r.lead_payload);
+  const body = bodyForSelectedAngle(dp) ?? null;
+  return {
+    approvalId: r.approval_id,
+    status: r.status,
+    createdAt: r.created_at,
+    authorHandle: lf.authorHandle ?? r.lead_author_handle ?? null,
+    subreddit: lf.subreddit,
+    threadTitle: lf.threadTitle,
+    postText: lf.postText,
+    postUrl: lf.postUrl,
+    postedAt: lf.postedAt,
+    body,
+  };
+}
+
+/** Filter/sort options for the Reddit approvals inbox (mirrors LinkedIn's). */
+export interface ListPendingRedditApprovalsOptions {
+  status?: ApprovalStatusFilter;
+  watchlist?: ApprovalWatchlistFilter;
+  sort?: "newest_post" | "oldest";
+  lastBatchSince?: string | null;
+  /** Default true: one representative row per thread. */
+  dedupe?: boolean;
+}
+
+export async function listPendingRedditApprovals(
+  instanceId: string,
+  limit = 300,
+  opts: ListPendingRedditApprovalsOptions = {},
+): Promise<RedditApprovalView[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+  const status = opts.status ?? "pending";
+  const watchlist = opts.watchlist ?? "all";
+  const sort = opts.sort ?? "newest_post";
+  const lastBatchSince = opts.lastBatchSince ?? null;
+  // Dynamic filters/sort use BOUND VALUES + SQL case/or — NOT conditional `sql`
+  // fragments (postgres.js throws "syntax error near order/desc" on those).
+  const rows = await readSql<RedditJoinedRow[]>`
+    select
+      a.id            as approval_id,
+      a.status        as status,
+      a.created_at    as created_at,
+      d.payload       as draft_payload,
+      l.payload       as lead_payload,
+      l.author_handle as lead_author_handle
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    where a.agent_instance_id = ${inst.id}
+      and l.platform = 'reddit'
+      and (${status} = 'all' or a.status = ${status})
+      and (${watchlist} = 'all'
+           or (${watchlist} = 'only' and l.priority = true)
+           or (${watchlist} = 'exclude' and (l.priority is null or l.priority = false)))
+      and (${lastBatchSince}::timestamptz is null
