@@ -198,3 +198,203 @@ export async function runAccountFeederTick(deps: FeederTickDeps): Promise<Feeder
       }
       // Non-quota per-source failure: fail-open, keep going with other sources.
       log.error(
+        { instance: instance.id, source: source.handle, err: (err as Error).message },
+        "feeder source pull failed; skipping this source",
+      );
+    }
+  }
+
+  // ---- Phase 2: fan out Gemini style extractors (one per pulled source) -----
+  let profilesWritten = 0;
+  if (extractable.length > 0) {
+    const outcomes = await batchMap(
+      extractable,
+      (source) => extractAndUpsert(deps, source),
+      { concurrency },
+    );
+    for (let i = 0; i < outcomes.length; i++) {
+      const outcome = outcomes[i]!;
+      if (outcome.ok && outcome.value) {
+        profilesWritten++;
+      } else if (!outcome.ok) {
+        // One extraction failing never loses the corpus — it's already stored.
+        log.error(
+          { instance: instance.id, source: extractable[i]?.handle, err: errMsg(outcome.error) },
+          "style extraction failed for source; corpus retained, profile skipped",
+        );
+      }
+    }
+  }
+
+  // ---- Phase 3: dense-embed corpus rows (one-time backfill + newly pulled) ---
+  // Voyage voyage-3-large → the pgvector `embedding` column the F4b hybrid ranker
+  // fuses with the rerank. Fail-open at every step: any missing dep, no key, an
+  // empty embed result, or an error leaves rows un-embedded (the ranker simply
+  // skips the dense half) and never fails the run.
+  let embeddedRows = 0;
+  if (deps.embed && deps.listUnembeddedStylePosts && deps.updateStylePostEmbeddings) {
+    try {
+      const missing = await deps.listUnembeddedStylePosts(instance.id, EMBED_MAX_PER_TICK);
+      for (let i = 0; i < missing.length; i += EMBED_CHUNK) {
+        const chunk = missing.slice(i, i + EMBED_CHUNK);
+        const vectors = await deps.embed(chunk.map((r) => r.body));
+        // Fail-open: voyageEmbed returns [] on any failure / a partial result.
+        if (vectors.length !== chunk.length) break;
+        const updates = chunk.map((r, j) => ({ id: r.id, body: r.body, embedding: vectors[j]! }));
+        embeddedRows += await deps.updateStylePostEmbeddings(updates);
+      }
+    } catch (err) {
+      log.warn(
+        { instance: instance.id, err: errMsg(err) },
+        "style embedding pass failed; corpus retained un-embedded (dense ranker falls back to rerank)",
+      );
+    }
+  }
+
+  log.info(
+    { instance: instance.id, sourcesPulled, corpusRows, profilesWritten, embeddedRows, quotaError: quotaError ?? null },
+    "account feeder tick complete",
+  );
+  return { sourcesPulled, corpusRows, profilesWritten, embeddedRows, ...(quotaError ? { quotaError } : {}) };
+}
+
+/**
+ * Pull a single source's recent timeline (originals + authored replies) via one
+ * Apify `userTweets` call, drop reposts, and split by is_reply into corpus rows:
+ * originals → kind='post' (capped at postLimit), replies → kind='comment' (capped
+ * at commentLimit). One metered Apify run per source.
+ */
+async function pullSourceCorpus(
+  deps: FeederTickDeps,
+  source: FeederSource,
+  limits: { postLimit: number; commentLimit: number },
+): Promise<StylePostUpsert[]> {
+  const { instance, recorder, credentialId } = deps;
+  const rows: StylePostUpsert[] = [];
+
+  // `from:` search returns the account's originals AND replies in one read; pull
+  // enough to fill both buckets, then classify + cap each below.
+  const { tweets } = await withMeteredApifyCall({
+    client: deps.apify, recorder, log: deps.log,
+    orgId: instance.org_id, instanceId: instance.id, agentRole: "x_intern",
+    worker: "x_feeder", actor: X_SCRAPER_ACTOR, startedAt: new Date(),
+    credentialId: credentialId ?? null,
+  }, operation => operation.userTweets({
+    handle: source.handle,
+    limit: limits.postLimit + limits.commentLimit,
+  }));
+
+  let posts = 0;
+  let comments = 0;
+  for (const t of tweets) {
+    if (!t.id || !t.text) continue;
+    // A native retweet lands on a stranger's words, not the account's own voice.
+    if (t.is_repost) continue;
+    const isReply = t.is_reply === true;
+    if (isReply) {
+      if (comments >= limits.commentLimit) continue;
+      comments++;
+    } else {
+      if (posts >= limits.postLimit) continue;
+      posts++;
+    }
+    rows.push({
+      orgId: instance.org_id,
+      agentInstanceId: instance.id,
+      platform: source.platform,
+      accountHandle: source.handle,
+      externalId: t.id,
+      kind: isReply ? "comment" : "post",
+      body: t.text,
+      // Missing source counts retain unknown measurement provenance.
+      likeCount: readSourceCount(t.likes),
+      commentCount: readSourceCount(t.replies),
+      repostCount: readSourceCount(t.reposts),
+      raw: t,
+      postedAt: t.created_at || null,
+    });
+  }
+
+  return rows;
+}
+
+/** Read one source's stored corpus, run the extractor, and upsert its profile. */
+async function extractAndUpsert(deps: FeederTickDeps, source: FeederSource): Promise<boolean> {
+  const { instance, log } = deps;
+  const corpus = await deps.getCorpus({
+    agentInstanceId: instance.id,
+    platform: source.platform,
+    accountHandle: source.handle,
+    limit: DEFAULT_CORPUS_FOR_EXTRACT,
+  });
+  if (corpus.length === 0) {
+    log.info({ source: source.handle }, "no stored corpus for source; skipping extraction");
+    return false;
+  }
+
+  const res = await deps.extractor.call({
+    system: SYSTEM_STYLE_EXTRACTOR,
+    prompt: renderExtractorPrompt(source, corpus),
+    model: STYLE_EXTRACTOR_MODEL,
+  });
+
+  const parsed = UltraProfileOutput.safeParse(extractJson(res.text));
+  if (!parsed.success) {
+    log.error(
+      { source: source.handle, raw: res.text.slice(0, 200) },
+      "style extractor output schema fail; skipping profile (corpus retained)",
+    );
+    return false;
+  }
+
+  const rollup = computePerfRollup(corpus);
+  await deps.upsertUltraProfile({
+    orgId: instance.org_id,
+    agentInstanceId: instance.id,
+    platform: source.platform,
+    accountHandle: source.handle,
+    voiceSummary: parsed.data.voice_summary,
+    tone: parsed.data.tone,
+    structureNotes: parsed.data.structure_notes,
+    hookPatterns: parsed.data.hook_patterns.slice(0, 8),
+    signaturePhrases: parsed.data.signature_phrases.slice(0, 8),
+    topTopics: parsed.data.top_topics.slice(0, 8),
+    avgLikeCount: rollup.avgLikeCount,
+    avgCommentCount: rollup.avgCommentCount,
+    postsAnalyzed: rollup.postsAnalyzed,
+    samplePostIds: rollup.samplePostIds,
+    model: STYLE_EXTRACTOR_MODEL,
+  });
+  return true;
+}
+
+function renderExtractorPrompt(source: FeederSource, corpus: CorpusItem[]): string {
+  const who = source.displayName ?? source.handle;
+  const posts = corpus.filter((c) => c.kind === "post");
+  const comments = corpus.filter((c) => c.kind === "comment");
+  const lines: string[] = [
+    `Extract the writing STYLE of this X account: ${who} (x.com/${source.handle}).`,
+    "",
+    `POSTS they wrote (${posts.length}), with engagement:`,
+    ...posts.map((p, i) => `[P${i + 1}] (${p.likeCount ?? "unknown"} likes, ${p.commentCount ?? "unknown"} replies) ${oneLine(p.body)}`),
+  ];
+  if (comments.length > 0) {
+    lines.push(
+      "",
+      `REPLIES they wrote on others' posts (${comments.length}) — their real reply voice:`,
+      ...comments.map((c, i) => `[C${i + 1}] (${c.likeCount ?? "unknown"} likes) ${oneLine(c.body)}`),
+    );
+  }
+  lines.push(
+    "",
+    "Output the strict JSON style object specified in the system prompt. Ground every field ONLY in the text above; do not invent. First char `{`, last char `}`.",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Whether an error is an Apify quota/concurrency wall that must SURFACE (402 usage
+ * cap, 429 too-many-runs, 403 monthly cap) or an "all tokens exhausted" rotation
+ * failure. Matched by ApifyXError.status and by name (AllApifyTokensExhaustedError
+ * is thrown from the rotating client and isn't importable here without a cycle, so
+ * match by name) — both mean the operator hit their cost gate.
