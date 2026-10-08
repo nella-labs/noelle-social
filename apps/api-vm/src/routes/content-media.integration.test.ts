@@ -198,3 +198,99 @@ describe.skipIf(!url)("content media bindings (native PostgreSQL)", () => {
     } finally {
       await sql.unsafe('drop trigger reject_media_upload on noelle.content_media; drop function noelle.reject_media_upload()');
     }
+  });
+  it("can clean up a crashed never-ready upload after its former parent was published", async () => {
+    const own = await seed(), id = await asset(own);
+    await sql`update noelle.content_media set status='uploading',url=null,
+      updated_at=now()-interval '1 hour' where id=${id}`;
+    await sql`update noelle.post_drafts set status='published' where id=${own.draftId}`;
+    const [before] = await sql`select storage_key from noelle.content_media where id=${id}`;
+    expect((await remove(id)).status).toBe(200);
+    expect(effects.remove).toHaveBeenCalledWith(before!.storage_key);
+    expect(await sql`select id from noelle.content_media where id=${id}`).toHaveLength(0);
+  });
+  it("retains a crashed upload cleanup claim when storage fails and retries its same key", async () => {
+    const id = await asset();
+    await sql`update noelle.content_media set status='uploading',url=null,
+      updated_at=now()-interval '1 hour' where id=${id}`;
+    const [before] = await sql`select storage_key from noelle.content_media where id=${id}`;
+    effects.remove.mockRejectedValueOnce(Error("cleanup unavailable"));
+    expect((await remove(id)).status).toBe(503);
+    expect((await sql`select status,storage_key from noelle.content_media where id=${id}`)[0])
+      .toEqual({ status: "deleting", storage_key: before!.storage_key });
+    expect((await remove(id)).status).toBe(200);
+    expect(effects.remove.mock.calls.map(call => call[0])).toEqual([before!.storage_key, before!.storage_key]);
+  });
+  it("does not clean up an active upload even when its persisted timestamp is old", async () => {
+    effects.put.mockImplementationOnce(async () => {
+      const [pending] = await sql`select id from noelle.content_media`;
+      await sql`update noelle.content_media set updated_at=now()-interval '1 hour' where id=${pending!.id}`;
+      expect((await remove(pending!.id)).status).toBe(409);
+      expect(effects.remove).not.toHaveBeenCalled();
+      return { url: "https://fixture.invalid/media" };
+    });
+    expect((await upload({ orgId: org })).status).toBe(200);
+    expect((await sql`select status from noelle.content_media`)[0]).toEqual({ status: "ready" });
+  });
+  it("does not expire the upload lease under a shorter database idle timeout", async () => {
+    const pool = postgres(url!, { max: 2, onnotice: () => {}, connection: { idle_in_transaction_session_timeout: 50 } });
+    __setDbClientForTests(pool);
+    effects.put.mockImplementationOnce(async () => {
+      const [pending] = await sql`select id from noelle.content_media`;
+      await sql`update noelle.content_media set updated_at=now()-interval '1 hour' where id=${pending!.id}`;
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect((await remove(pending!.id)).status).toBe(409);
+      expect(effects.remove).not.toHaveBeenCalled();
+      return { url: "https://fixture.invalid/media" };
+    });
+    try { expect((await upload({ orgId: org })).status).toBe(200); }
+    finally { __setDbClientForTests(sql); await pool.end({ timeout: 0 }); }
+  });
+  it("finishes two parallel uploads using only their two transaction connections", async () => {
+    const pool = postgres(url!, { max: 2, onnotice: () => {} });
+    __setDbClientForTests(pool);
+    let started = 0, safetyReleased = false, release!: () => void;
+    let deadlineTimer: NodeJS.Timeout | undefined;
+    const both = new Promise<void>(resolve => { release = resolve; });
+    const safety = setTimeout(() => { safetyReleased = true; release(); }, 1500);
+    effects.put.mockImplementation(async () => {
+      if (++started === 2) release();
+      await both; return { url: "https://fixture.invalid/media" };
+    });
+    try {
+      const requests = Promise.all([upload({ orgId: org }), upload({ orgId: org })]);
+      const deadline = new Promise<never>((_resolve, reject) => { deadlineTimer = setTimeout(() => {
+        void pool.end({ timeout: 0 }); reject(Error("parallel upload connection deadlock"));
+      }, 3000).unref(); });
+      const results = await Promise.race([requests, deadline]);
+      expect(results.map(response => response.status)).toEqual([200, 200]);
+      expect(started).toBe(2); expect(safetyReleased).toBe(false);
+      expect(await sql`select id from noelle.content_media where status='ready'`).toHaveLength(2);
+    } finally { clearTimeout(safety); clearTimeout(deadlineTimer); release(); __setDbClientForTests(sql); await pool.end({ timeout: 0 }); }
+  });
+  it("rejects an explicit draft and contradictory idea during relinking", async () => {
+    const own = await seed(), different = await seed(), id = await asset();
+    expect((await patch(id, { draftId: own.draftId, ideaId: different.ideaId })).status).toBe(400);
+    expect((await sql`select draft_id,idea_id from noelle.content_media where id=${id}`)[0]).toEqual({ draft_id: null, idea_id: null });
+  });
+  it("idea-only relinking clears the prior draft and derives the new owning instance", async () => {
+    const own = await seed(), next = await seed(org, other), id = await asset(own);
+    expect((await patch(id, { ideaId: next.ideaId })).status).toBe(200);
+    expect((await sql`select draft_id,idea_id,agent_instance_id from noelle.content_media where id=${id}`)[0])
+      .toEqual({ draft_id: null, idea_id: next.ideaId, agent_instance_id: other });
+  });
+  it("does not overwrite a newer draft binding read after authorization", async () => {
+    const own = await seed(), next = await seed(), id = await asset(own);
+    effects.onCheck = async () => { effects.onCheck = undefined;
+      await sql`update noelle.content_media set idea_id=${next.ideaId},draft_id=${next.draftId} where id=${id}`; };
+    expect((await patch(id, { ideaId: next.ideaId })).status).toBe(200);
+    expect((await sql`select draft_id,idea_id from noelle.content_media where id=${id}`)[0])
+      .toEqual({ draft_id: next.draftId, idea_id: next.ideaId });
+  });
+  it("cannot relink an asset moved to a foreign organization during authorization", async () => {
+    const own = await seed(), id = await asset();
+    effects.onCheck = async () => { effects.onCheck = undefined; await sql`update noelle.content_media set org_id=${foreign} where id=${id}`; };
+    expect((await patch(id, { draftId: own.draftId })).status).toBe(404);
+    expect((await sql`select org_id,draft_id from noelle.content_media where id=${id}`)[0]).toEqual({ org_id: foreign, draft_id: null });
+  });
+});
