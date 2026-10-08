@@ -598,3 +598,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
         const digest = renderCommentDigest(siblings, { sampleMax: 8 });
         if (digest) siblingBlock = digest;
       }
+
+      // Energy hint: a one-line nudge to MIRROR the thread's energy. Only for
+      // non-analytical energies; analytical stays byte-identical.
+      const energyHint = postEnergy ? renderEnergyHint(postEnergy) : undefined;
+
+      // Deterministic comment targeting: when on + the top comment clears the
+      // score floor, this draft replies to THAT comment (not the post). The
+      // comment body is UNTRUSTED — it's fenced in the prompt like the post.
+      const commentTarget = decideCommentTarget({
+        topComments: payload.topComments,
+        postId: lead.external_id,
+        ...(payload.subreddit !== undefined ? { subreddit: payload.subreddit } : {}),
+        enabled: commentTargeting?.enabled ?? false,
+        minScore: commentTargeting?.minScore ?? 0,
+      });
+
+      // Bind optional per-person memory to the same recipient as the reply.
+      const priorReplies = getPriorReplies
+        ? await getPriorReplies({
+            authorHandle: commentTarget ? null : lead.author_handle,
+            authorId: commentTarget ? null : lead.author_id,
+            ...(commentTarget ? { replyTarget: { kind: "comment" as const, author: commentTarget.author } } : {}),
+            excludeLeadId: lead.id,
+            limit: priorRepliesTopK,
+          }).catch(() => [])
+        : [];
+
+      const common: DraftCommonArgs = {
+        voiceExemplars: args.voiceExemplars,
+        lead,
+        postText,
+        payload,
+        anchors,
+        knowledgeAnchors,
+        imageCaption,
+        brand,
+        instance,
+        routing,
+        runner,
+        postOutbound,
+        markStatus,
+        log,
+        verify,
+        registerBlock,
+        shapeBlock,
+        genzBlock,
+        openingMoveBlock,
+        ...(energyHint ? { energyHint } : {}),
+        ...(siblingBlock ? { siblingBlock } : {}),
+        allowCelebration: postEnergy === "celebration",
+        priorReplies,
+        recentPhrasings,
+        fenceUntrusted,
+        commentTarget,
+        patternRules,
+      };
+
+      let ok: boolean;
+      if (replyKind === "light") {
+        ok = await draftLight(common);
+      } else {
+        const tier: "T1" | "T2" | "T3" = lead.tier ?? "T3";
+        ok = await draftSubstantial({ ...common, tier });
+      }
+      if (ok) {
+        processed++;
+        remaining[replyKind]--;
+        await bus?.emit({
+          topic: "draft.created",
+          worker: "drafter",
+          summary: `drafted ${replyKind} reply`,
+          payload: { lead_id: lead.id, reply_kind: replyKind, tier: lead.tier ?? null },
+          correlationId: lead.id,
+        });
+      }
+    } catch (err) {
+      if (err instanceof BudgetExceededError) {
+        log.warn(
+          { leadId: lead.id, layer: err.layer, spent_cents: err.spentCents, cap_cents: err.capCents },
+          "drafter blocked by budget cap; marking lead errored, will not retry",
+        );
+        await markStatus({
+          leadId: lead.id,
+          status: "errored",
+          meta: {
+            error: "budget_exceeded",
+            layer: err.layer,
+            spent_cents: err.spentCents,
+            cap_cents: err.capCents,
+            estimated_cents: err.estimatedCents,
+          },
+        });
+        continue;
+      }
+      log.error({ leadId: lead.id, err: (err as Error).message }, "drafter tick failed for lead");
+      await markStatus({ leadId: lead.id, status: "errored", meta: { error: (err as Error).message } });
+    }
+  }
+  return processed;
+}
+
+interface DraftCommonArgs {
+  /**
+   * The operator's approved replies paired with the posts they answered.
+   * Fetched once per tick — the set barely moves between leads.
+   */
+  voiceExemplars?: ReadonlyArray<{ post: string; reply: string }>;
+
+  lead: LeadRow;
+  postText: string;
+  payload: RedditPayload;
+  anchors: Array<{ snippet: string; score: number }>;
+  knowledgeAnchors: string[];
+  imageCaption: string;
+  brand: ReturnType<typeof parseBrandConfig>;
+  instance: ActiveInstance;
+  routing: ModelRouting;
+  runner: CodexRunner;
+  postOutbound: (body: OutboundIn) => Promise<{ id: string; approval_id: string }>;
+  markStatus: (args: { leadId: string; status: "drafted" | "errored" | "skipped"; meta?: Record<string, unknown> }) => Promise<void>;
+  log: Logger;
+  verify?: {
+    enabled: boolean;
+    retries: number;
+    makeCalls: (priority: boolean) => VerifierCall[];
+    voiceFloor?: number;
+  };
+  registerBlock?: string;
+  /**
+   * The standalone "THIS REPLY'S ASSIGNED SHAPE" block, rendered in the register
+   * slot (mutually exclusive — both claim comment length).
+   */
+  shapeBlock?: string;
+  /** The gen-z "SPOKEN REGISTER" marker block, or undefined when none was offered. */
+  genzBlock?: string;
+  openingMoveBlock?: string;
+  /** "POST ENERGY: …" mirror hint (renderEnergyHint), or undefined when off/analytical. */
+  energyHint?: string;
+  /** "THE ROOM" sibling-comment digest (renderCommentDigest), or undefined when off/empty. */
+  siblingBlock?: string;
+  /** True when the post reads as a celebration → tell the verifier warm/hype is allowed. */
+  allowCelebration?: boolean;
+  priorReplies?: string[];
+  recentPhrasings?: string[];
+  fenceUntrusted?: boolean;
+  /** The targeted top comment for this lead, or null when replying to the post. */
+  commentTarget?: RedditTopComment | null;
+  /** Active Pattern Breaker rules ([] when the breaker is off / has learned none). */
+  patternRules: DynamicPattern[];
+}
+
+/** The review source follows the same post or comment recipient as the writer. */
+function replyReviewSource(args: Pick<DraftCommonArgs, "lead" | "postText" | "commentTarget">):
+  Pick<VerifyContext, "postText" | "authorHandle"> {
+  const target = args.commentTarget;
+  if (!target) return { postText: args.postText, authorHandle: args.lead.author_handle };
+  return {
+    authorHandle: target.author || null,
+    postText: [
+      `COMMENT BEING REPLIED TO${target.author ? ` by ${target.author}` : ""}:`,
+      target.body,
+      "",
+      `ORIGINAL THREAD POST (context only)${args.lead.author_handle ? ` by ${args.lead.author_handle}` : ""}:`,
+      args.postText,
+    ].join("\n"),
+  };
+}
+
+/**
+ * Shared post-draft VERIFIER + regenerate loop for both paths. Off by default;
+ * when enabled, grade the drafts against the grounding context and, on a failing
+ * verdict, regenerate with the critique appended (up to `verify.retries`), keeping
+ * a passing attempt first, otherwise the highest-scoring failing attempt.
+ * Fail-open throughout.
+ *
+ * NOTE on charLimit: Reddit has no hard per-comment character cap, so we OMIT
+ * charLimit — the format check only flags em-dashes / choppiness, not length.
+ */
+async function runVerifyLoop<T>(args: {
+  initial: T;
+  toDrafts: (d: T) => DraftToVerify[];
+  regenerate: (fixPrompt: string) => Promise<T | null>;
+  basePrompt: string;
+  ctx: VerifyContext;
+  calls: VerifierCall[];
+  retries: number;
+  leadId: string;
+  log: Logger;
+}): Promise<{ best: T; meta: NonNullable<OutboundIn["verifierMeta"]> }> {
+  const { initial, toDrafts, regenerate, basePrompt, ctx, calls, retries, leadId, log } = args;
+  const total = (v: DraftVerdict) =>
+    v.scores.voice + v.scores.grounding + v.scores.relevance + v.scores.format + v.scores.novelty + v.scores.diversity;
+  let best = initial;
+  let bestVerdict = await verifyTiered(toDrafts(initial), ctx, calls);
+  let attempts = 0;
+  while (!bestVerdict.pass && attempts < retries) {
+    attempts++;
+    const fix = bestVerdict.fix ?? "make the comments more specific, grounded, and on-voice";
+    const fixPrompt = `${basePrompt}\n\nREVIEW FEEDBACK — an editor rejected the previous attempt: ${fix}\nRewrite all comments to fix this. Keep the exact strict JSON output shape.`;
+    let candidate: T | null = null;
