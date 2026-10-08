@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template. install.sh substitutes the configured paths and vault prefix
+     and writes the result to ~/Library/LaunchAgents/. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.noelle.vault-daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>exec "__RUN_SCRIPT__"</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/noelle-vault-daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/noelle-vault-daemon.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>VAULT_DIR</key>
+    <string>__VAULT_DIR__</string>
+    <key>NOELLE_VAULT_PREFIX</key>
+    <string>__VAULT_PREFIX__</string>
+  </dict>
+</dict>
+</plist>

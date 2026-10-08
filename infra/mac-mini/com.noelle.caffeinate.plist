@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps the Mac mini's system awake so the pm2 workers and the Chrome actuator
+  keep running unattended. LaunchAgent (per-user), NOT a LaunchDaemon: browser
+  automation needs the logged-in GUI session. Display sleep is intentionally NOT
+  prevented (-i -s only) so the screens can go dark overnight; that does not lock
+  the session or stop CDP input. Install to ~/Library/LaunchAgents via
+  infra/mac-mini/harden-mac-mini.sh.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.noelle.caffeinate</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>-s</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/noelle-caffeinate.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/noelle-caffeinate.log</string>
+</dict>
+</plist>
