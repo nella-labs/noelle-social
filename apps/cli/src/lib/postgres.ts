@@ -198,3 +198,42 @@ export async function recoverNativePostgres(args: {
     }
     try {
       rmSync(pidFile);
+      cleared = true;
+      const why =
+        pid === null ? "unparsable" : alive ? `pid ${pid} is now "${command}"` : `pid ${pid} is dead`;
+      args.log(`cleared stale postmaster.pid in ${dir} (${why})`);
+    } catch (err) {
+      args.log(`could not remove stale postmaster.pid in ${dir}: ${(err as Error).message}`);
+    }
+  }
+  if (process.platform !== "darwin") {
+    return { clearedStaleLock: cleared, kickedService: false, detail: "service kick skipped (not darwin)" };
+  }
+  const brew = await run(brewBin(), ["services", "restart", service], { allowFailure: true });
+  if (brew.code === 0) {
+    args.log(`brew services restart ${service} ok`);
+    return { clearedStaleLock: cleared, kickedService: true, detail: service };
+  }
+  args.log(
+    `brew services restart ${service} failed: ${(brew.stderr || brew.stdout).trim().slice(-200)}`,
+  );
+  return { clearedStaleLock: cleared, kickedService: false, detail: "brew restart failed" };
+}
+
+/** Set the noelle_app role password to the generated app password. */
+export async function setAppPassword(adminUrl: string, appPassword: string): Promise<void> {
+  const sql = postgres(adminUrl, { max: 1, ssl: false, onnotice: () => {} });
+  try {
+    // noelle_app is created by 0001; ensure it exists then set its password.
+    await sql.unsafe(`
+      do $$ begin
+        if not exists (select 1 from pg_roles where rolname = 'noelle_app') then
+          create role noelle_app login;
+        end if;
+      end $$;
+    `);
+    await sql.unsafe(`alter role noelle_app with login password '${appPassword.replace(/'/g, "''")}'`);
+  } finally {
+    await sql.end({ timeout: 1 }).catch(() => {});
+  }
+}
