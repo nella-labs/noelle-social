@@ -198,3 +198,81 @@ describe("listRepliedPeopleNeedingProfile", () => {
         author_public_id: "ACwAABlDYv4BnnBKfPQRpeO8bEiD6KWZWZw7Z2s",
         name: "Phil P.",
         headline: "Founder",
+        post_url: "https://www.linkedin.com/posts/pallifrone_a-activity-1-x",
+        replies: 17,
+      },
+    ]);
+    const out = await listRepliedPeopleNeedingProfile(t.sql, {
+      agentInstanceId: "i",
+      minReplies: 5,
+      windowDays: 90,
+      staleDays: 3,
+      batch: 3,
+    });
+    expect(out[0]).toEqual({
+      fsdProfileId: "ACwAABlDYv4BnnBKfPQRpeO8bEiD6KWZWZw7Z2s",
+      publicId: "ACwAABlDYv4BnnBKfPQRpeO8bEiD6KWZWZw7Z2s",
+      name: "Phil P.",
+      headline: "Founder",
+      postUrl: "https://www.linkedin.com/posts/pallifrone_a-activity-1-x",
+      replies: 17,
+    });
+
+    const off = tagged();
+    expect(
+      await listRepliedPeopleNeedingProfile(off.sql, {
+        agentInstanceId: "i",
+        minReplies: 5,
+        windowDays: 90,
+        staleDays: 3,
+        batch: 0,
+      }),
+    ).toEqual([]);
+    expect(off.fragments).toHaveLength(0);
+  });
+});
+
+describe("getWatchlistProfiles", () => {
+  const rows = [
+    {
+      fsd_profile_id: "ACoAAFX4vD8BaZrzmCr01DbMFhT1VdnWcYePU94",
+      public_id: "Kaia-Tham",
+      summary: "ships fast",
+      topics: ["agents"],
+      tone: "warm",
+      engagement_notes: "ask real questions",
+    },
+  ];
+  const sqlWith = (r: unknown[]) =>
+    Object.assign(vi.fn(async () => r), { json: (x: unknown) => x }) as never;
+
+  it("keys profiles by fsd id AND by the lowercased vanity slug", async () => {
+    // The drafter's primary key is lead.author_id (fsd), but keyword-lane leads
+    // have author_id = null — without the slug alias their profile is written,
+    // paid for, and then never read at draft time.
+    const map = await getWatchlistProfiles(sqlWith(rows), "i");
+    expect(map.get("ACoAAFX4vD8BaZrzmCr01DbMFhT1VdnWcYePU94")?.summary).toBe("ships fast");
+    expect(map.get("kaia-tham")?.summary).toBe("ships fast");
+    expect(map.get("kaia-tham")).toBe(map.get("ACoAAFX4vD8BaZrzmCr01DbMFhT1VdnWcYePU94"));
+  });
+
+  it("never lets one person's slug shadow another person's fsd key", async () => {
+    const map = await getWatchlistProfiles(
+      sqlWith([
+        { ...rows[0], fsd_profile_id: "sameid", public_id: "other", summary: "real fsd row" },
+        { ...rows[0], fsd_profile_id: "x", public_id: "sameid", summary: "slug alias row" },
+      ]),
+      "i",
+    );
+    expect(map.get("sameid")?.summary).toBe("real fsd row");
+  });
+
+  it("skips rows with no slug and tolerates a non-array topics value", async () => {
+    const map = await getWatchlistProfiles(
+      sqlWith([{ ...rows[0], public_id: null, topics: null }]),
+      "i",
+    );
+    expect(map.size).toBe(1);
+    expect(map.get("ACoAAFX4vD8BaZrzmCr01DbMFhT1VdnWcYePU94")?.topics).toEqual([]);
+  });
+});
