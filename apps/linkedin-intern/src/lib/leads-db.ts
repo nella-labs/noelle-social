@@ -598,3 +598,111 @@ async function reconcileSavedReplyDrafts(
   const leads = await sql<{ id: string }[]>`
     update noelle.leads l
     set status = 'drafted',
+        payload = l.payload || '{"claim_recovery":"saved_reply"}'::jsonb
+          || case when l.payload ? 'reply_request' then '{"reply_requested":false}'::jsonb else '{}'::jsonb end,
+        updated_at = now()
+    where l.agent_instance_id = ${agentInstanceId}
+      and l.status = 'drafting'
+      and l.updated_at < coalesce(${cutoff}::timestamptz, now() - make_interval(mins => ${STALE_CLAIM_MINUTES}))
+      and exists (
+        select 1 from noelle.drafts d
+        join noelle.approvals a on a.draft_id = d.id
+        where d.lead_id = l.id and d.org_id = l.org_id
+          and a.lead_id = l.id and a.agent_instance_id = l.agent_instance_id
+          and coalesce(d.payload->>'kind', 'reply') = 'reply'
+      )
+    returning l.id
+  `;
+  return { reconciled: leads.length, approvalsRepaired: approvals.length };
+}
+
+/**
+ * A clean worker restart gives us a stronger orphan signal than the ordinary
+ * 45-minute timeout: claims made before this process started have no owner.
+ * A saved reply with its approval is finalized; a reply without an approval
+ * gets an idempotent pending approval first. DM-only and draftless claims are
+ * requeued. Each instance is swept once; a failed query can retry next tick.
+ */
+export function createStartupDraftingRecovery(sql: Sql, startedAt: Date) {
+  const sweptInstances = new Set<string>();
+  return async (agentInstanceId: string): Promise<DraftingRecovery> => {
+    if (sweptInstances.has(agentInstanceId)) return { requeued: 0, reconciled: 0, approvalsRepaired: 0 };
+    const recovered = await reconcileSavedReplyDrafts(sql, agentInstanceId, startedAt);
+    const requeued = await sql<{ id: string }[]>`
+      update noelle.leads l
+      set status = 'classified', updated_at = now()
+      where l.agent_instance_id = ${agentInstanceId}
+        and l.status = 'drafting'
+        and l.updated_at < ${startedAt.toISOString()}::timestamptz
+        and l.updated_at >= now() - make_interval(hours => ${STALE_CLAIM_EXPIRE_HOURS})
+        and not exists (
+          select 1 from noelle.drafts d
+          where d.lead_id = l.id and d.org_id = l.org_id
+            and coalesce(d.payload->>'kind', 'reply') = 'reply'
+        )
+      returning l.id
+    `;
+    sweptInstances.add(agentInstanceId);
+    return { requeued: requeued.length, ...recovered };
+  };
+}
+
+/**
+ * Recover leads stranded mid-claim by a worker crash or restart. The claim RPCs
+ * flip status ('new'→'classifying', 'classified'→'drafting') and the worker
+ * later writes the terminal outcome — but a process death between the two
+ * leaves the lead invisible to every future claim (claims only pick the
+ * pre-claim status), so it is lost silently. Merge-driven deploys restart every
+ * worker, making this a steady leak (2026-07-19: 159 leads stranded at
+ * 'drafting'/'classifying' across the three interns).
+ *
+ * Fresh strands go back to `requeueStatus` for a retry; ones past the expiry
+ * horizon are marked 'skipped' with a payload.stale_claim marker so the
+ * dashboard can tell them apart from classifier skips. Saved replies first
+ * get their approval repaired and lead reconciled; DM-only drafts can requeue.
+ * Runs at the top of every worker tick; the usual match is zero rows.
+ */
+export async function reapStaleClaims(
+  sql: Sql,
+  args: {
+    agentInstanceId: string;
+    /** The mid-claim status this worker owns. */
+    claimedStatus: "classifying" | "observed_classifying" | "drafting";
+    /** The pre-claim status a fresh strand is returned to. */
+    requeueStatus: "new" | "observed" | "classified";
+  },
+): Promise<{ requeued: number; expired: number; reconciled: number; approvalsRepaired: number }> {
+  const recovered = args.claimedStatus === "drafting"
+    ? await reconcileSavedReplyDrafts(sql, args.agentInstanceId, null)
+    : { reconciled: 0, approvalsRepaired: 0 };
+  const requeued = await sql<{ id: string }[]>`
+    update noelle.leads l
+    set status = ${args.requeueStatus}, updated_at = now()
+    where agent_instance_id = ${args.agentInstanceId}
+      and status = ${args.claimedStatus}
+      and updated_at < now() - make_interval(mins => ${STALE_CLAIM_MINUTES})
+      and updated_at >= now() - make_interval(hours => ${STALE_CLAIM_EXPIRE_HOURS})
+      and (${args.claimedStatus} <> 'drafting' or not exists (
+        select 1 from noelle.drafts d
+        where d.lead_id = l.id and d.org_id = l.org_id
+          and coalesce(d.payload->>'kind', 'reply') = 'reply'
+      ))
+    returning id
+  `;
+  const expired = await sql<{ id: string }[]>`
+    update noelle.leads l
+    set status = 'skipped',
+        payload = payload || '{"stale_claim":"expired"}'::jsonb,
+        updated_at = now()
+    where agent_instance_id = ${args.agentInstanceId}
+      and status = ${args.claimedStatus}
+      and updated_at < now() - make_interval(hours => ${STALE_CLAIM_EXPIRE_HOURS})
+      and (${args.claimedStatus} <> 'drafting' or not exists (
+        select 1 from noelle.drafts d
+        where d.lead_id = l.id and d.org_id = l.org_id
+          and coalesce(d.payload->>'kind', 'reply') = 'reply'
+      ))
+    returning id
+  `;
+  return { requeued: requeued.length, expired: expired.length, ...recovered };
+}
