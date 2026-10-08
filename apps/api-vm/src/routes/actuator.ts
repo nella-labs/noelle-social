@@ -1798,3 +1798,131 @@ actuator.post("/api/reddit-activity", async (c) => {
     comment_id: e.comment_id ?? null,
     subreddit: e.subreddit ?? null,
     reason: e.reason ?? null,
+    at: e.at,
+  }));
+  await sql`insert into noelle.reddit_activity ${sql(values)}`;
+  return c.json({ inserted: values.length });
+});
+
+// GET /api/actuator/reddit-extension-build: the Reddit sibling of
+// /api/actuator/x-extension-build — the on-disk build stamp of the unpacked
+// Reddit actuator (`wxt build` writes build-stamp.json next to the manifest;
+// `noelle sync` refreshes it on every merge-driven deploy). The running
+// extension polls this on its 5-minute alarm and chrome.runtime.reload()s
+// itself when the stamp differs from the one compiled into its bundle.
+// Fail-soft: a missing/unreadable stamp file serves { stamp: null } and the
+// extension does nothing. pm2 starts api-vm via `pnpm --filter @noelle/api-vm
+// start`, so cwd is apps/api-vm; the repo-root candidate covers a bare
+// `node dist` start.
+actuator.use("/api/actuator/reddit-extension-build", requireActuatorToken);
+
+actuator.get("/api/actuator/reddit-extension-build", async (c) => {
+  const candidates = process.env.NOELLE_REDDIT_EXT_STAMP_PATH
+    ? [process.env.NOELLE_REDDIT_EXT_STAMP_PATH]
+    : [
+        join(process.cwd(), "../reddit-actuator/.output/chrome-mv3/build-stamp.json"),
+        join(process.cwd(), "apps/reddit-actuator/.output/chrome-mv3/build-stamp.json"),
+      ];
+  for (const p of candidates) {
+    try {
+      const raw = JSON.parse(await readFile(p, "utf8")) as { stamp?: unknown };
+      return c.json({ stamp: typeof raw.stamp === "string" ? raw.stamp : null });
+    } catch {
+      // try the next candidate; fall through to stamp:null when none is readable
+    }
+  }
+  return c.json({ stamp: null });
+});
+
+// GET /api/actuator/reddit-health: the Reddit sibling of /api/actuator/x-health,
+// aggregating noelle.reddit_activity. status: halt = a challenge/throttle in the
+// last hour (stop and back off), warn = one in the last 24h, ok = clean. writes =
+// replies (the only server-served write kind on Reddit). today.upvotes surfaces the
+// operator-opt-in idle-upvote volume (upvote-only, client-capped ≤10/15min).
+actuator.use("/api/actuator/reddit-health", requireActuatorToken);
+
+actuator.get("/api/actuator/reddit-health", async (c) => {
+  const { orgId } = c.get("actuator");
+  const sql = noelleDb();
+  const rows = await sql<Array<{
+    replies_today: number; upvotes_today: number;
+    skips_24h: number; challenges_24h: number; last_challenge_at: string | null;
+  }>>`
+    select
+      (count(*) filter (where type = 'reply'  and created_at >= date_trunc('day', now())))::int as replies_today,
+      (count(*) filter (where type = 'upvote' and created_at >= date_trunc('day', now())))::int as upvotes_today,
+      (count(*) filter (where type = 'skip'   and created_at >= now() - interval '24 hours'))::int as skips_24h,
+      (count(*) filter (where reason in ('challenge', 'throttle') and created_at >= now() - interval '24 hours'))::int as challenges_24h,
+      max(created_at) filter (where reason in ('challenge', 'throttle')) as last_challenge_at
+    from noelle.reddit_activity
+    where organization_id = ${orgId}
+  `;
+  const r = rows[0] ?? {
+    replies_today: 0, upvotes_today: 0,
+    skips_24h: 0, challenges_24h: 0, last_challenge_at: null,
+  };
+  const lastChallengeMs = r.last_challenge_at ? Date.parse(r.last_challenge_at) : 0;
+  const challengeWithinHour = lastChallengeMs > 0 && Date.now() - lastChallengeMs < 3600_000;
+  const status = challengeWithinHour ? "halt" : r.challenges_24h > 0 ? "warn" : "ok";
+  // Same resolver as the serve path (already aligned pre-port); Infinity isn't
+  // JSON — report the unlimited sentinel as null, matching x-health.
+  const writeCap = resolveRedditDailyWriteCap(process.env.NOELLE_REDDIT_ACTUATOR_DAILY_WRITE_CAP);
+  return c.json({
+    status,
+    today: {
+      replies: r.replies_today,
+      upvotes: r.upvotes_today,
+      writes: r.replies_today,
+      writeCap: Number.isFinite(writeCap) ? writeCap : null,
+    },
+    last24h: { skips: r.skips_24h, challenges: r.challenges_24h },
+    lastChallengeAt: r.last_challenge_at,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Notifications actor ingest — "part 2" of the reply system.
+//
+// The actuators' "Auto notifications" run sweeps the platform's notifications
+// page and POSTs the entries that are REPLIES TO US here. Each becomes a
+// noelle.leads row the intern drafter picks up with full voice grounding; the
+// approval it produces flows out through the normal actionable queue and the
+// same live run posts it in-thread. Nothing here writes to a platform — it is
+// an ingest, and the existing lead → draft → approval → actuate pipeline does
+// the rest.
+//
+// Two properties make the sweep safe to run repeatedly:
+//   - (org_id, platform, external_id) UNIQUE ⇒ re-sending a notification already ingested is a
+//     no-op insert reported as `duplicate`, so the sweep never needs perfect
+//     client-side memory.
+//   - the turn cap ⇒ a conversation can only be re-entered so many times, so
+//     two bots cannot ping-pong forever.
+// ---------------------------------------------------------------------------
+
+actuator.use("/api/actuator/inbound-reply", requireActuatorToken);
+
+actuator.post("/api/actuator/inbound-reply", async (c) => {
+  const { orgId } = c.get("actuator");
+  let body: InboundReplyIn;
+  try {
+    body = InboundReplyInSchema.parse(await c.req.json());
+  } catch (err) {
+    return c.json(
+      { error: "invalid_body", detail: err instanceof Error ? err.message : String(err) },
+      400,
+    );
+  }
+  const results = await queueNotificationReplies(noelleDb(), {
+    orgId, body, maxTurns: resolveNotificationMaxTurns(process.env.NOELLE_NOTIFICATION_MAX_TURNS),
+  });
+  if (!results) return c.json({ error: "instance_not_in_org" }, 403);
+
+  const accepted = results.filter((r) => r.accepted).length;
+  return c.json(
+    InboundReplyResponseSchema.parse({
+      accepted,
+      skipped: results.length - accepted,
+      results,
+    }),
+  );
+});
