@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { runDrafterTick } from "./drafter-tick.js";
 const { readRules } = vi.hoisted(() => ({ readRules: vi.fn() }));
 vi.mock("../lib/pattern-breaker-db.js", () => ({ loadActivePatternRules: readRules }));
 const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -14,7 +15,6 @@ beforeEach(() => {
 });
 async function replyTick(useCaptured = false) {
   const platform: string = "x";
-  const { runDrafterTick } = await import("./drafter-tick.js");
   const sql = Object.assign(
     vi.fn(async () => []),
     { json: (value: unknown) => value },
