@@ -4398,3 +4398,203 @@ export async function listPendingRedditApprovals(
            or (${watchlist} = 'only' and l.priority = true)
            or (${watchlist} = 'exclude' and (l.priority is null or l.priority = false)))
       and (${lastBatchSince}::timestamptz is null
+           or a.created_at >= ${lastBatchSince}::timestamptz)
+    order by
+      case when a.status = 'pending' then 0 else 1 end,
+      case when ${sort} = 'newest_post'
+           then (l.payload->>'posted_at')::timestamptz end desc nulls last,
+      case when ${sort} = 'oldest'
+           then (l.payload->>'posted_at')::timestamptz end asc nulls last,
+      a.created_at desc
+    limit ${limit}
+  `;
+  // Sort keys on the POST's own time (l.payload.posted_at, stamped by discovery
+  // and preserved by the drafter), NOT approval recency — batch drafting pushes
+  // many drafts at once, so ordering by a.created_at made an old thread drafted
+  // just now outrank a fresh thread drafted earlier and buried exactly the
+  // replies whose Reddit visibility window is still open. Pending rows first so
+  // unreviewed work sits above sent/skipped in the "all" view. Mirrors X.
+  const views = rows
+    .map(toRedditApprovalView)
+    .filter((v) => v.body != null && v.body.trim().length > 0);
+  return opts.dedupe === false ? views : dedupeRedditByThread(views);
+}
+
+/** One entry per source thread. Preserves order. */
+function dedupeRedditByThread(views: RedditApprovalView[]): RedditApprovalView[] {
+  const seen = new Set<string>();
+  const out: RedditApprovalView[] = [];
+  for (const v of views) {
+    const key = v.postUrl ?? `${v.subreddit ?? ""}::${v.threadTitle ?? v.approvalId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(v);
+  }
+  return out;
+}
+
+/** Full Reddit approval detail: the clicked approval + every reply angle for the thread. */
+export interface RedditApprovalDetail {
+  primary: RedditApprovalView;
+  replies: RedditApprovalView[];
+  instanceId: string;
+}
+
+/** One Reddit approval by id, with every sibling reply angle for the same thread. */
+export async function getRedditApprovalDetail(
+  approvalId: string,
+): Promise<RedditApprovalDetail | null> {
+  const userId = await getRequiredUserId();
+  const head = await readSql<Array<{ org_id: string; agent_instance_id: string; lead_id: string | null }>>`
+    select a.org_id, a.agent_instance_id, d.lead_id
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    where a.id = ${approvalId}
+    limit 1
+  `;
+  const h = head[0];
+  if (!h) return null;
+  await assertMember(h.org_id, userId);
+
+  const rows = await readSql<RedditJoinedRow[]>`
+    select
+      a.id            as approval_id,
+      a.status        as status,
+      a.created_at    as created_at,
+      d.payload       as draft_payload,
+      l.payload       as lead_payload,
+      l.author_handle as lead_author_handle
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    where a.agent_instance_id = ${h.agent_instance_id}
+      and (${h.lead_id}::uuid is not null and d.lead_id = ${h.lead_id}
+           or a.id = ${approvalId})
+    order by a.created_at asc
+  `;
+  const views = rows
+    .map(toRedditApprovalView)
+    .filter((v) => v.body != null && v.body.trim().length > 0);
+  if (views.length === 0) return null;
+
+  const primary = views.find((v) => v.approvalId === approvalId) ?? views[0]!;
+  return { primary, replies: views, instanceId: h.agent_instance_id };
+}
+
+/** Reddit pipeline snapshot (funnel: discovery → classifier → drafter → actuator auto-send). */
+export async function getRedditPipelineSnapshot(
+  instanceId: string,
+): Promise<PipelineSnapshot | null> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return null;
+  const since = inst.pipeline_started_at ?? "1970-01-01T00:00:00Z";
+  const goalStart = inst.goal_started_at ?? "1970-01-01T00:00:00Z";
+
+  const [leads] = await readSql<
+    Array<{ disc_life: number; disc_today: number; disc_since: number; cls_life: number; cls_today: number; cls_since: number }>
+  >`
+    select
+      count(*)::int as disc_life,
+      count(*) filter (where created_at >= date_trunc('day', now()))::int as disc_today,
+      count(*) filter (where created_at >= ${since})::int as disc_since,
+      count(*) filter (where classifier_label is not null)::int as cls_life,
+      count(*) filter (where classifier_label is not null and created_at >= date_trunc('day', now()))::int as cls_today,
+      count(*) filter (where classifier_label is not null and created_at >= ${since})::int as cls_since
+    from noelle.leads
+    where agent_instance_id = ${inst.id} and platform = 'reddit'
+  `;
+  const [drafts] = await readSql<Array<{ life: number; today: number; since: number }>>`
+    select
+      count(*)::int as life,
+      count(*) filter (where d.synced_at >= date_trunc('day', now()))::int as today,
+      count(*) filter (where d.synced_at >= ${since})::int as since
+    from noelle.drafts d join noelle.leads l on l.id = d.lead_id
+    where l.agent_instance_id = ${inst.id} and l.platform = 'reddit'
+  `;
+  const [appr] = await readSql<
+    Array<{ ready: number; leads_ready: number; leads_ready_run: number; produced: number }>
+  >`
+    select
+      count(*) filter (where status = 'pending')::int as ready,
+      count(distinct lead_id) filter (where status = 'pending')::int as leads_ready,
+      count(distinct lead_id) filter (where status = 'pending' and created_at >= ${goalStart})::int as leads_ready_run,
+      count(distinct lead_id) filter (where created_at >= ${goalStart})::int as produced
+    from noelle.approvals where agent_instance_id = ${inst.id}
+  `;
+
+  const states = await listVegaWorkerStatus({
+    discovery: inst.discovery_enabled,
+    classifier: inst.classifier_enabled,
+    drafter: inst.drafter_enabled,
+  });
+  const stateByKind = new Map(states.map((s) => [s.kind, s] as const));
+
+  const counts: Record<VegaWorkerKind, { lifetime: number; today: number; sinceStart: number }> = {
+    discovery: { lifetime: leads?.disc_life ?? 0, today: leads?.disc_today ?? 0, sinceStart: leads?.disc_since ?? 0 },
+    classifier: { lifetime: leads?.cls_life ?? 0, today: leads?.cls_today ?? 0, sinceStart: leads?.cls_since ?? 0 },
+    drafter: { lifetime: drafts?.life ?? 0, today: drafts?.today ?? 0, sinceStart: drafts?.since ?? 0 },
+    send: { lifetime: 0, today: 0, sinceStart: 0 },
+    profiler: { lifetime: 0, today: 0, sinceStart: 0 },
+    watchlist: { lifetime: drafts?.life ?? 0, today: drafts?.today ?? 0, sinceStart: drafts?.since ?? 0 },
+  };
+  const enabledByKind: Record<VegaWorkerKind, boolean> = {
+    discovery: inst.discovery_enabled,
+    classifier: inst.classifier_enabled,
+    drafter: inst.drafter_enabled,
+    send: false,
+    profiler: false,
+    watchlist: inst.watchlist_enabled ?? true,
+  };
+
+  // Reddit funnel: discovery -> classifier -> drafter (no profiler, no send).
+  const REDDIT_WORKERS: VegaWorkerKind[] = ["discovery", "classifier", "drafter"];
+  const workers: PipelineWorkerSnapshot[] = REDDIT_WORKERS.map((kind) => {
+    const ss = stateByKind.get(kind);
+    return {
+      kind,
+      enabled: enabledByKind[kind],
+      toggleable: true,
+      runsWhilePaused: false,
+      state: ss?.state ?? "idle",
+      lifetime: counts[kind].lifetime,
+      today: counts[kind].today,
+      sinceStart: counts[kind].sinceStart,
+      lastFinishedAt: ss?.lastFinishedAt ?? null,
+      runningSince: ss?.runningSince ?? null,
+      lastError: ss?.lastError ?? null,
+    };
+  });
+
+  return {
+    status: inst.status as string,
+    pipelineStartedAt: inst.pipeline_started_at,
+    leadsReady: appr?.leads_ready ?? 0,
+    leadsReadyLastRun: inst.goal_started_at ? appr?.leads_ready_run ?? 0 : null,
+    lastRunStartedAt: inst.goal_started_at,
+    goal: {
+      target: inst.goal_target,
+      startedAt: inst.goal_started_at,
+      produced: inst.goal_started_at ? appr?.produced ?? 0 : 0,
+      ready: appr?.ready ?? 0,
+    },
+    discoveryConfig: parseDiscoveryConfig(inst.discovery_config),
+    schedule: pipelineSchedule(inst),
+    workers,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Talk-to-agent chat history (noelle.agent_chat_messages, migration 0064)
+//
+// The per-agent "Talk to <agent>" panel persists every turn so a conversation
+// survives reloads and the model is fed the prior turns. One rolling thread per
+// (user, instance); "New chat" mints a fresh conversation_id. Tenancy piggybacks
+// on getAgentInstance (assertOrgMember inside) before any read/write.
+// ---------------------------------------------------------------------------
+
+/** How many of the most recent messages of a thread we hydrate + feed the model. */
+const CHAT_HISTORY_LIMIT = 40;
+
+/** One persisted chat turn, shaped for the client transcript. */
+export interface ChatHistoryMessage {
+  who: "agent" | "user";
