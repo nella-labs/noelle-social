@@ -198,3 +198,203 @@ describe("createClaudeCliBackend", () => {
   });
 
   it("reads NOELLE_CLAUDE_CLI_MODEL at call time, not import time", async () => {
+    // Workers call loadOperatorEnvFile() inside main(), AFTER @noelle/runtime is
+    // evaluated. Resolving against the import-time constant would ignore the
+    // operator's pin and silently send every call back to Opus.
+    const prev = process.env.NOELLE_CLAUDE_CLI_MODEL;
+    delete process.env.NOELLE_CLAUDE_CLI_MODEL; // unset at import, as on a real worker
+    vi.resetModules();
+    try {
+      const fresh = await import("./claudeCliBackend.js");
+      process.env.NOELLE_CLAUDE_CLI_MODEL = "claude-sonnet-5"; // arrives later
+      const { spawnImpl, calls } = fakeSpawn({ stdout: okJson });
+      const backend = fresh.createClaudeCliBackend({ spawnImpl });
+      await backend.call({ system: "s", prompt: "p", model: "claude-haiku-4-5" });
+      const argv = calls[0]!.args;
+      expect(argv[argv.indexOf("--model") + 1]).toBe("claude-sonnet-5");
+    } finally {
+      if (prev === undefined) delete process.env.NOELLE_CLAUDE_CLI_MODEL;
+      else process.env.NOELLE_CLAUDE_CLI_MODEL = prev;
+      vi.resetModules();
+    }
+  });
+
+  it("counts cache-creation and cache-read tokens as input", async () => {
+    // A cold `claude -p` spawn reports almost the entire prompt under
+    // cache_creation_input_tokens; usage.input_tokens alone is the uncached
+    // remainder (~2). Reading only that logged $0.00 for a ~29,000-token call.
+    const stdout = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      usage: {
+        input_tokens: 2,
+        cache_creation_input_tokens: 12_681,
+        cache_read_input_tokens: 14_619,
+        output_tokens: 611,
+      },
+    });
+    const { spawnImpl } = fakeSpawn({ stdout, code: 0 });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    const res = await backend.call({ system: "s", prompt: "p", model: "claude-haiku-4-5" });
+    expect(res.usage).toEqual({ input_tokens: 27_302, output_tokens: 611 });
+  });
+
+  it("falls back to the deny-list when the installed CLI does not know --tools", async () => {
+    // Nothing pins the CLI version on the VM, and callAgentModel routes the
+    // FALLBACK through this same engine for an llm_backend='claude' org — so an
+    // unknown flag would take out every call with nothing behind it.
+    const calls: string[][] = [];
+    let attempt = 0;
+    const spawnImpl = ((_cmd: string, argv: string[]) => {
+      calls.push(argv);
+      const child = makeFakeChild();
+      const first = attempt++ === 0;
+      queueMicrotask(() => {
+        if (first) {
+          child.stderr.emit("data", Buffer.from("error: unknown option '--tools'"));
+          child.emit("close", 1);
+        } else {
+          child.stdout.emit("data", Buffer.from(okJson));
+          child.emit("close", 0);
+        }
+      });
+      return child;
+    }) as unknown as typeof import("node:child_process").spawn;
+
+    const backend = createClaudeCliBackend({ spawnImpl });
+    const res = await backend.call({ system: "s", prompt: "p", model: "claude-haiku-4-5" });
+
+    expect(res.text).toBe("drafted reply text");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toContain("--tools");
+    expect(calls[1]).not.toContain("--tools");
+    expect(calls[1]![calls[1]!.indexOf("--disallowed-tools") + 1]).toContain("Bash");
+  });
+
+  it("does not retry when the failure is not an unknown flag", async () => {
+    const { spawnImpl, calls } = fakeSpawn({ stderr: "boom", code: 1 });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    await expect(
+      backend.call({ system: "s", prompt: "p", model: "claude-haiku-4-5" }),
+    ).rejects.toBeInstanceOf(ClaudeCliError);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("disables tools outright instead of deny-listing them", async () => {
+    // `--disallowed-tools` denies execution but still uploads every tool schema
+    // in the request body: 17,931 input tokens vs 1,609 with `--tools ""` on an
+    // identical one-shot call. These runs never need a tool, so ship none.
+    const { spawnImpl, calls } = fakeSpawn({ stdout: okJson });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    await backend.call({ system: "s", prompt: "p", model: "claude-haiku-4-5" });
+    const argv = calls[0]!.args;
+    expect(argv).not.toContain("--disallowed-tools");
+    expect(argv[argv.indexOf("--tools") + 1]).toBe("");
+    expect(argv).toContain("--disable-slash-commands");
+    expect(argv).toContain("--strict-mcp-config");
+  });
+
+  it("exports CLAUDE_CLI_MODEL as the exact string passed to --model", async () => {
+    // The dashboard chat route and Nova's text seam import this constant to
+    // label/stamp the call. Asserting it against the real argv is what keeps
+    // the recorded model honest — three hand-copied literals had drifted.
+    const { spawnImpl, calls } = fakeSpawn({ stdout: okJson });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    await backend.call({ system: "s", prompt: "p", model: CLAUDE_CLI_MODEL });
+    const argv = calls[0]!.args;
+    expect(argv[argv.indexOf("--model") + 1]).toBe(CLAUDE_CLI_MODEL);
+  });
+
+  it("NOELLE_CLAUDE_CLI_MODEL overrides the default model", async () => {
+    const prev = process.env.NOELLE_CLAUDE_CLI_MODEL;
+    process.env.NOELLE_CLAUDE_CLI_MODEL = "claude-sonnet-4-6";
+    // CLAUDE_CLI_MODEL is read at module load, so re-import the module fresh
+    // after setting the env so the override is picked up.
+    vi.resetModules();
+    try {
+      const fresh = await import("./claudeCliBackend.js");
+      const { spawnImpl, calls } = fakeSpawn({ stdout: okJson });
+      const backend = fresh.createClaudeCliBackend({ spawnImpl });
+      await backend.call({ system: "s", prompt: "p", model: "claude-opus-4-6" });
+      const argv = calls[0]!.args;
+      expect(argv[argv.indexOf("--model") + 1]).toBe("claude-sonnet-4-6");
+    } finally {
+      if (prev === undefined) delete process.env.NOELLE_CLAUDE_CLI_MODEL;
+      else process.env.NOELLE_CLAUDE_CLI_MODEL = prev;
+      vi.resetModules();
+    }
+  });
+
+  it("strips API-key / 3P-provider env so the child can only use the OAuth subscription", async () => {
+    const sanitized = [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_MODEL",
+      "ANTHROPIC_SMALL_FAST_MODEL",
+      "CLAUDE_CODE_USE_BEDROCK",
+      "CLAUDE_CODE_USE_VERTEX",
+    ];
+    const saved: Record<string, string | undefined> = {};
+    for (const k of sanitized) {
+      saved[k] = process.env[k];
+      process.env[k] = "should-be-stripped";
+    }
+    // A benign var that must survive untouched.
+    const prevPath = process.env.PATH;
+    try {
+      const { spawnImpl, calls } = fakeSpawn({ stdout: okJson });
+      const backend = createClaudeCliBackend({ spawnImpl });
+      await backend.call({ system: "s", prompt: "p", model: "claude-opus-4-6" });
+      const env = calls[0]!.options.env as Record<string, string | undefined>;
+      expect(env).toBeDefined();
+      for (const k of sanitized) {
+        expect(env[k]).toBeUndefined();
+      }
+      // Non-sanitized env passes through.
+      expect(env.PATH).toBe(prevPath);
+    } finally {
+      for (const k of sanitized) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
+  });
+
+  it("throws ClaudeCliError on non-zero exit", async () => {
+    const { spawnImpl } = fakeSpawn({ stdout: "", stderr: "boom", code: 1 });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    await expect(
+      backend.call({ system: "s", prompt: "p", model: "claude-sonnet-4-6" }),
+    ).rejects.toBeInstanceOf(ClaudeCliError);
+  });
+
+  it("throws ClaudeCliError when result json has is_error:true", async () => {
+    const errJson = JSON.stringify({ type: "result", is_error: true, result: "model failure" });
+    const { spawnImpl } = fakeSpawn({ stdout: errJson, code: 0 });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    await expect(
+      backend.call({ system: "s", prompt: "p", model: "claude-sonnet-4-6" }),
+    ).rejects.toBeInstanceOf(ClaudeCliError);
+  });
+
+  it("throws ClaudeCliAuthError when stderr signals an auth/login problem", async () => {
+    const { spawnImpl } = fakeSpawn({
+      stdout: "",
+      stderr: "Invalid API key - please log in",
+      code: 1,
+    });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    const err = await backend
+      .call({ system: "s", prompt: "p", model: "claude-sonnet-4-6" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClaudeCliAuthError);
+    expect(err).toBeInstanceOf(ClaudeCliError);
+  });
+
+  it("throws ClaudeCliAuthError when a code-0 is_error result detail signals auth", async () => {
+    const errJson = JSON.stringify({
+      type: "result",
+      is_error: true,
