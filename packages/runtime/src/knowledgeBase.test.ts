@@ -198,3 +198,203 @@ describe("parseIncludeDirs", () => {
   });
 });
 
+describe("knowledgeBaseFromNella adapter", () => {
+  it.each(["", " ", "\t\n"])("disables blank workspace %j before any retrieval", async (workspace) => {
+    const searchContext = vi.fn();
+    const kb = knowledgeBaseFromNella({ searchContext }, workspace);
+    expect(await kb.ready()).toBe(false);
+    expect(await kb.search("voice", 8, { filterDirs: ["02-brand"] })).toEqual([]);
+    expect(searchContext).not.toHaveBeenCalled();
+  });
+
+  it("maps NellaClient Hits to KbHits and fixes the workspace", async () => {
+    let calledWith: { workspace?: string } = {};
+    const stub = {
+      async searchContext(args: { workspace: string; query: string; topK?: number }) {
+        calledWith = args;
+        return [
+          { path: "p.md", snippet: "voice anchor", score: 4.2, filePath: "p.md", startLine: 1, endLine: 3, highlights: ["voice"] },
+        ];
+      },
+    };
+    const kb = knowledgeBaseFromNella(stub, " \tconfigured-workspace \n");
+    const hits = await kb.search("query", 8);
+    expect(calledWith.workspace).toBe("configured-workspace");
+    expect(hits[0]!.snippet).toBe("voice anchor");
+    expect(hits[0]!.source.filePath).toBe("p.md");
+    expect(await kb.ready()).toBe(true);
+    expect(calledWith.workspace).toBe("configured-workspace");
+  });
+
+  it("forwards filterDirs to the underlying NellaClient (and omits it when empty)", async () => {
+    const calls: Array<{ filterDirs: string[] | undefined }> = [];
+    const stub = {
+      async searchContext(args: { workspace: string; query: string; topK?: number; filterDirs?: string[] }) {
+        calls.push({ filterDirs: args.filterDirs });
+        return [];
+      },
+    };
+    const kb = knowledgeBaseFromNella(stub, "configured-workspace");
+    await kb.search("q", 8, { filterDirs: ["02-brand"] });
+    await kb.search("q", 8, { filterDirs: [] });
+    await kb.search("q", 8);
+    expect(calls[0]!.filterDirs).toEqual(["02-brand"]);
+    // Empty / absent must not narrow the backend call.
+    expect(calls[1]!.filterDirs).toBeUndefined();
+    expect(calls[2]!.filterDirs).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hybrid dense lane (voyage-context-4 ⊕ BM25) — injected deterministic embedder
+// ---------------------------------------------------------------------------
+
+/**
+ * A deterministic topic embedder: maps text to a 3-dim unit vector by keyword
+ * so cosine similarities are clean (1 same-topic, 0 cross-topic). No network.
+ * `safety→[1,0,0]`, `ops→[0,1,0]`, `business→[0,0,1]`, unknown→`[0,0,0]`.
+ */
+function topicVec(text: string): number[] {
+  const t = text.toLowerCase();
+  if (/(safety|alignment|corrigible|guardrail|oversight|overseeable)/.test(t)) return [1, 0, 0];
+  if (/(deploy|canary|uptime|kubernetes|rollout|restart)/.test(t)) return [0, 1, 0];
+  if (/(revenue|pricing|customers|margin)/.test(t)) return [0, 0, 1];
+  return [0, 0, 0];
+}
+
+function topicEmbedder(): KbDenseEmbedder {
+  return {
+    async embedDocuments(documents) {
+      return documents.map((chunks) => chunks.map((c) => topicVec(c)));
+    },
+    async embedQuery(query) {
+      return topicVec(query);
+    },
+  };
+}
+
+describe("createLocalFsKnowledgeBase — hybrid dense lane", () => {
+  beforeEach(async () => {
+    // Two lexically-disjoint, single-topic docs. "safety" doc deliberately
+    // shares NO query tokens with the dense query below (proves dense recall).
+    await mkdir(join(dir, "kb"), { recursive: true });
+    await writeFile(
+      join(dir, "kb", "safety.md"),
+      "## Keeping systems corrigible\nPowerful systems must stay corrigible and overseeable as they scale.\n",
+    );
+    await writeFile(
+      join(dir, "kb", "ops.md"),
+      "## Canary deploys\nRolling restart and canary rollout keep uptime high during releases.\n",
+    );
+  });
+
+  it("rescues a lexically-disjoint but semantically-related chunk BM25 misses", async () => {
+    const enabled = createLocalFsKnowledgeBase({
+      dir,
+      watch: false,
+      includeDirs: ["kb"],
+      dense: { enabled: true, embedder: topicEmbedder() },
+    });
+    const off = createLocalFsKnowledgeBase({
+      dir,
+      watch: false,
+      includeDirs: ["kb"],
+    });
+
+    // "AI guardrails oversight" shares no tokens with safety.md's body, so BM25
+    // finds nothing; the dense lane (same safety topic vector) surfaces it.
+    const q = "AI guardrails oversight";
+    expect(await off.search(q, 5)).toEqual([]); // pure BM25: no lexical overlap
+    const hybrid = await enabled.search(q, 5);
+    expect(hybrid.length).toBeGreaterThan(0);
+    expect(hybrid[0]!.source.filePath).toContain("safety.md");
+    // Dense-only hit ⇒ BM25-scale score is 0 (so it cannot lift the gate).
+    expect(hybrid[0]!.score).toBe(0);
+
+    enabled.close();
+    off.close();
+  });
+
+  it("preserves the BM25-max score (relevance gate is non-regressive)", async () => {
+    // A query with REAL lexical overlap on ops.md, plus a dense pull toward
+    // safety.md. The gate keys on max(score); it must match the pure-BM25 max.
+    const q = "canary rollout uptime";
+    const off = createLocalFsKnowledgeBase({ dir, watch: false, includeDirs: ["kb"] });
+    const on = createLocalFsKnowledgeBase({
+      dir,
+      watch: false,
+      includeDirs: ["kb"],
+      dense: { enabled: true, embedder: topicEmbedder() },
+    });
+
+    const offHits = await off.search(q, 5);
+    const onHits = await on.search(q, 5);
+    expect(offHits.length).toBeGreaterThan(0);
+    const maxOff = Math.max(...offHits.map((h) => h.score));
+    const maxOn = Math.max(...onHits.map((h) => h.score));
+    expect(maxOn).toBe(maxOff); // gate sees the identical ceiling
+    // The ops.md chunk keeps its exact BM25 score under hybrid.
+    const opsOff = offHits.find((h) => h.source.filePath.includes("ops.md"))!;
+    const opsOn = onHits.find((h) => h.source.filePath.includes("ops.md"))!;
+    expect(opsOn.score).toBe(opsOff.score);
+
+    off.close();
+    on.close();
+  });
+
+  it("guarantees the top BM25 hit stays in the returned window (gate guard)", async () => {
+    // topK=1, but the query is dense-aligned to safety.md while BM25 strongly
+    // matches ops.md. The gate guard must keep the BM25-max (ops.md) as the
+    // single returned hit, with its real score — never let a dense-only chunk
+    // (score 0) displace it out of the window.
+    const kb = createLocalFsKnowledgeBase({
+      dir,
+      watch: false,
+      includeDirs: ["kb"],
+      // Query embeds to the safety topic, pulling safety.md up in the dense lane.
+      dense: { enabled: true, embedder: topicEmbedder(), poolSize: 10 },
+    });
+    // "canary rollout" → BM25 hits ops.md; "overseeable" → dense pulls safety.md.
+    const hits = await kb.search("canary rollout overseeable", 1);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.source.filePath).toContain("ops.md");
+    expect(hits[0]!.score).toBeGreaterThan(0);
+    kb.close();
+  });
+
+  it("scopes hybrid hits to filterDirs", async () => {
+    await mkdir(join(dir, "other"), { recursive: true });
+    await writeFile(
+      join(dir, "other", "safety2.md"),
+      "## More safety\nCorrigible oversight and alignment guardrails matter.\n",
+    );
+    const kb = createLocalFsKnowledgeBase({
+      dir,
+      watch: false,
+      dense: { enabled: true, embedder: topicEmbedder() },
+    });
+    const hits = await kb.search("guardrails oversight", 8, { filterDirs: ["kb"] });
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits.every((h) => h.source.filePath.startsWith("kb/"))).toBe(true);
+    expect(hits.some((h) => h.source.filePath.includes("other"))).toBe(false);
+    kb.close();
+  });
+
+  it("fails open to BM25 when the query embed throws (never throws)", async () => {
+    const throwingEmbedder: KbDenseEmbedder = {
+      async embedDocuments(documents) {
+        return documents.map((chunks) => chunks.map((c) => topicVec(c)));
+      },
+      async embedQuery() {
+        throw new Error("voyage down");
+      },
+    };
+    const kb = createLocalFsKnowledgeBase({
+      dir,
+      watch: false,
+      includeDirs: ["kb"],
+      dense: { enabled: true, embedder: throwingEmbedder },
+    });
+    // BM25 still works; a dense-disjoint query just returns the BM25 hits.
+    const hits = await kb.search("canary rollout uptime", 5);
+    expect(hits.length).toBeGreaterThan(0);
