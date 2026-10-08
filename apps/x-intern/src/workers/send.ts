@@ -598,3 +598,14 @@ async function main() {
       } catch (err) {
         readyCache.reset(inst.org_id, "x-cookies");
         await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+  });
+}
+
+main().catch((err) => {
+  console.error("send fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
