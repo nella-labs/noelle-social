@@ -198,3 +198,203 @@ describe("scoreFormat", () => {
       ["something of the post really stuck with me", "something of"],
       ["this slaps, going to steal the approach", "slaps"],
     ] as const) {
+      const f = scoreFormat(reply(body), 250);
+      expect(f.score).toBe(0);
+      expect(f.reasons.join(" ").toLowerCase()).toContain(needle);
+    }
+  });
+
+  it("does NOT flag clean, specific replies that avoid the filler patterns", () => {
+    for (const body of [
+      "scoping it to one workflow first is the smart move",
+      "the pricing tiers you shipped map cleanly to the ICP",
+      "stealing your onboarding checklist idea for our flow",
+    ]) {
+      expect(scoreFormat(reply(body), 250).score).toBe(1);
+    }
+  });
+
+  // 'honestly' is a SOFT penalty, not a hard zero (operator decision). The prompt
+  // has always allowed one natural "honestly" as texture; this check used to
+  // hard-zero every occurrence, and across 1646 live drafts 71% of the drafts it
+  // killed were the mid-sentence usage the prompt explicitly permits.
+  it("penalizes ONE 'honestly' but still lets it clear the bar (strictVoice)", () => {
+    const f = scoreFormat(reply("honestly this explains a lot about why carousels win"), 250, false, true);
+    expect(f.score).toBeCloseTo(0.7);
+    expect(f.score).toBeGreaterThanOrEqual(0.7); // the pass threshold
+    expect(f.reasons.join(" ").toLowerCase()).toContain("honestly");
+  });
+
+  it("STACKS the penalty so leaning on 'honestly' drops below the bar", () => {
+    const f = scoreFormat(reply("honestly the docs are rough, and honestly nobody reads them"), 250, false, true);
+    expect(f.score).toBeCloseTo(0.4);
+    expect(f.score).toBeLessThan(0.7);
+    expect(f.reasons.join(" ")).toContain("2x");
+  });
+
+  it("one 'honestly' plus any other tell drops below the bar", () => {
+    // The soft penalty must not become a free pass when combined with real slop.
+    const f = scoreFormat(reply("honestly the offline-first bet is right, curious to hear how it lands"), 250, false, true);
+    expect(f.score).toBeLessThan(0.7);
+  });
+
+  it("the honestly penalty is NOT relaxed on the celebration path", () => {
+    // congrats / "this is huge!" are celebration-exempt, but the filler tic is not.
+    const f = scoreFormat(reply("honestly congrats, this is huge!"), undefined, true, true);
+    expect(f.score).toBeLessThan(1);
+    expect(f.reasons.join(" ").toLowerCase()).toContain("honestly");
+  });
+
+  it("honestly is ALLOWED when banFiller is off (e.g. X keeps it as intentional filler)", () => {
+    expect(scoreFormat(reply("honestly i swapped in mold and my link step halved"), 250).score).toBe(1);
+  });
+
+  it("a clean celebration reply with no honestly still passes on the celebration path", () => {
+    expect(scoreFormat(reply("congrats, this is huge!"), undefined, true).score).toBe(1);
+  });
+
+  it("fails the actual slop draft from the inbox (gap-between + curious-to-hear)", () => {
+    const f = scoreFormat(
+      reply(
+        "That panel framing is sharp, Hassan. The gap between strategy deck and actual execution is where most orgs quietly stall out. Curious to hear how the conversation lands.",
+      ),
+      400,
+    );
+    expect(f.score).toBe(0);
+  });
+
+  it("a clean conversational reply still scores 1.0 (no false positives)", () => {
+    const f = scoreFormat(
+      reply("yeah the rollout cadence is the hard part, what worked for us was shipping behind a flag and dialing it up slowly"),
+      400,
+    );
+    expect(f.score).toBe(1);
+    expect(f.reasons).toHaveLength(0);
+  });
+});
+
+describe("scoreFormat — contrastive-reframe crutch ('not X, it's Y' / 'is X, not Y')", () => {
+  const post = (body: string): DraftToVerify => ({ kind: "repost", angle: null, body });
+
+  it("flags the operator's real examples so they fail the pass bar and regenerate", () => {
+    for (const body of [
+      "raising $8M isn't a win, it's a countdown timer", // negate → re-assert
+      "being outside the scene is a filter, not a handicap", // affirm → negate tail
+      "the real work in growth is the deciding, not the doing", // affirm → negate tail
+    ]) {
+      const f = scoreFormat(post(body));
+      expect(f.score).toBeLessThan(0.7);
+      expect(f.reasons.join(" ").toLowerCase()).toContain("contrastive-reframe");
+    }
+  });
+
+  it("applies to replies too, not just posts", () => {
+    const f = scoreFormat(reply("shipping isn't the hard part, it's the deciding"), 250);
+    expect(f.score).toBeLessThan(0.7);
+  });
+
+  it("penalizes a single lean to exactly the base penalty (not a hard zero — rare use can survive best-of-set)", () => {
+    const f = scoreFormat(post("being outside the scene is a filter, not a handicap"));
+    expect(f.score).toBeCloseTo(0.5); // 1 - REFRAME_BASE_PENALTY
+    expect(f.score).toBeGreaterThan(0);
+  });
+
+  it("drives a STACK of reframes toward zero", () => {
+    // two distinct patterns: 'isn't … it's' + ', not a …'
+    const f = scoreFormat(post("this isn't a setback, it's a filter, not a handicap"));
+    expect(f.score).toBeLessThan(0.2);
+  });
+
+  it("does NOT flag ordinary either/or phrasing or plain negation (no false positives)", () => {
+    for (const body of [
+      "shipping behind a flag and dialing it up slowly worked for us",
+      "i'm not sure this holds up under real load yet",
+      "ping me whenever you get a sec, no rush at all",
+      "we cut the build time in half with sccache and a warm cache",
+      "the pricing tiers you shipped map cleanly to the ICP",
+    ]) {
+      const f = scoreFormat(post(body));
+      expect(f.score).toBe(1);
+      expect(f.reasons).toHaveLength(0);
+    }
+  });
+
+  it("via verifyDrafts: a reframe draft fails format even when the judge passes", async () => {
+    const v = await verifyDrafts([post("raising $8M isn't a win, it's a countdown timer")], ctx, goodJudge);
+    expect(v.pass).toBe(false);
+    expect(v.scores.format).toBeLessThan(0.7);
+    expect(v.fix?.toLowerCase()).toContain("contrastive-reframe");
+  });
+});
+
+describe("verifyDrafts", () => {
+  it("passes when the judge scores high and format is clean", async () => {
+    const v = await verifyDrafts([reply("sccache cut my rust builds in half, worth a look")], ctx, goodJudge);
+    expect(v.pass).toBe(true);
+    expect(v.scores.voice).toBeGreaterThanOrEqual(0.6);
+    expect(v.fix).toBeNull();
+  });
+
+  it("fails when the judge scores below threshold and surfaces the fix", async () => {
+    const v = await verifyDrafts([reply("great take, love this")], ctx, badJudge);
+    expect(v.pass).toBe(false);
+    expect(v.fix).toContain("rust build times");
+    expect(v.scores.grounding).toBeCloseTo(0.4);
+  });
+
+  it("fails on a format violation even when the judge passes", async () => {
+    const v = await verifyDrafts([reply("solid point — " + "x".repeat(300))], ctx, goodJudge);
+    expect(v.pass).toBe(false);
+    expect(v.scores.format).toBeLessThan(0.6);
+    expect(v.reasons.join(" ")).toMatch(/em dash|over length/);
+  });
+
+  it("fails open (passes) when the judge throws", async () => {
+    const v = await verifyDrafts([reply("a clean grounded reply")], ctx, () => Promise.reject(new Error("503")));
+    expect(v.pass).toBe(true);
+    expect(v.reasons.join(" ")).toContain("passed open");
+  });
+
+  it("fails open when the judge returns unparseable output", async () => {
+    const v = await verifyDrafts([reply("a clean grounded reply")], ctx, () => Promise.resolve("I think it's fine!"));
+    expect(v.pass).toBe(true);
+    expect(v.reasons.join(" ")).toContain("passed open");
+  });
+
+  it("passes a charLimit through to the format check", async () => {
+    const v = await verifyDrafts([reply("x".repeat(200))], { ...ctx, charLimit: 150 }, goodJudge);
+    expect(v.scores.format).toBeLessThan(1);
+  });
+
+  it("folds an imageCaption into the judge prompt (and omits it when absent)", async () => {
+    let withImg = "";
+    await verifyDrafts(
+      [reply("clean grounded reply")],
+      { ...ctx, imageCaption: "a bar chart showing 3x revenue growth" },
+      (_system, prompt) => {
+        withImg = prompt;
+        return goodJudge();
+      },
+    );
+    expect(withImg).toContain("THE POST'S IMAGE SHOWS:");
+    expect(withImg).toContain("a bar chart showing 3x revenue growth");
+
+    let noImg = "";
+    await verifyDrafts([reply("clean grounded reply")], ctx, (_system, prompt) => {
+      noImg = prompt;
+      return goodJudge();
+    });
+    expect(noImg).not.toContain("THE POST'S IMAGE SHOWS:");
+  });
+
+  it("treats a pinned faithful voice as the authoritative voice target", async () => {
+    let seenPrompt = "";
+
+    await verifyDrafts(
+      [reply("clean grounded reply")],
+      {
+        ...ctx,
+        faithfulVoiceAnchors: [
+          "@eliana_jordan: this is kind of ridiculous (I love it)",
+          "Voice notes: warm, playful, lowercase",
+        ],
