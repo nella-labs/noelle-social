@@ -198,3 +198,47 @@ export async function vegaStyleList(args: {
     sources: [],
   };
   try {
+    const inst = await xInstance(sql, args.orgSlug);
+    if (!inst) return empty;
+    const meta = await sql<
+      Array<{ account_feeder_config: unknown; account_feeder_last_run_at: string | null }>
+    >`
+      select account_feeder_config, account_feeder_last_run_at
+      from noelle.agent_instances where id = ${inst.id}
+    `;
+    const cfg = meta[0]?.account_feeder_config;
+    const parsed = cfg && typeof cfg === "object" ? AccountFeederConfigSchema.safeParse(cfg) : null;
+    const pinned = parsed && parsed.success ? (parsed.data.pinnedStyleHandle ?? null) : null;
+    const sources = await sql<
+      Array<{ handle: string; display_name: string | null; enabled: boolean; last_pulled_at: string | null }>
+    >`
+      select handle, display_name, enabled, last_pulled_at
+      from noelle.account_feeder_sources
+      where agent_instance_id = ${inst.id} and platform = 'x'
+      order by enabled desc, handle asc
+    `;
+    const postRows = await sql<Array<{ n: number }>>`
+      select count(*)::int as n from noelle.account_style_posts
+      where agent_instance_id = ${inst.id} and platform = 'x'
+    `;
+    const profRows = await sql<Array<{ n: number }>>`
+      select count(*)::int as n from noelle.account_ultra_profiles
+      where agent_instance_id = ${inst.id} and platform = 'x'
+    `;
+    return {
+      found: true,
+      pinnedStyleHandle: pinned,
+      lastRunAt: meta[0]?.account_feeder_last_run_at ?? null,
+      stylePostCount: postRows[0]?.n ?? 0,
+      ultraProfileCount: profRows[0]?.n ?? 0,
+      sources: sources.map((s) => ({
+        handle: s.handle,
+        displayName: s.display_name,
+        enabled: s.enabled,
+        lastPulledAt: s.last_pulled_at,
+      })),
+    };
+  } finally {
+    await sql.end({ timeout: 1 }).catch(() => {});
+  }
+}

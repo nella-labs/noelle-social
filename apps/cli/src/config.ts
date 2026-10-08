@@ -198,3 +198,67 @@ export function ensureHome(): Paths {
   for (const dir of [p.home, p.pgdata, p.logs, p.heartbeats, p.cloudflared, p.doctor]) {
     mkdirSync(dir, { recursive: true });
   }
+  return p;
+}
+
+export function saveConfig(config: SelfHostConfig): void {
+  const { configFile } = paths();
+  writeFileSync(configFile, JSON.stringify(config, null, 2) + "\n", { mode: 0o644 });
+}
+
+/**
+ * Parse a config.json string into a full SelfHostConfig, backfilling defaults.
+ * Shared by `loadConfig` (host disk) and the host-side reader of the VM's
+ * config.json, so both apply the same `remoteAccess` deep-merge. Returns null
+ * on invalid JSON.
+ */
+export function parseConfig(raw: string): SelfHostConfig | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<SelfHostConfig>;
+    const base = defaultConfig();
+    // Shallow-spread top level, but deep-merge `remoteAccess` so a config.json
+    // written before this block existed (or with only a partial sub-object)
+    // still fills in the tailscale/autostart defaults instead of clobbering.
+    return {
+      ...base,
+      ...parsed,
+      // Configurations predating the discriminator used the VM runtime.
+      runtime: parsed.runtime ?? "vm",
+      remoteAccess: {
+        tailscale: { ...base.remoteAccess.tailscale, ...parsed.remoteAccess?.tailscale },
+        autostart: { ...base.remoteAccess.autostart, ...parsed.remoteAccess?.autostart },
+      },
+      autoUpdate: { ...base.autoUpdate, ...parsed.autoUpdate },
+    } as SelfHostConfig;
+  } catch {
+    return null;
+  }
+}
+
+export function loadConfig(): SelfHostConfig | null {
+  const { configFile } = paths();
+  if (!existsSync(configFile)) return null;
+  return parseConfig(readFileSync(configFile, "utf8"));
+}
+
+/**
+ * Locate the monorepo root by walking up from this module until we find the
+ * pnpm-workspace.yaml. The CLI must `cd` here to run next / api-vm / workers.
+ */
+export function findRepoRoot(start?: string): string {
+  let dir = start ?? dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 12; i++) {
+    if (existsSync(resolve(dir, "pnpm-workspace.yaml"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Fallback to an explicit override or cwd.
+  return process.env.NOELLE_REPO ? expandHome(process.env.NOELLE_REPO) : process.cwd();
+}
+
+export function expandHome(p: string): string {
+  if (p === "~") return homedir();
+  if (p.startsWith("~/")) return resolve(homedir(), p.slice(2));
+  return resolve(p);
+}
