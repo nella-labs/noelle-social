@@ -198,3 +198,79 @@ export function redditLeadFields(raw: unknown): {
   postedAt: string | null;
   authorHandle: string | null;
 } {
+  const p = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const str = (v: unknown): string | null => typeof v === "string" && v.trim() ? v : null;
+  return {
+    subreddit: str(p.subreddit) ?? str(p.subreddit_name),
+    threadTitle: str(p.title) ?? str(p.post_title),
+    postText: str(p.original_post_text) ?? str(p.text) ?? str(p.post_text) ?? str(p.selftext) ?? str(p.body),
+    postUrl: str(p.original_post_url) ?? str(p.url) ?? str(p.post_url) ?? str(p.permalink),
+    postedAt: str(p.posted_at) ?? str(p.postedAt) ?? str(p.created_at),
+    authorHandle: str(p.author_handle) ?? str(p.author),
+  };
+}
+
+/**
+ * Live X permalink to Vega's SENT reply — the post with the reply in it.
+ *
+ * Prefers the authoritative `sent_url` the send worker wrote into the draft
+ * payload; otherwise synthesises one from the reply's tweet id
+ * (`drafts.sent_external_id`). Returns null for an unsent draft or the
+ * `manual:` sentinel (a hand-posted reply has no captured URL). Single source
+ * of truth so every surface (sent panel, activity feed, inbox, detail) links
+ * the same way.
+ */
+export function sentReplyUrl(opts: {
+  sentUrl?: string | null;
+  sentExternalId?: string | null;
+  authorHandle?: string | null;
+}): string | null {
+  if (opts.sentUrl) return opts.sentUrl;
+  if (!opts.sentExternalId || opts.sentExternalId.startsWith("manual:")) return null;
+  return buildXPostUrl({ handle: opts.authorHandle, tweetId: opts.sentExternalId });
+}
+
+/** A legacy bundle edit needs one recorded or uniquely available angle. */
+export function selectedDraftAngle(payload: DraftPayloadView): Angle | null {
+  const selected = AngleSchema.safeParse(payload.angle);
+  if (selected.success) return selected.data;
+  const available = AngleSchema.options.filter((angle) => textBody(payload.angles?.[angle]?.body) !== undefined);
+  if (Object.hasOwn(payload, "edited_body") && available.length !== 1) return null;
+  return available[0] ?? null;
+}
+
+function textBody(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+/** Resolve one variant; an explicit edit cannot revive its original body. */
+export function bodyForAngle(
+  payload: DraftPayloadView,
+  angle: "empathetic" | "technical" | "contrarian",
+): string | undefined {
+  if (Object.hasOwn(payload, "edited_body")) {
+    const selected = selectedDraftAngle(payload);
+    if (selected === null) return undefined;
+    if (selected === angle) return textBody(payload.edited_body);
+  }
+  const bundled = textBody(payload.angles?.[angle]?.body);
+  if (bundled !== undefined) return bundled;
+  if (payload.angle === angle) return textBody(payload.body);
+  return undefined;
+}
+
+/** Quote the authoritative body without inventing an ambiguous edit's angle. */
+export function bodyForSelectedAngle(payload: DraftPayloadView): string | undefined {
+  if (Object.hasOwn(payload, "edited_body")) return textBody(payload.edited_body);
+  const selected = selectedDraftAngle(payload);
+  return (selected ? bodyForAngle(payload, selected) : undefined) ?? textBody(payload.body);
+}
+
+/** Resolve the draft id to send for an angle. */
+export function draftIdForAngle(
+  payload: DraftPayloadView,
+  angle: "empathetic" | "technical" | "contrarian",
+  fallback: string,
+): string {
+  return payload.angles?.[angle]?.id ?? payload.id ?? fallback;
+}

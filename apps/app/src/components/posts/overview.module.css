@@ -1,0 +1,48 @@
+.overview { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 22px; }
+.metrics { display: grid; grid-template-columns: 1.25fr 1fr 1fr; gap: 18px; }
+.metric { position: relative; display: flex; flex-direction: column; min-height: 196px; padding: 24px; overflow: hidden; border: 1px solid var(--rule); border-radius: 22px; background: var(--paper); }
+.metricTop { position: relative; z-index: 1; display: flex; align-items: center; gap: 9px; font-size: 12px; font-weight: 500; }
+.metricIcon { display: grid; place-items: center; width: 33px; height: 33px; border: 1px solid var(--rule); background: var(--paper-2); border-radius: 50%; }
+.metricArrow { margin-left: auto; }
+.metricValue { position: relative; z-index: 1; margin: 20px 0 11px; font-size: 48px; line-height: 1; font-weight: 400; letter-spacing: -.06em; font-variant-numeric: tabular-nums; }
+.metricSub { position: relative; z-index: 1; margin: 0; max-width: 29ch; font-size: 12px; line-height: 1.5; color: var(--ink-muted); }
+.featured { background: var(--accent); border-color: var(--accent); color: var(--paper); }
+.featured::after { content: ""; position: absolute; right: -76px; bottom: -135px; width: 275px; height: 275px; border: 1px solid color-mix(in srgb, var(--paper) 17%, transparent); border-radius: 50%; box-shadow: 0 0 0 35px color-mix(in srgb, var(--paper) 4%, transparent), 0 0 0 70px color-mix(in srgb, var(--paper) 3%, transparent); pointer-events: none; }
+.featured .metricIcon { border-color: color-mix(in srgb, var(--paper) 25%, transparent); background: color-mix(in srgb, var(--paper) 8%, transparent); }
+.featured .metricSub { color: color-mix(in srgb, var(--paper) 90%, transparent); }
+a.metric:hover { border-color: var(--accent); box-shadow: 0 5px 16px rgba(23,33,36,.04); }
+.channels { padding: 24px; border: 1px solid var(--rule); border-radius: 22px; background: var(--paper); }
+.panelHead { display: flex; justify-content: space-between; align-items: center; gap: 15px; margin-bottom: 20px; }
+.panelHead h3 { margin: 0; font-size: 16px; font-weight: 500; letter-spacing: -.03em; }
+.panelHead p { margin: 5px 0 0; color: var(--ink-muted); font-size: 12px; }
+.channelGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.channel { padding: 17px; border: 1px solid var(--rule-soft); border-radius: 16px; background: var(--paper-2); }
+.channelHead { display: flex; align-items: center; gap: 9px; }
+.channelHead div { display: grid; gap: 3px; }
+.channelHead strong { font-size: 13px; font-weight: 500; }
+.channelHead span { font-size: 10px; color: var(--ink-muted); }
+.channelHead > svg { margin-left: auto; color: var(--ink-muted); }
+.tallies { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 20px; }
+.tallies div { display: grid; gap: 5px; }
+.tallies strong { font-size: 23px; line-height: 1; font-weight: 400; letter-spacing: -.04em; }
+.tallies span { font-size: 10px; color: var(--ink-muted); }
+.channel:hover { border-color: var(--accent); }
+a.metric:focus-visible, .channel:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.planner { padding: 24px; border: 1px solid var(--rule); border-radius: 22px; background: var(--paper); }
+.plannerGrid { display: grid; grid-template-columns: repeat(7, minmax(108px, 1fr)); gap: 8px; overflow-x: auto; }
+.plannerDay { min-height: 196px; padding: 12px; border: 1px solid var(--rule-soft); border-radius: 14px; background: var(--paper-2); transition: border-color .15s, background .15s; }
+.plannerToday { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 30%, var(--rule)); }
+.plannerDrop { border-color: var(--accent); background: var(--accent-soft); }
+.dayHead { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding-bottom: 12px; border-bottom: 1px solid var(--rule); }
+.dayHead span { color: var(--ink-muted); font-size: 10px; }
+.dayHead strong { font-weight: 500; font-size: 17px; }
+.dayCards { display: grid; gap: 8px; margin-top: 12px; }
+.dayCard { display: block; padding: 10px; border: 1px solid var(--rule); border-radius: 10px; background: var(--paper); cursor: grab; }
+.dayCard span { font-size: 9px; font-weight: 500; }
+.dayCard p { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; font-size: 11px; line-height: 1.45; margin: 5px 0 0; }
+.emptyDay { color: var(--ink-soft); font-size: 10px; text-align: center; padding-top: 22px; }
+.videoOverview { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 22px; }
+.videoObjective { padding: 22px; background: var(--paper); border: 1px solid var(--rule); border-radius: 22px; }
+.videoActions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
+.videoDays { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 16px; }
+@media (max-width: 750px) { .metrics { grid-template-columns: 1fr; gap: 12px; } .metric { min-height: 158px; padding: 20px; } .metricValue { margin: 14px 0 8px; font-size: 42px; } .metricSub { max-width: none; } .channels, .planner { padding: 18px; } .panelHead { align-items: flex-start; flex-wrap: wrap; } }
