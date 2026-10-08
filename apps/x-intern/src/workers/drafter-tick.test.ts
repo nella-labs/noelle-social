@@ -198,3 +198,203 @@ describe("runDrafterTick", () => {
         { id: "L", external_id: "x1", payload: { text: "post", url: "https://x.com/u/status/1", outbound_error: "api-vm 502" }, author_handle: "u", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
       ],
       runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ leadId: "L", status: "errored" }),
+    );
+  });
+
+  // Regression (2026-07-19, Lyra sibling bug): the model often omits `char_count`.
+  // charCount is recomputed off the cleaned body before anything ships, so a
+  // missing count must never error a lead with a perfectly good body.
+  it("drafts WITHOUT char_count still post (count recomputed from body)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e" },
+            { angle: "technical", body: "t" },
+            { angle: "contrarian", body: "c" },
+          ],
+          dm: { body: "x".repeat(500) },
+        }),
+        engine: "claude-cli",
+        model: "claude-sonnet-4-6",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "post text", url: "https://x.com/u/status/1" }, author_handle: "u", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(n).toBe(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    const body = postOutbound.mock.calls[0]![0];
+    const replies = body.drafts.filter((d: { kind: string }) => d.kind === "reply");
+    expect(replies).toHaveLength(3);
+    expect(replies[0].charCount).toBe(1);
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ leadId: "L", status: "drafted" }));
+  });
+
+  it("grounds the reply in the watchlist person's profile (loaded from sql, injected into system)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e", char_count: 1 },
+            { angle: "technical", body: "t", char_count: 1 },
+            { angle: "contrarian", body: "c", char_count: 1 },
+          ],
+        }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    // Mock sql: profiles query returns one row for handle "u"; the objectives
+    // query (x_watchlist_people) returns nothing.
+    const sql = ((strings: TemplateStringsArray) => {
+      const q = strings.join(" ");
+      if (q.includes("x_watchlist_profiles")) {
+        return Promise.resolve([
+          {
+            handle: "u",
+            summary: "Indie hacker shipping a Rust CLI",
+            topics: ["devtools", "rust"],
+            tone: "dry, technical",
+            engagement_notes: "respond with a concrete benchmark, never hype",
+          },
+        ]);
+      }
+      return Promise.resolve([]);
+    }) as never;
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "shipping is hard", url: "https://x.com/u/status/1" }, author_handle: "u", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      sql,
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    expect(system).toContain("WHO YOU'RE REPLYING TO");
+    expect(system).toContain("Indie hacker shipping a Rust CLI");
+    expect(system).toContain("devtools, rust");
+  });
+
+  it("does NOT add a profile block when the author has no profile row", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e", char_count: 1 },
+            { angle: "technical", body: "t", char_count: 1 },
+            { angle: "contrarian", body: "c", char_count: 1 },
+          ],
+        }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const sql = (() => Promise.resolve([])) as never; // no profiles, no objectives
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "post text", url: "https://x.com/u/status/1" }, author_handle: "stranger", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      sql,
+    });
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    expect(system).not.toContain("WHO YOU'RE REPLYING TO");
+  });
+
+  it("runs a second knowledge pass and injects product knowledge into the prompt", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e", char_count: 1 },
+            { angle: "technical", body: "t", char_count: 1 },
+            { angle: "contrarian", body: "c", char_count: 1 },
+          ],
+        }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    // Voice search (no filterDirs) → voice anchor; knowledge search (filterDirs)
+    // → a product fact. Proves the two scoped passes are distinct.
+    const nella = {
+      search: vi.fn().mockImplementation((_q: string, _k: number, opts?: { filterDirs?: string[] }) => {
+        if (opts?.filterDirs?.length) {
+          return Promise.resolve([
+            { snippet: "Nella does AST-aware code search", score: 9, filePath: "01-business/x.md", startLine: 1, endLine: 1, highlights: [] },
+          ]);
+        }
+        return Promise.resolve([
+          { snippet: "i ship small and often", score: 8.0, filePath: "02-brand/voice.md", startLine: 1, endLine: 1, highlights: [] },
+        ]);
+      }),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "agents keep hallucinating imports", url: "https://x.com/u/status/1" }, author_handle: "u", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      knowledgeDirs: ["01-business"],
+      knowledgeTopK: 4,
+    });
+    // Two retrieval passes: voice (no filterDirs) + knowledge (filterDirs).
+    expect(nella.search).toHaveBeenCalledTimes(2);
