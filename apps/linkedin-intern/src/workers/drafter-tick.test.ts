@@ -1598,3 +1598,203 @@ describe("runDrafterTick — verifier (grounded-drafting)", () => {
     vi.stubEnv("NOELLE_LINKEDIN_REVIEW_TRACE_LEAD_ID", selectedId);
     vi.stubEnv("TYPESAFE_API_KEY", "");
     vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    runner.draft
+      .mockResolvedValueOnce({ text: JSON.stringify({ drafts: [{ angle: "empathetic", body: "First weak reply" }] }), engine: "bedrock", model: "m" })
+      .mockResolvedValueOnce({ text: JSON.stringify({ drafts: [{ angle: "empathetic", body: "Second weak reply" }] }), engine: "bedrock", model: "m" });
+    const judge = vi.fn().mockResolvedValue(verdict(false));
+    try {
+      await runDrafterTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [lead({ id: selectedId, tier: "T1", payload: { ...leadPayload, source: "extension_observed", text: "SECRET SOURCE POST", authorName: "SECRET AUTHOR" } })] as never,
+        runner: runner as never,
+        kb: kb as never,
+        postOutbound,
+        markStatus,
+        verify: { enabled: true, retries: 1, voiceFloor: 0.8, makeCalls: () => [judge] },
+      });
+      const directory = join(home, ".noelle", "private-review-traces");
+      const files = readdirSync(directory);
+      expect(files).toEqual([`linkedin-${selectedId}.json`]);
+      expect(statSync(directory).mode & 0o777).toBe(0o700);
+      const path = join(directory, files[0]!);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      const raw = readFileSync(path, "utf8");
+      expect(raw).not.toContain("SECRET SOURCE POST");
+      expect(raw).not.toContain("SECRET AUTHOR");
+      const trace = JSON.parse(raw) as { attempts: Array<{ drafts: Array<{ body: string }>; verdict: { pass: boolean; judgeProvider: string; scores: { voice: number }; reasons: string[]; fix: string } }> };
+      expect(trace.attempts).toHaveLength(2);
+      expect(trace.attempts.map((attempt) => attempt.drafts[0]?.body)).toEqual(["First weak reply", "Second weak reply"]);
+      expect(trace.attempts[0]?.verdict).toMatchObject({ pass: false, judgeProvider: "legacy", scores: { voice: 0.3 }, reasons: expect.arrayContaining(["too generic"]), fix: "name a concrete detail" });
+      expect(postOutbound).not.toHaveBeenCalled();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  const verdict = (pass: boolean) =>
+    JSON.stringify(
+      pass
+        ? { voice: 0.9, grounding: 0.9, relevance: 0.9, reasons: [], fix: null }
+        : { voice: 0.3, grounding: 0.4, relevance: 0.5, reasons: ["too generic"], fix: "name a concrete detail" },
+    );
+
+  it("disabled by default → no judge calls, verifierMeta null", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    expect(postOutbound.mock.calls[0]![0].verifierMeta).toBeNull();
+  });
+
+  it("passes on the first try → no regenerate, verdict attached", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 2, makeCalls: () => [judge] },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(1); // no regenerate
+    expect(judge).toHaveBeenCalledTimes(4); // aggregate set, then three exact reply angles
+    const meta = postOutbound.mock.calls[0]![0].verifierMeta;
+    expect(meta.pass).toBe(true);
+    expect(meta.attempts).toBe(0);
+    expect(meta.judgeOk).toBe(true);
+    expect(meta.judgeProvider).toBe("legacy");
+  });
+
+  it("reviews each cleaned substantial reply angle separately after the aggregate review", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    runner.draft.mockResolvedValue({
+      text: JSON.stringify({
+        ...fullSubstantial,
+        drafts: [{ ...fullSubstantial.drafts[0], body: "The customer feedback loop is strong 🎉" }, ...fullSubstantial.drafts.slice(1)],
+      }),
+      engine: "bedrock", model: "m",
+    });
+    const judge = vi.fn()
+      .mockResolvedValueOnce(verdict(true)) // aggregate set
+      .mockResolvedValueOnce(verdict(true)) // empathetic
+      .mockResolvedValueOnce(verdict(false)) // technical
+      .mockResolvedValueOnce(verdict(true)); // contrarian
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o", dm_autodraft_enabled: true } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+
+    const outbound = postOutbound.mock.calls[0]![0];
+    const replies = outbound.drafts.filter((d: { kind: string }) => d.kind === "reply");
+    expect(replies).toHaveLength(3);
+    expect(replies[0]!.body).not.toContain("🎉");
+    expect(judge).toHaveBeenCalledTimes(4);
+    for (let index = 0; index < replies.length; index++) {
+      const prompt = judge.mock.calls[index + 1]![1] as string;
+      expect(prompt).toContain(`[reply/${replies[index]!.angle}] ${replies[index]!.body}`);
+      for (const sibling of replies.filter((_: unknown, siblingIndex: number) => siblingIndex !== index)) {
+        expect(prompt).not.toContain(`[reply/${sibling.angle}] ${sibling.body}`);
+      }
+      expect(prompt).not.toContain("[dm]");
+      expect(replies[index]!.verifierMeta).toEqual(expect.objectContaining({ judgeOk: true, judgeProvider: "legacy" }));
+    }
+    expect(judge.mock.calls[1]![1]).not.toContain("🎉");
+    expect(replies.map((d: { verifierMeta: { pass: boolean } }) => d.verifierMeta.pass)).toEqual([true, false, true]);
+    expect(outbound.verifierMeta.pass).toBe(true); // aggregate result remains for regeneration history
+    const dms = outbound.drafts.filter((d: { kind: string }) => d.kind === "dm");
+    expect(dms).toHaveLength(1);
+    expect(dms[0]!.verifierMeta).toBeUndefined();
+  });
+
+  it("marks a per-angle judge outage as failing even when the verifier fails open", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn()
+      .mockResolvedValueOnce(verdict(true))
+      .mockResolvedValueOnce(verdict(true))
+      .mockRejectedValueOnce(new Error("judge unavailable"))
+      .mockResolvedValueOnce(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+    const technical = postOutbound.mock.calls[0]![0].drafts.find((d: { angle: string }) => d.angle === "technical");
+    expect(technical.verifierMeta).toEqual(expect.objectContaining({
+      pass: false, judgeOk: false, judgeProvider: "none", attempts: 0,
+    }));
+  });
+
+  it("still reviews the final reply when multiple generated variants collapse to one angle", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    runner.draft.mockResolvedValue({
+      text: JSON.stringify({ drafts: [
+        { angle: "empathetic", body: "The customer feedback loop matters here." },
+        { angle: "empathetic", body: "A duplicate angle." },
+      ] }),
+      engine: "bedrock", model: "m",
+    });
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+    const drafts = postOutbound.mock.calls[0]![0].drafts;
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0]!.verifierMeta).toEqual(expect.objectContaining({ pass: true, judgeOk: true }));
+    expect(judge).toHaveBeenCalledTimes(2);
+    expect(judge.mock.calls[1]![1]).not.toContain("A duplicate angle.");
+  });
+
+  it("keeps strong reply angles when a weak sibling lowers the aggregate voice score", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const judge = vi.fn()
+      .mockResolvedValueOnce(verdict(false)) // the set failed and retries are exhausted
+      .mockResolvedValueOnce(verdict(true)) // empathetic is strong
+      .mockResolvedValueOnce(verdict(false)) // technical is weak
+      .mockResolvedValueOnce(verdict(true)); // contrarian is strong
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 0, voiceFloor: 0.8, makeCalls: () => [judge] },
