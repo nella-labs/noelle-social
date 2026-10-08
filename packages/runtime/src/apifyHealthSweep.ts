@@ -198,3 +198,16 @@ export function createThrottledApifyHealthSweep(opts: {
       // A failed run retries immediately. A removed org's old completion must
       // not repopulate state after the latest roster reconciliation.
       if (!claim.retained || claim.completedAt === undefined) state.delete(orgId);
+    }
+  };
+  const reconcileOrganizations = (orgIds: Iterable<string>): void => {
+    const roster = new Set(orgIds);
+    const at = now();
+    for (const [orgId, claim] of state) {
+      claim.retained = roster.has(orgId);
+      if (!claim.running && (!claim.retained || (claim.completedAt !== undefined
+        && at - claim.completedAt >= opts.intervalMs))) state.delete(orgId);
+    }
+  };
+  return Object.assign(run, { reconcileOrganizations });
+}
