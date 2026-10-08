@@ -1,0 +1,120 @@
+name: supabase-deploy
+
+# Deploys schema migrations + the noelle-sync-openclaw Edge Function to the
+# configured Supabase project. The project may be shared with
+# Nella, so we name everything noelle_*; see docs/secrets.md and docs/runbook.md.
+#
+# Runs only on main, only when supabase/migrations/** or supabase/functions/**
+# actually changed — keeps the deploy noisy enough to notice in the Actions tab
+# but not so noisy it fires on every doc PR merge.
+#
+# Required secrets (Settings → Secrets and variables → Actions):
+#   SUPABASE_ACCESS_TOKEN     personal access token from supabase.com/dashboard/account/tokens
+#   SUPABASE_PROJECT_REF      target Supabase project reference
+#   SUPABASE_DB_PASSWORD      noelle project DB password (for `supabase db push`)
+#
+# Manual deploy from a laptop is documented in docs/runbook.md § "Manual Supabase deploy".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "supabase/migrations/**"
+      - "supabase/functions/**"
+      - ".github/workflows/supabase-deploy.yml"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "What to deploy"
+        required: true
+        default: "all"
+        type: choice
+        options: [all, migrations, functions]
+
+concurrency:
+  # Never overlap two Supabase deploys against the same project — one might be
+  # mid-migration.
+  group: supabase-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+jobs:
+  detect-changes:
+    name: detect-changes
+    if: vars.NOELLE_ENABLE_SUPABASE_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      migrations: ${{ steps.changes.outputs.migrations }}
+      functions: ${{ steps.changes.outputs.functions }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+      - id: changes
+        run: |
+          # workflow_dispatch -> honor input.target; push -> diff vs HEAD^
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            target="${{ inputs.target }}"
+            case "$target" in
+              all)        echo "migrations=true" >> "$GITHUB_OUTPUT"; echo "functions=true" >> "$GITHUB_OUTPUT" ;;
+              migrations) echo "migrations=true" >> "$GITHUB_OUTPUT"; echo "functions=false" >> "$GITHUB_OUTPUT" ;;
+              functions)  echo "migrations=false" >> "$GITHUB_OUTPUT"; echo "functions=true" >> "$GITHUB_OUTPUT" ;;
+            esac
+            exit 0
+          fi
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            changed=$(git diff --name-only HEAD^ HEAD)
+          else
+            changed=$(git diff-tree --root --no-commit-id --name-only -r HEAD)
+          fi
+          echo "$changed"
+          if echo "$changed" | grep -q "^supabase/migrations/"; then
+            echo "migrations=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "migrations=false" >> "$GITHUB_OUTPUT"
+          fi
+          if echo "$changed" | grep -q "^supabase/functions/"; then
+            echo "functions=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "functions=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  db-push:
+    name: db push (migrations)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.migrations == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: supabase/setup-cli@v2
+        with:
+          version: latest
+      - name: Link project
+        run: |
+          supabase link --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}"
+      - name: Push migrations (--include-all so all noelle.* migrations apply)
+        env:
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          supabase db push --include-all --password "$SUPABASE_DB_PASSWORD"
+
+  functions-deploy:
+    name: deploy noelle-sync-openclaw
+    needs: detect-changes
+    if: needs.detect-changes.outputs.functions == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: supabase/setup-cli@v2
+        with:
+          version: latest
+      - name: Deploy Edge Function
+        # The function name MUST stay `noelle-sync-openclaw` because the noelle
+        # Supabase project is shared with Nella; the noelle_* prefix is how we
+        # avoid namespace collisions in functions, cron jobs, and vault secrets.
+        run: |
+          supabase functions deploy noelle-sync-openclaw \
+            --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}" \
+            --no-verify-jwt

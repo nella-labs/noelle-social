@@ -1,0 +1,51 @@
+version: 2
+
+# Dependabot config for the Noelle monorepo.
+#
+# - One `npm` entry at the repo root: dependabot reads the pnpm workspace
+#   lockfile from there and opens combined PRs across packages.
+# - One `github-actions` entry for the workflow files in .github/workflows.
+# - No auto-merge: dependency changes are reviewed by the maintainers.
+
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Bogota"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      types:
+        patterns:
+          - "@types/*"
+      dev-tooling:
+        patterns:
+          - "typescript"
+          - "turbo"
+          - "prettier"
+          - "eslint*"
+          - "vitest"
+          - "@vitest/*"
+          - "@playwright/*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Bogota"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
