@@ -198,3 +198,96 @@ describe("parseLinkedInApprovalFilters", () => {
     expect(
       parseLinkedInApprovalFilters({
         status: "sent",
+        watchlist: "only",
+        sort: "oldest",
+        batch: "last",
+        wlLatest: "on",
+      }),
+    ).toEqual({
+      status: "sent",
+      watchlist: "only",
+      sort: "oldest",
+      batch: "last",
+      latestPerWatchlisted: true,
+    });
+  });
+
+  it("treats any wlLatest value other than 'on' as off", () => {
+    expect(parseLinkedInApprovalFilters({ wlLatest: "1" }).latestPerWatchlisted).toBe(false);
+    expect(parseLinkedInApprovalFilters({ wlLatest: "on" }).latestPerWatchlisted).toBe(true);
+  });
+
+  it("ignores the X-only score sort (no classifier on LinkedIn)", () => {
+    expect(parseLinkedInApprovalFilters({ sort: "score" }).sort).toBe("newest_post");
+  });
+});
+
+describe("linkedInApprovalFilterQuery", () => {
+  const base = {
+    status: "pending" as const,
+    watchlist: "all" as const,
+    sort: "newest_post" as const,
+    batch: "all" as const,
+    latestPerWatchlisted: false,
+  };
+
+  it("is empty when all filters are default", () => {
+    expect(linkedInApprovalFilterQuery(base)).toBe("");
+  });
+
+  it("serializes the per-person filter on its own", () => {
+    expect(
+      linkedInApprovalFilterQuery({ ...base, latestPerWatchlisted: true }),
+    ).toBe("?wlLatest=on");
+  });
+
+  it("round-trips through parseLinkedInApprovalFilters", () => {
+    const f = {
+      status: "sent" as const,
+      watchlist: "only" as const,
+      sort: "oldest" as const,
+      batch: "last" as const,
+      latestPerWatchlisted: true,
+    };
+    const sp = new URLSearchParams(linkedInApprovalFilterQuery(f).slice(1));
+    expect(
+      parseLinkedInApprovalFilters({
+        status: sp.get("status") ?? undefined,
+        watchlist: sp.get("watchlist") ?? undefined,
+        sort: sp.get("sort") ?? undefined,
+        batch: sp.get("batch") ?? undefined,
+        wlLatest: sp.get("wlLatest") ?? undefined,
+      }),
+    ).toEqual(f);
+  });
+});
+
+describe("hasActiveFilter", () => {
+  it("is false when every filter is at its default", () => {
+    expect(hasActiveFilter({ ...DEFAULTS })).toBe(false);
+  });
+
+  it("is true for a watchlist filter (the reported case: Watchlist only)", () => {
+    expect(hasActiveFilter({ ...DEFAULTS, watchlist: "only" })).toBe(true);
+    expect(hasActiveFilter({ ...DEFAULTS, watchlist: "exclude" })).toBe(true);
+  });
+
+  it("is true for a min-score floor, a non-real source, or last-batch", () => {
+    expect(hasActiveFilter({ ...DEFAULTS, minScore: 0.5 })).toBe(true);
+    expect(hasActiveFilter({ ...DEFAULTS, source: "synthetic" })).toBe(true);
+    expect(hasActiveFilter({ ...DEFAULTS, source: "all" })).toBe(true);
+    expect(hasActiveFilter({ ...DEFAULTS, batch: "last" })).toBe(true);
+  });
+
+  it("is true for the latest-per-person collapse (narrows the list)", () => {
+    expect(hasActiveFilter({ ...DEFAULTS, latestPerWatchlisted: true })).toBe(
+      true,
+    );
+  });
+
+  it("ignores status and sort — they pick the view/order, they don't narrow", () => {
+    expect(hasActiveFilter({ ...DEFAULTS, status: "sent" })).toBe(false);
+    expect(hasActiveFilter({ ...DEFAULTS, status: "all" })).toBe(false);
+    expect(hasActiveFilter({ ...DEFAULTS, sort: "newest_post" })).toBe(false);
+  });
+});
