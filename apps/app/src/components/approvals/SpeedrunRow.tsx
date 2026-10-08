@@ -198,3 +198,203 @@ export function SpeedrunRow({
                 target="_blank"
                 rel="noreferrer"
                 style={{
+                  fontFamily: "var(--body)",
+                  fontSize: 12,
+                  color: "var(--accent)",
+                }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                {d.lead.handle} ↗
+              </a>
+            ) : (
+              <span
+                style={{
+                  fontFamily: "var(--body)",
+                  fontSize: 12,
+                  color: "var(--ink)",
+                }}
+              >
+                {d.lead.handle}
+              </span>
+            )}
+            {d.lead.tier ? (
+              <span
+                className="tag"
+                style={{
+                  color:
+                    d.lead.tier === "T1"
+                      ? "var(--accent)"
+                      : "var(--ink-muted)",
+                }}
+              >
+                {d.lead.tier}
+                {followerLabel ? ` · ${followerLabel}` : ""}
+              </span>
+            ) : followerLabel ? (
+              <span className="tag">{followerLabel}</span>
+            ) : null}
+            {d.kind === "reply" && d.status === "pending" ? (
+              <ReplyReadinessBadge ready={d.readyForActor === true}
+                unavailable={d.reviewPolicyAvailable === false} />
+            ) : null}
+            {d.lead.score != null ? (
+              <span
+                className="tag"
+                style={{
+                  color:
+                    d.lead.score >= 0.75
+                      ? "var(--accent)"
+                      : d.lead.score >= 0.5
+                        ? "var(--ink-2)"
+                        : "var(--ink-muted)",
+                }}
+                title="Classifier score"
+              >
+                q · {Math.round(d.lead.score * 100)}
+              </span>
+            ) : null}
+            <span
+              style={{
+                fontSize: 11.5,
+                color: "var(--ink-soft)",
+                fontFamily: "var(--body)",
+              }}
+            >
+              · {d.pushedAt}
+            </span>
+          </div>
+          {d.sourceTweet ? (
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 13,
+                color: "var(--ink-muted)",
+                lineHeight: 1.65,
+                display: "-webkit-box",
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: "vertical",
+                overflow: "hidden",
+              }}
+            >
+              <span style={{ color: "var(--ink-soft)" }}>↳ source:</span>{" "}
+              &ldquo;{d.sourceTweet}&rdquo;
+            </div>
+          ) : null}
+        </div>
+        <div className={styles.actions}>
+          {error ? (
+            <span
+              className="tag"
+              style={{ color: "var(--danger)", fontSize: 11 }}
+            >
+              {error}
+            </span>
+          ) : null}
+          <Link
+            href={fullReviewHref}
+            className="btn btn-sm btn-ghost"
+            style={{ textDecoration: "none" }}
+          >
+            Full review →
+          </Link>
+          {isSent ? (
+            <span
+              className="btn btn-sm"
+              aria-disabled="true"
+              style={{ color: "var(--accent)", cursor: "default", opacity: 0.8 }}
+            >
+              ✓ Sent
+            </span>
+          ) : (
+            <>
+              {/* Skip the whole lead — clears it from the queue (reversible
+                  under Status → Skipped). Same one-click skip the Review inbox
+                  uses; shown for both interns. */}
+              <button
+                type="button"
+                className="btn btn-sm btn-ghost"
+                onClick={onSkip}
+                title="Skip this lead — remove it from the queue (reversible under Status → Skipped)"
+              >
+                Skip
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm btn-ghost"
+                onClick={() => onMarkSent()}
+                title={
+                  d.kind === "dm"
+                    ? `I sent this DM on ${platform === "linkedin" ? "LinkedIn" : "X"} by hand — just record it`
+                    : canSend
+                    ? "I already posted the picked reply on X by hand — just record it"
+                    : platform === "reddit"
+                      ? "Record this reply as sent — takes it out of the auto-send queue"
+                      : "I already sent the picked reply on LinkedIn by hand — just record it"
+                }
+              >
+                Mark sent
+              </button>
+              {/* Draft the next DM to this person (LinkedIn only, on a post/reply
+                  card). Lyra warms up over a progressive ladder toward a call,
+                  queued for approval — never auto-sent. */}
+              {platform === "linkedin" && d.kind === "reply" && orgSlug ? (
+                <DraftDmButton orgSlug={orgSlug} approvalId={d.id} />
+              ) : null}
+              {/* Agent posts the picked reply to X now (red). Draft-only
+                  platforms (LinkedIn) never post, so no Send button. */}
+              {canSend ? (
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={onSend}
+                  style={{ background: "var(--danger)", color: "#fff", borderColor: "var(--danger)" }}
+                  title="The agent posts the picked reply to X now, via your connected account"
+                >
+                  Send →
+                </button>
+              ) : null}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Reply angles — pick one (the DM for this lead renders below). */}
+      {d.angles.length > 0 ? (
+      <div role="radiogroup" aria-label={`${d.lead.handle} reply options`}>
+        {d.angles.map((a) => {
+          const isPicked = a.id === (picked?.id ?? null);
+          return (
+            <div
+              key={a.id}
+              onClick={() => onPick(a.id)}
+              role="radio"
+              aria-checked={isPicked}
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === " " || e.key === "Enter") {
+                  e.preventDefault();
+                  onPick(a.id);
+                }
+              }}
+              className={styles.angle}
+              aria-label={a.kind}
+            >
+              <span
+                aria-hidden
+                style={{
+                  width: 18,
+                  height: 18,
+                  borderRadius: "50%",
+                  border: isPicked
+                    ? "5px solid var(--accent)"
+                    : "1.5px solid var(--rule)",
+                  background: "var(--paper-2)",
+                  justifySelf: "center",
+                  transition: "border .15s",
+                }}
+              />
+              <div className={styles.angleMeta}>
+                <div
+                  style={{
+                    fontFamily: "var(--body)",
+                    fontSize: 10.5,
