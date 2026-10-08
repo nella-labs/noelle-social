@@ -398,3 +398,203 @@ describe("runDiscoveryTick", () => {
       userTweets: vi.fn().mockResolvedValue(
         res([
           // pre-added_at post → profiler owns history, discovery must not draft it
+          { id: "1", text: "old", created_at: "2026-05-28T00:00:00.000Z", author: { handle: "patio11", id: "p", followers: 9 }, url: "u" },
+          // post-added_at post → still ingested as a priority lead
+          { id: "2", text: "new", created_at: "2026-05-29T12:00:00.000Z", author: { handle: "patio11", id: "p", followers: 9 }, url: "u" },
+        ]),
+      ),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: [] },
+      watchlistPeople: [{ handle: "patio11", addedAt: "2026-05-29T00:00:00.000Z" }],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    // Only the post-added_at tweet is upserted, as a priority lead.
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "2", priority: true }));
+  });
+
+  it("threads the resolved config (limit + time window + search operators) into the X client", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const userTweets = vi.fn().mockResolvedValue(res([]));
+    const searchTimeline = vi.fn().mockResolvedValue(res([]));
+    const xClient = { userTweets, searchTimeline };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const now = new Date("2026-06-10T12:00:00.000Z");
+    await runDiscoveryTick({
+      log,
+      instance: {
+        id: "i",
+        org_id: "o",
+        discovery_config: { postsPerSource: 40, minFaves: 50 },
+        run_config: { timeWindowHours: 6 },
+      },
+      watchlist: { handles: ["u"], keywords: ["ai agents"] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      now,
+    });
+    // Handle poll: run-override window + default limit, both applied — plus the
+    // server-side operators (replies would be billed then dropped client-side;
+    // retweets are always dropped, so both ride the from: query server-side).
+    expect(userTweets).toHaveBeenCalledWith({
+      handle: "u",
+      limit: 40,
+      sinceISO: "2026-06-10T06:00:00.000Z",
+      excludeReplies: true,
+      excludeRetweets: true,
+    });
+    // Keyword search: limit + sinceISO + the augmented query (min_faves + since_time).
+    const call = searchTimeline.mock.calls[0]![0] as { query: string; limit: number; sinceISO?: string };
+    expect(call.limit).toBe(40);
+    expect(call.sinceISO).toBe("2026-06-10T06:00:00.000Z");
+    expect(call.query).toContain("ai agents");
+    expect(call.query).toContain("min_faves:50");
+    expect(call.query).toContain("since_time:");
+  });
+
+  it("polls a handle that is both a targeting handle and a watchlist person only once", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const userTweets = vi.fn().mockResolvedValue(res([]));
+    const xClient = {
+      userTweets,
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["patio11"], keywords: [] },
+      watchlistPeople: [{ handle: "patio11", addedAt: "2026-05-01T00:00:00.000Z" }],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    expect(userTweets).toHaveBeenCalledTimes(1);
+  });
+
+  it("still ingests a dual targeting+watchlist handle's pre-added_at post (as a normal lead), not skipping it", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(
+        res([
+          // pre-added_at post from a handle that is BOTH targeting + watchlist
+          { id: "old", text: "older", created_at: "2026-05-28T00:00:00.000Z", author: { handle: "patio11", id: "p", followers: 9 }, url: "u" },
+          // post-added_at post → priority
+          { id: "new", text: "newer", created_at: "2026-05-29T12:00:00.000Z", author: { handle: "patio11", id: "p", followers: 9 }, url: "u" },
+        ]),
+      ),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["patio11"], keywords: [] }, // also a targeting handle
+      watchlistPeople: [{ handle: "patio11", addedAt: "2026-05-29T00:00:00.000Z" }],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    // both ingested: the old one as a normal (priority:false) targeting lead,
+    // the new one as a priority watchlist lead — nothing skipped.
+    expect(upsert).toHaveBeenCalledTimes(2);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "old", priority: false }));
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "new", priority: true }));
+  });
+
+  it("watchlistOnly: polls only watchlist-person handles and skips keyword search", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const userTweets = vi.fn().mockResolvedValue(res([]));
+    const searchTimeline = vi.fn().mockResolvedValue(res([]));
+    const xClient = { userTweets, searchTimeline };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["targetHandle"], keywords: ["ai agents"] },
+      watchlistPeople: [{ handle: "WatchedPerson", addedAt: "2026-01-01T00:00:00.000Z" }],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      watchlistOnly: true,
+    });
+    // only the watched person is polled — not the targeting handle
+    expect(userTweets).toHaveBeenCalledTimes(1);
+    expect(userTweets).toHaveBeenCalledWith(expect.objectContaining({ handle: "watchedperson" }));
+    // keyword search is the keyword lane — skipped entirely in watchlist-only mode
+    expect(searchTimeline).not.toHaveBeenCalled();
+  });
+
+  it("full mode polls targeting handles AND runs keyword search", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const userTweets = vi.fn().mockResolvedValue(res([]));
+    const searchTimeline = vi.fn().mockResolvedValue(res([]));
+    const xClient = { userTweets, searchTimeline };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["targetHandle"], keywords: ["ai agents"] },
+      watchlistPeople: [{ handle: "WatchedPerson", addedAt: "2026-01-01T00:00:00.000Z" }],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    // both the targeting handle and the watched person are polled, plus keywords
+    expect(userTweets).toHaveBeenCalledTimes(2);
+    expect(searchTimeline).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a repost (is_repost) instead of upserting it — keyword lane", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(res([])),
+      searchTimeline: vi.fn().mockResolvedValue(
+        res([
+          { id: "1", text: 'RT @orig: "great"', created_at: "2026-05-18T00:00:00.000Z", author: { handle: "u", id: "uid", followers: 100 }, url: "u", is_repost: true },
+        ]),
+      ),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: ["ai agents"] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    expect(upsert).not.toHaveBeenCalled();
+    expect(inserted).toBe(0);
+  });
+
+  it("drops a repost from a watchlist person too — reposts never bypass into the queue", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(
+        res([
+          // a watched person's repost (priority would normally bypass all filters)
+          { id: "rt", text: 'RT @orig: "great"', created_at: "2026-05-29T12:00:00.000Z", author: { handle: "patio11", id: "p", followers: 9 }, url: "u", is_repost: true },
+          // their own authored post on the same tick → still ingested as priority
+          { id: "own", text: "my own take", created_at: "2026-05-29T13:00:00.000Z", author: { handle: "patio11", id: "p", followers: 9 }, url: "u", is_repost: false },
+        ]),
+      ),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: [] },
+      watchlistPeople: [{ handle: "patio11", addedAt: "2026-05-29T00:00:00.000Z" }],
+      xClient: xClient as never,
