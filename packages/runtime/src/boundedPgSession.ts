@@ -198,3 +198,8 @@ export class BoundedPgSession {
       if (this.active || this.queue.length || !this.pool) return;
       const pool = this.pool;
       this.pool = undefined;
+      this.idleDisposal = pool.end({ timeout: 0 }).catch(() => {});
+    }, this.config.idleTimeoutMs);
+    this.idleTimer.unref();
+  }
+}

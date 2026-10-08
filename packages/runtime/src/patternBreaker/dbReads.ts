@@ -198,3 +198,198 @@ export async function listPatternRules(
     const { total: _total, active_count: _active, malformed_active: _malformed, ...data } = row;
     try {
       return { ...admitRule(data), admitted: true };
+    } catch {
+      return {
+        ...data,
+        admitted: false,
+        label: row.label ?? "Malformed rule",
+        instruction:
+          row.instruction ?? "This stored rule exceeds the instruction admission contract.",
+        suggestion: row.suggestion && row.suggestion.length <= 600 ? row.suggestion : null,
+        regex: row.regex && row.regex.length <= 300 ? row.regex : null,
+      };
+    }
+  });
+  const last = rules.at(-1);
+  return {
+    rules,
+    total: context.total,
+    counts: {
+      active: context.active_count,
+      disabled: context.total - context.active_count,
+      malformedActive: context.malformed_active,
+    },
+    nextCursor:
+      selected.length > limit && last
+        ? {
+            section,
+            active: last.active,
+            severity: last.severity,
+            createdAt: last.created_at,
+            id: last.id,
+          }
+        : null,
+  };
+}
+/** Complete active rule set; malformed rows fail explicitly instead of silently omitting a hard rule. */
+export async function loadActivePatternRules(
+  client: Sql | PatternReadClient,
+  scope: PatternScope,
+): Promise<DynamicPattern[]> {
+  requireScope(scope);
+  const rows = await patternRead(
+    client,
+    async (query, sql) =>
+      await query<PatternRuleRow[]>`
+    with owner as materialized (${patternOwner(sql, scope)})
+    select page.* from owner left join lateral (
+      select ${ruleFields(sql)} from noelle.pattern_rules r
+      where r.org_id=${scope.orgId} and r.agent_instance_id=${scope.agentInstanceId} and r.active
+      order by r.created_at desc,r.id limit ${PATTERN_ACTIVE_RULE_LIMIT + 1}
+    ) page on true order by page.created_at desc,page.id`,
+  ).catch(() => {
+    throw new PatternRulesHeldError("unavailable");
+  });
+  if (!rows.length) throw new PatternRulesHeldError("unavailable");
+  const active = rows.filter((row) => row.id !== null);
+  if (active.length > PATTERN_ACTIVE_RULE_LIMIT) throw new PatternRulesHeldError("overflow");
+  return active.map((row) => {
+    const r = admitRule(row);
+    return {
+      kind: r.kind,
+      label: r.label,
+      instruction: r.instruction,
+      suggestion: r.suggestion,
+      regex: r.regex,
+      source: r.source,
+    };
+  });
+}
+export async function loadActiveRuleLabels(
+  client: Sql | PatternReadClient,
+  scope: PatternScope,
+): Promise<string[]> {
+  return (await loadActivePatternRules(client, scope)).map((row) => row.label);
+}
+export async function countPatternRules(
+  client: Sql | PatternReadClient,
+  scope: PatternScope,
+): Promise<{ active: number; total: number }> {
+  if (!validPatternScope(scope)) return { active: 0, total: 0 };
+  const rows = await patternRead(
+    client,
+    async (query, sql) =>
+      await query<{ active: number; total: number }[]>`
+    with owner as materialized (${patternOwner(sql, scope)})
+    select count(*) filter(where r.active)::int as active,count(*)::int as total from noelle.pattern_rules r
+    where r.org_id=${scope.orgId} and r.agent_instance_id=${scope.agentInstanceId} and exists(select 1 from owner)`,
+  );
+  return rows[0] ?? { active: 0, total: 0 };
+}
+export async function loadVisibleAlerts(
+  client: Sql | PatternReadClient,
+  scope: PatternScope,
+  input: PatternAlertsPageInput = {},
+): Promise<StoredPatternAlertsPage> {
+  requireScope(scope);
+  const { view, limit, cursor } = PatternAlertsPageInputSchema.parse(input);
+  cursorDate(cursor?.createdAt);
+  const rows = await patternRead(
+    client,
+    async (query, sql) =>
+      await query<(PatternAlertRow & { total: number })[]>`
+    with owner as materialized (${patternOwner(sql, scope)}), eligible as not materialized (
+      select ${alertFields(sql)} from noelle.pattern_alerts a left join noelle.pattern_rules r on ${scopedRuleJoin(sql)}
+      where a.org_id=${scope.orgId} and a.agent_instance_id=${scope.agentInstanceId}
+        and (a.rule_id is null or r.id is not null) and ${admittedAlertSql(sql)}
+        and (${view}='history' or a.status in ('open','refining','refined'))
+    ), counts as (select count(*)::int as total from eligible)
+    select page.*,counts.total from owner cross join counts left join lateral (
+      select * from eligible where (${cursor?.id ?? null}::uuid is null or
+        created_at::text::timestamptz<${cursor?.createdAt ?? null}::text::timestamptz or
+        (created_at::text::timestamptz=${cursor?.createdAt ?? null}::text::timestamptz and id>${cursor?.id ?? null}::uuid))
+      order by created_at desc,id limit ${limit + 1}
+    ) page on true order by page.created_at desc,page.id`,
+  );
+  if (!rows.length) throw new PatternRulesHeldError("unavailable");
+  const selected = rows.filter((row) => row.id !== null);
+  const alerts = selected.slice(0, limit).map(({ total: _total, ...row }) => row);
+  const last = alerts.at(-1);
+  return {
+    alerts,
+    total: rows[0]!.total,
+    nextCursor:
+      selected.length > limit && last ? { view, createdAt: last.created_at, id: last.id } : null,
+  };
+}
+/** Eligible prefixes are filtered before the ten oldest unclaimed requests are selected. */
+export async function loadRefiningAlerts(
+  parent: Sql,
+  scope: PatternScope,
+): Promise<RefiningAlertRow[]> {
+  if (!validPatternScope(scope)) return [];
+  return patternRead(
+    parent,
+    async (query, sql) =>
+      await query<RefiningAlertRow[]>`
+    with owner as materialized (${patternOwner(sql, scope)})
+    select ${refiningFields(sql)} from noelle.pattern_alerts a join noelle.pattern_rules r on ${scopedRuleJoin(sql)}
+    where a.org_id=${scope.orgId} and a.agent_instance_id=${scope.agentInstanceId} and exists(select 1 from owner)
+      and a.status='refining' and a.refine_claim_id is null and r.active
+      and ${admittedRuleSql(sql)} and ${admittedAlertSql(sql)} and ${coherentAlertSources(sql, scope)}
+    order by a.decided_at asc nulls first,a.created_at,a.id limit 10`,
+  );
+}
+export function patternAlertView(row: PatternAlertRow): PatternAlertView {
+  return {
+    id: row.id,
+    ruleId: row.rule_id,
+    patternName: row.pattern_name,
+    description: row.description,
+    severity: row.severity,
+    windowSize: row.window_size,
+    frequencyCount: row.frequency_count,
+    examples: PatternExampleSchema.array().max(6).parse(row.examples),
+    status: row.status,
+    ruleInstruction: row.rule_instruction,
+    suggestion: row.rule_suggestion,
+    createdAt: row.created_at,
+    refineRequestId: row.refine_request_id,
+    refineClaimed: row.refine_claim_id !== null,
+    refineFailed:
+      row.status === "open" && row.refine_request_id !== null && row.refine_claim_id !== null,
+  };
+}
+
+/** Resolve only native coherent ownership; authorization still supplies the verified user before mutation. */
+export async function getPatternAlertScope(
+  parent: Sql,
+  alertId: string,
+): Promise<PatternScope | null> {
+  if (!UuidSchema.safeParse(alertId).success) return null;
+  return patternRead(parent, async (query, sql) => {
+    const [row] = await query<
+      { org_id: string; agent_instance_id: string; role: PatternScope["role"] }[]
+    >`
+      select a.org_id,a.agent_instance_id,i.role from noelle.pattern_alerts a
+      join noelle.agent_instances i on i.id=a.agent_instance_id and i.org_id=a.org_id
+        and i.role=any(${PATTERN_ROLES}::text[])
+      left join noelle.pattern_rules r on ${scopedRuleJoin(sql)}
+      where a.id=${alertId} and (a.rule_id is null or r.id is not null)`;
+    return row
+      ? { orgId: row.org_id, agentInstanceId: row.agent_instance_id, role: row.role }
+      : null;
+  });
+}
+
+export async function getPatternInstanceScope(
+  parent: Sql,
+  instanceId: string,
+): Promise<PatternScope | null> {
+  if (!UuidSchema.safeParse(instanceId).success) return null;
+  return patternRead(parent, async (query) => {
+    const [row] = await query<{ org_id: string; role: PatternScope["role"] }[]>`
+      select org_id,role from noelle.agent_instances where id=${instanceId} and role=any(${PATTERN_ROLES}::text[])`;
+    return row ? { orgId: row.org_id, agentInstanceId: instanceId, role: row.role } : null;
+  });
+}
