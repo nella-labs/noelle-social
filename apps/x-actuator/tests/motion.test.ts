@@ -198,3 +198,146 @@ describe("clickPoint — 2D-Gaussian, ~70% edge→center", () => {
   });
 });
 
+describe("tremor — 8–12Hz micro-tremor on every coordinate", () => {
+  const base: Point = { x: 300, y: 300 };
+
+  it("is deterministic for a fixed (seed, time)", () => {
+    const rngState = () => makeRng(77);
+    expect(tremor(base, 123, rngState())).toEqual(tremor(base, 123, rngState()));
+  });
+
+  it("stays within a few px of base", () => {
+    for (let t = 0; t < 500; t += 7) {
+      const p = tremor(base, t, makeRng(9));
+      expect(dist(p, base)).toBeLessThan(4);
+    }
+  });
+
+  it("varies over time", () => {
+    const rng = makeRng(21);
+    const a = tremor(base, 0, rng);
+    const b = tremor(base, 33, rng);
+    const c = tremor(base, 66, rng);
+    // not all identical
+    const allSame = a.x === b.x && a.y === b.y && b.x === c.x && b.y === c.y;
+    expect(allSame).toBe(false);
+  });
+});
+
+describe("hoverDwellMs — logNormal ~220ms median, clamped [80,650]", () => {
+  it("is deterministic for a fixed seed", () => {
+    expect(hoverDwellMs(makeRng(2))).toBe(hoverDwellMs(makeRng(2)));
+  });
+
+  it("always lands in [80,650]", () => {
+    for (let seed = 0; seed < 300; seed++) {
+      const v = hoverDwellMs(makeRng(seed + 1));
+      expect(v).toBeGreaterThanOrEqual(80);
+      expect(v).toBeLessThanOrEqual(650);
+    }
+  });
+
+  it("median is in a plausible band around ~220ms", () => {
+    const xs: number[] = [];
+    for (let seed = 0; seed < 400; seed++) xs.push(hoverDwellMs(makeRng(seed * 5 + 1)));
+    xs.sort((a, b) => a - b);
+    const median = xs[Math.floor(xs.length / 2)]!;
+    expect(median).toBeGreaterThan(150);
+    expect(median).toBeLessThan(320);
+  });
+});
+
+// ===========================================================================
+// SCROLL ENGINE (§3a)
+// ===========================================================================
+
+describe("planScrollGestures — momentum scroll mixture", () => {
+  it("is deterministic for a fixed seed", () => {
+    expect(planScrollGestures(makeRng(31), 3000)).toEqual(planScrollGestures(makeRng(31), 3000));
+  });
+
+  it("total scrolled is within ±15% of totalPx", () => {
+    for (const target of [1500, 3000, 6000]) {
+      for (let seed = 0; seed < 12; seed++) {
+        const gestures = planScrollGestures(makeRng(seed * 17 + 3), target);
+        const total = gestures.reduce(
+          (s, g) => s + g.deltas.reduce((a, d) => a + d, 0),
+          0,
+        );
+        expect(total).toBeGreaterThan(target * 0.85);
+        expect(total).toBeLessThan(target * 1.15);
+      }
+    }
+  });
+
+  it("never emits the same deltaY twice consecutively within a gesture", () => {
+    for (let seed = 0; seed < 30; seed++) {
+      const gestures = planScrollGestures(makeRng(seed * 11 + 1), 4000);
+      for (const g of gestures) {
+        for (let i = 1; i < g.deltas.length; i++) {
+          expect(g.deltas[i]).not.toBe(g.deltas[i - 1]);
+        }
+      }
+    }
+  });
+
+  it("flick gestures decay in magnitude (momentum), trend-wise and at least once strictly", () => {
+    // A flick is the dominant (p=0.45) type. Its peak velocity decays ×0.95/frame,
+    // so the |delta| envelope must trend downward. The ±8% wheel jitter means a
+    // single frame can wobble up, so we assert TWO things:
+    //   (1) TREND: for EVERY multi-notch flick, the last delta is clearly smaller
+    //       than the first and the series never wobbles up by more than the ±8%
+    //       jitter band can explain (≤ prev × 1.18, comfortably above 2·8%).
+    //   (2) EXISTENCE: at least one flick is *strictly* non-increasing (a clean
+    //       decay with no wobble) — proving the underlying envelope is monotone.
+    let foundStrictlyMonotone = false;
+    let checkedAnyFlick = false;
+    for (let seed = 0; seed < 60; seed++) {
+      const gestures = planScrollGestures(makeRng(seed * 7 + 5), 8000);
+      for (const g of gestures) {
+        if (g.kind !== "flick") continue;
+        const mags = g.deltas.map((d) => Math.abs(d));
+        if (mags.length < 4) continue;
+        checkedAnyFlick = true;
+
+        // (1) trend: end well below start, no frame-to-frame jump beyond the jitter band
+        expect(mags[mags.length - 1]!).toBeLessThan(mags[0]!);
+        for (let i = 1; i < mags.length; i++) {
+          expect(mags[i]!).toBeLessThanOrEqual(mags[i - 1]! * 1.18 + 1e-9);
+        }
+
+        // (2) existence of a perfectly clean decay
+        let strict = true;
+        for (let i = 1; i < mags.length; i++) {
+          if (mags[i]! > mags[i - 1]! + 1e-9) {
+            strict = false;
+            break;
+          }
+        }
+        if (strict) foundStrictlyMonotone = true;
+      }
+    }
+    expect(checkedAnyFlick).toBe(true);
+    expect(foundStrictlyMonotone).toBe(true);
+  });
+
+  it("CV of all inter-delta times exceeds 0.4 (non-uniform spacing)", () => {
+    const all: number[] = [];
+    for (let seed = 0; seed < 8; seed++) {
+      const gestures = planScrollGestures(makeRng(seed * 23 + 2), 6000);
+      for (const g of gestures) all.push(...g.interDeltaMs);
+    }
+    expect(all.length).toBeGreaterThan(20);
+    expect(cv(all)).toBeGreaterThan(0.4);
+  });
+
+  it("each gesture has one inter-delta gap per delta and a tagged kind", () => {
+    const gestures = planScrollGestures(makeRng(99), 5000);
+    expect(gestures.length).toBeGreaterThan(0);
+    for (const g of gestures) {
+      expect(g.deltas.length).toBe(g.interDeltaMs.length);
+      expect(g.deltas.length).toBeGreaterThan(0);
+      expect(["flick", "slow-drag", "micro-nudge", "back-scroll"]).toContain(g.kind);
+    }
+  });
+});
