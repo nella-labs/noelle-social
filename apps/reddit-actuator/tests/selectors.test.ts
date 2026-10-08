@@ -198,3 +198,203 @@ describe("composer + reply box + submit (new Reddit)", () => {
 
 describe("findReplyBox / findReplySubmit — new-Reddit comment scoping (FIX 2)", () => {
   it.each(["new", "old"] as const)("refuses another composer's editor and submit when the requested %s comment has no composer", (flavor) => {
+    const root = mount(flavor === "new"
+      ? `<comment-composer-host><div contenteditable="true" name="body"></div><button slot="submit-button">Comment</button></comment-composer-host><shreddit-comment thingid="t1_target"></shreddit-comment>`
+      : `<div class="thing comment" data-fullname="t1_other"><div class="child"><div class="usertext-edit"><textarea name="text"></textarea></div><div class="usertext-buttons"><button class="save">save</button></div></div></div><div class="thing comment" data-fullname="t1_target"></div>`);
+    expect.soft(findReplyBox(root, flavor, "target")).toBeNull();
+    expect.soft(findReplySubmit(root, flavor, "target")).toBeNull();
+  });
+
+  it.each(["new", "old"] as const)("does not select a nested child's editor or submit for the %s parent comment", (flavor) => {
+    const root = mount(flavor === "new"
+      ? `<shreddit-comment thingid="t1_target"><shreddit-comment thingid="t1_child"><comment-composer-host><div contenteditable="true" name="body"></div><button slot="submit-button">Comment</button></comment-composer-host></shreddit-comment></shreddit-comment>`
+      : `<div class="thing comment" data-fullname="t1_target"><div class="child"><div class="thing comment" data-fullname="t1_child"><div class="child"><div class="usertext-edit"><textarea name="text"></textarea></div><div class="usertext-buttons"><button class="save">save</button></div></div></div></div></div>`);
+    expect.soft(findReplyBox(root, flavor, "target")).toBeNull();
+    expect.soft(findReplySubmit(root, flavor, "target")).toBeNull();
+  });
+
+  it("does not borrow the following comment's editor or submit", () => {
+    const root = mount(`<shreddit-comment thingid="t1_target"></shreddit-comment><shreddit-comment thingid="t1_other"><comment-composer-host><div contenteditable="true" name="body"></div><button slot="submit-button">Comment</button></comment-composer-host></shreddit-comment>`);
+    expect.soft(findReplyBox(root, "new", "target")).toBeNull();
+    expect.soft(findReplySubmit(root, "new", "target")).toBeNull();
+  });
+
+  it("keeps the existing adjacent new-Reddit composer association", () => {
+    const root = mount(`<shreddit-comment thingid="t1_target"></shreddit-comment><comment-composer-host><div contenteditable="true" name="body" id="target-box"></div><button slot="submit-button" id="target-submit">Comment</button></comment-composer-host>`);
+    expect.soft(findReplyBox(root, "new", "target")?.id).toBe("target-box");
+    expect.soft(findReplySubmit(root, "new", "target")?.id).toBe("target-submit");
+  });
+
+  it("selects the requested old-Reddit editor and submit among two distinct open comments", () => {
+    const composer = (id: string) => `<div class="thing comment" data-fullname="t1_${id}"><div class="child"><div class="usertext-edit"><textarea name="text" id="${id}-box"></textarea></div><div class="usertext-buttons"><button class="save" id="${id}-submit">save</button></div></div></div>`;
+    const root = mount(composer("other") + composer("target"));
+    expect.soft(findReplyBox(root, "old", "target")?.id).toBe("target-box");
+    expect.soft(findReplySubmit(root, "old", "target")?.id).toBe("target-submit");
+  });
+
+  it.each(["new", "old"] as const)("returns no editor or submit for an absent %s target", (flavor) => {
+    const root = mount(flavor === "new"
+      ? `<comment-composer-host><div contenteditable="true" name="body"></div><button slot="submit-button">Comment</button></comment-composer-host>`
+      : OLD_COMPOSER);
+    expect.soft(findReplyBox(root, flavor, "absent")).toBeNull();
+    expect.soft(findReplySubmit(root, flavor, "absent")).toBeNull();
+  });
+
+  const SCOPED = `
+    <comment-composer-host>
+      <div contenteditable="true" name="body" role="textbox" id="post-box"></div>
+      <button type="submit" slot="submit-button" id="post-submit">Comment</button>
+    </comment-composer-host>
+    <shreddit-comment thingid="t1_c1" author="alice">
+      <shreddit-comment-action-row><button>Reply</button></shreddit-comment-action-row>
+      <comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox" id="comment-box"></div>
+        <button type="submit" slot="submit-button" id="comment-submit">Comment</button>
+      </comment-composer-host>
+    </shreddit-comment>`;
+
+  it("scopes the reply box + submit to the TARGET comment's composer", () => {
+    const root = mount(SCOPED);
+    expect(findReplyBox(root, "new", "c1")!.id).toBe("comment-box");
+    expect(findReplySubmit(root, "new", "c1")!.id).toBe("comment-submit");
+  });
+  it("without a commentId uses the page-level POST composer (first in document order)", () => {
+    const root = mount(SCOPED);
+    expect(findReplyBox(root, "new")!.id).toBe("post-box");
+    expect(findReplySubmit(root, "new")!.id).toBe("post-submit");
+  });
+  it("relaxed editable selector: name='body' WITHOUT role='textbox' still matches", () => {
+    const root = mount(`<div contenteditable="true" name="body" id="b"></div>`);
+    expect(findReplyBox(root, "new")!.id).toBe("b");
+  });
+
+  /** jsdom lays nothing out, so a box only counts as visible when stubbed. */
+  const show = (el: HTMLElement) => {
+    el.getBoundingClientRect = () =>
+      ({ x: 0, y: 0, width: 300, height: 80, top: 0, left: 0, right: 300, bottom: 80, toJSON: () => ({}) }) as DOMRect;
+    return el;
+  };
+
+  // The clear-before-navigate path has no commentId to scope by, and the test
+  // directly above is exactly why it must NOT reuse findReplyBox: unscoped, that
+  // answers "where would a reply be typed" and returns the page-level POST
+  // composer. If the operator has expanded that box, an EMPTY post composer
+  // outranks a comment reply composer still holding text — the emptiness check
+  // reads the wrong box, reports nothing to clear, and the navigation raises the
+  // leave-site dialog the clear exists to prevent.
+  it("findDirtyReplyBox picks the box that HOLDS TEXT, not the one findReplyBox would type into", () => {
+    const root = mount(SCOPED);
+    // The operator has EXPANDED the page-level post composer (so it is visible)
+    // and left it empty, while a comment reply composer holds text. That is the
+    // exact state in which the two questions give different answers.
+    show(root.querySelector<HTMLElement>("#post-box")!);
+    show(root.querySelector<HTMLElement>("#comment-box")!).textContent = "half-typed reply";
+    // The trap, pinned: unscoped findReplyBox still points at the empty post box.
+    expect(findReplyBox(root, "new")!.id).toBe("post-box");
+    expect(findDirtyReplyBox(root, "new")!.id).toBe("comment-box");
+  });
+
+  it("findDirtyReplyBox returns null when nothing on the page holds text", () => {
+    const root = mount(SCOPED);
+    expect(findDirtyReplyBox(root, "new")).toBeNull();
+  });
+
+  // Without the ownership-aware search the clear gives up on the wrong box:
+  // the operator's own text sits in the page-level composer, which is FIRST in
+  // document order, so "the dirty box is not ours" would be the answer while
+  // our leftover reply sat further down — navigating away from it and arming
+  // the dialog with nothing logged.
+  it("findDirtyReplyBox skips the operator's dirty box to find OURS further down", () => {
+    const root = mount(SCOPED);
+    show(root.querySelector<HTMLElement>("#post-box")!).textContent = "something the operator is writing";
+    show(root.querySelector<HTMLElement>("#comment-box")!).textContent = "our leftover reply";
+    // Unqualified, the first visible dirty box wins — the operator's.
+    expect(findDirtyReplyBox(root, "new")!.id).toBe("post-box");
+    // Asked for OURS, it finds ours.
+    const mine = (t: string) => t.includes("our leftover reply");
+    expect(findDirtyReplyBox(root, "new", mine)!.id).toBe("comment-box");
+  });
+
+  it("findDirtyReplyBox returns null when nothing on the page holds OUR text", () => {
+    const root = mount(SCOPED);
+    show(root.querySelector<HTMLElement>("#post-box")!).textContent = "only the operator's text";
+    expect(findDirtyReplyBox(root, "new", (t) => t.includes("ours"))).toBeNull();
+  });
+
+  it("findDirtyReplyBox ignores whitespace-only text", () => {
+    const root = mount(SCOPED);
+    show(root.querySelector<HTMLElement>("#comment-box")!).textContent = "   \n  ";
+    expect(findDirtyReplyBox(root, "new")).toBeNull();
+  });
+
+  // Taking the first dirty candidate regardless of visibility DEADLOCKS the
+  // clear: the probe reports "still dirty" forever off a box the focus click can
+  // never land on, so runClearComposer bails through its no-composer path and
+  // the visible box actually holding a reply is never cleared at all.
+  it("findDirtyReplyBox prefers a VISIBLE dirty box over a hidden one earlier in the document", () => {
+    const root = mount(`
+      <div contenteditable="true" name="body" role="textbox" id="hidden">stale prefill</div>
+      <div contenteditable="true" name="body" role="textbox" id="shown">half-typed reply</div>`);
+    show(root.querySelector<HTMLElement>("#shown")!);
+    expect(findDirtyReplyBox(root, "new")!.id).toBe("shown");
+  });
+
+  // A hidden dirty box is not a fallback either. old.reddit prefills a
+  // collapsed usertext-edit textarea with every one of your own comments, so
+  // returning one would report the page dirty forever: the probe reads
+  // present:true while the focus click can never land on a zero-rect element,
+  // deadlocking the clear and logging a false "would not clear" on every hop.
+  it("findDirtyReplyBox ignores a dirty box that is hidden", () => {
+    const root = mount(`<div contenteditable="true" name="body" role="textbox" id="hidden">stale prefill</div>`);
+    expect(findDirtyReplyBox(root, "new")).toBeNull();
+  });
+
+  it("findDirtyReplyBox ignores old Reddit's hidden prefilled comment textareas", () => {
+    const root = mount(`
+      <div class="thing comment"><div class="usertext-edit"><textarea name="text">my earlier comment</textarea></div></div>
+      <div class="commentarea"><div class="usertext-edit"><textarea name="text"></textarea></div></div>`);
+    expect(findDirtyReplyBox(root, "old")).toBeNull();
+  });
+
+  it("findDirtyReplyBox reads a value, not textContent, on old Reddit", () => {
+    const root = mount(`<textarea name="text" id="t"></textarea>`);
+    const ta = show(root.querySelector<HTMLTextAreaElement>("#t")!) as HTMLTextAreaElement;
+    expect(findDirtyReplyBox(root, "old")).toBeNull();
+    ta.value = "half-typed reply";
+    expect(findDirtyReplyBox(root, "old")!.id).toBe("t");
+  });
+});
+
+// ── Reply-submit locator rewrite (ports #407 + #442) ─────────────────────────
+// The old fallback was a bare document-wide querySelector for
+// button[slot='submit-button'] — first match wins regardless of which composer
+// was typed into. These lock the anchored, word-gated, decoy-excluded search.
+
+describe("findReplySubmit — anchored fallback + decoy rejection (ports #407/#442)", () => {
+  it("DECOY: never returns the thread-level 'Reply' opener (action row) when the slot attr is missing", () => {
+    // Composer whose submit lost its slot attr (drift) + a comment's Reply opener.
+    const root = mount(`
+      <shreddit-comment thingid="t1_x" author="a">
+        <shreddit-comment-action-row><button>Reply</button></shreddit-comment-action-row>
+      </shreddit-comment>
+      <comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox"></div>
+        <button type="submit" id="real">Comment</button>
+      </comment-composer-host>`);
+    const hit = findReplySubmit(root, "new")!;
+    expect(hit.id).toBe("real");
+  });
+  it("DECOY: a count-only button whose aria carries the word is rejected (comment-count shape)", () => {
+    const root = mount(`
+      <button aria-label="Comment" id="decoy">1.2K</button>
+      <comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox"></div>
+        <button type="submit" slot="submit-button" id="real">Comment</button>
+      </comment-composer-host>`);
+    expect(findReplySubmit(root, "new")!.id).toBe("real");
+  });
+  it("ANCHOR: a worded button PRECEDING the box (toggle position) is never picked", () => {
+    const root = mount(`
+      <button id="before">Comment</button>
+      <comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox"></div>
