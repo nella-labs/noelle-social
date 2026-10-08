@@ -198,3 +198,203 @@ const TWEETS_LOOKUP_MAX = 100;
 
 function measuredCount(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.trunc(value) : null;
+}
+
+function chunk<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+/** The single gate: only an enabled x_intern may obtain a writable client. */
+export function assertXWriteAllowed(o: { role: string; sendEnabled: boolean; xApiWriteEnabled: boolean }): void {
+  if (o.role !== "x_intern" || !o.sendEnabled || !o.xApiWriteEnabled) {
+    throw new XWriteForbiddenError(
+      `x write refused: role=${o.role} send_enabled=${o.sendEnabled} x_api_write_enabled=${o.xApiWriteEnabled}`,
+    );
+  }
+}
+
+interface FetchResp {
+  status: number;
+  ok: boolean;
+  headers: { get(k: string): string | null };
+  json(): Promise<unknown>;
+  text(): Promise<string>;
+}
+
+function extractDetail(body: unknown): string {
+  if (!body || typeof body !== "object") return "";
+  const b = body as { detail?: unknown; title?: unknown; errors?: unknown };
+  const parts: string[] = [];
+  if (typeof b.detail === "string") parts.push(b.detail);
+  if (typeof b.title === "string") parts.push(b.title);
+  if (Array.isArray(b.errors)) {
+    for (const e of b.errors) {
+      const m = e && typeof e === "object" ? (e as { message?: unknown }).message : undefined;
+      if (typeof m === "string") parts.push(m);
+    }
+  }
+  return parts.join(" — ");
+}
+
+function retryAfterMs(headers: { get(k: string): string | null }): number | undefined {
+  const reset = headers.get("x-rate-limit-reset");
+  if (reset && /^\d+$/.test(reset)) {
+    const ms = Number(reset) * 1000 - Date.now();
+    if (ms > 0) return ms;
+  }
+  const ra = headers.get("retry-after");
+  if (ra && /^\d+$/.test(ra)) return Number(ra) * 1000;
+  return undefined;
+}
+
+function classifyApiError(status: number, body: unknown, headers: { get(k: string): string | null }): never {
+  const detail = extractDetail(body);
+  if (status === 429) {
+    const e = new XRateLimitError(`x api 429 ${detail}`.trim());
+    const ms = retryAfterMs(headers);
+    if (ms !== undefined) e.retryAfterMs = ms;
+    throw e;
+  }
+  if (status === 403) {
+    if (/duplicate content/i.test(detail)) throw new XDuplicateError(`x api ${detail}`);
+    if (/suspend|locked|automated|not permitted to perform/i.test(detail)) throw new XLockError(`x api ${detail}`);
+    if (
+      /reply to this conversation is not allowed|not been mentioned or otherwise engaged|not permitted to reply|who can reply|cannot reply/i.test(
+        detail,
+      )
+    ) {
+      throw new XReplyRestrictedError(`x api ${detail}`);
+    }
+    throw new XError(`x api 403 ${detail}`.trim(), 403);
+  }
+  if (status === 401) throw new XAuthError(`x api 401 ${detail}`.trim());
+  throw new XError(`x api ${status} ${detail}`.trim(), status);
+}
+
+function pctEncode(s: string): string {
+  return encodeURIComponent(s).replace(/[!*'()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+/**
+ * OAuth 1.0a (HMAC-SHA1) Authorization header. For a JSON POST /2/tweets there
+ * are no request parameters to sign; for a GET /2/tweets?ids=… the query params
+ * MUST be folded into the signature base string (pass them as `fixed.query` —
+ * the RAW, un-encoded values; they are percent-encoded here, matching what
+ * URLSearchParams sends on the wire). Query params stay in the URL, never in the
+ * returned header.
+ */
+export function oauth1aHeader(
+  method: string,
+  url: string,
+  creds: OAuth1aCreds,
+  fixed?: { nonce?: string; timestamp?: string; query?: Record<string, string> },
+): string {
+  const oauth: Record<string, string> = {
+    oauth_consumer_key: creds.consumerKey,
+    oauth_nonce: fixed?.nonce ?? randomBytes(16).toString("hex"),
+    oauth_signature_method: "HMAC-SHA1",
+    oauth_timestamp: fixed?.timestamp ?? Math.floor(Date.now() / 1000).toString(),
+    oauth_token: creds.accessToken,
+    oauth_version: "1.0",
+  };
+  // The signature base covers ALL request params: oauth_* plus any query params.
+  const allParams: Record<string, string> = { ...oauth, ...(fixed?.query ?? {}) };
+  const paramStr = Object.keys(allParams)
+    .sort()
+    .map((k) => `${pctEncode(k)}=${pctEncode(allParams[k]!)}`)
+    .join("&");
+  const base = [method.toUpperCase(), pctEncode(url), pctEncode(paramStr)].join("&");
+  const signingKey = `${pctEncode(creds.consumerSecret)}&${pctEncode(creds.accessTokenSecret)}`;
+  const signature = createHmac("sha1", signingKey).update(base).digest("base64");
+  const header: Record<string, string> = { ...oauth, oauth_signature: signature };
+  return "OAuth " + Object.keys(header).sort().map((k) => `${pctEncode(k)}="${pctEncode(header[k]!)}"`).join(", ");
+}
+
+export function createXApiClient(opts: XApiClientOpts): XWriteClient {
+  assertXWriteAllowed(opts);
+  const rawFetch = opts.fetchFn ?? fetch;
+  const requestTimeoutMs = Number.isFinite(opts.requestTimeoutMs) && opts.requestTimeoutMs! > 0
+    ? Math.min(120_000, Math.ceil(opts.requestTimeoutMs!)) : 20_000;
+  const doFetch: typeof fetch = (input, init) => rawFetch(input, {
+    ...init, signal: AbortSignal.timeout(requestTimeoutMs),
+  });
+  let tokens: XApiTokens = { ...(opts.tokens ?? { accessToken: "" }) };
+  const handle = opts.handle ?? null;
+
+  // The raw HTTP refresh-token grant, factored out so a coordinator can drive it
+  // under an advisory lock. Takes the refresh token as a param (so the caller can
+  // pass the CURRENT persisted token, not a stale in-memory one) and RETURNS the
+  // rotated tokens — throwing XAuthError on failure rather than returning false.
+  async function performHttpRefresh(refreshToken: string): Promise<XApiTokens> {
+    const params = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: opts.clientId ?? "",
+    });
+    const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+    if (opts.clientSecret) {
+      headers.authorization = `Basic ${Buffer.from(`${opts.clientId}:${opts.clientSecret}`).toString("base64")}`;
+    }
+    const res = (await doFetch(X_OAUTH_TOKEN_URL, {
+      method: "POST",
+      headers,
+      body: params.toString(),
+    } as RequestInit)) as unknown as FetchResp;
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new XAuthError(`x oauth2 refresh failed ${res.status} ${extractDetail(body)}`.trim());
+    }
+    const j = (await res.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
+    if (!j.access_token) throw new XAuthError("x oauth2 refresh: response missing access_token");
+    const next: XApiTokens = {
+      accessToken: j.access_token,
+      // X may omit refresh_token on a refresh; keep the one we refreshed WITH.
+      refreshToken: j.refresh_token ?? refreshToken,
+    };
+    if (j.expires_in) next.expiresAt = Date.now() + j.expires_in * 1000;
+    return next;
+  }
+
+  // Refresh the access token. With a `refreshCoordinator`, refresh is serialized
+  // + persisted across processes (it re-reads the current DB token, calls X once
+  // under a lock, and writes the rotation itself — so we do NOT also invoke
+  // onTokensRefreshed). Without one, we keep the original inline behavior. Either
+  // way, returns false (never throws) on failure so the reactive 401 path can
+  // surface a clean XAuthError.
+  async function refresh(): Promise<boolean> {
+    if (!tokens.refreshToken || !opts.clientId) return false;
+    if (opts.refreshCoordinator) {
+      try {
+        tokens = await opts.refreshCoordinator(performHttpRefresh);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    try {
+      tokens = await performHttpRefresh(tokens.refreshToken);
+      await opts.onTokensRefreshed?.(tokens);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const tweetUrl = `${X_API_BASE}/tweets`;
+  async function tweetRequest(payload: object): Promise<FetchResp> {
+    const authorization = opts.oauth1a
+      ? oauth1aHeader("POST", tweetUrl, opts.oauth1a)
+      : `Bearer ${tokens.accessToken}`;
+    return (await doFetch(tweetUrl, {
+      method: "POST",
+      headers: { authorization, "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    } as RequestInit).catch(() => {
+      throw new XWriteUncertainError("x post response lost; check X before retrying");
+    })) as unknown as FetchResp;
+  }
+
+  async function metricsRequest(ids: string[]): Promise<FetchResp> {
