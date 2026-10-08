@@ -1,0 +1,26 @@
+{
+  "name": "@noelle/vault-daemon",
+  "version": "0.0.1-alpha.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "bin": { "noelle-vault-daemon": "./src/index.ts" },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "watch": "tsx src/index.ts",
+    "sync:once": "tsx src/index.ts --once",
+    "sync:prune": "tsx src/index.ts --once --prune"
+  },
+  "dependencies": {
+    "@noelle/runtime": "workspace:*",
+    "chokidar": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  }
+}
