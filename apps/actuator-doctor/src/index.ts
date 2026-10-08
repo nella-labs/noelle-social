@@ -198,3 +198,203 @@ async function runTick(cx: TickContext): Promise<void> {
         "incident resolved",
       );
     }
+  }
+
+  // 2) Handle current faults — one incident per target, climbing the ladder.
+  for (const [target, match] of byTarget.entries()) {
+    bumpSignatureOnMatch(store, match.signature.id, nowIso);
+    const prior = openIncidents.get(target);
+    const continuing = prior && prior.signatureId === match.signature.id;
+    const lastAction = continuing ? prior.lastAction : null;
+
+    const { action, capped } = decideAction({
+      ladder: match.signature.ladder,
+      lastAction,
+      counter,
+      signatureId: match.signature.id,
+      maxPerHour: match.signature.maxPerHour,
+      globalCap: env.NOELLE_DOCTOR_MAX_REMEDIATIONS_PER_HOUR,
+      now,
+      lastPagedAt: continuing ? prior.pagedAt ?? null : null,
+      repageMs: env.NOELLE_DOCTOR_REPAGE_MS,
+    });
+
+    const ctx: RemediateCtx = {
+      target,
+      signatureId: match.signature.id,
+      appsToRestart: offlineAppsFor(target, probes),
+      instanceIds: arm[target]?.instanceIds ?? [],
+    };
+    const res = await remediate(action, ctx, {
+      env,
+      alert,
+      logger,
+      pm2: { restartApp: (name) => restartApp(env, name) },
+      bridge: cx.bridgeRemediator,
+      db: cx.dbRemediator,
+    });
+
+    // Count only actions that actually mutated (not dry-run, not page_human).
+    if (isMutating(action) && !env.NOELLE_DOCTOR_DRYRUN && res.mutated) {
+      counter.record(match.signature.id, now);
+    }
+
+    const incident: Incident = {
+      id: continuing ? prior.incident.id : `${nowIso}::${target}`,
+      at: nowIso,
+      target,
+      signatureId: match.signature.id,
+      summary: `${match.signature.title} on ${target}${capped ? " [capped -> page]" : ""}`,
+      probes: probes.filter((p) => p.target === target),
+      actionTaken: action,
+      // null = awaiting verification next tick; false only if the action itself failed.
+      actionOk: env.NOELLE_DOCTOR_DRYRUN ? null : res.ok ? null : false,
+      verifiedAt: null,
+      resolved: false,
+      escalated: false,
+    };
+    appendIncident(env, incident);
+    // "none" from decideAction means a deduped repeat page: keep the ladder's
+    // real lastAction (nextRung restarts the ladder on an unknown action) and
+    // the original page stamp. A real page refreshes the stamp.
+    const dedupedPage = action === "none" && continuing;
+    openIncidents.set(target, {
+      signatureId: match.signature.id,
+      lastAction: dedupedPage ? prior.lastAction : action,
+      incident,
+      capped,
+      pagedAt: action === "page_human" ? now : continuing ? prior.pagedAt : undefined,
+    });
+
+    logger.warn(
+      { target, signature: match.signature.id, action, capped, ok: res.ok, dryrun: env.NOELLE_DOCTOR_DRYRUN },
+      "fault handled",
+    );
+  }
+
+  // Escalation pass (OFF by default; NOELLE_DOCTOR_AUTOFIX). Sees the full tick:
+  // an UNMATCHED fault (a failing probe no signature covers) may spawn `claude -p`
+  // to propose a strictly-validated new signature. No-op unless autofix is on.
+  await maybeEscalate({
+    env,
+    store,
+    logger,
+    alert,
+    probes,
+    matchedTargets: new Set(byTarget.keys()),
+    nowIso,
+  });
+
+  persistStore(env, store);
+  writeLastReport(
+    env,
+    buildReport({ tick: cx.tick, now, probes, arm, openIncidents, counter, store, env, inWindow }),
+  );
+
+  await stampHeartbeat(env, nowIso);
+  await recordDoctorRun(sql, probes.length);
+
+  logger.info(
+    { tick: cx.tick, faults: byTarget.size, open: openIncidents.size, dryrun: env.NOELLE_DOCTOR_DRYRUN },
+    "tick complete",
+  );
+}
+
+// A sleep that a signal can interrupt, so SIGTERM stops the loop promptly.
+function makeSleeper() {
+  let wake: (() => void) | null = null;
+  return {
+    sleep(ms: number): Promise<void> {
+      return new Promise((resolve) => {
+        const t = setTimeout(() => {
+          wake = null;
+          resolve();
+        }, ms);
+        wake = () => {
+          clearTimeout(t);
+          wake = null;
+          resolve();
+        };
+      });
+    },
+    wake() {
+      wake?.();
+    },
+  };
+}
+
+function emptyReport(env: Env): DoctorReport {
+  return {
+    at: new Date().toISOString(),
+    tick: 0,
+    healthy: true,
+    targets: ALL_TARGETS.map((target) => ({
+      target,
+      healthy: true,
+      armed: false,
+      inWindow: true,
+      probes: [],
+      openIncident: null,
+    })),
+    remediationsThisHour: {},
+    autofixEnabled: env.NOELLE_DOCTOR_AUTOFIX,
+  };
+}
+
+async function main(): Promise<void> {
+  const env = loadEnv();
+  const logger = createLogger({ kind: "actuator-doctor", workerId: "0" });
+  const alert = makeAlert({ cmd: env.NOELLE_ALERT_CMD, dryrun: env.NOELLE_DOCTOR_DRYRUN, logger });
+  const sql = noelleDb();
+  const store = loadSignatureStore(env);
+  const counter = new RollingCounter();
+  const openIncidents = new Map<DoctorTarget, OpenIncident>();
+  const bridgeRemediator = makeBridgeRemediator(env);
+  const dbRemediator = makeDbRemediator(sql);
+  const sleeper = makeSleeper();
+
+  let stopping = false;
+  const onStop = (sig: string) => {
+    logger.info({ sig }, "signal received; stopping after this tick");
+    stopping = true;
+    sleeper.wake();
+  };
+  process.on("SIGTERM", () => onStop("SIGTERM"));
+  process.on("SIGINT", () => onStop("SIGINT"));
+
+  logger.info(
+    {
+      dryrun: env.NOELLE_DOCTOR_DRYRUN,
+      intervalMs: env.NOELLE_DOCTOR_INTERVAL_MS,
+      bridge: env.NOELLE_BRIDGE_URL,
+      api: env.NOELLE_API_URL,
+      stateDir: env.NOELLE_DOCTOR_STATE_DIR,
+      signatures: store.signatures.length,
+    },
+    "actuator-doctor starting",
+  );
+
+  // Always leave a last-report.json on disk, even before tick 1 finishes.
+  writeLastReport(env, emptyReport(env));
+
+  let tick = 0;
+  while (!stopping) {
+    tick++;
+    try {
+      await runTick({
+        env,
+        sql,
+        logger,
+        alert,
+        store,
+        counter,
+        openIncidents,
+        bridgeRemediator,
+        dbRemediator,
+        tick,
+      });
+    } catch (e) {
+      logger.error({ err: String(e) }, "tick failed (loop continues)");
+      await alert(env.NOELLE_DOCTOR_ALERT_CATEGORY, `[doctor] tick error: ${String(e).slice(0, 160)}`);
+    }
+    if (stopping) break;
