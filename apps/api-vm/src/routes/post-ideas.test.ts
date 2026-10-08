@@ -198,3 +198,75 @@ describe("POST /api/post-ideas ideation request ownership", () => {
 
   it("rejects an unknown explicit ideation request without inserting ideas", async () => {
     const db = makeDb({ request: null });
+    __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", postIdeas);
+
+    const res = await app.request("/api/post-ideas", {
+      method: "POST",
+      body: JSON.stringify({
+        platform: "x",
+        ideationRequestId: REQUEST_ID,
+        ideas: [ideaPayload()],
+      }),
+    });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ error: "ideation_request_not_found" });
+    expect(resolveActiveInstanceForPlatform).not.toHaveBeenCalled();
+    expect(db.insertedIdeas).toHaveLength(0);
+  });
+
+  it("rejects an explicit ideation request owned by another platform role", async () => {
+    const db = makeDb({
+      request: {
+        org_id: ORG_ID,
+        agent_instance_id: LINKEDIN_AGENT_ID,
+        role: "linkedin_intern",
+        batch_id: null,
+        require_review: true,
+      },
+    });
+    __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", postIdeas);
+
+    const res = await app.request("/api/post-ideas", {
+      method: "POST",
+      body: JSON.stringify({
+        platform: "x",
+        ideationRequestId: REQUEST_ID,
+        ideas: [ideaPayload()],
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "ideation_request_platform_mismatch" });
+    expect(db.insertedIdeas).toHaveLength(0);
+  });
+
+  it("rejects an explicit batch request when idea batch ids do not match", async () => {
+    const db = makeDb({
+      request: {
+        org_id: ORG_ID,
+        agent_instance_id: X_AGENT_ID,
+        role: "x_intern",
+        batch_id: BATCH_ID,
+        require_review: true,
+      },
+    });
+    __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", postIdeas);
+
+    const res = await app.request("/api/post-ideas", {
+      method: "POST",
+      body: JSON.stringify({
+        platform: "x",
+        ideationRequestId: REQUEST_ID,
+        ideas: [ideaPayload({ batchId: "different-batch" })],
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "ideation_request_batch_mismatch" });
+    expect(db.insertedIdeas).toHaveLength(0);
+  });
+});
