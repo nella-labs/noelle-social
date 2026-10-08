@@ -598,3 +598,198 @@ drafts.post("/api/drafts/:id/unskip", (c) =>
 // Wait for reply is an explicit DM-only transition, with current state rechecked.
 drafts.post("/api/drafts/:id/park", (c) =>
   mutateApproval(c, async (sql, scope) => {
+    const result = await parkApprovalDm(sql, scope);
+    return c.json({ approval_id: result.approvalId, status: "deferred" as const });
+  }),
+);
+
+export { markApprovalSent, type MarkApprovalSentResult } from "../lib/manual-sent-db.js";
+
+// POST /api/drafts/:id/mark-sent — JWT. Records a MANUAL send: the reviewer
+// already posted the reply on X by hand (the Speedrun copy → paste flow, or
+// because the lead has no valid in_reply_to anchor so the synchronous /send
+// path can't post). We flip the approval to 'sent' and skip the lead's other
+// angles — the SAME end state as /send — but WITHOUT calling X.
+//
+// Worker-safety: the send worker claims rows where `status='sent' AND
+// drafts.sent_external_id IS NULL` and posts them to X. To stop it from
+// re-posting this manual send we write a non-null sentinel into
+// sent_external_id (`manual:<draft-id>`, per-row unique so a future UNIQUE
+// constraint on the column can't collide). posted_at + payload.sent_via mark
+// the row as a hand-posted reply for the dashboard.
+
+drafts.post("/api/drafts/:id/mark-sent", async (c) => {
+  const auth = c.get("auth");
+  const approvalId = c.req.param("id");
+
+  let tweetUrl: string | null = null;
+  let sentVia: "manual" | "extension" = "manual";
+  try {
+    const raw = await c.req.json().catch(() => ({}));
+    // Optional tweet_url: the reviewer can paste the link to the reply they
+    // posted by hand so we capture the real tweet id. Parse so a malformed
+    // payload is a clean 400.
+    const parsed = DraftMarkSentInSchema.parse(raw);
+    tweetUrl = parsed.tweet_url ?? null;
+    sentVia = parsed.sent_via ?? "manual";
+  } catch (err) {
+    return c.json(
+      {
+        error: "invalid_body",
+        detail: err instanceof Error ? err.message : String(err),
+      },
+      400,
+    );
+  }
+
+  const sql = noelleDb();
+
+  // Verify org membership before delegating to shared core.
+  let orgRow: { org_id: string } | undefined;
+  try {
+    const rows = await sql<Array<{ org_id: string }>>`
+      select org_id from noelle.approvals where id = ${approvalId} limit 1
+    `;
+    orgRow = rows[0];
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json({ error: "internal", detail: msg }, 500);
+  }
+  if (!orgRow) {
+    return c.json({ error: "not_found" }, 404);
+  }
+  if (!(await isOrgMember(auth.userId, orgRow.org_id))) {
+    return c.json({ error: "not_org_member" }, 403);
+  }
+
+  const res = await markApprovalSent(sql, { approvalId, orgId: orgRow.org_id, decidedBy: auth.userId, sentVia, tweetUrl });
+  if (!res.ok) {
+    return c.json({ error: res.error, detail: res.detail }, res.status);
+  }
+  return c.json(res.result);
+});
+
+// Undo a manual record; the storage owner rechecks receipts under row locks.
+drafts.post("/api/drafts/:id/unmark-sent", async (c) => {
+  const sql = noelleDb();
+  const approvalId = c.req.param("id");
+  try {
+    const [row] = await sql<{ org_id: string }[]>`
+      select org_id from noelle.approvals where id=${approvalId}
+    `;
+    if (!row) return c.json({ error: "not_found" }, 404);
+    if (!(await isOrgMember(c.get("auth").userId, row.org_id)))
+      return c.json({ error: "not_org_member" }, 403);
+    const result = await undoManualSent(sql, { approvalId, orgId: row.org_id });
+    if (!result.ok) return c.json({ error: result.error, detail: result.detail }, result.status);
+    const { ok: _ok, ...body } = result;
+    return c.json(body);
+  } catch (err) {
+    return c.json({ error: "internal", detail: err instanceof Error ? err.message : String(err) }, 500);
+  }
+});
+
+// POST /api/drafts/:id/save-edit — JWT. Persist an operator edit to a draft's
+// body WITHOUT sending or marking it sent. An edit is also a learning signal.
+// The reply/DM /send routes fold edited_body into the same write that posts;
+// this route saves the text for a later actor or manual send. Re-saving the
+// same effective body preserves its review; a changed body invalidates it.
+//
+// Body validated inline (not via @noelle/contracts) — a tiny edit-capture shape
+// scoped to this route. It never touches approval status, so a later /mark-sent
+// still records the send.
+
+const SaveEditInSchema = z.object({
+  /** The edited draft body the operator wants to persist as the learning signal. */
+  body: z.string().min(1).max(4000),
+});
+
+drafts.post("/api/drafts/:id/save-edit", async (c) => {
+  let body: string;
+  try {
+    const raw = await c.req.json().catch(() => ({}));
+    body = SaveEditInSchema.parse(raw).body;
+  } catch (err) {
+    return c.json(
+      {
+        error: "invalid_body",
+        detail: err instanceof Error ? err.message : String(err),
+      },
+      400,
+    );
+  }
+
+  return mutateApproval(c, async (sql, scope) => {
+    const result = await saveApprovalEdit(sql, scope, body);
+    return c.json({ approval_id: result.approvalId, draft_id: result.draftId, saved: true });
+  });
+});
+
+// POST /api/drafts/schedule-auto-send — JWT. Queue a batch of picked reply
+// approvals for staggered auto-send: stamp each with a scheduled
+// auto_send_target_at (random gaps, overnight quiet hours) and skip each lead's
+// other reply angles. The send worker fires them, rate-braked (per-hour + daily
+// cap). No posting happens here.
+drafts.post("/api/drafts/schedule-auto-send", async (c) => {
+  const auth = c.get("auth");
+  let body: ScheduleAutoSendIn;
+  try {
+    body = ScheduleAutoSendInSchema.parse(await c.req.json().catch(() => ({})));
+  } catch (err) {
+    return c.json({ error: "invalid_body", detail: err instanceof Error ? err.message : String(err) }, 400);
+  }
+  if (!(await isOrgMember(auth.userId, body.org_id))) {
+    return c.json({ error: "not_org_member" }, 403);
+  }
+
+  let cap = Number(process.env.NOELLE_AUTOSEND_MAX_PER_DAY ?? 50);
+  if (!Number.isFinite(cap) || cap < 0) cap = 50;
+  const enabled = process.env.NOELLE_AUTOSEND_REQUIRE_SEND_ENABLED ?? "";
+  try {
+    const result = await scheduleAutoSendApprovals(noelleDb(), {
+      orgId: body.org_id, approvalIds: body.approval_ids, userId: auth.userId, cap,
+      requireSendEnabled: enabled === "1" || enabled.toLowerCase() === "true",
+      quietStartHourUtc: Number(process.env.NOELLE_AUTOSEND_QUIET_START_UTC ?? 4),
+      quietEndHourUtc: Number(process.env.NOELLE_AUTOSEND_QUIET_END_UTC ?? 12),
+    });
+    return "error" in result ? c.json(result, 409) : c.json(result);
+  } catch (err) {
+    return c.json({ error: "internal", detail: err instanceof Error ? err.message : String(err) }, 500);
+  }
+});
+
+// GET /api/x/whoami?org_id=... — JWT. Which X account the org's cookies post
+// as. Best-effort: never 500s on an X error — returns { connected: false } so
+// the dashboard can show "not connected" instead of breaking the page.
+drafts.get("/api/x/whoami", async (c) => {
+  const auth = c.get("auth");
+  const orgId = c.req.query("org_id");
+  if (!orgId) return c.json({ error: "missing_org_id" }, 400);
+  if (!(await isOrgMember(auth.userId, orgId))) {
+    return c.json({ error: "not_org_member" }, 403);
+  }
+
+  let ct0: string;
+  let authToken: string;
+  try {
+    const secrets = getSecrets();
+    [ct0, authToken] = await Promise.all([
+      secrets.getForOrg(orgId, "x-cookies-ct0"),
+      secrets.getForOrg(orgId, "x-cookies-auth-token"),
+    ]);
+  } catch {
+    return c.json({ connected: false as const });
+  }
+
+  try {
+    const me = await _xClientFactory({ ct0, authToken }).verifyCredentials();
+    if (me.id_str && me.id_str !== "0") {
+      return c.json({ connected: true as const, handle: me.screen_name, id: me.id_str });
+    }
+    return c.json({ connected: false as const });
+  } catch {
+    return c.json({ connected: false as const });
+  }
+});
+
+export { drafts };
