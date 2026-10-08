@@ -198,3 +198,76 @@ describe("planDrainTimeline — under a per-session archetype (bounds + equal-or
   });
 });
 
+describe("inQuietDrainGap — cooldown-band quiet signal (reply-only drain)", () => {
+  const FLOOR = 240_000 + Math.round(900_000 * 0.62); // 798000 — the cooldown-band floor
+
+  it("is FALSE inside a quick/normal-band gap and TRUE inside a cooldown-band gap", () => {
+    const plan = [
+      { kind: "comment" as const, atMs: 0 },
+      { kind: "comment" as const, atMs: 300_000 },           // gap 300k < 798k → not quiet
+      { kind: "comment" as const, atMs: 300_000 + 900_000 }, // gap 900k ≥ 798k → quiet
+    ];
+    expect(inQuietDrainGap(plan, 150_000)).toBe(false);          // inside the 300k gap
+    expect(inQuietDrainGap(plan, 300_000 + 450_000)).toBe(true); // inside the 900k cooldown gap
+  });
+
+  it("flips exactly at the cooldown-band floor", () => {
+    const belowFloor = [
+      { kind: "comment" as const, atMs: 0 },
+      { kind: "comment" as const, atMs: FLOOR - 1 },
+    ];
+    const atFloor = [
+      { kind: "comment" as const, atMs: 0 },
+      { kind: "comment" as const, atMs: FLOOR },
+    ];
+    expect(inQuietDrainGap(belowFloor, Math.floor((FLOOR - 1) / 2))).toBe(false);
+    expect(inQuietDrainGap(atFloor, Math.floor(FLOOR / 2))).toBe(true);
+  });
+
+  it("is FALSE before the first reply and after the last (no enclosing gap)", () => {
+    const plan = [
+      { kind: "comment" as const, atMs: 100_000 },
+      { kind: "comment" as const, atMs: 100_000 + 900_000 },
+    ];
+    expect(inQuietDrainGap(plan, 50_000)).toBe(false);                     // before the first reply
+    expect(inQuietDrainGap(plan, 100_000 + 900_000 + 10_000)).toBe(false); // after the last reply
+  });
+
+  it("agrees with planDrainTimeline: quiet EXACTLY where the drawn gap is a cooldown/break gap", () => {
+    for (let seed = 1; seed <= 40; seed++) {
+      const actions = planDrainTimeline({
+        approvedComments: 8, startMs: seed * 100_000, rng: makeRng(seed),
+        ...REDDIT_DRAIN, longBreakMs: 1_000_000,
+      });
+      const c = actions.filter((a) => a.kind === "comment").map((a) => a.atMs).sort((x, y) => x - y);
+      for (let i = 0; i < c.length - 1; i++) {
+        const lo = c[i]!, hi = c[i + 1]!;
+        const gap = hi - lo;
+        const mid = lo + Math.floor(gap / 2);
+        expect(inQuietDrainGap(actions, mid)).toBe(gap >= FLOOR);
+      }
+    }
+  });
+});
+
+describe("planDrainTimeline — drainStyle fallback (old persisted state)", () => {
+  it("omitting the archetype ≡ the explicit default band mix (byte-identical comment schedule)", () => {
+    // maybeExtendDrain spreads `...(s.drainStyle ?? {})`; an old state contributes {},
+    // so the plan uses the default [0.2,0.38,0.42] bands. Prove the fallback and the
+    // explicit default produce the same comment schedule for a fixed rng.
+    const commentTimes = (p: { kind: string; atMs: number }[]) =>
+      p.filter((a) => a.kind === "comment").map((a) => a.atMs);
+    const fallback = planDrainTimeline({ approvedComments: 20, startMs: 0, rng: makeRng(4242), ...REDDIT_DRAIN });
+    const explicit = planDrainTimeline({ approvedComments: 20, startMs: 0, rng: makeRng(4242), ...REDDIT_DRAIN, bandWeights: [0.2, 0.38, 0.42] });
+    expect(commentTimes(fallback)).toEqual(commentTimes(explicit));
+  });
+
+  it("an undefined drainStyle spreads to a no-op (matches maybeExtendDrain's `...(s.drainStyle ?? {})`)", () => {
+    const drainStyle: { bandWeights?: number[]; longBreakMs?: number } | undefined = undefined;
+    const commentTimes = (p: { kind: string; atMs: number }[]) =>
+      p.filter((a) => a.kind === "comment").map((a) => a.atMs);
+    const withSpread = planDrainTimeline({ approvedComments: 15, startMs: 0, rng: makeRng(77), ...REDDIT_DRAIN, ...(drainStyle ?? {}) });
+    const plain = planDrainTimeline({ approvedComments: 15, startMs: 0, rng: makeRng(77), ...REDDIT_DRAIN });
+    expect(commentTimes(withSpread)).toEqual(commentTimes(plain));
+  });
+});

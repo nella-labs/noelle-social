@@ -198,3 +198,38 @@ describe("microBreakDue", () => {
 
   it("breakMs is within [20000, 600000] when due", () => {
     // Find a seed that triggers a break at high activity
+    // gamma(k=1.5, theta=960000) mean = 24min; try high activity values
+    let foundDue = false;
+    for (let seed = 0; seed < 2000; seed++) {
+      const rng = makeRng(seed);
+      const result = microBreakDue(60 * 60000, rng); // 60 minutes of activity
+      if (result.due) {
+        expect(result.breakMs).toBeGreaterThanOrEqual(20000);
+        expect(result.breakMs).toBeLessThanOrEqual(600000);
+        foundDue = true;
+        break;
+      }
+    }
+    expect(foundDue).toBe(true);
+  });
+
+  it("due-rate increases with more activity", () => {
+    const N = 2000;
+    const countLow = Array.from({ length: N }, (_, i) =>
+      microBreakDue(5 * 60000, makeRng(i)).due
+    ).filter(Boolean).length;
+
+    const countHigh = Array.from({ length: N }, (_, i) =>
+      microBreakDue(60 * 60000, makeRng(i)).due
+    ).filter(Boolean).length;
+
+    expect(countHigh).toBeGreaterThan(countLow);
+  });
+
+  it("breakMs is 0 when not due", () => {
+    const rng = makeRng(1);
+    const result = microBreakDue(0, rng);
+    expect(result.due).toBe(false);
+    expect(result.breakMs).toBe(0);
+  });
+});
