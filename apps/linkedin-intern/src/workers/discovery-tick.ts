@@ -398,3 +398,203 @@ export async function runDiscoveryTick(args: RunDiscoveryTickArgs): Promise<numb
               name: post.author.name,
               headline: post.author.headline,
               source: "post_search",
+            }).catch(() => {});
+          }
+        }
+        try {
+          const res = await upsertLead({
+            orgId: instance.org_id,
+            agentInstanceId: instance.id,
+            platform: "linkedin",
+            externalId: post.id,
+            authorHandle: handle,
+            // No fsd_profile_id for a stranger from search (only watched people
+            // have one). The profiler/drafter fall back to the public id.
+            authorId: null,
+            payload: {
+              text: post.text,
+              url: post.url,
+              postedAt,
+              authorName: post.author.name,
+              authorHeadline: post.author.headline,
+              authorPublicId: handle,
+              reactions: post.reactions,
+              comments: post.comments,
+              // Post media image URLs for the downstream vision-caption step.
+              // Mirrors the watch lane — only present when the post has media so
+              // the drafter can react to charts/screenshots/memes, not just text.
+              ...(post.images && post.images.length > 0 ? { images: post.images } : {}),
+              // Lane + matched keyword, for observability + downstream debugging.
+              source: "keyword",
+              keyword,
+            },
+            postedAt,
+            // A vetted author (ICP gate passed) is a priority lead — never hard-skipped.
+            priority: Boolean(icp),
+          });
+          if (res.inserted) {
+            inserted++;
+            extractedToday++;
+            await bus?.emit({
+              topic: "lead.discovered",
+              worker: "discovery",
+              summary: `discovered ${handle} (kw: ${keyword})`,
+              payload: {
+                lead_id: res.id,
+                external_id: post.id,
+                handle,
+                reactions: post.reactions ?? null,
+                source: "keyword",
+                keyword,
+              },
+              correlationId: res.id,
+            });
+          }
+        } catch (err) {
+          log.error({ activityId: post.id, err: (err as Error).message }, "keyword lead upsert failed");
+        }
+      }
+    }
+  }
+
+  // ── Profile-first (PROFILE-SEARCH) lane — Feeder A ─────────────────────────
+  // The unit is the PERSON: find people matching the ICP via the profile-search
+  // actor, keep only those whose headline qualifies, then turn each one's recent
+  // (≤ icp.timeWindowHours) and engaged (≥ icp.minReactions) posts into PRIORITY
+  // leads. Skipped entirely when no ICP is set or the client can't searchProfiles.
+  let profilesFound = 0;
+  let profilesQualified = 0;
+  const searchProfiles = postsSource.searchProfiles;
+  if (icp && searchProfiles && extractedToday < dailyExtractCap) {
+    const icpMinReactions = icp.minReactions ?? ICP_DEFAULT_MIN_REACTIONS;
+    const icpWindowSince = windowSinceISO(
+      tickNow,
+      icp.timeWindowHours ?? ICP_DEFAULT_TIME_WINDOW_HOURS,
+    );
+    let profiles: CandidateProfile[] = [];
+    try {
+      profiles = await metered("linkedin-profile-search", operation => operation.searchProfiles!({
+        ...(icp.searchQuery ? { searchQuery: icp.searchQuery } : {}),
+        ...(icp.currentJobTitles ? { currentJobTitles: icp.currentJobTitles } : {}),
+        ...(icp.locations ? { locations: icp.locations } : {}),
+        ...(icp.seniorityLevelIds ? { seniorityLevelIds: icp.seniorityLevelIds } : {}),
+        ...(icp.yearsOfExperienceIds ? { yearsOfExperienceIds: icp.yearsOfExperienceIds } : {}),
+        ...(icp.industryIds ? { industryIds: icp.industryIds } : {}),
+        ...(icp.schools ? { schools: icp.schools } : {}),
+        maxItems: icp.maxProfiles ?? ICP_DEFAULT_MAX_PROFILES,
+      }));
+    } catch (err) {
+      // A dry token pool propagates (the worker surfaces it); any other
+      // profile-search failure is non-fatal — the watch + keyword lanes already
+      // ran, so we just skip Feeder A this tick.
+      if (err instanceof AllApifyTokensExhaustedError) throw err;
+      log.error({ err: (err as Error).message }, "apify searchProfiles failed");
+      profiles = [];
+    }
+    profilesFound = profiles.length;
+
+    for (const prof of profiles) {
+      if (extractedToday >= dailyExtractCap) break;
+      if (!prof.publicId) continue;
+      // The PERSON gate: only harvest people whose headline matches the ICP.
+      if (!qualifyByHeadline(prof.headline, icp).qualified) {
+        filtered++;
+        continue;
+      }
+      profilesQualified++;
+      // Retain every qualified person, even if they yield no lead this tick.
+      if (recordDiscoveredPerson) {
+        await recordDiscoveredPerson({
+          publicId: prof.publicId,
+          fsdProfileId: prof.fsdProfileId,
+          name: prof.name,
+          headline: prof.headline,
+          source: "profile_search",
+        }).catch(() => {});
+      }
+
+      let posts: LinkedInPost[] = [];
+      try {
+        posts = await metered("linkedin-profile-posts", operation => operation.profilePosts({
+          publicId: prof.publicId!,
+          maxPosts: discoveryLimit,
+          sinceISO: icpWindowSince ?? undefined,
+        }));
+      } catch (err) {
+        if (err instanceof AllApifyTokensExhaustedError) throw err;
+        log.error(
+          { publicId: prof.publicId, err: (err as Error).message },
+          "apify profilePosts failed for icp profile",
+        );
+        continue;
+      }
+      scanned += posts.length;
+
+      for (const post of posts) {
+        const postedAt = readSourceTimestamp(post.postedAt);
+        if (extractedToday >= dailyExtractCap) break;
+        if (seen.has(post.id)) continue;
+        seen.add(post.id);
+        // Engagement + recency gate — the whole point of profile-first leads.
+        if (
+          (icpMinReactions > 0 && (post.reactions ?? 0) < icpMinReactions) ||
+          (icpWindowSince != null && postedAt != null && postedAt < icpWindowSince)
+        ) {
+          filtered++;
+          continue;
+        }
+        try {
+          const res = await upsertLead({
+            orgId: instance.org_id,
+            agentInstanceId: instance.id,
+            platform: "linkedin",
+            externalId: post.id,
+            authorHandle: prof.publicId,
+            // fsd_profile_id when the actor returned it (often absent in short
+            // mode); the drafter/profiler fall back to the public id.
+            authorId: prof.fsdProfileId,
+            payload: {
+              text: post.text,
+              url: post.url,
+              postedAt,
+              authorName: prof.name ?? post.author.name,
+              authorHeadline: prof.headline ?? post.author.headline,
+              authorPublicId: prof.publicId,
+              reactions: post.reactions,
+              comments: post.comments,
+              ...(post.images && post.images.length > 0 ? { images: post.images } : {}),
+              source: "profile_search",
+            },
+            postedAt,
+            // A profile-first lead is always from a vetted person → priority.
+            priority: true,
+          });
+          if (res.inserted) {
+            inserted++;
+            extractedToday++;
+            await bus?.emit({
+              topic: "lead.discovered",
+              worker: "discovery",
+              summary: `discovered ${prof.publicId} (icp)`,
+              payload: {
+                lead_id: res.id,
+                external_id: post.id,
+                handle: prof.publicId,
+                reactions: post.reactions ?? null,
+                source: "profile_search",
+              },
+              correlationId: res.id,
+            });
+          }
+        } catch (err) {
+          log.error({ activityId: post.id, err: (err as Error).message }, "icp lead upsert failed");
+        }
+      }
+    }
+  }
+
+  log.info(
+    {
+      inserted,
+      scanned,
+      filtered,
