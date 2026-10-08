@@ -798,3 +798,203 @@ export function findReplySubmitInfo(
   }
 
   // Composer-anchored climb (ports #442): the box is the one node we KNOW is the
+  // right composer (we type into it), so its submit must live in a near ancestor
+  // and FOLLOW it in document order.
+  const box = findReplyBox(root, "new", commentId);
+  const follows = (el: HTMLElement) =>
+    !!box && (box.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  if (box) {
+    let scope: HTMLElement | null = box.parentElement;
+    for (let hops = 1; scope && hops <= 6; hops++) {
+      const wouldBe = Array.from(scope.querySelectorAll<HTMLElement>("button, [role='button']")).filter(
+        (el) => submitEligible(el) && follows(el),
+      );
+      if (wouldBe.length > 0) return { el: bestSubmit(wouldBe), via: `composer:${hops}` };
+      const tag = scope.tagName.toLowerCase();
+      if (tag === "form" || tag === "comment-composer-host" || tag === "shreddit-composer") break;
+      scope = scope.parentElement;
+    }
+  }
+
+  // Global two-pass (ports #407): no box located, or the submit sits outside the
+  // climb region. Word-gated + decoy-excluded; when a box exists the candidate
+  // must still FOLLOW it.
+  const candidates = Array.from(root.querySelectorAll<HTMLElement>("button, [role='button']")).filter(
+    (el) => submitEligible(el) && (!box || follows(el)),
+  );
+  const slotted = candidates.filter(submitSlotted);
+  if (slotted.length > 0) return { el: bestSubmit(slotted), via: "global-slotted" };
+  if (candidates.length > 0) return { el: bestSubmit(candidates), via: "global-word" };
+  return null;
+}
+
+export function findReplySubmit(root: ParentNode, flavor: RedditFlavor, commentId?: string): HTMLElement | null {
+  return findReplySubmitInfo(root, flavor, commentId)?.el ?? null;
+}
+
+export interface ReplySubmitDiag {
+  flavor: RedditFlavor;
+  /** a reply box was found at all */
+  box: boolean;
+  /** slot='submit-button' hits inside the TARGET comment's composer scope
+   * (0 when no commentId was given, or the scoped composer never mounted) */
+  scoped: number;
+  /** button[slot='submit-button'] anywhere on the page — a floor on "does a
+   * slotted submit even exist on this surface" */
+  slots: number;
+  /** eligible worded candidates that FOLLOW the box — the passes' pool */
+  wf: number;
+  /** of `wf`, how many are enabled */
+  en: number;
+  /** of the enabled ones, how many have a non-zero layout rect — `en>0, vis=0`
+   * means the submit exists and is enabled but has no box yet (the locator's
+   * submit-zero-rect skip fires) */
+  vis: number;
+  /** the most telling candidate + WHY it was rejected, as
+   * `<label>_<dis|zr|pre|row|chat|nobox|ok>` */
+  top: string;
+  /** compact dump of the buttons in/around the composer (the 6-hop climb region
+   * plus every slotted / type=submit button document-wide), each as
+   * `<label>_<pos><type>_<disabled><zerorect><worded>_g<group>` —
+   *   pos:   f=follows box, p=precedes, n=no box
+   *   type:  s=slot='submit-button', t=type='submit', x=other/none
+   *   group: o=reply-opener (action row / count decoy), c=chat drawer, n=none
+   * This shows the REAL submit's shape even when it's icon-only (worded=0) or
+   * mis-ordered — the thing the bucket counts alone can't reveal. Space-separated
+   * so it survives the reason sanitizer. */
+  region: string;
+}
+
+/**
+ * Why did findReplySubmitInfo resolve to nothing clickable? `submit-not-found`
+ * collapses very different failures — no worded submit exists, one exists but
+ * stays disabled the whole poll, one is enabled but has no layout box — into a
+ * single reason. This re-walks the same predicates and counts each bucket so a
+ * failure row in reddit_activity says WHICH, without a live DevTools session
+ * (chrome.debugger blocks it during a run) — shreddit custom elements drift, and
+ * this row is the only debugging window. `isZeroRect` is injected: the content
+ * script measures real rects, tests stub it. Read-only, no side effects; called
+ * by the background ONLY on the failure path. Ports #444.
+ */
+export function diagnoseReplySubmit(
+  root: ParentNode,
+  flavor: RedditFlavor,
+  isZeroRect: (el: HTMLElement) => boolean,
+  commentId?: string,
+): ReplySubmitDiag {
+  const box = findReplyBox(root, flavor, commentId);
+  const buttons = Array.from(root.querySelectorAll<HTMLElement>("button, [role='button']"));
+  const slotSel = "button[slot='submit-button'], [role='button'][slot='submit-button']";
+  const slots = root.querySelectorAll(slotSel).length;
+  let scoped = 0;
+  if (flavor === "new" && commentId) {
+    const comment = root.querySelector(`shreddit-comment[thingid="t1_${commentId}"]`);
+    scoped =
+      (comment?.querySelectorAll(slotSel).length ?? 0) +
+      (comment?.nextElementSibling?.querySelectorAll(slotSel).length ?? 0);
+  }
+  const follows = (el: HTMLElement) =>
+    !!box && (box.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  const wf = buttons.filter((el) => submitEligible(el) && follows(el));
+  const en = wf.filter((el) => !submitDisabled(el));
+  const vis = en.filter((el) => !isZeroRect(el));
+  const worded = buttons.filter(submitWordy);
+  const label = (el: HTMLElement) => (((el.getAttribute("aria-label") || el.textContent) ?? "")).trim().slice(0, 12);
+  const why = (el: HTMLElement): string =>
+    !box ? "nobox"
+      : submitDisabled(el) ? "dis"
+      : !follows(el) ? "pre"
+      : replyOpenerLike(el) ? "row"
+      : !notChat(el) ? "chat"
+      : isZeroRect(el) ? "zr"
+      : "ok";
+  // Name the most telling candidate, in priority of what best explains the
+  // failure: an enabled-but-invisible one (the zero-rect skip → `zr`), then a
+  // disabled would-be submit (never enabled → `dis`), then a healthy one (`ok` —
+  // it SHOULD have been clicked, a real locator bug), then any worded button
+  // whose `why` reveals what excluded it (only worded button is an opener →
+  // `row`/`pre`).
+  const pick = en.find(isZeroRect) ?? wf.find(submitDisabled) ?? vis[0] ?? worded[0];
+
+  // Region dump (ports linkedin #444): every button within the box's 6-hop climb
+  // scope (where the real submit MUST live for the anchored locator to find it)
+  // plus every slotted / type=submit button document-wide — so an icon-only or
+  // mis-ordered real submit surfaces even when it sits outside the climb region or
+  // precedes the box. Reuses the same predicates as the locator (follows /
+  // submitDisabled / isZeroRect / submitWordy / replyOpenerLike / notChat) so the
+  // dump can never describe a button differently than the passes judged it.
+  let region: ParentNode = root;
+  if (box) {
+    let s: HTMLElement = box;
+    for (let i = 0; i < 6 && s.parentElement; i++) s = s.parentElement;
+    region = s;
+  }
+  const near = new Set<HTMLElement>(Array.from(region.querySelectorAll<HTMLElement>("button, [role='button']")));
+  for (const s of Array.from(
+    root.querySelectorAll<HTMLElement>(
+      "button[slot='submit-button'], [role='button'][slot='submit-button'], button[type='submit'], [role='button'][type='submit']",
+    ),
+  )) {
+    near.add(s);
+  }
+  const typeChar = (el: HTMLElement) =>
+    el.getAttribute("slot") === "submit-button" ? "s" : el.getAttribute("type") === "submit" ? "t" : "x";
+  const groupChar = (el: HTMLElement) => (replyOpenerLike(el) ? "o" : !notChat(el) ? "c" : "n");
+  const token = (el: HTMLElement) =>
+    `${label(el).slice(0, 10)}_${box ? (follows(el) ? "f" : "p") : "n"}${typeChar(el)}_` +
+    `${submitDisabled(el) ? 1 : 0}${isZeroRect(el) ? 1 : 0}${submitWordy(el) ? 1 : 0}_g${groupChar(el)}`;
+  const region_ = Array.from(near).slice(0, 8).map(token).join(" ");
+
+  return {
+    flavor,
+    box: !!box,
+    scoped,
+    slots,
+    wf: wf.length,
+    en: en.length,
+    vis: vis.length,
+    top: pick ? `${label(pick)}_${why(pick)}` : "none",
+    region: region_,
+  };
+}
+
+// ── Ambient (read-only decoys) ───────────────────────────────────────────────
+
+/** A read-only "…more" / expand affordance for the idle browse, or null. */
+export function findAmbientExpand(root: ParentNode, flavor: RedditFlavor): HTMLElement | null {
+  if (flavor === "old") {
+    return root.querySelector<HTMLElement>(".expando-button.collapsed, .expando-button:not(.expanded), .morecomments a");
+  }
+  return root.querySelector<HTMLElement>(
+    'faceplate-partial[src*="more-comments" i], shreddit-comment-tree faceplate-partial, button[aria-label*="more repl" i]',
+  );
+}
+
+/**
+ * A read-only "open this thread" affordance for the idle browse: a post's
+ * comments link. Returns the clickable element plus the owning post (for a media
+ * dwell hint), or null.
+ */
+export function findAmbientComments(
+  root: ParentNode,
+  flavor: RedditFlavor,
+): { el: HTMLElement; post: Element } | null {
+  if (flavor === "old") {
+    for (const p of Array.from(root.querySelectorAll(".thing.link"))) {
+      const link = p.querySelector<HTMLElement>("a.comments");
+      if (link) return { el: link, post: p };
+    }
+    return null;
+  }
+  for (const p of Array.from(root.querySelectorAll("shreddit-post"))) {
+    const link = p.querySelector<HTMLElement>(
+      'a[slot="full-post-link"], a[data-testid="comments-page-link-num-comments"], a[href*="/comments/"]',
+    );
+    if (link) return { el: link, post: p };
+  }
+  return null;
+}
+
+// ── Challenge / throttle detection ───────────────────────────────────────────
+
+export interface ChallengeResult {
