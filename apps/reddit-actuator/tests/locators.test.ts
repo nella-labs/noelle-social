@@ -398,3 +398,55 @@ describe("detectChallenge (locator wrapper)", () => {
 });
 
 describe("locateDirtyReplyBox", () => {
+  /** A dirty composer. `visible` stubs a real rect — jsdom lays nothing out, so
+   *  without it the box counts as hidden and is deliberately not a candidate. */
+  const dirty = (visible = false) => {
+    const root = mount(`<div contenteditable="true" name="body" role="textbox" id="b">half-typed</div>`);
+    const box = root.querySelector<HTMLElement>("#b")!;
+    if (visible) stubRect(box, { x: 0, y: 0, width: 300, height: 80 });
+    return { root, box };
+  };
+
+  it("returns the dirty box with its rect once it has one", () => {
+    const { root, box } = dirty();
+    stubRect(box, { x: 10, y: 20, width: 300, height: 80 });
+    const res = locateDirtyReplyBox(root, "www.reddit.com");
+    expect(res.ok).toBe(true);
+    expect(res.observed?.present).toBe(true);
+  });
+
+  // A HIDDEN dirty box is not reported at all. old.reddit prefills a collapsed
+  // usertext-edit textarea with every one of your own comments, so treating
+  // those as "the page is dirty" would report present:true forever: the probe
+  // never goes clean while the focus click can never land on a zero-rect
+  // element, deadlocking the clear and logging a false "would not clear" on
+  // every hop until the run ends.
+  it("ignores a dirty box that is hidden — it is unclearable and usually Reddit's own prefill", () => {
+    const { root } = dirty(); // jsdom rect is 0x0 ⇒ hidden
+    const res = locateDirtyReplyBox(root, "www.reddit.com");
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("no-dirty-composer");
+    expect(res.observed?.present).toBe(false);
+  });
+
+  it("reports present:false when nothing on the page holds text", () => {
+    const root = mount(`<div contenteditable="true" name="body" role="textbox"></div>`);
+    const res = locateDirtyReplyBox(root, "www.reddit.com");
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("no-dirty-composer");
+    expect(res.observed?.present).toBe(false);
+  });
+
+  // It doubles as the emptiness probe inside runClearComposer's poll loop, so
+  // scrolling on every read would drag the operator's viewport around a dozen
+  // times per clear. Only the focus call, which is about to click, scrolls.
+  it("does not scroll when probing, and does when it is about to click", () => {
+    const { root, box } = dirty(true);
+    let scrolls = 0;
+    box.scrollIntoView = () => { scrolls += 1; };
+    locateDirtyReplyBox(root, "www.reddit.com", false);
+    expect(scrolls).toBe(0);
+    locateDirtyReplyBox(root, "www.reddit.com", true);
+    expect(scrolls).toBe(1);
+  });
+});
