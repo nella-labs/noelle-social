@@ -198,3 +198,6 @@ export async function fetchKumaHealthSummary(): Promise<{
     if (m.status === "up") ok += 1;
     else if (m.status === "down") down += 1;
     else warn += 1;
+  }
+  return { ok, warn, down, total: snapshot.monitors.length, reachable: true };
+}
