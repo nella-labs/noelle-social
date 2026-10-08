@@ -398,3 +398,203 @@ describe("classifyOneLead", () => {
     expect(values).toContain("skipped");
   });
 
+  it("does NOT drop a watched author on an AI-slop false positive", async () => {
+    // Measured on live data: 56 of 2813 priority leads trip the detector and 10
+    // of the 11 that would drop had actually been drafted and sent.
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(clsOut({ ai_slop: true }));
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: true },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("classified");
+  });
+
+  it("STILL drops a slop post from a stranger", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(clsOut({ ai_slop: true }));
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: false },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("ai_slop");
+    expect(values).toContain("skipped");
+  });
+
+  it("runs the classifier engine for a normal (non-priority) lead", async () => {
+    const { sql } = makeSql();
+    const classify = vi.fn().mockResolvedValue({
+      on_brand: true,
+      on_brand_reason: "ok",
+      kind: "question",
+      velocity_score: 40,
+      tier: "T2",
+      raw: {},
+    });
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: false },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a post older than the age cutoff before any classify call", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn();
+    const sixteenDaysAgo = new Date(Date.now() - 16 * 86_400_000).toISOString();
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: false, payload: { text: "hi", posted_at: sixteenDaysAgo } },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).not.toHaveBeenCalled();
+    // markLeadClassified ran with onBrand:false → status 'skipped', label 'too_old'.
+    expect(values).toContain("skipped");
+    expect(values).toContain("too_old");
+  });
+
+  it("age cutoff beats the watchlist bypass — a stale priority post is still dropped", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn();
+    const sixteenDaysAgo = new Date(Date.now() - 16 * 86_400_000).toISOString();
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: true, payload: { text: "hi", posted_at: sixteenDaysAgo } },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).not.toHaveBeenCalled();
+    expect(values).toContain("too_old");
+    expect(values).not.toContain("watchlist");
+  });
+
+  const frenchText =
+    "Nous avons lancé notre nouvelle application et les retours sont très positifs";
+
+  it("skips a non-English (French) lead before any classify call — label 'non_english'", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn();
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: false, payload: { text: frenchText } },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).not.toHaveBeenCalled();
+    expect(values).toContain("skipped");
+    expect(values).toContain("non_english");
+    // skip_reason rides inside the classifierMeta object passed to sql.json().
+    const meta = values.find(
+      (v) => v && typeof v === "object" && (v as { classifier?: { skip_reason?: string } }).classifier?.skip_reason,
+    ) as { classifier: { skip_reason: string } } | undefined;
+    expect(meta?.classifier.skip_reason).toBe("non-english");
+  });
+
+  it("skips a non-English WATCHLIST (priority) lead — language beats the bypass", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn();
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: true, payload: { text: frenchText } },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).not.toHaveBeenCalled();
+    // dropped as non_english, NOT auto-classified as 'watchlist'.
+    expect(values).toContain("skipped");
+    expect(values).toContain("non_english");
+    expect(values).not.toContain("watchlist");
+  });
+
+  it("still drafts a clearly-English lead (not flagged non-English)", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue({ ...meteredOnBrand });
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: {
+        ...baseLead,
+        priority: false,
+        payload: { text: "any tips for postgres migrations? we keep losing context", author_followers: 8000 },
+      },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(values).toContain("classified");
+    expect(values).not.toContain("non_english");
+  });
+
+  it("records one admitted receipt for the actual classifier backend", async () => {
+    const { sql } = makeSql();
+    const record = vi.fn().mockResolvedValue(undefined);
+    const reserveAttempt = vi.fn(async () => ({ attemptId: "classifier_attempt" }));
+    const backend = createBudgetedBackend({ call: async () => ({
+      text: JSON.stringify({ on_brand: true, on_brand_reason: "ok", kind: "question", velocity_score: 50, q: 92, reply_kind: "substantial", tier: "T1" }), usage: { input_tokens: 300, output_tokens: 20 },
+    }) }, { engine: "vertex", context: { orgId: "o", instanceId: "i", agentRole: "x_intern", worker: "classifier", bucket: "classifier" },
+      budget: { adapters: { ...unlimitedBudget.adapters, reserveAttempt }, estimateCents: () => 1 }, recorder: { record } });
+    const classifier = createClassifier({ backend, evaluate: async () => ({ kind: "unavailable", provider: "jev" }) });
+    await classifyOneLead({ sql, classifier, notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false }, lead: { ...baseLead, priority: false },
+      log: { warn: vi.fn() } });
+    expect(reserveAttempt).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledOnce();
+    expect(record.mock.calls[0]?.[0]).toMatchObject({ attemptId: "classifier_attempt", engine: "vertex",
+      worker: "classifier", bucket: "classifier", agentRole: "x_intern", inputTokens: 300 });
+  });
+
+
+
+  const slopText = "It's not a tool. It's a system. The question isn't how, it's why.";
+
+  it("drops a slop post (deterministic detector) when followers are unknown", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue({ ...meteredOnBrand });
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: false, payload: { text: slopText } },
+      log: { warn: vi.fn() },
+    });
+    // off-brand → status 'skipped', label 'ai_slop'.
+    expect(values).toContain("skipped");
+    expect(values).toContain("ai_slop");
+  });
+
+  it("drops a slop post under the 1500-follower rescue threshold", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue({ ...meteredOnBrand });
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: false, payload: { text: slopText, author_followers: 1000 } },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("skipped");
+  });
