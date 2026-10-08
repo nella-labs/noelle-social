@@ -198,3 +198,10 @@ day-to-day mechanism that replaces forever-bans with variety.
 See `packages/runtime/src/drafting/draftVerifier.ts` (`recentReplies`,
 `replyDiversityScore`, `DimensionScores.diversity`).
 
+## Draft-only invariant
+
+The Pattern Breaker writes anti-pattern rules + operator alerts only. It never
+writes a lead and never a platform write — it runs inside the drafter worker
+with no own entrypoint, and `apps/linkedin-intern/src/invariants.test.ts` /
+`apps/reddit-intern/src/invariants.test.ts` guard that there is still NO send
+worker on either intern.
