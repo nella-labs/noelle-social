@@ -2998,3 +2998,203 @@ export async function runDmRequestTick(
   let drafted = 0;
   for (const lead of claimedLeads) {
     const payload = lead.payload as {
+      text?: string;
+      url?: string;
+      authorName?: string | null;
+      authorPublicId?: string | null;
+      authorHeadline?: string | null;
+    };
+    const postText = payload.text ?? "";
+    if (!postText) continue;
+    try {
+      // Where in the relationship are we? The rung is chosen by how many DMs the
+      // operator has already SENT this person: 0 → Open, 1 → Deepen, 2 → Bridge,
+      // 3+ → Invite (the only rung that may propose a call). Start small, progress.
+      const authorHandle = payload.authorPublicId ?? lead.author_handle;
+      const sentCount = sql
+        ? await countSentDmsToAuthor(sql, {
+            agentInstanceId: instance.id,
+            authorHandle,
+            authorId: lead.author_id,
+          })
+        : 0;
+      const rung = pickRung(sentCount);
+      const priorDmBodies = sql
+        ? await getRecentDmsToAuthor(sql, {
+            agentInstanceId: instance.id,
+            authorHandle,
+            authorId: lead.author_id,
+            excludeLeadId: lead.id,
+            limit: 4,
+          })
+        : [];
+
+      const draftArgs = {
+        bucket: "drafter-codex",
+        routing,
+        orgId: instance.org_id,
+        instanceId: instance.id,
+        worker: "drafter",
+        agentRole: "linkedin_intern",
+        system: buildLadderDmSystem(rung),
+        prompt: renderLadderDmPrompt({
+          rung,
+          postText,
+          person: {
+            name: payload.authorName ?? null,
+            publicId: authorHandle,
+            headline: payload.authorHeadline ?? null,
+          },
+          priorDmBodies,
+        }),
+      } satisfies Parameters<CodexRunner["draft"]>[0];
+      const res = await runner.draft(draftArgs);
+      const parsed = IntroDmOutput.safeParse(safeJsonParse(res.text));
+      if (!parsed.success) {
+        log.warn(
+          { leadId: lead.id, rung: rung.index, raw: res.text.slice(0, 200) },
+          "dm-ladder: drafter output schema fail; skipping",
+        );
+        continue;
+      }
+      // Hard voice backstop: strip em dashes (buildOutbound strips disallowed
+      // emoji + recomputes char_count, but not em dashes). The rung is recorded in
+      // the log line below; the visible per-draft badge is a follow-up (needs the
+      // OutboundIn → api-vm payload plumbing).
+      const reviewed = await refineDmVoice({
+        body: stripDisallowedEmoji(stripEmDashes(parsed.data.body)),
+        charLimit: 700,
+        regenerate: async (feedback) => {
+          const result = await runner.draft({ ...draftArgs, prompt: `${draftArgs.prompt}\n\n${feedback}` });
+          const revised = IntroDmOutput.safeParse(safeJsonParse(result.text));
+          return revised.success ? stripDisallowedEmoji(stripEmDashes(revised.data.body)) : null;
+        },
+      });
+      if (!reviewed.body) {
+        log.warn({ leadId: lead.id, reasons: reviewed.reasons }, "dm-ladder: DM failed shared voice check");
+        continue;
+      }
+      const body = reviewed.body;
+      const dmRow = {
+        id: randomUUID(),
+        kind: "dm" as const,
+        angle: null,
+        body,
+        charCount: [...body].length,
+        dmVoiceCheck: { pass: true, attempts: reviewed.attempts, reasons: reviewed.reasons },
+      };
+      // A DM row is never emptied by the reply gate (the policy only applies
+      // the post-match clause to kind === "reply"), so null here means the DM
+      // body itself was empty, which the schema already rejected upstream.
+      // Guarded anyway rather than asserted.
+      const dmOutbound = buildOutbound({ lead, postText, payload, anchors: [], drafts: [dmRow] });
+      if (!dmOutbound) {
+        log.warn({ leadId: lead.id }, "dm-ladder: outbound empty; skipping");
+        continue;
+      }
+      await postOutbound(dmOutbound);
+      drafted++;
+      log.info(
+        { leadId: lead.id, handle: authorHandle, rung: rung.index, label: rung.label, sentCount },
+        "dm-ladder: queued rung DM",
+      );
+    } catch (err) {
+      log.error(
+        { leadId: lead.id, err: (err as Error).message },
+        "dm-ladder: generation failed",
+      );
+    }
+  }
+  return drafted;
+}
+
+/** Placeholder "post" text for an intro DM — there is no source post; this DM is
+ *  relationship outreach, not a reply. Surfaced in the approval detail so the
+ *  operator sees WHY there's no post to read above the draft. */
+export const INTRO_DM_POST_TEXT = "(intro DM — relationship outreach, not a reply to a post)";
+
+export interface RunIntroDmTickArgs {
+  log: Logger;
+  instance: ActiveInstance;
+  /** People claimed + stamped by claimIntroDmPeople (each gets exactly one DM). */
+  claimedPeople: IntroDmPerson[];
+  runner: CodexRunner;
+  postOutbound: (body: OutboundIn) => Promise<{ id: string; approval_id: string }>;
+  /**
+   * Optional per-person status hook (kept symmetric with the reply path's
+   * markStatus). The intro DM has no lead row to advance — the claim already
+   * stamped intro_dm_drafted_at — so this is purely for observability/tests. No-op
+   * when absent.
+   */
+  markStatus?: (args: {
+    fsdProfileId: string;
+    status: "drafted" | "errored";
+    meta?: Record<string, unknown>;
+  }) => Promise<void>;
+}
+
+/**
+ * One-time INTRO DM pass (Lyra). For each watchlist person the caller already
+ * CLAIMED + STAMPED (claimIntroDmPeople — so each person is processed exactly
+ * once, ever), draft a single warm relationship-building DM that references their
+ * work and asks what they're building. NO pitch. Queue it for approval as a
+ * synthetic, POST-LESS lead (kind="dm"), draft-only — Lyra never auto-sends.
+ *
+ * Fail-open PER PERSON: a draft/parse/post failure for one person logs + continues
+ * to the next; it never aborts the tick. (The person was already stamped by the
+ * claim, so a failure means that one intro DM is lost — acceptable, matching the
+ * claim-removes-flag pattern.) Returns the count of DMs actually queued.
+ */
+export async function runIntroDmTick(args: RunIntroDmTickArgs): Promise<number> {
+  const { log, instance, claimedPeople, runner, postOutbound, markStatus } = args;
+  if (claimedPeople.length === 0) return 0;
+  const routing = linkedinInternRouting(instance);
+  let drafted = 0;
+
+  for (const person of claimedPeople) {
+    try {
+      const prompt = renderIntroDmPrompt(person);
+      const draftArgs = {
+        bucket: "drafter-codex",
+        routing,
+        orgId: instance.org_id,
+        instanceId: instance.id,
+        worker: "drafter",
+        agentRole: "linkedin_intern",
+        system: SYSTEM_LINKEDIN_INTRO,
+        prompt,
+      } satisfies Parameters<CodexRunner["draft"]>[0];
+      const res = await runner.draft(draftArgs);
+      const parsed = IntroDmOutput.safeParse(safeJsonParse(res.text));
+      if (!parsed.success) {
+        log.error(
+          { fsdProfileId: person.fsdProfileId, raw: res.text.slice(0, 200) },
+          "intro-dm: drafter output schema fail; skipping person",
+        );
+        await markStatus?.({ fsdProfileId: person.fsdProfileId, status: "errored", meta: { error: "schema" } });
+        continue;
+      }
+
+      // Hard voice backstop: strip em dashes (a top AI tell) + any emoji outside
+      // the {💀 😭 😛} allowlist, then recompute char_count off the cleaned body so
+      // the inbox count matches what ships. The model can't be trusted to self-restrict.
+      const reviewed = await refineDmVoice({
+        body: stripDisallowedEmoji(stripEmDashes(parsed.data.body)),
+        charLimit: 700,
+        regenerate: async (feedback) => {
+          const result = await runner.draft({ ...draftArgs, prompt: `${prompt}\n\n${feedback}` });
+          const revised = IntroDmOutput.safeParse(safeJsonParse(result.text));
+          return revised.success ? stripDisallowedEmoji(stripEmDashes(revised.data.body)) : null;
+        },
+      });
+      if (!reviewed.body) {
+        log.warn({ fsdProfileId: person.fsdProfileId, reasons: reviewed.reasons }, "intro-dm: DM failed shared voice check");
+        await markStatus?.({ fsdProfileId: person.fsdProfileId, status: "errored", meta: { error: "dm-voice", reasons: reviewed.reasons } });
+        continue;
+      }
+      const body = reviewed.body;
+      const charCount = [...body].length;
+
+      // Synthetic, POST-LESS lead. There is no source post — this is a first-touch
+      // DM — so the lead fields describe the PERSON, not a post: a stable
+      // `<fsd>:intro` id, the placeholder post text, the person's profile URL, and
