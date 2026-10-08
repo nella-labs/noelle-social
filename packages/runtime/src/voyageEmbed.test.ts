@@ -198,3 +198,37 @@ describe("voyageEmbed — fail-open (returns [], never throws)", () => {
     vi.useFakeTimers();
     process.env["VOYAGE_API_KEY"] = "k";
 
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (signal) {
+              signal.addEventListener("abort", () => {
+                reject(new DOMException("Aborted", "AbortError"));
+              });
+            }
+          }),
+      ),
+    );
+
+    const promise = voyageEmbed(["a", "b"]);
+    await vi.advanceTimersByTimeAsync(10_001);
+
+    const out = await promise;
+    expect(out).toEqual([]);
+  });
+});
+
+describe("voyageEmbed — edge cases", () => {
+  it("returns [] for an empty text list without calling fetch", async () => {
+    process.env["VOYAGE_API_KEY"] = "k";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const out = await voyageEmbed([]);
+    expect(out).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
