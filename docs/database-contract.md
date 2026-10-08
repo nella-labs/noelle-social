@@ -198,3 +198,203 @@ LinkedIn `public_id`) against `noelle.leads.author_handle` / `noelle.approvals`.
 ### 2.4 `noelle.leads`
 
 Raw lead rows produced by the discovery worker. Owned end-to-end by the X intern agent on `noelle-vm-0`.
+
+```sql
+create table noelle.leads (
+  id                 uuid         primary key default gen_random_uuid(),
+  org_id             uuid         not null references noelle.organizations(id) on delete cascade,
+  agent_instance_id  uuid         not null references noelle.agent_instances(id) on delete cascade,
+  external_id        text         not null,
+  platform           text         not null
+                       check (platform in ('x', 'linkedin', 'reddit')),
+  author_handle      text         not null,
+  author_id          text         null,
+  payload            jsonb        not null,
+  tier               text         null
+                       check (tier in ('T1', 'T2', 'T3') or tier is null),
+  status             text         not null default 'new'
+                       check (status in ('new', 'classified', 'drafting', 'drafted', 'sent', 'skipped', 'errored')),
+  classifier_label   text         null,
+  classifier_score   numeric(5,4) null,
+  vip_signal         jsonb        null,  -- 0071: relationship-scout verdict {vip, reason, tags[], add_to_watchlist, dm_soon, suggested_dm}; NULL = scout never ran. See @noelle/contracts VipSignalSchema.
+  priority           boolean      not null default false,  -- always-reply (x_watchlist_people); bypasses classifier + drafter filters
+  posted_at          timestamptz  null,
+  claimed_at         timestamptz  null,
+  created_at         timestamptz  not null default now(),
+  updated_at         timestamptz  not null default now(),
+
+  unique (external_id)   -- single-column; upsertDiscoveredLead relies on `on conflict (external_id)`
+);
+
+create index leads_org_status_idx on noelle.leads (org_id, status, created_at desc);
+create index leads_status_claimable_idx on noelle.leads (status) where status in ('new', 'classified');
+create index leads_payload_gin_idx on noelle.leads using gin (payload jsonb_path_ops);
+
+create trigger tg_leads_updated_at
+  before update on noelle.leads
+  for each row execute function noelle.tg_set_updated_at();
+```
+
+**Mid-claim statuses are leased, not owned.** `classifying` and `drafting` are
+transient claim states: the claim RPCs flip into them and the worker writes the
+terminal outcome, but a worker crash/restart between the two would strand the
+lead (claims only pick the pre-claim status). Every classifier/drafter tick
+therefore starts with `reapStaleClaims` (each intern's `lib/leads-db.ts`):
+claims stranded longer than 45 minutes are returned to their pre-claim status
+(`classifying`→`new`, `drafting`→`classified`), and strands older than 48 hours
+are expired to `skipped` with a `payload.stale_claim = "expired"` marker (a
+reply to a two-day-old post reads as necro-engagement). Anything that adds a new
+claim state must add it to the reaper.
+
+---
+
+### 2.5 `noelle.drafts`
+
+The drafts produced by the drafter worker — one row per variant. Per lead the drafter emits three `kind='reply'` angle variants (empathetic / technical / contrarian) **plus one `kind='dm'`** cold-outreach DM. A DM has no angle (`angle=null`); it is manual-send (the founder copies it and sends it on X by hand, then marks the approval sent). The send worker never posts a `kind='dm'` row to X.
+
+```sql
+create table noelle.drafts (
+  id                 uuid         primary key default gen_random_uuid(),
+  org_id             uuid         not null references noelle.organizations(id) on delete cascade,
+  agent_instance_id  uuid         not null references noelle.agent_instances(id) on delete cascade,
+  lead_id            uuid         not null references noelle.leads(id) on delete cascade,
+  kind               text         not null
+                       check (kind in ('reply', 'dm', 'repost')),
+  angle              text         null  -- null for kind='dm' (a DM has no angle)
+                       check (angle is null or angle in ('empathetic', 'technical', 'contrarian')),
+  body               text         not null,
+  final_body         text         null,
+  char_count         integer      not null,
+  source_engine      text         not null,
+  model              text         null,
+  quality_score      numeric(5,4) null,
+  quality_passed     boolean      null,
+  sent_at            timestamptz  null,
+  created_at         timestamptz  not null default now(),
+  updated_at         timestamptz  not null default now()
+);
+
+create index drafts_lead_id_idx on noelle.drafts (lead_id);
+create index drafts_org_created_at_idx on noelle.drafts (org_id, created_at desc);
+
+create trigger tg_drafts_updated_at
+  before update on noelle.drafts
+  for each row execute function noelle.tg_set_updated_at();
+```
+
+---
+
+### 2.6 `noelle.approvals`
+
+The approvals inbox. Hono inserts the row when the drafter posts `POST /api/outbound`; Hono updates `status` when the user clicks "send" or "skip". `actioned_by` (formerly `decided_by` in some drafts) is a plain uuid — the Supabase user id of the actor — **no FK to `auth.users`**.
+
+```sql
+create table noelle.approvals (
+  id                 uuid         primary key default gen_random_uuid(),
+  org_id             uuid         not null references noelle.organizations(id) on delete cascade,
+  agent_instance_id  uuid         not null references noelle.agent_instances(id) on delete cascade,
+  lead_id            uuid         not null references noelle.leads(id) on delete cascade,
+  draft_ids          uuid[]       not null,
+  sent_draft_id      uuid         null references noelle.drafts(id) on delete set null,
+  status             text         not null default 'pending'
+                       check (status in ('pending', 'sent', 'skipped', 'errored')),
+  tier               text         null,
+  quality_score      numeric(5,4) null,
+  quality_passed     boolean      null,
+  skip_reason        text         null,
+  skip_note          text         null,
+  actioned_by        uuid         null,    -- Supabase user id; no FK
+  sent_at            timestamptz  null,
+  skipped_at         timestamptz  null,
+  created_at         timestamptz  not null default now(),
+  updated_at         timestamptz  not null default now(),
+
+  constraint approvals_lead_unique unique (lead_id),
+  constraint approvals_decided_pair check (
+    (status = 'pending'  and sent_at is null and skipped_at is null)
+    or (status = 'sent'  and sent_at is not null)
+    or (status = 'skipped' and skipped_at is not null)
+    or status = 'errored'
+  )
+);
+
+create index approvals_org_status_created_at_idx
+  on noelle.approvals (org_id, status, created_at desc);
+
+create index approvals_agent_instance_id_idx
+  on noelle.approvals (agent_instance_id);
+
+create trigger tg_approvals_updated_at
+  before update on noelle.approvals
+  for each row execute function noelle.tg_set_updated_at();
+```
+
+---
+
+### 2.7 `noelle.llm_calls`
+
+Per-call cost telemetry. Every `callAgentModel` writes one row here. Drives the 5-min spend rollup.
+
+```sql
+create table noelle.llm_calls (
+  id                 bigserial    primary key,
+  org_id             uuid         not null references noelle.organizations(id) on delete cascade,
+  agent_instance_id  uuid         not null references noelle.agent_instances(id) on delete cascade,
+  bucket             text         not null,
+  engine             text         not null,
+  model              text         not null,
+  input_tokens       integer      not null default 0,
+  output_tokens      integer      not null default 0,
+  cost_cents         integer      not null default 0,
+  latency_ms         integer      not null default 0,
+  outcome            text         not null
+                       check (outcome in ('ok', 'fallback_to_vertex', 'fallback_to_bedrock', 'fallback_to_claude', 'error')),
+  created_at         timestamptz  not null default now()
+);
+
+create index llm_calls_org_bucket_created_at_idx
+  on noelle.llm_calls (org_id, bucket, created_at desc);
+
+create index llm_calls_org_month_idx
+  on noelle.llm_calls (org_id, date_trunc('month', created_at));
+```
+
+---
+
+### 2.8 `noelle.org_spend_month`
+
+Monthly per-bucket spend rollup. Refreshed every 5 min by the Vercel cron.
+
+```sql
+create table noelle.org_spend_month (
+  org_id      uuid         not null references noelle.organizations(id) on delete cascade,
+  month       date         not null,
+  bucket      text         not null,
+  cents       integer      not null default 0 check (cents >= 0),
+  updated_at  timestamptz  not null default now(),
+  primary key (org_id, month, bucket)
+);
+
+create trigger tg_org_spend_month_updated_at
+  before update on noelle.org_spend_month
+  for each row execute function noelle.tg_set_updated_at();
+```
+
+---
+
+### 2.9 `noelle.worker_runs`
+
+Operational telemetry for the workers on `noelle-vm-0`.
+
+```sql
+create table noelle.worker_runs (
+  id              bigserial    primary key,
+  kind            text         not null
+                    check (kind in ('discovery', 'classifier', 'drafter', 'send', 'spend_rollup')),
+  started_at      timestamptz  not null default now(),
+  finished_at     timestamptz  null,
+  status          text         not null default 'running'
+                    check (status in ('running', 'ok', 'error')),
+  rows_processed  integer      not null default 0 check (rows_processed >= 0),
+  error_message   text         null
+);
