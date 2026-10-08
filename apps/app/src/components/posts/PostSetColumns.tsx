@@ -198,3 +198,203 @@ function GenerateAll({
       <button
         className="btn btn-primary"
         disabled={pending}
+        onClick={() =>
+          start(async () => {
+            setMsg(null);
+            const res = await generatePost({ orgSlug, ideaId });
+            if (!res.ok) setMsg(res.error.message);
+            else router.refresh();
+          })
+        }
+      >
+        {pending ? "Generating…" : `Generate ${labels}`}
+      </button>
+      {msg && <span className="ideas-msg mono">{msg}</span>}
+    </div>
+  );
+}
+
+function PlatformColumn({
+  orgSlug,
+  ideaTitle,
+  ideaId,
+  platform,
+  versions,
+  mediaByDraft,
+  generating,
+}: {
+  orgSlug: string;
+  ideaTitle: string;
+  ideaId: string;
+  platform: string;
+  versions: PostDraftRow[];
+  mediaByDraft: Record<string, ContentMediaRow[]>;
+  generating: boolean;
+}) {
+  const meta = PLATFORM_META[platform] ?? { label: platform, accent: "#888", charLimit: 1000, counter: "total" as Counter };
+  const [idx, setIdx] = useState(Math.max(0, versions.length - 1));
+  const [pending, start] = useTransition();
+  const [msg, setMsg] = useState<string | null>(null);
+  const [refineOpen, setRefineOpen] = useState(false);
+  const [guidance, setGuidance] = useState("");
+  const router = useRouter();
+
+  const selectedIdx = Math.min(idx, versions.length - 1);
+  const selected = versions[selectedIdx] ?? null;
+
+  // Generate another version of this platform. An optional `guide` is a one-off
+  // steer ("make it punchier") the drafter applies to the new version.
+  function addVersion(guide?: string) {
+    setMsg(null);
+    start(async () => {
+      const res = await generatePost({
+        orgSlug,
+        ideaId,
+        platforms: [platform as "linkedin" | "x" | "reddit"],
+        guidance: guide?.trim() || undefined,
+      });
+      if (!res.ok) setMsg(res.error.message);
+      else {
+        setRefineOpen(false);
+        setGuidance("");
+        router.refresh();
+      }
+    });
+  }
+
+  return (
+    <section className="platform-column clay" style={{ ["--col-accent" as string]: meta.accent }}>
+      <header className="platform-column__bar">
+        <span className="platform-column__name" style={{ color: meta.accent }}>{meta.label}</span>
+        <span className="mono platform-column__ver">
+          {versions.length > 0 ? `v${selectedIdx + 1} / ${versions.length}` : "—"}
+        </span>
+        <div className="platform-column__nav">
+          <button
+            className="btn btn-ghost btn-xs"
+            onClick={() => setIdx((i) => Math.max(0, i - 1))}
+            disabled={selectedIdx <= 0}
+            title={`Previous ${meta.label} version`}
+            aria-label="Previous version"
+          >
+            ‹
+          </button>
+          <button
+            className="btn btn-ghost btn-xs"
+            onClick={() => setIdx((i) => Math.min(versions.length - 1, i + 1))}
+            disabled={selectedIdx >= versions.length - 1 || versions.length === 0}
+            title={`Next ${meta.label} version`}
+            aria-label="Next version"
+          >
+            ›
+          </button>
+          <button
+            className="btn btn-xs"
+            onClick={() => setRefineOpen((o) => !o)}
+            disabled={pending}
+            title="Generate another version — optionally tell it what to change"
+          >
+            {refineOpen ? "Close" : "✎ Refine"}
+          </button>
+        </div>
+      </header>
+
+      {refineOpen && (
+        <div className="platform-column__refine">
+          <textarea
+            className="input"
+            placeholder={`What should this ${meta.label} version change? (optional — blank = a fresh take)`}
+            value={guidance}
+            onChange={(e) => setGuidance(e.target.value)}
+            rows={2}
+            autoFocus
+          />
+          <div className="platform-column__refine-row">
+            <button className="btn btn-sm btn-primary" onClick={() => addVersion(guidance)} disabled={pending}>
+              {pending ? "Generating…" : guidance.trim() ? "Refine → new version" : "New version"}
+            </button>
+            <span className="ink-muted" style={{ fontSize: 11 }}>
+              Adds a new version; the current ones stay.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {generating && versions.length > 0 && (
+        <div className="platform-column__generating mono">✎ writing a new {meta.label} version…</div>
+      )}
+
+      {versions.length > 1 && (
+        <div className="platform-column__dots">
+          {versions.map((v, i) => (
+            <button
+              key={v.id}
+              className={`platform-column__dot${i === selectedIdx ? " is-active" : ""}`}
+              onClick={() => setIdx(i)}
+              title={`${meta.label} version ${i + 1}`}
+              aria-label={`${meta.label} version ${i + 1}`}
+            />
+          ))}
+        </div>
+      )}
+
+      {msg && <span className="ideas-msg mono">{msg}</span>}
+
+      {selected ? (
+        <DraftEditor
+          key={selected.id}
+          orgSlug={orgSlug}
+          draft={selected}
+          meta={meta}
+          ideaTitle={ideaTitle}
+          media={mediaByDraft[selected.id] ?? []}
+        />
+      ) : generating ? (
+        <div className="clay-flat platform-column__empty">
+          <p className="mono">Generating {meta.label}…</p>
+        </div>
+      ) : (
+        <div className="clay-flat platform-column__empty">
+          <p>No {meta.label} version yet.</p>
+          <button className="btn btn-sm btn-primary" onClick={() => addVersion()} disabled={pending}>
+            {pending ? "Generating…" : `Generate ${meta.label}`}
+          </button>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DraftEditor({
+  orgSlug,
+  draft,
+  meta,
+  ideaTitle,
+  media,
+}: {
+  orgSlug: string;
+  draft: PostDraftRow;
+  meta: PlatformMeta;
+  ideaTitle: string;
+  media: ContentMediaRow[];
+}) {
+  const [hook, setHook] = useState(draft.draft_hook ?? "");
+  const [body, setBody] = useState(draft.final_body ?? draft.body);
+  const [pending, start] = useTransition();
+  const [msg, setMsg] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const router = useRouter();
+
+  // X counts the whole post; LinkedIn counts only the first line (before "…see more").
+  const count = meta.counter === "firstline" ? (body.split("\n")[0]?.length ?? 0) : body.length;
+  const over = count > meta.charLimit;
+  const counterLabel = meta.counter === "firstline" ? `first line ${count}/${meta.charLimit}` : `${count}/${meta.charLimit}`;
+
+  function save(patch: PatchFields) {
+    setMsg(null);
+    start(async () => {
+      const res = await patchPostDraft({ orgSlug, draftId: draft.id, ...patch });
+      if (!res.ok) setMsg(res.error.message);
+      else router.refresh();
+    });
+  }
