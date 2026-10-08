@@ -198,3 +198,11 @@ async function main() {
         }
       }
     },
+    shouldStop,
+  });
+}
+
+main().catch((err) => {
+  console.error("ideation fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
