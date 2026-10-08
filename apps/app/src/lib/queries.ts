@@ -2598,3 +2598,203 @@ export async function getPersonForOrg(orgId: string, personId: string): Promise<
 export interface PersonWatcher {
   /**
    * Which watchlist this row lives on. 'x' rows are editable inline (objective
+   * kind + remove); 'linkedin' rows are read-only here (Lyra's objective is
+   * free-text and managed on her own watchlist page).
+   */
+  platform: "x" | "linkedin";
+  /** x_watchlist_people.id / linkedin_watchlist_people.id — used by row actions. */
+  watchlistRowId: string;
+  agentInstanceId: string;
+  agentName: string;
+  agentRole: string;
+  objectiveKind: WatchlistObjectiveKind | null;
+  objectiveNote: string | null;
+  addedAt: string;
+}
+
+/**
+ * The agents that watch a contact, so the Contacts detail can show + edit
+ * watchlist membership in one place — Contacts is the single person surface.
+ * Unions the X watchlist (matched on the CRM `person_id` link, or the X handle
+ * as a fallback for legacy rows that predate the link) and the LinkedIn
+ * watchlist (matched via the person's 'linkedin' account = public_id, so a
+ * dual-platform contact still surfaces a LinkedIn watcher). Tenancy piggybacks
+ * on the page's earlier asserted read (getPersonForOrg) on the same request,
+ * like the sibling getPersonProfileForOrg/getPersonStatsForOrg.
+ */
+export async function getWatchersForPerson(
+  orgId: string,
+  personId: string,
+  handle?: string | null,
+): Promise<PersonWatcher[]> {
+  const h = handle ? normHandle(handle) : null;
+  const rows = await readSql<
+    Array<{
+      platform: "x" | "linkedin";
+      watchlist_row_id: string;
+      agent_instance_id: string;
+      agent_name: string | null;
+      agent_role: string;
+      objective_kind: WatchlistObjectiveKind | null;
+      objective_note: string | null;
+      added_at: string;
+    }>
+  >`
+    select
+      'x'                  as platform,
+      wp.id                as watchlist_row_id,
+      wp.agent_instance_id as agent_instance_id,
+      ai.display_name      as agent_name,
+      ai.role              as agent_role,
+      wp.objective_kind    as objective_kind,
+      wp.objective_note    as objective_note,
+      wp.added_at          as added_at
+    from noelle.x_watchlist_people wp
+    join noelle.agent_instances ai on ai.id = wp.agent_instance_id
+    where wp.org_id = ${orgId}
+      and (wp.person_id = ${personId} or lower(wp.handle) = ${h})
+    union all
+    select
+      'linkedin'           as platform,
+      lp.id                as watchlist_row_id,
+      lp.agent_instance_id as agent_instance_id,
+      ai.display_name      as agent_name,
+      ai.role              as agent_role,
+      null::text           as objective_kind,
+      lp.objective         as objective_note,
+      lp.added_at          as added_at
+    from noelle.linkedin_watchlist_people lp
+    join noelle.agent_instances ai on ai.id = lp.agent_instance_id
+    join noelle.person_social_accounts a
+      on a.org_id = lp.org_id and a.platform = 'linkedin'
+      and lower(a.handle) = lower(lp.public_id)
+    where lp.org_id = ${orgId} and a.person_id = ${personId}
+    order by added_at asc
+  `;
+  return rows.map((r) => ({
+    platform: r.platform,
+    watchlistRowId: r.watchlist_row_id,
+    agentInstanceId: r.agent_instance_id,
+    agentName: r.agent_name?.trim() || "Agent",
+    agentRole: r.agent_role,
+    objectiveKind: r.objective_kind,
+    objectiveNote: r.objective_note,
+    addedAt: r.added_at,
+  }));
+}
+
+/**
+ * Resolve the Contacts person id for an X handle in an org, if one exists.
+ * Lets the approvals detail page deep-link a lead's author into the Contacts
+ * CRM. Tenancy: the caller already ran an asserted read on the same request
+ * (the approvals page loads the approval via getApprovalDetail → assertMember).
+ */
+export async function getPersonIdForHandle(orgId: string, handle: string): Promise<string | null> {
+  const h = normHandle(handle);
+  const rows = await readSql<Array<{ person_id: string }>>`
+    select person_id
+    from noelle.person_social_accounts
+    where org_id = ${orgId} and platform = 'x' and lower(handle) = ${h}
+    limit 1
+  `;
+  return rows[0]?.person_id ?? null;
+}
+
+/**
+ * The most-recent profiler-built profile for a handle across ANY of the org's
+ * agent instances (x_watchlist_profiles is per-instance; we collapse to the
+ * freshest for the org-level contact view).
+ */
+export async function getPersonProfileForOrg(
+  orgId: string,
+  handle: string,
+): Promise<WatchlistProfileView | null> {
+  const h = normHandle(handle);
+  const rows = await readSql<
+    Array<{
+      handle: string;
+      summary: string | null;
+      topics: unknown;
+      tone: string | null;
+      engagement_notes: string | null;
+      posts_analyzed: number;
+      generated_at: string | null;
+    }>
+  >`
+    select pr.handle, pr.summary, pr.topics, pr.tone, pr.engagement_notes,
+           pr.posts_analyzed, pr.generated_at
+    from noelle.x_watchlist_profiles pr
+    join noelle.agent_instances ai on ai.id = pr.agent_instance_id
+    where ai.org_id = ${orgId} and pr.handle = ${h} and pr.summary is not null
+    order by pr.generated_at desc nulls last
+    limit 1
+  `;
+  const r = rows[0];
+  if (!r || r.summary == null) return null;
+  return {
+    handle: r.handle,
+    summary: r.summary,
+    topics: Array.isArray(r.topics) ? (r.topics as string[]) : [],
+    tone: r.tone,
+    engagementNotes: r.engagement_notes,
+    postsAnalyzed: r.posts_analyzed,
+    generatedAt: r.generated_at,
+  };
+}
+
+/**
+ * The freshest LinkedIn profile the profiler built for a public_id across the
+ * org's LinkedIn-intern instances — the Lyra counterpart to
+ * getPersonProfileForOrg, reading linkedin_watchlist_profiles. Lets the Contacts
+ * detail show "What Lyra knows" for a LinkedIn contact.
+ */
+export async function getLinkedInProfileForOrg(
+  orgId: string,
+  publicId: string,
+): Promise<WatchlistProfileView | null> {
+  const h = normHandle(publicId);
+  const rows = await readSql<
+    Array<{
+      public_id: string;
+      summary: string | null;
+      topics: unknown;
+      tone: string | null;
+      engagement_notes: string | null;
+      posts_analyzed: number;
+      generated_at: string | null;
+    }>
+  >`
+    select pr.public_id, pr.summary, pr.topics, pr.tone, pr.engagement_notes,
+           pr.posts_analyzed, pr.generated_at
+    from noelle.linkedin_watchlist_profiles pr
+    join noelle.agent_instances ai on ai.id = pr.agent_instance_id
+    where ai.org_id = ${orgId} and lower(pr.public_id) = ${h} and pr.summary is not null
+    order by pr.generated_at desc nulls last
+    limit 1
+  `;
+  const r = rows[0];
+  if (!r || r.summary == null) return null;
+  return {
+    handle: r.public_id,
+    summary: r.summary,
+    topics: Array.isArray(r.topics) ? (r.topics as string[]) : [],
+    tone: r.tone,
+    engagementNotes: r.engagement_notes,
+    postsAnalyzed: r.posts_analyzed,
+    generatedAt: r.generated_at,
+  };
+}
+
+/** Org-wide interaction stats for a handle (across every agent instance). */
+export async function getPersonStatsForOrg(orgId: string, handle: string): Promise<PersonStats> {
+  const h = normHandle(handle);
+  const [leadAgg] = await readSql<Array<{ posts_seen: number }>>`
+    select count(*)::int as posts_seen
+    from noelle.leads
+    where org_id = ${orgId} and lower(author_handle) = ${h}
+  `;
+  const topics = await readSql<Array<{ classifier_label: string }>>`
+    select classifier_label
+    from noelle.leads
+    where org_id = ${orgId} and lower(author_handle) = ${h}
+      and classifier_label is not null
