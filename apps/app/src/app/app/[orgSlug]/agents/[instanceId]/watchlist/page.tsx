@@ -998,3 +998,43 @@ function DiscoverList({ clips }: { clips: VideoClipRow[] }) {
         <h3>Discover — top harvested videos</h3>
         <span className="tag">{clips.length}</span>
       </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 12 }}>
+        {clips.map((c) => (
+          <a
+            key={c.id}
+            href={c.url}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              textDecoration: "none",
+              color: "inherit",
+              border: "1px solid var(--rule-soft)",
+              borderRadius: 8,
+              overflow: "hidden",
+              display: "block",
+            }}
+          >
+            <ClipThumb src={c.thumb_url} handle={c.author_handle} />
+            <div style={{ padding: 8 }}>
+              <div style={{ fontFamily: "var(--mono)", fontSize: 11 }}>
+                {fmtCount(c.views)} views · {fmtCount(c.likes)} ♥{c.deep_tier ? " · ★" : ""}
+              </div>
+              <div
+                style={{
+                  fontSize: 11,
+                  color: "var(--ink-muted)",
+                  marginTop: 2,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                @{c.author_handle}
+              </div>
+            </div>
+          </a>
+        ))}
+      </div>
+    </section>
+  );
+}
