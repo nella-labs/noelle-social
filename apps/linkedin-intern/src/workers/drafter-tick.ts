@@ -598,3 +598,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
 
   // Per-watchlist-person profiles + objectives, fetched once per tick.
   const profilesByFsd: Map<string, WatchlistProfileRow> = sql
+    ? await getWatchlistProfiles(sql, instance.id)
+    : new Map();
+  const objectivesByPublicId: Map<string, WatchlistObjectiveEntry> = sql
+    ? await getWatchlistObjectives(sql, instance.id)
+    : new Map();
+
+  // Active Pattern Breaker rules — over-used structures the breaker discovered
+  // from the operator's last-N posts. Loaded ONCE per tick (instance-scoped) and
+  // threaded into every draft's SYSTEM prompt + verifier. A failed or incomplete
+  // read holds drafting for this tick.
+  const patternRules: DynamicPattern[] = args.patternRules
+    ? [...args.patternRules]
+    : sql
+      ? await loadActivePatternRules(sql, {
+          orgId: instance.org_id,
+          agentInstanceId: instance.id,
+          role: "linkedin_intern",
+        })
+      : [];
+
+  // 0 (or any non-positive value) means UNLIMITED, matching how discovery reads
+  // LINKEDIN_DAILY_EXTRACT_CAP. Normalized HERE rather than at the call site so a
+  // caller passing the raw env value can never turn "no cap" into "draft nothing"
+  // — the destructuring default above only covers `undefined`, not 0.
+  const substantialCap = dailySubstantialCap > 0 ? dailySubstantialCap : Number.MAX_SAFE_INTEGER;
+  const lightCap = dailyLightCap > 0 ? dailyLightCap : Number.MAX_SAFE_INTEGER;
+
+  // Running daily-cap budget. Seed each kind from how many were already drafted
+  // today, then decrement as we draft this tick. When a kind's budget hits 0,
+  // remaining leads of that kind are left 'classified' for a later day.
+  const remaining: Record<"substantial" | "light", number> = {
+    substantial: substantialCap - (draftedTodayByKind ? await draftedTodayByKind("substantial") : 0),
+    light: lightCap - (draftedTodayByKind ? await draftedTodayByKind("light") : 0),
+  };
+
+  // Whether tiered batching is enabled for this tick (env flag on + instance permits).
+  // Default OFF → byte-identical to today.
+  const batchingEnabled =
+    batch?.enabled === true && (batch.batchLightLeads ?? true);
+
+  // Pre-compute phase budget shadow: tracks how many slots remain for each kind
+  // AS we categorize leads in the pre-compute loop. Starts equal to `remaining`
+  // and is decremented when a lead is accepted (enqueued into batchableLights or
+  // singleLeads). The `remaining` object itself is decremented only on actual
+  // successful drafts (in the batch path + singles loop) so the two stay in sync
+  // and cap semantics match the original sequential loop exactly.
+  // Leads left 'classified' this tick because their kind's daily cap is spent.
+  // Collected here and logged ONCE after the pre-compute loop (see the cap gate).
+  const capDeferred: Record<"substantial" | "light", string[]> = { substantial: [], light: [] };
+
+  // Set once the org's spend cap trips. The cap is ORG-WIDE, so every remaining
+  // lead this tick would hit the same wall — and the pre-draft gathering that
+  // runs BEFORE the model call is not free (captionImages = a vision call,
+  // fetchCommentDigest = a metered Apify fetch, and Apify does NOT count toward
+  // the LLM cap). Budget-deferred leads are retried on the next tick, so without
+  // this flag a blown budget would re-pay that gathering for every lead, every
+  // ~30s. With it, at most ONE lead's gathering is spent per tick.
+  let budgetBlown = false;
+
+  const budgetLeft: Record<"substantial" | "light", number> = {
+    substantial: remaining.substantial,
+    light: remaining.light,
+  };
+
+  // ── Categorize leads before paid gathering ────────────────────────────────
+  // Saved engagement and review/request gates decide batch eligibility. Single
+  // LIGHT contexts are gathered only after their turn's spend-budget gate.
+
+  /** Full per-lead context for a light lead that might go into the batch. */
+  interface LightLeadCtx {
+    lead: LeadRow;
+    postText: string;
+    payload: {
+      text?: string; url?: string; authorName?: string | null; authorHeadline?: string | null;
+      authorPublicId?: string | null; reactions?: number | null; comments?: number | null;
+      reactionCount?: number | null; commentCount?: number | null;
+      source?: string;
+      images?: string[];
+    };
+    anchors: Array<{ snippet: string; score: number }>;
+    knowledgeAnchors: string[];
+    imageCaption: string;
+    personDirective: string | null;
+    commentDigest: string;
+    routing: ModelRouting;
+    useSmartest: boolean;
+    styleForLead: StyleForPrompt | null;
+    postRegister: PostRegister;
+    /** Faithful-voice mode (operator pinned a source) — carried alongside postRegister. */
+    faithful: boolean;
+    registerBlock: string | undefined;
+    /**
+     * The standalone "THIS REPLY'S ASSIGNED SHAPE" block, for a lead whose shape
+     * could NOT be rendered inside the faithful style block (no pinned voice, or
+     * no style pool). Mutually exclusive with registerBlock.
+     */
+    shapeBlock: string | undefined;
+    /**
+     * Whether a shape was assigned AT ALL (inline in the style block OR
+     * standalone). The closing length line in the user prompt keys off this: a
+     * fixed char band printed under an assigned shape silently overrides it.
+     */
+    shapeAssigned: boolean;
+    openingMoveBlock: string | undefined;
+    /**
+     * The gen-z "SPOKEN REGISTER" marker block, or undefined on the majority of
+     * leads that are offered no marker. See @noelle/runtime genzMarkers.ts.
+     */
+    genzBlock: string | undefined;
+    priorReplies: string[];
+    replyRequest: ReplyRequestMeta | null;
+  }
+
+  // Two buckets after categorization:
+  // - batchable: light, non-Opus, no-verifier, batch on → go to batch call
+  // - singles: everything else (substantial, Opus-eligible lights, verifier-on lights)
+  const batchableLights: LightLeadCtx[] = [];
+  const singleLeads: Array<{
+    lead: LeadRow;
+    replyKind: "substantial" | "light";
+    gatherLight?: () => Promise<LightLeadCtx>;
+    replyRequest?: ReplyRequestMeta | null;
+    // Substantial leads have their own ctx inline in the loop below
+  }> = [];
+
+  for (const lead of claimedLeads) {
+    const replyKind: "substantial" | "light" =
+      lead.classifier_label === "light" ? "light" : "substantial";
+    const payload = lead.payload as {
+      text?: string; url?: string; authorName?: string | null; authorHeadline?: string | null;
+      authorPublicId?: string | null; reactions?: number | null; comments?: number | null;
+      reactionCount?: number | null; commentCount?: number | null;
+      source?: string;
+      images?: string[];
+    };
+    const replyRequest = readReplyRequest(payload as Record<string, unknown>);
+
+    // Cap gate uses the pre-compute shadow (budgetLeft) so leads accepted earlier
+    // in this same pass are counted — matching the original sequential loop.
+    if (!replyRequest && budgetLeft[replyKind] <= 0) {
+      // Logged in aggregate after the loop, not per lead: the drafter re-claims
+      // the same capped leads every tick, so a per-lead line here produced tens
+      // of thousands of identical entries a day once a cap was reached.
+      capDeferred[replyKind].push(lead.id);
+      await deferLeadToClassified({ sql, leadId: lead.id, replyKind });
+      continue;
+    }
+
+    // Org spend cap already tripped this tick — defer WITHOUT doing the paid
+    // pre-draft gathering below (see `budgetBlown`).
+    if (budgetBlown) {
+      await deferLeadToClassified({ sql, leadId: lead.id, replyKind, reason: "budget" });
+      continue;
+    }
+
+    const postText = payload.text ?? "";
+    if (!postText) {
+      await markStatus({ leadId: lead.id, status: "skipped", meta: { skip_reason: "empty post text" } });
+      continue;
+    }
+
+    // NOTIFICATION TRIAGE (see the X twin + docs/notifications-actor.md). A
+    // lead the actuator harvested because someone replied to us does not
+    // automatically deserve a reply: most inbound is a thanks, and a few are
+    // real opportunities where an agent answering is the wrong outcome. Runs
+    // before any retrieval so an ignored lead costs zero LLM spend.
+    if (!replyRequest && (payload as { source?: string }).source === "notification") {
+      const decision = triageNotification({
+        text: postText,
+        author: payload.authorPublicId ?? lead.author_handle,
+        priorTurns: Number((payload as { prior_turns?: number }).prior_turns ?? 0),
+      });
+      if (decision.verdict !== "reply") {
+        let pinned = false;
+        if (decision.verdict === "pin" && args.pinNotification) {
+          const pin = renderPin({
+            platform: "linkedin",
+            author: payload.authorPublicId ?? lead.author_handle,
+            text: postText,
+            reason: decision.reason,
+          });
+          pinned = await args
+            .pinNotification({ ...pin, url: (payload as { url?: string }).url ?? undefined })
+            .catch((err) => {
+              log.warn({ err: (err as Error).message }, "notification pin failed");
+              return false;
+            });
+        }
+        // An UNDELIVERED pin is never filed as 'skipped' — see the X twin. A
+        // real opportunity with no reply AND no push is the worst outcome this
+        // feature can produce, so it surfaces as 'errored' instead.
+        const undeliveredPin = decision.verdict === "pin" && !pinned;
+        if (undeliveredPin) {
+          log.error(
+            { leadId: lead.id, reason: decision.reason },
+            "notification pin NOT delivered — leaving the lead visible",
+          );
+        }
+        log.info({ leadId: lead.id, verdict: decision.verdict, reason: decision.reason, pinned }, "notification triage");
+        await markStatus({
