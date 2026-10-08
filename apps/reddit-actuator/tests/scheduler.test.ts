@@ -198,3 +198,130 @@ describe("planTimeline", () => {
     // startMs changes WHICH gaps get an extra pause, but the main stream (volume
     // factor, shuffle, bursts, tempo) consumes zero pause draws, so the planned
     // kind ORDER is identical across startMs values. Pauses only push the tail
+    // past the window end (dropped + surfaced as ClampNotes), so the shorter
+    // plan's kind sequence must be a PREFIX of the longer one — never reshuffled.
+    const kindsAt = (startMs: number) =>
+      planTimeline({
+        params: { windowHours: 8, targetComments: 30, targetLikes: 60 },
+        approvedDms: 2,
+        caps,
+        startMs,
+        deepNightTaper: false,
+        rng: makeRng(123),
+      }).actions.map((a) => a.kind);
+    // Different startMs ⇒ different pauseRng seed; same main seed ⇒ same order.
+    const a = kindsAt(start);
+    const b = kindsAt(start + 987_654_321);
+    const n = Math.min(a.length, b.length);
+    expect(n).toBeGreaterThan(0);
+    expect(a.slice(0, n)).toEqual(b.slice(0, n));
+  });
+
+  // ── NEW: ±20% volume variation — multiple seeds never all produce the same count ─
+  it("total action count varies across seeds (±20% volume jitter)", () => {
+    const counts = [1, 2, 3, 4, 5].map((seed) =>
+      planTimeline({
+        params: { windowHours: 8, targetComments: 30, targetLikes: 60 },
+        approvedDms: 2,
+        caps,
+        startMs: start,
+        deepNightTaper: false,
+        rng: makeRng(seed),
+      }).actions.length,
+    );
+    // Not all identical
+    const allSame = counts.every((c) => c === counts[0]);
+    expect(allSame).toBe(false);
+  });
+
+  // ── NEW: ClampNote emitted when volume variation pushes over cap ─────────────
+  it("records a ClampNote when ±20% volume variation would exceed a cap", () => {
+    // Set target = cap so +20% always exceeds
+    const tightCaps = { likes: 60, comments: 30, dms: 2 };
+    // Run many seeds; at least one should exceed and record a clamp
+    const clampSeen = [10, 20, 30, 40, 50].some((seed) => {
+      const { clamps } = planTimeline({
+        params: { windowHours: 8, targetComments: 30, targetLikes: 60 },
+        approvedDms: 2,
+        caps: tightCaps,
+        startMs: start,
+        deepNightTaper: false,
+        rng: makeRng(seed),
+      });
+      return clamps.length > 0;
+    });
+    expect(clampSeen).toBe(true);
+  });
+});
+
+// A 30-min window with 90 requested actions is the case that produced the
+// "nothing happens for ~15 min, then it all fires at once" bug: a single burst
+// centered at the midpoint plus fixed multi-hour gaps that overflow the window.
+describe("planTimeline — short window pacing", () => {
+  const HALF_HOUR = 30 * 60_000;
+  // noon UTC start so the overnight curfew never interferes with these assertions
+  const noonStart = new Date("2025-01-15T12:00:00.000Z").getTime();
+  function shortPlan(seed: number) {
+    return planTimeline({
+      params: { windowHours: 0.5, targetComments: 30, targetLikes: 60 },
+      approvedDms: 0,
+      caps,
+      startMs: noonStart,
+      deepNightTaper: false,
+      rng: makeRng(seed),
+    });
+  }
+
+  it("fires the first action within 8s even in a 30-min window", () => {
+    for (let seed = 1; seed <= 5; seed++) {
+      const { actions } = shortPlan(seed);
+      expect(actions.length).toBeGreaterThan(0);
+      expect(actions[0]!.atMs).toBeLessThanOrEqual(noonStart + 8_000);
+    }
+  });
+
+  it("uses the whole window — the first half is not dead", () => {
+    // The old bug: with one burst centered at the midpoint, almost every action
+    // landed in the SECOND half. A healthy plan spreads across both halves.
+    const mid = noonStart + HALF_HOUR / 2;
+    for (let seed = 1; seed <= 5; seed++) {
+      const { actions } = shortPlan(seed);
+      const firstHalf = actions.filter((a) => a.atMs < mid).length;
+      expect(firstHalf / actions.length).toBeGreaterThanOrEqual(0.25);
+    }
+  });
+
+  it("never clusters actions at the window end", () => {
+    // Old bug: overflowed actions all clamped to exactly endMs. Now they drop.
+    const end = noonStart + HALF_HOUR;
+    for (let seed = 1; seed <= 5; seed++) {
+      const { actions } = shortPlan(seed);
+      const atEnd = actions.filter((a) => a.atMs >= end - 1).length;
+      expect(atEnd).toBeLessThanOrEqual(1);
+      for (const a of actions) expect(a.atMs).toBeLessThanOrEqual(end);
+    }
+  });
+
+  it("keeps a human minimum gap between consecutive actions", () => {
+    // 90 actions can't fit in 30 min at a human pace, so the plan holds the
+    // minimum gap and drops the overflow rather than firing every few seconds.
+    for (let seed = 1; seed <= 5; seed++) {
+      const { actions } = shortPlan(seed);
+      const gaps: number[] = [];
+      for (let i = 1; i < actions.length; i++) gaps.push(actions[i]!.atMs - actions[i - 1]!.atMs);
+      const median = gaps.slice().sort((a, b) => a - b)[Math.floor(gaps.length / 2)] ?? 0;
+      // median gap should be near the 40s human floor, not 20s (fits-count) or 200s (overflow)
+      expect(median).toBeGreaterThanOrEqual(20_000);
+    }
+  });
+
+  it("records the window-fit shortfall as a ClampNote instead of dropping it silently", () => {
+    const { actions, clamps } = shortPlan(1);
+    const placed = actions.length;
+    // ~90 requested (30c + 60l, ±20%) can't fit a 30-min window at a human pace.
+    expect(placed).toBeLessThan(70);
+    // The shortfall is reported, not silently swallowed.
+    const shortfall = clamps.reduce((n, c) => n + (c.requested - c.allowed), 0);
+    expect(shortfall).toBeGreaterThan(0);
+  });
+});
