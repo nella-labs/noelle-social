@@ -198,3 +198,162 @@ export function locateCommentSubmit(root: ParentNode): LocateResult {
  */
 export function diagnoseCommentSubmit(root: ParentNode): LocateResult {
   const isZeroRect = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    return r.width <= 0 || r.height <= 0;
+  };
+  return { ok: true, observed: { ...selDiagnoseCommentSubmit(root, isZeroRect) } };
+}
+
+/**
+ * Read the comment composer's current text so the background can CONFIRM a submit
+ * actually landed. LinkedIn clears the composer on a successful post, so:
+ *   observed.present=false  → the composer is gone (posted / navigated away)
+ *   observed.empty=true     → the box is present but cleared (posted)
+ *   observed.empty=false    → text still sitting there (submit did NOT land)
+ * ok is always true (this is a read, not an action); `present` distinguishes the
+ * two "posted" shapes from the "still populated" one.
+ */
+export function readCommentBox(root: ParentNode): LocateResult {
+  const text = selCommentBoxText(root);
+  if (text === null) return { ok: true, observed: { present: false, empty: true, text: "" } };
+  return { ok: true, observed: { present: true, empty: text.length === 0, text } };
+}
+
+/**
+ * Locate the like button on the currently-open post page. doComment/doDm
+ * navigate to a single post, so we search the whole document (not feed-scoped)
+ * for the primary React Like button. Skips if the post is already liked.
+ */
+export function locatePostLike(root: ParentNode): LocateResult {
+  const btn = findLikeButton(root as Element);
+  if (!btn) return { ok: false, skipReason: "no-like-button" };
+  if (isAlreadyLiked(root as Element)) return { ok: false, skipReason: "already-liked" };
+  btn.scrollIntoView?.({ block: "center" });
+  const { x, y } = elementCenter(btn);
+  return { ok: true, x, y, rect: elementRect(btn) };
+}
+
+/**
+ * Locate a specific reaction inside the OPEN reaction flyout (the background
+ * hovers the Like button to reveal it, then calls this). Returns the reaction
+ * button's rect so the background can click it. A miss (flyout not open yet, or
+ * the reaction word/enum drifted) skips → the background falls back to a plain
+ * Like on the still-hovered Like button, so a react attempt never loses the like.
+ * Deliberately does NOT scrollIntoView: the flyout is already in view above the
+ * Like button, and a scroll here would dismiss it.
+ */
+export function locateReaction(root: ParentNode, type: ReactionType): LocateResult {
+  const btn = selFindReactionButton(root, type, reactionLabel(type));
+  if (!btn) return { ok: false, skipReason: `reaction-not-found(${type})` };
+  const { x, y } = elementCenter(btn);
+  return { ok: true, x, y, rect: elementRect(btn), observed: { reaction: type } };
+}
+
+export function locateMessageCompose(root: ParentNode): LocateResult {
+  const box = selMessageCompose(root);
+  if (!box) return { ok: false, skipReason: "selector-not-found" };
+  box.scrollIntoView?.({ block: "center" });
+  const rect = elementRect(box);
+  // Same zero-rect guard locateCommentBox carries, and it matters MORE here:
+  // `.msg-form` matches the messaging overlay that persists on every LinkedIn
+  // page, including while minimised/hidden, where it measures 0x0. Flowing that
+  // through as ok would have rectFrom synthesize a 4x4 box around {0,0} and the
+  // trusted click would land in the viewport corner — on LinkedIn's global nav,
+  // not a composer.
+  if (rect.width <= 0 || rect.height <= 0) return { ok: false, skipReason: "compose-zero-rect" };
+  const { x, y } = elementCenter(box);
+  return { ok: true, x, y, rect };
+}
+
+/**
+ * Read the message composer's current text, so the DM box can be cleared and
+ * confirmed the way the comment box is (see readCommentBox for the shape).
+ *   observed.present=false → no compose box on the page
+ *   observed.empty=true    → present but cleared
+ *   observed.empty=false   → text still sitting there
+ */
+export function readMessageCompose(root: ParentNode): LocateResult {
+  const text = selMessageComposeText(root);
+  if (text === null) return { ok: true, observed: { present: false, empty: true, text: "" } };
+  return { ok: true, observed: { present: true, empty: text.length === 0, text } };
+}
+
+export function locateMessageSend(root: ParentNode): LocateResult {
+  const btn = selMessageSend(root);
+  if (!btn) return { ok: false, skipReason: "selector-not-found" };
+  btn.scrollIntoView?.({ block: "center" });
+  const rect = elementRect(btn);
+  // Same hazard as the compose box above: a hidden overlay's Send button
+  // measures 0x0, and a corner click is never a send.
+  if (rect.width <= 0 || rect.height <= 0) return { ok: false, skipReason: "send-zero-rect" };
+  const { x, y } = elementCenter(btn);
+  return { ok: true, x, y, rect };
+}
+
+/**
+ * In-viewport (or just below) posts, mirroring the like-target heuristic so
+ * ambient clicks land on a post the reader can actually see. Falls back to all
+ * posts when none are in view.
+ */
+function inViewPosts(posts: Element[]): Element[] {
+  const vh = typeof window !== "undefined" ? window.innerHeight || 800 : 800;
+  const inView = posts.filter((p) => {
+    const top = p.getBoundingClientRect().top;
+    return top > -200 && top < vh * 1.4;
+  });
+  return inView.length > 0 ? inView : posts;
+}
+
+/**
+ * Ambient decoy: locate a truncated post's "…more" toggle so the loop can
+ * expand-and-read it (a strong human signal). Non-counted, read-only.
+ */
+export function locateAmbientExpand(root: ParentNode, rng: Rng): LocateResult {
+  const truncated = findFeedPosts(root).filter((p) => !isSponsored(p) && selIsTruncated(p));
+  if (truncated.length === 0) return { ok: false, skipReason: "no-truncated-post" };
+  const candidates = inViewPosts(truncated);
+  const pick = candidates[rng.int(0, candidates.length - 1)]!;
+  const btn = selFindSeeMore(pick);
+  if (!btn) return { ok: false, skipReason: "see-more-not-found" };
+  btn.scrollIntoView?.({ block: "center" });
+  const { x, y } = elementCenter(btn);
+  return {
+    ok: true, x, y, rect: elementRect(btn),
+    observed: {
+      activity_urn: postActivityUrn(pick),
+      wordCount: selWordCount(pick),
+      hasMedia: selHasMedia(pick),
+    },
+  };
+}
+
+/**
+ * Ambient decoy: locate a post's comments affordance so the loop can open the
+ * thread and read it. Non-counted, read-only — never types or submits.
+ */
+export function locateAmbientComments(root: ParentNode, rng: Rng): LocateResult {
+  const withComments = findFeedPosts(root).filter((p) => !isSponsored(p) && selHasComments(p));
+  if (withComments.length === 0) return { ok: false, skipReason: "no-commentable-post" };
+  const candidates = inViewPosts(withComments);
+  const pick = candidates[rng.int(0, candidates.length - 1)]!;
+  const btn = selFindCommentsToggle(pick);
+  if (!btn) return { ok: false, skipReason: "comments-toggle-not-found" };
+  btn.scrollIntoView?.({ block: "center" });
+  const { x, y } = elementCenter(btn);
+  return {
+    ok: true, x, y, rect: elementRect(btn),
+    observed: { activity_urn: postActivityUrn(pick), hasMedia: selHasMedia(pick) },
+  };
+}
+
+export function detectChallenge(root: ParentNode): boolean {
+  return findChallenge(root);
+}
+
+export function detectPostUnavailable(root: ParentNode): boolean {
+  return selIsPostUnavailable(root);
+}
+
+export function detectCommentRestricted(root: ParentNode): boolean {
+  return selIsCommentRestricted(root);
+}
