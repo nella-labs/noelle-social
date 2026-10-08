@@ -598,3 +598,32 @@ function readLeadPayload(payload: unknown): LeadPayloadView {
 
 function replySource(inst: NoelleAgentInstance, payload: unknown): { postText: string | null; postUrl: string | null; authorHandle: string | null } {
   if (inst.role === "reddit_intern") return redditLeadFields(payload);
+  if (inst.role === "linkedin_intern") {
+    const lead = linkedinLeadPayload({ payload } as Parameters<typeof linkedinLeadPayload>[0]);
+    return { postText: lead.postText ?? null, postUrl: lead.postUrl ?? null, authorHandle: lead.authorPublicId ?? null };
+  }
+  const lead = readLeadPayload(payload);
+  return { postText: lead.post_text ?? null, postUrl: lead.originalPostUrl ?? null, authorHandle: lead.author_handle ?? null };
+}
+
+function normaliseHandle(handle: string | null): string | null {
+  if (typeof handle !== "string" || !handle) return null;
+  return handle.replace(/^@/, "").trim() || null;
+}
+
+function normaliseTier(tier: string | null): ChatApprovalSummary["tier"] {
+  if (tier === "T1" || tier === "T2" || tier === "T3") return tier;
+  return null;
+}
+
+function parseScore(
+  raw: string | null,
+  fallback: number | undefined,
+): number | null {
+  if (raw !== null) {
+    const n = Number(raw);
+    if (Number.isFinite(n)) return n;
+  }
+  if (typeof fallback === "number" && Number.isFinite(fallback)) return fallback;
+  return null;
+}
