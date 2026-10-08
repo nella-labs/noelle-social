@@ -198,3 +198,83 @@ function renderRows(rows: Array<Record<string, unknown>>, cap: number): string {
     if (v === null || v === undefined) return "";
     if (typeof v === "object") return truncate(JSON.stringify(v), 60);
     return truncate(String(v), 60);
+  };
+  return mdTable(
+    headers,
+    shown.map((r) => headers.map((h) => cell(r[h]))),
+  );
+}
+
+async function sqlQuery(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  const raw = reqStr(args, "query");
+  const q = raw.trim().replace(/;\s*$/, ""); // tolerate a single trailing semicolon
+  if (/;/.test(q)) {
+    throw new NoelleError("noelle_sql_query runs a single statement only (found ';'). Split it or use one statement.");
+  }
+  if (!/^\s*(select|with)\b/i.test(q)) {
+    throw new NoelleError("noelle_sql_query only runs SELECT/WITH. Use noelle_sql_execute for writes.");
+  }
+  const timeoutMs = Number(ctx.env.NOELLE_MCP_STATEMENT_TIMEOUT_MS);
+  const rows = (await ctx.sql.begin(async (sql) => {
+    await sql.unsafe("set transaction read only");
+    await sql.unsafe(`set local statement_timeout = ${timeoutMs}`);
+    return sql.unsafe(q);
+  })) as unknown as Array<Record<string, unknown>>;
+
+  const cap = limitOf(args, 100, 1000);
+  const table = renderRows(rows, cap);
+  const note = rows.length > cap ? ` (showing first ${cap})` : "";
+  return text(`**${rows.length} row(s)**${note}\n\n${table}`);
+}
+
+async function sqlExecute(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("run a write SQL statement");
+  const query = reqStr(args, "query");
+
+  if (DANGEROUS_RE.test(query) && !(optBool(args, "allowDangerous") ?? false)) {
+    throw new NoelleError(
+      "This looks like a structural/privileged statement (DROP/TRUNCATE/ALTER/GRANT/…). Re-run with allowDangerous:true to permit it.",
+    );
+  }
+  if (!(optBool(args, "confirm") ?? false)) {
+    return text(
+      "Refusing to execute without `confirm:true`. Review the statement, then re-run with confirm:true:\n\n```sql\n" +
+        query +
+        "\n```",
+    );
+  }
+
+  const timeoutMs = Number(ctx.env.NOELLE_MCP_STATEMENT_TIMEOUT_MS);
+  const result = (await ctx.sql.begin(async (sql) => {
+    await sql.unsafe(`set local statement_timeout = ${timeoutMs}`);
+    return sql.unsafe(query);
+  })) as unknown as Array<Record<string, unknown>> & { count?: number };
+
+  const affected = typeof result.count === "number" ? result.count : result.length;
+  let out = `OK — ${affected} row(s) affected.`;
+  if (result.length > 0) {
+    out += `\n\n**RETURNING (${result.length})**\n\n${renderRows(result, 100)}`;
+  }
+  return text(out);
+}
+
+async function handle(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult | null> {
+  switch (name) {
+    case "noelle_list_tables":
+      return guard(() => listTables(args, ctx));
+    case "noelle_describe_table":
+      return guard(() => describeTable(args, ctx));
+    case "noelle_sql_query":
+      return guard(() => sqlQuery(args, ctx));
+    case "noelle_sql_execute":
+      return guard(() => sqlExecute(args, ctx));
+    default:
+      return null;
+  }
+}
+
+export const adminModule: ToolModule = { tools, handle };

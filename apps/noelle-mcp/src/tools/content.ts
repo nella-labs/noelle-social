@@ -398,3 +398,92 @@ async function triggerIdeation(
       `Noelle generates the ideas; do not insert chat-written replacements.`,
   );
 }
+
+async function generatePost(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("approve an idea for drafting");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const ideaId = reqStr(args, "ideaId");
+  const guidance = optStr(args, "guidance");
+  return generatePostWithProgress(args, ctx, org, ideaId, guidance);
+}
+
+async function schedulePost(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("set a suggested post day");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const ideaId = reqStr(args, "ideaId");
+  const day = optStr(args, "day");
+
+  await scheduleContentPostIdea(ctx.sql, { orgId: org.orgId, ideaId }, day ?? null);
+
+  return text(
+    day
+      ? `Stored the suggested publish day **${day}** for idea ${ideaId}. No publication slot was created.`
+      : `Cleared the suggested day for idea ${ideaId}.`,
+  );
+}
+
+async function markPostReady(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("mark a post ready");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const draftId = reqStr(args, "draftId");
+  const editedBody = optStr(args, "editedBody");
+
+  await markContentPostReady(ctx.sql, { orgId: org.orgId, draftId }, editedBody);
+
+  return text(`Marked draft ${draftId} **ready**${editedBody ? " (saved your edited body)" : ""}.`);
+}
+
+async function dismissPost(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("dismiss a post");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const id = reqStr(args, "id");
+  const target = reqStr(args, "target");
+  if (target !== "idea" && target !== "draft")
+    throw new NoelleError(`target must be "idea" or "draft".`);
+
+  await dismissContentPost(ctx.sql, { orgId: org.orgId, ...(target === "idea" ? { ideaId: id } : { draftId: id }) });
+
+  return text(`Dismissed ${target} ${id}.`);
+}
+
+async function handle(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult | null> {
+  switch (name) {
+    case "noelle_list_post_ideas":
+      return guard(() => listPostIdeas(args, ctx));
+    case "noelle_list_post_drafts":
+      return guard(() => listPostDrafts(args, ctx));
+    case "noelle_get_post":
+      return guard(() => getPost(args, ctx));
+    case "noelle_add_post_idea":
+      return guard(() => addPostIdea(args, ctx));
+    case "noelle_trigger_ideation":
+      return guard(() => triggerIdeation(args, ctx));
+    case "noelle_get_ideation_request":
+      return guard(async () => getIdeationRequest(ctx, await ctx.resolveOrg(optStr(args, "org")), reqStr(args, "requestId"), args));
+    case "noelle_generate_post":
+      return guard(() => generatePost(args, ctx));
+    case "noelle_schedule_post":
+      return guard(() => schedulePost(args, ctx));
+    case "noelle_mark_post_ready":
+      return guard(() => markPostReady(args, ctx));
+    case "noelle_dismiss_post":
+      return guard(() => dismissPost(args, ctx));
+    default:
+      return null;
+  }
+}
+
+export const contentModule: ToolModule = { tools, handle };
