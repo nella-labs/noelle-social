@@ -198,3 +198,75 @@ export async function runBrowserObservation(args: {
             if (args.stopped() || !(await args.enabled())) return null;
             attempt++;
             continue;
+          }
+          if (recovered || !args.recoverReceiver || !(await args.recoverReceiver(args.tabId))) throw error;
+          recovered = true;
+          attempt = 0;
+        }
+      }
+      if (!result.ok || !Array.isArray(result.items)) throw new Error("invalid content-script response");
+      visible = result.items;
+      args.onVisible?.(visible);
+    }
+    const candidates = new Map<string, VisiblePost>();
+    // Anonymous cards can only be resolved while still visible. Stage at most
+    // one paced read's worth, then resolve its qualified cards before moving on.
+    if (!args.deferredOnly) for (const item of visible) {
+      const key = observationKey(item);
+      if (item.urn || key === null || args.seen.has(`${args.instanceId}:${key}`) || candidates.has(key)) continue;
+      candidates.set(key, item);
+      if (candidates.size >= MAX_OBSERVATIONS_PER_READ) break;
+    }
+    // A visible URN-only card can still be submitted now, but only a card
+    // with a matching permalink is safe to carry into a later read.
+    const identified = args.deferredOnly
+      ? (args.deferred ?? []).filter(isCanonicalObservation)
+      : [...visible.filter((item) => Boolean(item.urn)), ...(args.deferred ?? []).filter(isCanonicalObservation)];
+    for (const item of identified) {
+      const key = observationKey(item);
+      if (key !== null && !args.seen.has(`${args.instanceId}:${key}`) && !candidates.has(key)) candidates.set(key, item);
+    }
+    items = [...candidates.values()];
+  } catch (error) {
+    if (args.stopped() || !(await args.enabled())) return null;
+    status.result = "failed";
+    status.stage = "extract";
+    status.error = discoveryError(error);
+    await args.report(status);
+    return status;
+  }
+  status.observed = items.length;
+  const limit = Math.min(items.length, args.available ?? Infinity, MAX_OBSERVATIONS_PER_READ);
+  let processed = 0;
+  for (let start = 0; start < limit; start += 50) {
+    if (args.stopped() || !(await args.enabled())) {
+      if (start === 0) {
+        retainCanonicalDeferred(args.deferred, items);
+        return null;
+      }
+      break;
+    }
+    const batch = items.slice(start, Math.min(start + 50, limit));
+    try {
+      const result = await args.submit(batch);
+      status.accepted += result.accepted;
+      status.duplicates += result.duplicates;
+      status.invalid += result.invalid;
+      for (const item of batch) {
+        const key = observationKey(item);
+        if (key) args.seen.add(`${args.instanceId}:${key}`);
+      }
+      if (args.seen.size > 5000) args.seen.clear();
+      status.result = "submitted";
+      processed += batch.length;
+    } catch (error) {
+      status.result = "failed";
+      status.stage = "submit";
+      status.error = discoveryError(error);
+      break; // Failed batch stays unseen and is retried on the next read.
+    }
+  }
+  retainCanonicalDeferred(args.deferred, items.slice(processed));
+  await args.report(status);
+  return status;
+}
