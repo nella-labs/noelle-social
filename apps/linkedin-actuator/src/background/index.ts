@@ -398,3 +398,203 @@ async function endRun(status: RunState["status"], terminal = reserveStop()): Pro
   const term = await terminal;
   // Abort immediately when STOP is reserved, then recheck the owned controller
   // after the epoch write: a start may have activated while that write waited.
+  if (!(await runIfCurrent(term, async () => {
+    runAbort.abort();
+    pendingPriority = null;
+    needsRunRestore = false;
+    if (status === "halted-challenge") {
+      await chrome.storage.local.set({ [CHALLENGE_DAY_KEY]: localDayKey(new Date()) });
+    }
+  }))) return term;
+  const s = await loadState();
+  if (s) {
+    s.status = status;
+    s.epoch = term;
+    if (!(await saveIfCurrent(s))) return term;
+    // Detach EVERY tab this run attached (a re-pin after the pinned tab closed
+    // attaches more than one, and the re-pin may not be persisted yet), so no
+    // debugger session — or its banner — lingers after the run halts.
+    if (term === await currentEpoch()) await cdp.detachAll();
+  }
+  const cfg = await getConfig();
+  if (cfg) {
+    const api = new ActuatorApi(cfg);
+    // A manual start can enable sending before it has saved its first state.
+    // Serialize consent writes separately from storage; a newer run owns its flag.
+    await withSendSwitch(async () => {
+      if (tickIsCurrent(term, await currentEpoch())) {
+        await api.enableSend(cfg.instanceId, false).catch(() => {});
+      }
+    });
+    if (s) {
+      const events: LinkedInActivityEvent[] = [];
+      const at = new Date(Date.now()).toISOString();
+      for (const k of ["comments", "dms"] as const) {
+        const miss = shortfall(s.targets[k], s.done[k]);
+        if (miss > 0) events.push({ type: "skip", reason: `shortfall-${k}-${miss}`, at });
+      }
+      if (events.length) await api.logActivity(s.sessionId, events).catch(() => {});
+    }
+  }
+  await runIfCurrent(term, async () => { await chrome.alarms.clear(ALARM); });
+  return term;
+}
+
+// Drain auto-continue. A drain plans a FIXED number of comment slots (the queue
+// size at start), so it used to STOP after that first batch even when the inbox
+// still held approvals — the ones capped at start, that arrived mid-run, or that
+// were re-queued after a transient failure ("the actuator stopped before
+// finishing the approvals inbox"). When every planned slot is done, re-fetch the
+// queue and, if pending comments remain, APPEND a fresh batch of comment+like
+// slots and extend the window — so one operator Drain clears the WHOLE inbox
+// without a manual re-trigger. Returns true iff it extended (caller keeps the run
+// running). Bounded by MAX_DRAIN_ROUNDS. Naturally self-limiting: an empty queue
+// (nothing left, or sending disabled server-side) returns false → the drain ends;
+// posts that keep failing hit the per-draft retry cap → doneDraftIds → filtered
+// out of the next fetch → remaining reaches 0.
+async function maybeExtendDrain(
+  s: RunState, api: ActuatorApi, now: number, rng: ReturnType<typeof makeRng>,
+): Promise<boolean> {
+  if (s.mode !== "drain") return false;
+  const q = await api.fetchQueue().catch(() => null);
+  if (!q) return false;
+  const done = new Set(s.doneDraftIds);
+  s.commentPool = mergePool(
+    s.commentPool,
+    q.comments.map((c) => ({
+      approvalId: c.approval_id,
+      draftId: c.draft_id,
+      body: c.body,
+      url: c.target.url,
+      // Carried through so doComment knows to THREAD rather than add a
+      // top-level comment. api-vm only sets these for notification leads.
+      commentUrn: c.target.comment_urn ?? null,
+      commentAuthorName: c.target.comment_author_name ?? null,
+    })),
+    done,
+  );
+  s.lastPollMs = now; // this fetch counts as a poll; don't double-fetch next tick
+  const remaining = s.commentPool.length;
+  if (!shouldExtendDrain(s.mode, s.drainRounds ?? 0, remaining)) return false;
+
+  // Plan a fresh drain batch for the remaining comments, starting shortly from
+  // now, and splice it onto the timeline. The existing comment-slot executor
+  // shifts these off s.commentPool exactly as it did the first batch. Carries the
+  // SAME persisted session temperament so every round keeps one coherent mood
+  // (old states without drainStyle fall back to today's defaults via `?? {}`).
+  const planned = planDrainTimeline({ approvedComments: remaining, startMs: now, rng, ...(s.drainStyle ?? {}) });
+  const newLast = planned.reduce((m, a) => Math.max(m, a.atMs), now);
+  for (const a of planned) s.actions.push({ kind: a.kind, atMs: a.atMs, executed: false });
+  s.windowHours = (newLast - s.startMs) / 3600_000 + 0.15; // extend so the new tail fits
+  s.targets.comments += remaining;
+  s.targets.likes += planned.filter((a) => a.kind === "like").length;
+  s.drainRounds = (s.drainRounds ?? 0) + 1;
+  s.lastEvent = `draining more — ${remaining} left in inbox (round ${s.drainRounds})`;
+  return true;
+}
+
+async function maybeReplenish(s: RunState, api: ActuatorApi, now: number, rng: ReturnType<typeof makeRng>) {
+  if (now - s.lastPollMs < POLL_MS * rng.float(0.8, 1.6)) return;
+  s.lastPollMs = now;
+  const q = await api.fetchQueue().catch(() => null);
+  if (!q) return;
+  const done = new Set(s.doneDraftIds);
+  s.commentPool = mergePool(s.commentPool, q.comments.map((c) => ({
+      approvalId: c.approval_id,
+      draftId: c.draft_id,
+      body: c.body,
+      url: c.target.url,
+      // Carried through so doComment knows to THREAD rather than add a
+      // top-level comment. api-vm only sets these for notification leads.
+      commentUrn: c.target.comment_urn ?? null,
+      commentAuthorName: c.target.comment_author_name ?? null,
+    })), done);
+  s.dmPool = mergePool(s.dmPool, q.dms.map((d) => ({ approvalId: d.approval_id, draftId: d.draft_id, body: d.body, url: d.target.url })), done);
+}
+
+// Ambient read-actions (expand "…more" / open a post's comments to read) are
+// paced by a rolling cooldown so they cluster like real reading instead of
+// firing on every ~4s idle tick. Base gap × a 1–2 jitter ⇒ roughly one every
+// 20–40s at most; many attempts also find nothing in view and downgrade to a
+// scroll, so the real rate is lower. Read-only + non-counted against targets.
+// Tightened (was 30s×1–2.5) so the actor actively clicks "…more" while waiting.
+const AMBIENT_READ_MIN_GAP_MS = 20_000;
+
+// Minimum spacing between idle-likes (a like slipped into the wait between
+// scheduled actions — Run/auto mode only; drain never idle-likes, see the
+// shouldIdleLike inDrain gate). 2026-07-23 quiet re-tune: raised 45s → 5 min
+// (×1-1.8 jitter ⇒ one like per ~5-9 min of waiting, was ~45-80s) — the
+// operator wants waits to look idle, not busy. The filler still tops the
+// session toward its like budget, just at a reading pace.
+const IDLE_LIKE_MIN_GAP_MS = 300_000;
+
+// One ambient browse: pick a behavior (read-actions gated by cooldown + config
+// kill switch, default ON) and run it. Advances the cooldown anchor only on an
+// action that actually happened, so a downgraded-to-scroll attempt doesn't burn
+// the gap. Mutates `s` in place; the caller persists it.
+async function resolveQualifiedVisiblePost(tabId: number, api: ActuatorApi, rng: ReturnType<typeof makeRng>, visibleFingerprints: string[], attempted: Set<string>, s: RunState): Promise<"resolved" | "none" | "classifying" | "not-visible" | "unresolved" | "stopped"> {
+  return resolveVisibleDiscoveryIdentity({
+    stopped, enabled: browserDiscoveryEnabled,
+    visibleFingerprints, attempted, pending: (fingerprints) => api.fetchDiscoveryIdentities(fingerprints),
+    locate: (fingerprint) => send(tabId, { cmd: "locateDiscoveryPostMenu", fingerprint }),
+    click: async (rect) => { await cdp.attach(tabId); await cdp.moveAndClick(tabId, rect, rng, sleep); },
+    wait: () => sleep(350),
+    readShareUrn: () => send(tabId, { cmd: "readDiscoveryMenuShareUrn" }),
+    captureCopyLink: async () => {
+      const isCurrent = async (): Promise<boolean> => {
+        if (stopped() || s.status !== "running" || s.epoch !== await currentEpoch() ||
+            await remoteStopped() || !(await browserDiscoveryEnabled())) return false;
+        const challenge = await send<{ ok?: boolean; observed?: { challenge?: boolean } }>(
+          tabId, { cmd: "detectChallenge" },
+        ).catch(() => null);
+        return challenge?.ok === true && challenge.observed?.challenge === false &&
+          !stopped() && s.epoch === await currentEpoch();
+      };
+      const target = await locateCopyLinkAfterHydration({
+        isCurrent,
+        locate: () => send(tabId, { cmd: "locateDiscoveryCopyLink" }),
+        wait: () => sleep(350),
+      });
+      if (target.skipReason === "stopped") return { failure: { stage: "stopped" } as const };
+      if (!target?.ok || !target.rect) return { failure: {
+        stage: "locate" as const,
+        ...(target?.skipReason ? { locatorReason: target.skipReason } : {}),
+        ...(target?.diagnostic ? { menuDiagnostic: target.diagnostic } : {}),
+      } };
+      if (!(await isCurrent())) return { failure: { stage: "stopped" } as const };
+      let captureFailure: CopyCaptureFailure | undefined;
+      const identity = await captureCopyLinkIdentity({
+        evaluate: (expression) => cdp.evaluatePage(tabId, expression),
+        click: async () => {
+          if (!(await isCurrent())) throw new Error("identity capture no longer current");
+          await cdp.moveAndClick(tabId, target.rect!, rng, sleep);
+        },
+        wait: () => sleep(350),
+        stopped,
+        onFailure: (failure) => { captureFailure = failure; },
+      });
+      if (!(await isCurrent())) return { failure: { stage: "stopped" } as const };
+      return identity ?? { failure: captureFailure ?? { stage: "exception" } };
+    },
+    closeMenu: () => cdp.pressEscape(tabId),
+    resolve: (item, urn) => api.resolveDiscoveryIdentity(item.leadId, item.fingerprint, urn),
+    resolveShortLink: (item, shortUrl) => api.resolveDiscoveryShortLink(item.leadId, item.fingerprint, shortUrl),
+    report: async ({ result, reason, diagnostic, copy }) => {
+      const status = { at: new Date().toISOString(), result,
+        ...(reason ? { reason } : {}), ...(diagnostic ? { diagnostic } : {}), ...(copy ? { copy } : {}) };
+      await chrome.storage.local.set({ [DISCOVERY_IDENTITY_STATUS_KEY]: status }).catch((error) => {
+        sinkLog("warn", "discovery identity telemetry write failed", { error: discoveryError(error) });
+      });
+      sinkLog(result === "unresolved" ? "warn" : "info", "discovery identity", status);
+    },
+  });
+}
+
+async function observeVisiblePosts(tabId: number, api: ActuatorApi, instanceId: string, rng: ReturnType<typeof makeRng>, s: RunState, available: number, deferredOnly = false): Promise<void> {
+  let visibleFingerprints: string[] = [];
+  const status = await runBrowserObservation({
+    tabId, instanceId, seen: observedUrns, deferred: (s.deferredObservations ??= []), available, deferredOnly,
+    stopped, enabled: browserDiscoveryEnabled, now: Date.now, wait: sleep,
+    send: (id) => send<{ ok: boolean; items?: VisiblePost[] }>(id, { cmd: "harvestVisiblePosts" }),
+    recoverReceiver: async (id) => {
+      const isCurrent = async () => !stopped() && s.epoch === (await currentEpoch()) &&
