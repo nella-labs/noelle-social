@@ -598,3 +598,203 @@ export function findDirtyReplyBox(
 ): HTMLElement | null {
   const all: HTMLElement[] = flavor === "old"
     ? Array.from(root.querySelectorAll<HTMLElement>("textarea[name='text']"))
+    : newReplyEditables(root);
+  const candidates = matches ? all.filter((el) => matches(editableText(el))) : all;
+  // VISIBLE ONLY, deliberately — a hidden dirty editable is not a candidate at
+  // all, not even a fallback.
+  //
+  // Hidden dirty boxes are routine rather than exceptional. old.reddit ships a
+  // collapsed `.usertext-edit textarea[name='text']` prefilled with the text of
+  // every one of your own comments on the page, and new Reddit keeps a
+  // collapsed post composer around. Returning one of those would report the
+  // page dirty FOREVER: the emptiness probe reads present:true while the focus
+  // click can never land on a zero-rect element, so the clear would deadlock
+  // and every subsequent hop would log a false "composer would not clear",
+  // burying the real diagnostics.
+  //
+  // What is given up is a hidden composer that genuinely holds a live draft.
+  // That one goes unreported — but it could not have been cleared either, and
+  // Reddit's own prefill proves the hidden ones are overwhelmingly noise.
+  return candidates.find((el) => hasBox(el) && editableText(el).length > 0) ?? null;
+}
+
+/** Only the requested comment's own elements and its adjacent composer qualify. */
+function commentReplyElements(
+  root: ParentNode, flavor: RedditFlavor, targetId: string,
+  elements: (scope: ParentNode) => HTMLElement[],
+): HTMLElement[] {
+  const comment = findComments(root, flavor).find((candidate) => commentId(candidate, flavor) === targetId);
+  if (!comment) return [];
+  const ownerSelector = flavor === "old" ? ".thing.comment" : "shreddit-comment";
+  const own = elements(comment).filter((candidate) => candidate.closest(ownerSelector) === comment);
+  const adjacent = comment.nextElementSibling;
+  if (flavor === "new" && adjacent?.tagName.toLowerCase() === "comment-composer-host") {
+    const parentOwner = comment.parentElement?.closest(ownerSelector) ?? null;
+    own.push(...elements(adjacent).filter((candidate) => candidate.closest(ownerSelector) === parentOwner));
+  }
+  return own.filter(notChat);
+}
+
+/**
+ * The ACTIVE reply editable/textarea.
+ *
+ * New Reddit: a slotted `div[contenteditable][name="body"]`. For a COMMENT target
+ * (`commentId` given) the search is SCOPED to the composer that mounts under the
+ * target `shreddit-comment[thingid="t1_<id>"]` (its descendant / adjacent
+ * `comment-composer-host`), so we never type into the page-level "Add a comment"
+ * POST box — which sits first in document order and, collapsed, is 0×0. Among
+ * candidates a non-zero box wins (the collapsed post composer is skipped). POST
+ * targets (no commentId) use the page-level composer.
+ *
+ * Old Reddit: a requested comment's own child reply box. Without an explicit
+ * comment target, prefer an open child reply over the page-level post box.
+ */
+export function findReplyBox(root: ParentNode, flavor: RedditFlavor, commentId?: string): HTMLElement | null {
+  if (commentId) {
+    const candidates = commentReplyElements(root, flavor, commentId, flavor === "old"
+      ? (scope) => Array.from(scope.querySelectorAll<HTMLElement>(".child .usertext-edit textarea[name='text']"))
+      : newReplyEditables);
+    return candidates.find(hasBox) ?? candidates[0] ?? null;
+  }
+  if (flavor === "old") {
+    return (
+      root.querySelector<HTMLElement>(".thing.comment .child .usertext-edit textarea[name='text']") ??
+      root.querySelector<HTMLElement>(".commentarea .usertext-edit textarea[name='text']") ??
+      root.querySelector<HTMLElement>("textarea[name='text']")
+    );
+  }
+  const all = newReplyEditables(root);
+  return all.find(hasBox) ?? all[0] ?? null;
+}
+
+/** True for a submit button that is disabled / aria-disabled — the composer has
+ * not accepted the typed text yet, so clicking it would be a no-op (never posts).
+ * Shared by the selector passes below and locateReplySubmit's
+ * "reply-submit-disabled" gate so the definition never drifts between the two. */
+export function submitDisabled(el: Element): boolean {
+  if ((el as HTMLButtonElement).disabled === true) return true;
+  return (el.getAttribute("aria-disabled") ?? "").toLowerCase() === "true";
+}
+
+// ── Reply-submit locator (ports #407 + #442) ────────────────────────────────
+// The old fallback was a bare document-wide querySelector for
+// `button[slot='submit-button']` — the exact unanchored hijack channel the
+// LinkedIn actuator deleted: on a page with multiple open composers (or a decoy
+// carrying the slot attr) the FIRST match wins regardless of which composer we
+// typed into. The search is now word-gated, decoy-excluded, and ANCHORED to the
+// reply box: a decoy can only lose. If nothing qualifies we return null (or the
+// disabled real submit), which keeps the background's poll waiting and ends in a
+// diagnosable failure instead of a wrong click.
+
+// Exact-word gate on the trimmed aria-label OR text: "Comment" (new Reddit),
+// "Reply" (comment-reply composers), "Post", "save" (old Reddit). Never a
+// substring, so "42 Comments" / "Post insights" can't qualify.
+const REPLY_SUBMIT_WORD = /^(comment|reply|post|save)$/i;
+function submitWordy(el: HTMLElement): boolean {
+  return (
+    REPLY_SUBMIT_WORD.test((el.getAttribute("aria-label") ?? "").trim()) ||
+    REPLY_SUBMIT_WORD.test((el.textContent ?? "").trim())
+  );
+}
+
+/** Slot/type submit-styling — a TIEBREAKER between worded candidates, never a
+ * qualifier on its own (a chat drawer's Send could be type=submit). */
+function submitSlotted(el: HTMLElement): boolean {
+  return el.getAttribute("slot") === "submit-button" || el.getAttribute("type") === "submit";
+}
+
+// Per-comment thread affordances (the "Reply" opener, Share, …) live inside
+// shreddit-comment-action-row; the composer submit never does.
+const ACTION_ROW_SEL = "shreddit-comment-action-row, shreddit-post-action-row";
+
+/** The thread-level "Reply" opener / a comment-count affordance — never posts.
+ * Identified by its action-row home, or (hook-independent shape check, in case
+ * the row wrapper drifts) a count-only visible text ("42", "1.2K") while the
+ * aria-label carries the word — the real submit shows the word itself. */
+function replyOpenerLike(el: HTMLElement): boolean {
+  if (el.closest(ACTION_ROW_SEL) !== null) return true;
+  const ownText = (el.textContent ?? "").trim();
+  return /^\d[\d,.]*[kKmM]?$/.test(ownText) && REPLY_SUBMIT_WORD.test((el.getAttribute("aria-label") ?? "").trim());
+}
+
+/** Shared candidate filter for every submit pass: word-gated, not a thread
+ * opener, not inside the chat drawer. Bare "Reply" is also the label of
+ * hook-less thread openers, so it only qualifies when the button is ALSO
+ * slot/type submit-styled. Disabled is deliberately NOT filtered here — the
+ * passes prefer an enabled candidate but return the disabled real submit over
+ * widening to a decoy, so locateReplySubmit can report "reply-submit-disabled"
+ * and the background waits (never a wrong click). */
+function submitEligible(el: HTMLElement): boolean {
+  if (replyOpenerLike(el)) return false;
+  if (!notChat(el)) return false;
+  if (!submitWordy(el)) return false;
+  const bareReply =
+    /^reply$/i.test((el.getAttribute("aria-label") ?? "").trim()) || /^reply$/i.test((el.textContent ?? "").trim());
+  return !bareReply || submitSlotted(el);
+}
+
+export interface ReplySubmitHit {
+  el: HTMLElement;
+  /** Which pass found it (scoped | composer:<hops> | global-slotted |
+   * global-word | old-save) — rides locateReplySubmit's observed.via into the
+   * failure diagnostics. */
+  via: string;
+}
+
+/** Among eligible candidates: enabled first, then slot='submit-button', then
+ * type='submit'; querySelectorAll order keeps first-in-document among equals. */
+function bestSubmit(pool: HTMLElement[]): HTMLElement {
+  const score = (el: HTMLElement) =>
+    (submitDisabled(el) ? 0 : 4) +
+    (el.getAttribute("slot") === "submit-button" ? 2 : 0) +
+    (el.getAttribute("type") === "submit" ? 1 : 0);
+  return pool.reduce((a, b) => (score(b) > score(a) ? b : a));
+}
+
+/**
+ * The ACTIVE reply submit button + which pass matched it.
+ *
+ * New Reddit, in order:
+ *   1. SCOPED fast path (COMMENT target): `button[slot="submit-button"]` inside
+ *      the target `shreddit-comment[thingid]`'s own composer subtree — a
+ *      page-level post composer's button is never clicked.
+ *   2. COMPOSER-ANCHORED climb: from the located reply box up to 6 ancestors
+ *      (stop after FORM / comment-composer-host / shreddit-composer), the first
+ *      level with an eligible candidate that FOLLOWS the box in document order
+ *      wins (the submit renders after the editor; openers/toggles precede it —
+ *      position outlives attr drift). A level holding only a DISABLED would-be
+ *      submit returns it (→ "reply-submit-disabled", wait for enable) rather
+ *      than widening toward decoys.
+ *   3. Global two-pass, word-gated + decoy-excluded (and FOLLOWING the box when
+ *      one exists): slot/type-styled matches first, then any exact-word match.
+ *      The bare unanchored slot query is gone — that was the hijack channel.
+ *
+ * Old Reddit: `button.save` in the `.usertext-buttons` of the open child reply
+ * box, else the post box.
+ */
+export function findReplySubmitInfo(
+  root: ParentNode,
+  flavor: RedditFlavor,
+  commentId?: string,
+): ReplySubmitHit | null {
+  if (commentId) {
+    const selector = flavor === "old" ? ".child .usertext-buttons button.save" : "button, [role='button']";
+    const candidates = commentReplyElements(root, flavor, commentId,
+      (scope) => Array.from(scope.querySelectorAll<HTMLElement>(selector)))
+      .filter((candidate) => flavor === "old" || submitEligible(candidate));
+    return candidates.length ? { el: bestSubmit(candidates), via: "scoped" } : null;
+  }
+  if (flavor === "old") {
+    for (const sel of [
+      ".thing.comment .child .usertext-buttons button.save",
+      ".commentarea .usertext-buttons button.save",
+      ".usertext-buttons button.save",
+      "button.save",
+    ]) {
+      const el = root.querySelector<HTMLElement>(sel);
+      if (el && notChat(el)) return { el, via: "old-save" };
+    }
+    return null;
+  }
+
+  // Composer-anchored climb (ports #442): the box is the one node we KNOW is the
