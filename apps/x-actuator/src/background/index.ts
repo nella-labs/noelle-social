@@ -1998,3 +1998,203 @@ const LAST_COMMAND_AT_KEY = "actuator.remoteCommandAt";
 // The gate the autonomy paths consult. Fail-OPEN on a storage error (return
 // false): the real stop enforcement is the cleared DRAIN_INTENT_KEY + STOP stamps
 // applyRemoteIntent writes at stop time (which don't depend on this read), so a
+// transient storage blip must not halt a normally-running actuator.
+async function remoteStopped(): Promise<boolean> {
+  try {
+    const s = await chrome.storage.local.get(REMOTE_STATE_KEY);
+    return s[REMOTE_STATE_KEY] === "stopped";
+  } catch {
+    return false;
+  }
+}
+
+// Reconcile the LIVE run to the operator's remote intent. Idempotent — safe to
+// call on every long-poll return and after any SW restart. The GATE
+// (REMOTE_STATE_KEY) is level-triggered (always re-asserted); the STOP *action*
+// (endRun) is EDGE-triggered — it fires only on the transition INTO 'stopped', so
+// a re-apply never kills a one-shot manual Run the operator started afterward.
+//   'stopped' → clear the standing drain intent, stamp today's STOP (so a
+//               lights-out `autonomous` config can't relaunch it, matching a local
+//               STOP), and end any live run: the hands go down and stay down.
+//   'running' → set the standing drain intent with the overnight curfew (remote
+//               "running" is the leave-it-running Full-auto mode; clears a same-day
+//               STOP) and let checkDrainResume resume the drain BEHIND the existing
+//               health + challenge-cooldown + curfew safety gates. On X this arms
+//               NOTHING to send — reply_send stays the operator's separate consent.
+//   null      → no remote override: clear the mirror; local autonomy governs.
+async function applyRemoteIntent(desired: "running" | "stopped" | null): Promise<void> {
+  const cfg = await getConfig();
+  if (!cfg) return;
+  const prevStore = await chrome.storage.local.get(REMOTE_STATE_KEY).catch(() => ({}));
+  const prev = (prevStore as Record<string, unknown>)[REMOTE_STATE_KEY];
+
+  if (desired === "stopped") {
+    await chrome.storage.local.set({ [REMOTE_STATE_KEY]: "stopped" });
+    await chrome.storage.local.remove([DRAIN_INTENT_KEY, DISCOVERY_MODE_KEY]);
+    await chrome.storage.local.set({
+      [AUTO_START_DAY_KEY]: localDayKey(new Date()),
+      [STOP_DAY_KEY]: localDayKey(new Date()),
+    });
+    if (prev !== "stopped") {
+      const s = await loadState().catch(() => null);
+      if (s?.status === "running") await endRun("stopped").catch(() => {});
+    }
+  } else if (desired === "running") {
+    await chrome.storage.local.set({ [REMOTE_STATE_KEY]: "running" });
+    await chrome.storage.local.remove(STOP_DAY_KEY); // a remote start clears a prior same-day STOP
+    // Preserve the operator's curfew choice when a drain intent already exists (a
+    // local Drain click = curfew off, Full-auto = on), so re-applying a published
+    // 'running' never flips a Drain to curfew-on. A phone-initiated start with no
+    // local intent defaults to curfew ON (unattended → don't reply overnight).
+    const existing = parseDrainIntent((await chrome.storage.local.get(DRAIN_INTENT_KEY))[DRAIN_INTENT_KEY]);
+    // Carry `notifications` through too: a phone/dashboard "start" re-applied
+    // over an Auto-notifications intent must resume the SWEEP, not silently
+    // downgrade it to a plain drain.
+    await chrome.storage.local.set({
+      [DRAIN_INTENT_KEY]: { curfew: existing?.curfew ?? true, notifications: existing?.notifications === true },
+    });
+    await checkDrainResume(); // resumes the drain behind the health/challenge/curfew gate
+  } else {
+    await chrome.storage.local.remove(REMOTE_STATE_KEY);
+  }
+
+  // Ack the actuator's ACTUAL run state so the dashboard shows reality, not just
+  // intent. Best-effort — a telemetry failure must never break the loop.
+  const after = await loadState().catch(() => null);
+  const runState: "running" | "idle" = after?.status === "running" ? "running" : "idle";
+  await new ActuatorApi(cfg).ackIntent(runState).catch(() => {});
+}
+
+// Singleton guard for the intent loop (in-memory; resets on SW death, so
+// ensureIntentLoop re-arms it after any restart — driven by onStartup and the 30s
+// tick alarm). At most one loop runs per service-worker lifetime.
+let intentLoopRunning = false;
+function ensureIntentLoop(): void {
+  if (intentLoopRunning) return;
+  intentLoopRunning = true;
+  void runIntentLoop().finally(() => {
+    intentLoopRunning = false;
+  });
+}
+
+// The near-real-time remote control channel. A cold start forces `since=0` so the
+// FIRST poll returns the current standing intent immediately and reconciles (in
+// case a SW death/self-reload wiped the run); thereafter `since` tracks the last
+// applied commandAt so the poll blocks until a genuine change. Fail-open: a null
+// (down api-vm / parse error) backs off ~4s and retries; the 30s alarm re-arms
+// this loop if the SW was killed during that gap. The in-flight long-poll keeps
+// the MV3 service worker alive between reconciles.
+async function runIntentLoop(): Promise<void> {
+  let since = 0; // cold-start: force an immediate reconcile of the current intent
+  for (;;) {
+    const cfg = await getConfig().catch(() => null);
+    if (!cfg?.instanceId || !cfg.apiBaseUrl || !cfg.token) {
+      await plainSleep(15_000);
+      continue;
+    }
+    const intent = await new ActuatorApi(cfg).fetchIntent(since).catch(() => null);
+    if (!intent) {
+      await plainSleep(4000);
+      continue;
+    }
+    since = intent.commandAt ?? since;
+    await chrome.storage.local.set({ [LAST_COMMAND_AT_KEY]: since }).catch(() => {});
+    await applyRemoteIntent(intent.desired).catch((e) =>
+      console.warn("[intent] apply failed:", e instanceof Error ? e.message : e),
+    );
+  }
+}
+
+// Publish a LOCAL panel action's intent to the server so the phone/dashboard and
+// the local panel never disagree, and mirror it locally so the gate honors it
+// immediately (before the loop reads it back). Full-automatic, Drain, and STOP are
+// master-switch actions (all persistent now); only the timed one-shot Run stays
+// orthogonal and never publishes.
+function requireStarted(epoch: number | null): number {
+  if (epoch === null) throw new Error("start superseded");
+  return epoch;
+}
+async function prepareDrain(run: PendingStart, intent: { curfew: boolean; notifications?: boolean }): Promise<void> {
+  const epoch = requireStarted(await run.epoch);
+  if (!(await runIfCurrent(epoch, async () => {
+    await chrome.storage.local.set({ [DRAIN_INTENT_KEY]: intent });
+    await chrome.storage.local.remove([DISCOVERY_MODE_KEY, STOP_DAY_KEY, REMOTE_STATE_KEY]);
+  }))) throw new Error("start superseded");
+}
+async function publishLocalIntent(desired: "running" | "stopped", epoch: number): Promise<void> {
+  const cfg = await getConfig().catch(() => null);
+  if (!cfg) return;
+  if (!(await runIfCurrent(epoch, () => chrome.storage.local.set({ [REMOTE_STATE_KEY]: desired })).catch(() => false))) return;
+  const s = await loadState().catch(() => null);
+  const runState: "running" | "idle" = s?.status === "running" ? "running" : "idle";
+  if (epoch !== await currentEpoch().catch(() => null)) return;
+  await new ActuatorApi(cfg).ackIntent(runState, desired).catch(() => {});
+}
+
+chrome.tabs.onCreated.addListener((tab) => { void childTabGuard.onCreated(tab); });
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (change.url && !isXPageUrl(change.url)) void recoverPinnedTab(tabId);
+});
+
+chrome.runtime.onStartup.addListener(() => { void ensureAutonomyAlarm(); void ensureIntentLoop(); void checkDrainResume(); void checkAutonomy(); });
+chrome.runtime.onInstalled.addListener(() => { void ensureAutonomyAlarm(); void ensureIntentLoop(); void checkDrainResume(); });
+
+chrome.alarms.onAlarm.addListener((a) => {
+  // The 0.5-min ALARM survives a self-reload/SW-death (alarms persist), so it is
+  // the fastest place to resume a wiped standing drain — checkDrainResume no-ops
+  // when a run is already live, so this never double-starts one.
+  if (a.name === ALARM) { void ensureIntentLoop(); void tick(); void checkDrainResume(); void pulseBridge(false); }
+  else if (a.name === AUTONOMY_ALARM) { void ensureIntentLoop(); void checkAutonomy(); void checkDrainResume(); void checkSelfReload(); void pulseBridge(true); }
+});
+chrome.runtime.onMessage.addListener((msg: { cmd: string; params?: never; cap?: unknown; minimum?: unknown }, _s, reply) => {
+  (async () => {
+    try {
+      // No auto-enable of reply_send_enabled on Run/Drain (unlike the LinkedIn
+      // actuator): on X that column also arms the x-intern official-API send
+      // worker — see the block comment above endRun. The operator enables reply
+      // sending from the Vega agent page; with it off these run against an
+      // empty queue (likes/ambient only).
+      if (msg.cmd === "startRun") {
+        const run = reserveStart();
+        const epoch = requireStarted(await run.epoch);
+        if (!(await runIfCurrent(epoch, () => chrome.storage.local.remove(DISCOVERY_MODE_KEY)))) throw new Error("start superseded");
+        requireStarted(await startRun(msg.params!, undefined, run));
+        reply({ ok: true });
+      }
+      else if (msg.cmd === "startDrain" || msg.cmd === "startFullAuto") {
+        const run = reserveStart();
+        const curfew = msg.cmd === "startFullAuto";
+        await prepareDrain(run, { curfew });
+        const epoch = requireStarted(await startDrain({ manual: true, curfew }, run));
+        void publishLocalIntent("running", epoch);
+        reply({ ok: true });
+      }
+      else if (msg.cmd === "startDiscovery") {
+        const expectedEpoch = await currentEpoch();
+        if (!(await getConfig())) throw new Error("not configured");
+        const current = await loadState();
+        const decision = discoveryStartDecision(current, ticking);
+        if (decision === "blocked") throw new Error("X challenge is active; discovery remains stopped");
+        if (!(await runIfCurrent(expectedEpoch, async () => {
+          await chrome.storage.local.set({ [DISCOVERY_MODE_KEY]: true, [DRAIN_INTENT_KEY]: { curfew: false } });
+          await chrome.storage.local.remove([STOP_DAY_KEY, REMOTE_STATE_KEY]);
+          await chrome.storage.session.remove("actuator.lastDryXDiscoveryMs").catch(() => {});
+        }))) throw new Error("start superseded");
+        let epoch = expectedEpoch;
+        if (decision === "defer") discoveryDrainAfterTick = expectedEpoch;
+        else if (decision === "start") epoch = requireStarted(await startDrain({ manual: true, curfew: false, expectedEpoch }));
+        void publishLocalIntent("running", epoch);
+        reply({ ok: true });
+      }
+      // Auto notifications: an unattended drain WITH the notifications sweep on.
+      // It has to be a drain, not a sweep-only mode — a sweep-only run would
+      // harvest replies-to-us, hand them to Vega, and then never post the
+      // drafts, because the thing that posts approvals is the drain it would
+      // have superseded. One click therefore runs the whole conversation loop.
+      else if (msg.cmd === "startNotifications") {
+        // Kill switch. Refuse even when invoked directly (an old content script
+        // still holding the button, a stale message, a console call) — the
+        // panel hiding the button is cosmetic, this is the actual gate.
+        if (!NOTIFICATIONS_ACTOR_ENABLED) {
+          reply({ ok: false, error: "notifications actor is disabled in code (lib/notifications-feature.ts)" });
+          return;
