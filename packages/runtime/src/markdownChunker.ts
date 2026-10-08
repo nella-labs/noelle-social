@@ -198,3 +198,120 @@ function splitOversized(
   }
 
   // Try splitting at ### sub-headings first.
+  const h3Pieces = splitByH3(section);
+  if (h3Pieces.length > 1) {
+    const out: MarkdownChunk[] = [];
+    for (const piece of h3Pieces) {
+      let pieceHeadingPath = headingPath;
+      const firstLine = piece.body.split("\n", 1)[0] ?? "";
+      const h3Match = /^### (.+)$/.exec(firstLine);
+      if (h3Match?.[1]) {
+        pieceHeadingPath = [...headingPath, h3Match[1].trim()];
+      }
+      for (const sub of splitOversized(filePath, piece, pieceHeadingPath)) {
+        out.push(sub);
+      }
+    }
+    return out;
+  }
+
+  // No ### subheadings (or only one) — pack paragraphs greedily.
+  return packParagraphs(filePath, section, headingPath);
+}
+
+function splitByH3(section: RawSection): RawSection[] {
+  const lines = section.body.split("\n");
+  const pieces: RawSection[] = [];
+  let inFence = false;
+  let currentStart = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i] ?? "";
+    if (/^```/.test(ln)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (!inFence && /^### /.test(ln) && i > 0) {
+      pieces.push({
+        kind: "h2",
+        body: lines.slice(currentStart, i).join("\n").replace(/\s+$/, ""),
+        startLine: section.startLine + currentStart,
+        endLine: section.startLine + i - 1,
+      });
+      currentStart = i;
+    }
+  }
+  pieces.push({
+    kind: "h2",
+    body: lines.slice(currentStart).join("\n").replace(/\s+$/, ""),
+    startLine: section.startLine + currentStart,
+    endLine: section.startLine + lines.length - 1,
+  });
+  return pieces.filter((p) => p.body.trim() !== "");
+}
+
+/**
+ * Pack paragraphs (blank-line delimited) into pieces ≤ MAX_CHUNK_CHARS.
+ * A single paragraph larger than the cap is emitted as its own chunk —
+ * we never split mid-paragraph since that destroys semantics. The
+ * drafter consumer treats oversize chunks as still-useful matches.
+ */
+function packParagraphs(
+  filePath: string,
+  section: RawSection,
+  headingPath: ReadonlyArray<string>,
+): MarkdownChunk[] {
+  const lines = section.body.split("\n");
+  // Build paragraphs as { body, startLineOffset, endLineOffset } (offsets
+  // are 0-indexed within the section).
+  interface Para {
+    body: string;
+    startOffset: number;
+    endOffset: number;
+  }
+  const paras: Para[] = [];
+  let start = 0;
+  for (let i = 0; i <= lines.length; i++) {
+    const atEnd = i === lines.length;
+    const blank = !atEnd && (lines[i] ?? "").trim() === "";
+    if ((blank || atEnd) && i > start) {
+      const body = lines.slice(start, i).join("\n");
+      if (body.trim() !== "") {
+        paras.push({ body, startOffset: start, endOffset: i - 1 });
+      }
+      start = i + 1;
+    } else if (blank) {
+      start = i + 1;
+    }
+  }
+
+  const out: MarkdownChunk[] = [];
+  let buf: Para[] = [];
+  let bufLen = 0;
+  const flushBuf = (): void => {
+    if (buf.length === 0) return;
+    const body = buf.map((p) => p.body).join("\n\n");
+    const firstStart = buf[0]?.startOffset ?? 0;
+    const lastEnd = buf[buf.length - 1]?.endOffset ?? firstStart;
+    out.push({
+      filePath,
+      body,
+      headingPath,
+      startLine: section.startLine + firstStart,
+      endLine: section.startLine + lastEnd,
+    });
+    buf = [];
+    bufLen = 0;
+  };
+
+  for (const para of paras) {
+    const addLen = para.body.length + (buf.length > 0 ? 2 : 0); // "\n\n" join
+    if (bufLen + addLen > MAX_CHUNK_CHARS && buf.length > 0) {
+      flushBuf();
+    }
+    buf.push(para);
+    bufLen += addLen;
+    if (bufLen >= MAX_CHUNK_CHARS) flushBuf();
+  }
+  flushBuf();
+  return out;
+}
