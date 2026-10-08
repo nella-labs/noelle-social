@@ -798,3 +798,110 @@ describe("runDiscoveryTick — profile-first (ICP / Feeder A) lane", () => {
       icp,
     });
 
+    const rows = record.mock.calls.map((c) => c[0]).filter((r) => r.model === "apify/linkedin-profile-search");
+    expect(rows).toHaveLength(1);
+  });
+
+  it("persists every qualified person (recordDiscoveredPerson) — stored, not just used", async () => {
+    const recordDiscoveredPerson = vi.fn().mockResolvedValue(undefined);
+    const searchProfiles = vi
+      .fn()
+      .mockResolvedValue([candidate("yc-founder", "Founder"), candidate("nope", "Staff Accountant")]);
+    const profilePosts = vi.fn().mockResolvedValue([]); // no posts → no leads, but the person is still retained
+
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [],
+      postsSource: { profilePosts, searchProfiles },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+      icp,
+      recordDiscoveredPerson,
+    });
+
+    // Only the qualified profile is retained — and even though it produced no lead.
+    expect(recordDiscoveredPerson).toHaveBeenCalledTimes(1);
+    expect(recordDiscoveredPerson).toHaveBeenCalledWith(
+      expect.objectContaining({ publicId: "yc-founder", source: "profile_search" }),
+    );
+  });
+
+  it("does not run Feeder A when no ICP is set", async () => {
+    const searchProfiles = vi.fn();
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      postsSource: { profilePosts: vi.fn().mockResolvedValue([]), searchProfiles },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+    });
+    expect(searchProfiles).not.toHaveBeenCalled();
+  });
+});
+
+describe("watch-lane repoll gate (per-person cooldown)", () => {
+  const baseArgs = <P, U>(profilePosts: P, upsert: U) => ({
+    log,
+    instance: { id: "i", org_id: "o" } as never,
+    postsSource: { profilePosts },
+    discoveryLimit: 5,
+    dailyExtractCap: CAP,
+    alreadyExtractedToday: 0,
+    upsertLead: upsert,
+  });
+
+  it("skips a person who is not due; a due person is still fetched", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const profilePosts = vi.fn().mockResolvedValue([post("1")]);
+    const gate = createRepollGate(4 * 3600_000, () => 0);
+    gate.stamp("jane-builder"); // jane was polled moments ago
+    const bob = { ...person, id: "wp2", fsdProfileId: "XYZ", publicId: "bob" };
+
+    await runDiscoveryTick({
+      ...baseArgs(profilePosts, upsert),
+      watchlistPeople: [person, bob],
+      repollGate: gate,
+    });
+
+    expect(profilePosts).toHaveBeenCalledTimes(1);
+    expect(profilePosts).toHaveBeenCalledWith(expect.objectContaining({ publicId: "bob" }));
+  });
+
+  it("stamps a person on attempt, so the next tick within the window skips them", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const profilePosts = vi.fn().mockResolvedValue([post("1")]);
+    const gate = createRepollGate(4 * 3600_000, () => 0);
+
+    await runDiscoveryTick({ ...baseArgs(profilePosts, upsert), watchlistPeople: [person], repollGate: gate });
+    await runDiscoveryTick({ ...baseArgs(profilePosts, upsert), watchlistPeople: [person], repollGate: gate });
+
+    expect(profilePosts).toHaveBeenCalledTimes(1);
+  });
+
+  it("stamps even when the person's fetch throws (a failing profile is not re-hammered)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const profilePosts = vi.fn().mockRejectedValue(new Error("apify error"));
+    const gate = createRepollGate(4 * 3600_000, () => 0);
+
+    await runDiscoveryTick({ ...baseArgs(profilePosts, upsert), watchlistPeople: [person], repollGate: gate });
+    await runDiscoveryTick({ ...baseArgs(profilePosts, upsert), watchlistPeople: [person], repollGate: gate });
+
+    expect(profilePosts).toHaveBeenCalledTimes(1);
+  });
+
+  it("without a gate the old every-tick behaviour is unchanged", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const profilePosts = vi.fn().mockResolvedValue([post("1")]);
+
+    await runDiscoveryTick({ ...baseArgs(profilePosts, upsert), watchlistPeople: [person] });
+    await runDiscoveryTick({ ...baseArgs(profilePosts, upsert), watchlistPeople: [person] });
+
+    expect(profilePosts).toHaveBeenCalledTimes(2);
+  });
+});
