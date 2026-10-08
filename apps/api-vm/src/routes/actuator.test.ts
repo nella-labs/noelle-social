@@ -998,3 +998,112 @@ describe("resolveRedditDailyWriteCap (daily write-cap fail-safe, FIX 5)", () => 
     expect(resolveRedditDailyWriteCap("eight")).toBe(8);
   });
   it("an unset env value falls back to 8", () => {
+    expect(resolveRedditDailyWriteCap(undefined)).toBe(8);
+  });
+  it("a negative env value falls back to 8", () => {
+    expect(resolveRedditDailyWriteCap("-3")).toBe(8);
+  });
+  it("a valid numeric env value is honored (0 is respected = serve nothing)", () => {
+    expect(resolveRedditDailyWriteCap("5")).toBe(5);
+    expect(resolveRedditDailyWriteCap("0")).toBe(0);
+  });
+  it("only the explicit sentinel lifts the cap — unset never means unlimited (ports #426 as opt-in)", () => {
+    expect(resolveRedditDailyWriteCap("off")).toBe(Number.POSITIVE_INFINITY);
+    expect(resolveRedditDailyWriteCap("unlimited")).toBe(Number.POSITIVE_INFINITY);
+    expect(resolveRedditDailyWriteCap(" Unlimited ")).toBe(Number.POSITIVE_INFINITY);
+    // near-miss strings are garbage, not sentinels → fail-safe default
+    expect(resolveRedditDailyWriteCap("offf")).toBe(8);
+  });
+  it("with the sentinel the trim branch never fires and reddit-health reports null", () => {
+    const cap = resolveRedditDailyWriteCap("off");
+    const remaining = Math.max(0, cap - 0); // usage query is skipped ⇒ used = 0
+    expect(10 > remaining).toBe(false); // any served length ≤ Infinity
+    expect(Number.isFinite(cap) ? cap : null).toBeNull(); // reddit-health writeCap shape
+  });
+  it("with env='eight' the served queue is TRIMMED to the fallback cap (NaN would leave it un-trimmed)", () => {
+    const cap = resolveRedditDailyWriteCap("eight"); // 8 (not NaN)
+    const usedToday = 5;
+    const remaining = Math.max(0, cap - usedToday); // 3
+    const served = Array.from({ length: 10 }, (_, i) => i); // 10 pending replies
+    // The bug being fixed: `served.length > NaN` is ALWAYS false → the cap never trims.
+    expect(served.length > Number("eight")).toBe(false); // documents the old fail-OPEN
+    // The fix: a finite cap trims the queue down to the remaining budget.
+    expect(served.length > remaining).toBe(true);
+    expect(served.slice(0, remaining)).toHaveLength(3);
+  });
+});
+
+describe("reddit activity payload validation", () => {
+  it("rejects an empty events array", () => {
+    expect(() =>
+      RedditActivityInSchema.parse({ session_id: "44444444-4444-4444-4444-444444444444", events: [] }),
+    ).toThrow();
+  });
+  it("accepts a reply/skip/upvote event batch (UPVOTE-ONLY — the operator opted in)", () => {
+    const parsed = RedditActivityInSchema.parse({
+      session_id: "44444444-4444-4444-4444-444444444444",
+      events: [
+        { type: "reply", approval_id: "11111111-1111-1111-1111-111111111111", post_id: "abc123", comment_id: "def456", subreddit: "SaaS", at: "2026-07-11T20:00:00.000Z" },
+        { type: "upvote", post_id: "abc123", subreddit: "SaaS", at: "2026-07-11T20:01:00.000Z" },
+        { type: "skip", reason: "throttle", at: "2026-07-11T20:02:00.000Z" },
+      ],
+    });
+    expect(parsed.events).toHaveLength(3);
+    expect(parsed.events.map((e) => e.type)).toContain("upvote");
+  });
+  it("rejects a 'downvote' event — voting is UPVOTE-ONLY, downvotes can never be logged", () => {
+    expect(() =>
+      RedditActivityInSchema.parse({
+        session_id: "44444444-4444-4444-4444-444444444444",
+        events: [{ type: "downvote", post_id: "abc123", at: "2026-07-11T20:00:00.000Z" }],
+      }),
+    ).toThrow();
+  });
+});
+
+describe("intentAdvanced (remote start/stop long-poll early-return, 0089)", () => {
+  it("returns true only when a real commandAt is strictly newer than `since`", () => {
+    expect(intentAdvanced(1_000, 999)).toBe(true);
+    expect(intentAdvanced(1_000, 1_000)).toBe(false); // equal → the extension already saw it
+    expect(intentAdvanced(999, 1_000)).toBe(false);
+  });
+
+  it("NEVER early-returns when commandAt is null (no command ever) — guards the busy-loop", () => {
+    expect(intentAdvanced(null, 0)).toBe(false);
+    expect(intentAdvanced(null, 1_700_000_000_000)).toBe(false);
+  });
+
+  it("a fresh extension (since=0) picks up any standing command immediately", () => {
+    expect(intentAdvanced(1_700_000_000_000, 0)).toBe(true);
+  });
+});
+
+
+describe("Reddit dispatch claim HTTP admission", () => {
+  it.each([
+    ["invalid_json", "{", 400],
+    ["invalid_capture", JSON.stringify({ instance_id: "not-a-uuid" }), 400],
+    ["oversize_request", " ".repeat(131073), 413],
+  ])("rejects %s before SQL", async (_name, body, status) => {
+    const { actuator } = await import("./actuator.js");
+    const { __setDbClientForTests, resetDbClientForTests } = await import("../lib/db.js");
+    const { resetEnvForTests } = await import("../env.js");
+    vi.stubEnv("NODE_ENV", "test");
+    vi.stubEnv("NOELLE_DATABASE_URL", "postgres://inert:inert@127.0.0.1:9/not-opened");
+    vi.stubEnv("NOELLE_HMAC_SECRET", "h".repeat(48));
+    vi.stubEnv("NOELLE_ACTUATOR_TOKEN", "inert-token");
+    vi.stubEnv("NOELLE_ACTUATOR_ORG_ID", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    resetEnvForTests();
+    const unexpectedSql = vi.fn(() => { throw new Error("SQL must not be admitted"); });
+    __setDbClientForTests(unexpectedSql as never);
+    try {
+      const response = await actuator.request("/api/reddit-reply-claim", {
+        method: "POST", headers: { authorization: "Bearer inert-token", "content-type": "application/json" }, body,
+      });
+      expect(response.status).toBe(status);
+      expect(unexpectedSql).not.toHaveBeenCalled();
+    } finally {
+      resetDbClientForTests(); resetEnvForTests(); vi.unstubAllEnvs();
+    }
+  });
+});
