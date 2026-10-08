@@ -198,3 +198,203 @@ export function normalizeTiktokVideo(raw: unknown): VideoClip | null {
     durationSec: readSourceNonnegativeNumber(videoMeta.duration, it.duration),
     musicId: firstStr(musicMeta.musicId, musicMeta.id) || null,
     musicName: firstStr(musicMeta.musicName, musicMeta.title, musicMeta.name) || null,
+    videoUrl: firstStr(videoMeta.downloadAddr, it.videoUrl, videoMeta.playAddr) || null,
+    thumbUrl: firstStr(videoMeta.coverUrl, it.covers, videoMeta.cover) || null,
+    authorFollowerCount: readSourceCount(author.fans, author.followerCount, author.followers),
+    postedAt: readSourceTimestamp(it.createTimeISO, it.createTimestamp)
+      ?? readSourceEpochTimestamp(it.createTime, "seconds"),
+    raw,
+  };
+}
+
+function normalizerFor(platform: VideoPlatform): (raw: unknown) => VideoClip | null {
+  return platform === "tiktok" ? normalizeTiktokVideo : normalizeInstagramReel;
+}
+
+// --- Client ------------------------------------------------------------------
+
+export interface CreateApifyVideoClientOpts {
+  /** Apify API token. The only credential — no IG/TikTok cookies. */
+  token: string;
+  baseUrl?: string;
+  /** Override the Instagram actor (default apify~instagram-scraper). */
+  instagramActorId?: string;
+  /** Override the IG keyword/topic discovery actor (default apify~instagram-search-scraper). */
+  instagramSearchActorId?: string;
+  /** Override the IG hashtag discovery actor (default apify~instagram-hashtag-scraper). */
+  instagramHashtagActorId?: string;
+  /** Override the TikTok actor (default clockworks~tiktok-scraper). */
+  tiktokActorId?: string;
+  /**
+   * OPT-IN, default OFF. Route TikTok niche discovery through the clockworks
+   * `searchQueries` keyword input instead of the hashtag lane. UNVERIFIED: the
+   * exact clockworks input field is not confirmed in-repo — run ONE live harvest
+   * to confirm `searchQueries` actually returns videos before wiring this on in
+   * prod (see docs/content-studio.md "Activating TikTok"). When off, TikTok niche
+   * stays hashtag-based (nicheCreatorReels → hashtagReels), which is the tested,
+   * shipped default.
+   */
+  tiktokKeywordSearch?: boolean;
+  /** Max wait for a synchronous actor run (ms). Default 120000. */
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}
+
+export interface ApifyVideoClient {
+  /** Independent logical-operation state, provided by rotating client facades. */
+  isolateOperation?(): ApifyVideoClient;
+  /** A creator's recent videos, newest first, with engagement metrics. */
+  creatorReels(args: {
+    platform: VideoPlatform;
+    handle: string;
+    maxItems?: number;
+    /** Drop videos older than this ISO time (recency window). */
+    sinceISO?: string;
+  }): Promise<VideoClip[]>;
+  /** Videos for a niche keyword/hashtag (the "newest top performers in a niche" lane). */
+  hashtagReels(args: {
+    platform: VideoPlatform;
+    query: string;
+    maxItems?: number;
+    sinceISO?: string;
+  }): Promise<VideoClip[]>;
+  /**
+   * Niche discovery by PROFILE: find creators who post in the niche
+   * (searchType:"user") and harvest each one's recent reels, merged. More
+   * reliable than hashtag matching — a reel rarely carries the niche keyword,
+   * but a creator who consistently posts it is a strong signal. Instagram only;
+   * TikTok falls back to hashtagReels. Falls back to hashtagReels if profile
+   * discovery finds nothing.
+   */
+  nicheCreatorReels(args: {
+    platform: VideoPlatform;
+    query: string;
+    maxItems?: number;
+    /** Max creators to discover + harvest for the niche. */
+    maxCreators?: number;
+    sinceISO?: string;
+  }): Promise<VideoClip[]>;
+  /** A creator's account snapshot (follower count + recent videos). */
+  accountSnapshot(args: {
+    platform: VideoPlatform;
+    handle: string;
+    recentLimit?: number;
+  }): Promise<AccountSnapshot>;
+  /** Final reported charges for every run in the current operation. */
+  drainRunReceipts?(): ApifyRunReceipt[];
+  /** Legacy single drain; null when any run's actual charge is unknown. */
+  drainLastRunUsd?(): number | null;
+
+}
+
+function igProfileUrl(handle: string): string {
+  return `https://www.instagram.com/${handle.replace(/^@/, "")}/`;
+}
+
+// A niche label -> its Instagram hashtag explore URL. IG hashtags are a single
+// token, so strip the leading #, spaces, and punctuation and lowercase:
+// "YC Founders" -> #ycfounders, "Building in Public" -> #buildinginpublic.
+function igExploreTagUrl(query: string): string {
+  const tag = query.replace(/^#/, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return `https://www.instagram.com/explore/tags/${tag}/`;
+}
+
+// --- Instagram provider chain ------------------------------------------------
+// One IG source actor + how to drive and read it. The client tries these in
+// order and uses the first that yields clips, so a single actor's IG-block
+// outage (or a free-tier gate) auto-falls-through to the next instead of
+// failing the whole harvest.
+interface IgProvider {
+  actorId: string;
+  /** Creator-posts input, or null when the actor has no creator lane. */
+  creatorInput(handle: string, maxItems: number): unknown | null;
+  /** Hashtag/niche input, or null when the actor has no hashtag lane. */
+  hashtagInput(tag: string, maxItems: number): unknown | null;
+  /** Flatten the dataset into individual post records for normalizeInstagramReel. */
+  extract(items: unknown[]): unknown[];
+}
+
+// Primary: apify/instagram-scraper (and any drop-in override). Standard
+// directUrls/hashtags input; the dataset items are already per-post.
+function apifyIgProvider(actorId: string): IgProvider {
+  return {
+    actorId,
+    creatorInput: (handle, maxItems) => ({
+      directUrls: [igProfileUrl(handle)],
+      resultsType: "posts",
+      resultsLimit: maxItems,
+      addParentData: false,
+    }),
+    // Niche/hashtag lane: the general scraper's `hashtags` field yields nothing,
+    // so drive it by the hashtag's explore/tags URL and ask for reels (videos
+    // only). This is the LAST-resort hashtag source behind the dedicated
+    // discovery actors, so it catches niches they return empty for.
+    hashtagInput: (tag, maxItems) => ({
+      directUrls: [igExploreTagUrl(tag)],
+      resultsType: "reels",
+      resultsLimit: maxItems,
+      addParentData: false,
+    }),
+    extract: (items) => items,
+  };
+}
+
+// Keep only video/reel items — the search + hashtag discovery actors return
+// MIXED media (photos, sidecars, reels). The type marker varies by actor, so read
+// defensively: an explicit video-ish `type`/`productType`, or a truthy video
+// field. Photos (views 0, no videoUrl) are dropped so Nova studies reels only.
+function igVideoItems(items: unknown[]): unknown[] {
+  return items.filter((raw) => {
+    if (!raw || typeof raw !== "object") return false;
+    const it = raw as Record<string, unknown>;
+    const type = asStr(it.type ?? it.productType ?? it.mediaType ?? it.media_type).toLowerCase();
+    if (type.includes("video") || type === "clips" || type === "reel" || type === "2") return true;
+    return Boolean(it.videoUrl ?? it.videoViewCount ?? it.videoPlayCount ?? it.videoDuration);
+  });
+}
+
+// Discovery: a fuzzy keyword/topic -> trending reels via searchType:"popular".
+// Hashtag-lane only (creatorInput -> null, skipped on the creator chain). The
+// "popular" feed can be empty for an obscure topic — igVideoItems then yields []
+// and runIgChain falls through to the hashtag actor.
+function igSearchProvider(actorId: string): IgProvider {
+  return {
+    actorId,
+    creatorInput: () => null,
+    hashtagInput: (tag, maxItems) => ({
+      search: tag,
+      searchType: "popular",
+      searchLimit: maxItems,
+    }),
+    extract: igVideoItems,
+  };
+}
+
+// Discovery: a concrete hashtag -> recent top reels (resultsType:"reels").
+// keywordSearch lets a bare word resolve to its hashtag. Hashtag-lane only.
+function igHashtagProvider(actorId: string): IgProvider {
+  return {
+    actorId,
+    creatorInput: () => null,
+    hashtagInput: (tag, maxItems) => ({
+      hashtags: [tag.replace(/\s+/g, "")],
+      resultsType: "reels",
+      resultsLimit: maxItems,
+      keywordSearch: true,
+    }),
+    extract: igVideoItems,
+  };
+}
+
+// Fallback: coderx returns ONE profile object per username with the recent posts
+// nested under `latestPosts`; lift them out and graft the profile's handle +
+// follower count onto each so normalizeInstagramReel can read author fields.
+// Username-based, so there is no hashtag lane (hashtagInput -> null).
+const coderxIgProvider: IgProvider = {
+  actorId: INSTAGRAM_FALLBACK_ACTOR_ID,
+  creatorInput: (handle) => ({ usernames: [handle] }),
+  hashtagInput: () => null,
+  extract: (items) =>
+    items.flatMap((item) => {
+      const profile = (item ?? {}) as Record<string, unknown>;
+      const posts = Array.isArray(profile.latestPosts) ? profile.latestPosts : [];
