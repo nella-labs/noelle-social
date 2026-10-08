@@ -198,3 +198,183 @@ export function ApifyConnectionCard({ orgSlug, connections, spend }: Props) {
                 title="Apify rejected this token (401) — the account is wrong, deleted, or banned. Replace it."
               >
                 <span className="dot dot-warn" /> invalid · replace
+              </span>
+            ) : c.status === "exhausted" ? (
+              <span
+                className="tag tag-warn"
+                title={`Hit its monthly cap ${c.exhaustedAt ?? ""} — retries automatically on its billing reset`}
+              >
+                <span className="dot dot-warn" /> exhausted
+                {c.retryLabel ? ` · retries ${c.retryLabel}` : ""}
+              </span>
+            ) : (
+              <span className="tag tag-ok">
+                <span className="dot dot-ok" /> live
+              </span>
+            )}
+          </span>
+          <span style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <span
+              style={{ color: "var(--ink-muted)" }}
+              title={expense ? `Last reported Apify billing-cycle usage, fetched ${expense.fetchedAt}` : "No provider balance saved. Test this token to fetch its usage."}
+            >
+              {expense ? formatCents(expense.cents) : "Not fetched"}
+            </span>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => onTest(c.id)}
+              disabled={!mounted || testing}
+              title="Health-check this token against Apify (live + remaining budget)"
+            >
+              {testing && testingId === c.id ? "Testing…" : "Test"}
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => onMove(c.id, move.inUse)}
+              disabled={pending && busyId === c.id}
+              title={
+                move.inUse
+                  ? "Promote this spare token into the agents' rotation"
+                  : "Park this token as spare — the agents stop using it"
+              }
+            >
+              {pending && busyId === c.id ? "…" : move.label}
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => onRemove(c.id)}
+              disabled={pending && busyId === c.id}
+              title="Remove this token from the pool"
+            >
+              {pending && busyId === c.id ? "…" : "Remove"}
+            </button>
+          </span>
+        </div>
+        {line ? (
+          <div
+            style={{
+              marginTop: 6,
+              fontFamily: "var(--mono)",
+              fontSize: 11.5,
+              color: line.ok ? "var(--green, #2f7d54)" : "var(--rust, #b0461f)",
+              paddingLeft: 18,
+            }}
+          >
+            {line.text}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  // A token bucket rendered with a "View all N" / "Show fewer" collapse past
+  // COLLAPSE_AT rows, so a big pool doesn't run forever down the page.
+  function bucketList(
+    items: ApifyTokenView[],
+    expanded: boolean,
+    setExpanded: (v: boolean) => void,
+    move: { label: string; inUse: boolean },
+  ) {
+    const visible = expanded ? items : items.slice(0, COLLAPSE_AT);
+    const hidden = items.length - visible.length;
+    return (
+      <div style={{ marginTop: 8, display: "flex", flexDirection: "column" }}>
+        {visible.map((c, i) => tokenRow(c, i, move))}
+        {items.length > COLLAPSE_AT ? (
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => setExpanded(!expanded)}
+            style={{ marginTop: 10, alignSelf: "flex-start" }}
+          >
+            {expanded ? "Show fewer" : `View all ${items.length} (+${hidden} more)`}
+          </button>
+        ) : null}
+      </div>
+    );
+  }
+
+  return (
+    <div className="card">
+      <div className="card-h">
+        <h3>Apify</h3>
+        {inUse.length === 0 ? (
+          <span className="tag tag-warn">
+            <span className="dot dot-warn" /> none in use
+          </span>
+        ) : (
+          <span className={healthy > 0 ? "tag tag-ok" : "tag tag-warn"}>
+            <span className={healthy > 0 ? "dot dot-ok" : "dot dot-warn"} />
+            {healthy}/{inUse.length} live
+          </span>
+        )}
+      </div>
+      <div style={{ color: "var(--ink-muted)", fontSize: 12.5, marginBottom: 12, maxWidth: "60ch" }}>
+        Tokens used to fetch posts and comments. Add <strong>spare</strong> tokens
+        below, then move them into <strong>in use</strong>. Usage comes from Apify
+        and stays visible after a token is retired.
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <textarea
+          placeholder={"apify_api_…\nPaste one or more tokens — one per line, or comma/space separated."}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          disabled={!mounted || pending}
+          style={inputStyle}
+          rows={3}
+        />
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <button type="button" className="btn" onClick={onAdd} disabled={!canAdd}>
+            {pending && !busyId ? "Adding…" : "Add to spare"}
+          </button>
+        </div>
+      </div>
+      {addNote ? (
+        <div style={{ color: "var(--green, #2f7d54)", fontSize: 12, marginTop: 8 }}>{addNote}</div>
+      ) : null}
+      {error ? (
+        <div style={{ color: "var(--rust, #b0461f)", fontSize: 12, marginTop: 8 }}>{error}</div>
+      ) : null}
+
+      {/* IN USE — the live rotation the agents pull from. */}
+      <div style={{ marginTop: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+          <div className="eyebrow">In use · agents rotate through these</div>
+          {inUse.length > 0 ? (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={onTestAll}
+              disabled={!mounted || testing}
+              title="Health-check every token (live + remaining budget). Resurrects any wrongly-retired token that tests alive."
+            >
+              {testing && testingId === "__all__" ? "Testing…" : "Test all"}
+            </button>
+          ) : null}
+        </div>
+        {inUse.length === 0 ? (
+          <div style={{ fontSize: 12, color: "var(--ink-muted)", marginTop: 8 }}>
+            No tokens in use — the agents fall back to the env token. Move a spare token
+            in to give them a dedicated pool.
+          </div>
+        ) : (
+          bucketList(inUse, showAllInUse, setShowAllInUse, { label: "Move to spare", inUse: false })
+        )}
+      </div>
+
+      {/* SPARE — parked tokens the agents never touch until promoted. */}
+      {spare.length > 0 ? (
+        <div style={{ marginTop: 18 }}>
+          <div className="eyebrow">Spare · parked ({spare.length})</div>
+          {bucketList(spare, showAllSpare, setShowAllSpare, { label: "Move to in use", inUse: true })}
+        </div>
+      ) : null}
+
+      <ApifyExpenseHistory spend={spend} />
+    </div>
+  );
+}
