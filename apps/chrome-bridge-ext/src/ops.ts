@@ -398,3 +398,67 @@ async function runOp(op: ChromeOp): Promise<unknown> {
       // x.com/linkedin.com slip past the guard.
       const url = tab?.url || tab?.pendingUrl;
       const host = hostOf(url);
+      const onActuator = isActuatorDomain(tab?.url) || isActuatorDomain(tab?.pendingUrl);
+      const alreadyAttached = (await getAttachedTabIds()).has(op.tabId);
+
+      // THE GUARD. Refuse to take the single per-tab debugger slot on an actuator
+      // domain, or a tab that already has a debugger client, unless force:true. This
+      // is what stops the bridge from derailing a live Vega/Lyra/Orion run.
+      if (!op.force && onActuator) {
+        throw new Error(
+          `refusing debugger.attach on actuator domain ${host} (a live actuator run owns the per-tab debugger slot); pass force:true to override`,
+        );
+      }
+      if (!op.force && alreadyAttached) {
+        throw new Error(
+          `refusing debugger.attach: tab ${op.tabId} already has a debugger attached; pass force:true to override`,
+        );
+      }
+      // force used on an actuator domain: log LOUDLY (console.warn + ExtEvent) — this
+      // can steal the slot from, and derail, a live actuator run.
+      if (op.force && onActuator) {
+        console.warn(
+          `[chrome-bridge] FORCE debugger.attach on actuator domain ${host} (tab ${op.tabId}) — this can steal the debugger slot from a live actuator run`,
+        );
+        await emitEvent("debugger", {
+          warning: "force-attach-actuator-domain",
+          tabId: op.tabId,
+          host: host ?? "",
+          url: url ?? "",
+        });
+      }
+      await chrome.debugger.attach({ tabId: op.tabId }, DEBUGGER_PROTOCOL_VERSION);
+      ownAttached.add(op.tabId);
+      return { attached: op.tabId, host };
+    }
+    case "debugger.command": {
+      // Requires an attached tab (debugger.attach first). sendCommand throws
+      // "Debugger is not attached to the tab" otherwise → surfaced as the op error.
+      const result = await chrome.debugger.sendCommand({ tabId: op.tabId }, op.method, op.params);
+      return result ?? null;
+    }
+    case "debugger.detach": {
+      await chrome.debugger.detach({ tabId: op.tabId }).catch(() => {});
+      ownAttached.delete(op.tabId);
+      return { detached: op.tabId };
+    }
+
+    // --- meta ---
+    case "meta.ping":
+      return "pong";
+    case "meta.info": {
+      const manifest = chrome.runtime.getManifest();
+      const targets = await chrome.debugger.getTargets().catch(() => [] as chrome.debugger.TargetInfo[]);
+      return {
+        chromeVersion: chromeVersion(),
+        extVersion: manifest.version,
+        extId: chrome.runtime.id,
+        buildStamp: typeof __BUILD_STAMP__ === "string" ? __BUILD_STAMP__ : null,
+        attachedTargets: targets
+          .filter((t) => t.attached)
+          .map((t) => ({ tabId: t.tabId, url: t.url, title: t.title, type: t.type })),
+        ownAttached: [...ownAttached],
+      };
+    }
+  }
+}
