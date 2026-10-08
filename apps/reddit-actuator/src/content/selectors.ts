@@ -398,3 +398,203 @@ export function findSaveMenuItem(root: ParentNode): HTMLElement | null {
 /**
  * On a feed, a post whose SAVE affordance is available (not already saved), plus
  * that owning post (for the observed post id/subreddit). Mirrors
+ * findFeedUpvoteTarget exactly — random in-view candidate with an `rng` (a
+ * first-match pick is a positional fingerprint), the same viewport restriction
+ * (top in (-200, 1.4×vh)) falling back to all candidates when none is in view,
+ * and post containers from the shared findFeedPosts. Returns null when no post is
+ * saveable. SAVE-ONLY.
+ */
+export function findFeedSaveTarget(
+  root: ParentNode,
+  flavor: RedditFlavor,
+  rng?: { int(min: number, max: number): number },
+): { el: HTMLElement; post: Element } | null {
+  const candidates: Array<{ el: HTMLElement; post: Element }> = [];
+  for (const p of findFeedPosts(root, flavor)) {
+    const btn = findSaveButton(p, flavor);
+    if (btn) candidates.push({ el: btn, post: p });
+  }
+  if (candidates.length === 0) return null;
+  const vh = typeof window !== "undefined" ? window.innerHeight || 800 : 800;
+  const inView = candidates.filter(({ post }) => {
+    const top = post.getBoundingClientRect().top;
+    return top > -200 && top < vh * 1.4;
+  });
+  const pool = inView.length > 0 ? inView : candidates;
+  return pool[rng ? rng.int(0, pool.length - 1) : 0]!;
+}
+
+// ── Comments ─────────────────────────────────────────────────────────────────
+
+/** All comment nodes in the tree (both flavors keep comments in light DOM). */
+export function findComments(root: ParentNode, flavor: RedditFlavor): Element[] {
+  return Array.from(root.querySelectorAll(flavor === "old" ? ".thing.comment" : "shreddit-comment"));
+}
+
+/** A comment's t1 id, prefix stripped (new: `[thingid]`; old: `[data-fullname]`). */
+export function commentId(comment: Element, flavor: RedditFlavor): string | null {
+  return stripThing(flavor === "old" ? comment.getAttribute("data-fullname") : comment.getAttribute("thingid"));
+}
+
+/** A comment's author (no `u/`), or null. */
+export function commentAuthor(comment: Element, flavor: RedditFlavor): string | null {
+  return attrStr(comment, flavor === "old" ? "data-author" : "author");
+}
+
+/**
+ * A comment's OWN score as an int, or null. New Reddit exposes it as a `[score]`
+ * attribute on the element itself (nesting-safe). Old Reddit keeps the exact
+ * integer in the `title` of its `.score` span — scoped to this comment's own
+ * `.entry` (via `:scope >`) so a nested child comment's score is never read.
+ */
+export function commentScore(comment: Element, flavor: RedditFlavor): number | null {
+  if (flavor === "old") {
+    const s = comment.querySelector(
+      ":scope > .entry .score.unvoted[title], :scope > .entry .score.likes[title], :scope > .entry .score[title]",
+    );
+    return attrInt(s?.getAttribute("title") ?? null);
+  }
+  return attrInt(comment.getAttribute("score"));
+}
+
+/**
+ * The single most-upvoted comment in the tree, or null. Sorts every comment node
+ * by its own score descending (missing/unparseable scores count as 0). This is
+ * the operator's "engage the most-upvoted comment" target.
+ */
+export function mostUpvotedComment(root: ParentNode, flavor: RedditFlavor): Element | null {
+  let best: Element | null = null;
+  let bestScore = -Infinity;
+  for (const c of findComments(root, flavor)) {
+    const sc = commentScore(c, flavor) ?? 0;
+    if (sc > bestScore) {
+      bestScore = sc;
+      best = c;
+    }
+  }
+  return best;
+}
+
+/**
+ * A comment's Reply affordance, or null. New Reddit: a light-DOM `<button>` whose
+ * trimmed text is "Reply" inside the comment's own `shreddit-comment-action-row`
+ * (no aria-label — match by text). Old Reddit: `li.reply-button a` (text "reply")
+ * scoped to this comment's own `.entry`.
+ */
+export function commentReplyButton(comment: Element, flavor: RedditFlavor): HTMLElement | null {
+  if (flavor === "old") {
+    const links = comment.querySelectorAll<HTMLElement>(":scope > .entry li.reply-button a, :scope > .entry a");
+    for (const a of Array.from(links)) {
+      if ((a.textContent ?? "").trim().toLowerCase() === "reply") return a;
+    }
+    return null;
+  }
+  const row = comment.querySelector("shreddit-comment-action-row") ?? comment;
+  for (const btn of Array.from(row.querySelectorAll<HTMLElement>("button, a"))) {
+    if ((btn.textContent ?? "").trim().toLowerCase() === "reply") return btn;
+  }
+  return null;
+}
+
+// ── Composer / reply box / submit ────────────────────────────────────────────
+
+/**
+ * The collapsed post-composer ENTRY on new Reddit — a `faceplate-textarea-input`
+ * proxy (placeholder "Add a comment" / "Join the conversation") inside
+ * `comment-composer-host`. Clicking it is what expands the real editable (which
+ * is 0×0 until then). On old Reddit there is no such proxy — the post box is a
+ * plain always-visible textarea — so this returns that textarea directly.
+ */
+export function findComposerEntry(root: ParentNode, flavor: RedditFlavor): HTMLElement | null {
+  if (flavor === "old") return findReplyBox(root, "old");
+  const host = root.querySelector("comment-composer-host") ?? root;
+  const entry = host.querySelector<HTMLElement>("faceplate-textarea-input");
+  if (entry) return entry;
+  for (const el of Array.from(root.querySelectorAll<HTMLElement>("faceplate-textarea-input"))) {
+    const ph = (el.getAttribute("placeholder") ?? "").toLowerCase();
+    if (ph.includes("add a comment") || ph.includes("join the conversation")) return el;
+  }
+  return null;
+}
+
+/**
+ * A contenteditable/textarea currently rendered with a NON-ZERO box. The new-Reddit
+ * page-level "Add a comment" POST composer sits FIRST in document order at 0×0 until
+ * expanded, so preferring a non-zero box skips that collapsed post box in favor of a
+ * just-opened reply editable. (jsdom returns an all-zero rect unless a test stubs one.)
+ */
+function hasBox(el: Element): boolean {
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+
+// The www.reddit.com chat drawer persists across navigations and mounts its own
+// contenteditable composer + send button (the `rs-*` chat custom elements). The
+// reply flow must NEVER touch it: typing there and submitting would send a
+// PRIVATE CHAT MESSAGE from the operator's real account — and the cleared-
+// composer confirmation would read the sent chat as a posted reply. Both the
+// reply-box search and every submit pass reject anything inside it. The aria
+// check backs up the tag check: if Reddit remounts the chat surface under new
+// element names, its accessible name still says "message"/"chat" — while the
+// thread reply composer's never does.
+export const CHAT_SEL =
+  "rs-app, rs-room, rs-message-composer, rs-conversation, faceplate-chat, [class*='chat-drawer' i]";
+function notChat(el: Element): boolean {
+  return el.closest(CHAT_SEL) === null && !/\b(message|chat)\b/i.test(el.getAttribute("aria-label") ?? "");
+}
+
+// New-Reddit reply editables in priority order: the verified-live
+// `div[contenteditable][name="body"]` first; `[role="textbox"]` is a nice-to-have
+// fallback, NOT a hard requirement (the live composer does not always set role).
+// Chat-drawer editables are rejected outright (see CHAT_SEL).
+function newReplyEditables(scope: ParentNode): HTMLElement[] {
+  return [
+    ...scope.querySelectorAll<HTMLElement>('div[contenteditable="true"][name="body"]'),
+    ...scope.querySelectorAll<HTMLElement>('div[contenteditable="true"][role="textbox"]:not([name="body"])'),
+  ].filter(notChat);
+}
+
+/** The text an editable/textarea currently holds, trimmed. */
+function editableText(el: HTMLElement): string {
+  const raw = el.tagName.toLowerCase() === "textarea"
+    ? ((el as HTMLTextAreaElement).value ?? "")
+    : (el.textContent ?? "");
+  return raw.trim();
+}
+
+/**
+ * The first composer on the page that actually HOLDS text — any flavor, any
+ * scope. Used ONLY by the clear-before-navigate path, never by the reply flow.
+ *
+ * `findReplyBox` is the wrong tool for that job when there is no commentId to
+ * scope by: it answers "where would a reply be typed", picking the first
+ * VISIBLE editable in document order. On new Reddit that is the page-level
+ * "Add a comment" POST composer. Collapsed it is 0x0 and correctly skipped, but
+ * once the operator has expanded it, an empty post box outranks a comment reply
+ * composer that is still holding text — so the emptiness check would read the
+ * wrong box, report "nothing to clear", and the navigation would raise the
+ * exact leave-site dialog the clear exists to prevent.
+ *
+ * Asking "which box has text" instead has no such ambiguity, and it is also the
+ * only question the clear path actually needs answered.
+ */
+export function findDirtyReplyBox(
+  root: ParentNode,
+  flavor: RedditFlavor,
+  /**
+   * When given, only a box whose text MATCHES wins — the caller is looking for
+   * the reply this run typed, not merely for something dirty.
+   *
+   * Without it the search stops at the first visible dirty box on the page, and
+   * that is the wrong answer whenever the operator has text of their own
+   * somewhere earlier in document order (the expanded page-level "Add a
+   * comment" composer sits above every comment composer). The caller would read
+   * "the dirty box is not ours", conclude there is nothing to clear, and
+   * navigate away from OUR leftover reply further down — raising the dialog
+   * with nothing logged. Filtering here instead of at the caller is what makes
+   * "is there anything of ours to clear" answerable at all.
+   */
+  matches?: (text: string) => boolean,
+): HTMLElement | null {
+  const all: HTMLElement[] = flavor === "old"
+    ? Array.from(root.querySelectorAll<HTMLElement>("textarea[name='text']"))
