@@ -198,3 +198,8 @@ export function integratePriorityReady(state: RunState, queue: EngineQueue, now:
   const lastAt = planned.reduce((latest, action) => Math.max(latest, action.atMs), startMs);
   state.windowHours = (lastAt - state.startMs) / 3600_000 + 0.15;
   state.targets.comments += state.commentPool.length;
+  state.targets.likes += planned.filter((action) => action.kind === "like").length;
+  state.drainRounds = (state.drainRounds ?? 0) + 1;
+  state.lastEvent = `priority reply ready — ${added} added at next scheduled slot`;
+  return added;
+}
