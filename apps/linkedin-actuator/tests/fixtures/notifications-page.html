@@ -1,0 +1,180 @@
+<!-- REAL markup captured from a logged-in linkedin.com/notifications on
+     2026-07-26. Names, profile ids and body text are anonymized; SVG innards
+     and the settings dropdown are trimmed EXCEPT one dropdown entry (its class
+     contains "headline", which is why cardHeadline cannot use a bare
+     [class*='headline'] selector). Every href shape is byte-faithful.
+
+     This page disproved three more assumptions:
+       1. A REPLY card's headline links to `/feed/?highlightedUpdateUrn=…`,
+          NOT `/feed/update/…`. The card filter required the latter, so it
+          matched only impressions cards and found ZERO replies.
+       2. A reply link carries BOTH commentUrn (OUR comment) and replyUrn
+          (THEIR reply). Taking the first comment urn returns OURS, so every
+          person replying to one comment of ours collided on one external_id.
+       3. highlightedUpdateUrn is the NOTIFICATION's activity, not the post.
+          The thread root is the entity inside the comment urn tuple.
+
+     It also confirmed the last open question: reply cards DO carry a profile
+     link, in the left rail as a[data-view-name="notification-card-image"],
+     percent-encoded ("/in/mara%2Dlopez").
+
+     6 cards: 3 genuine replies (must be harvested) + 3 negatives. -->
+<div class="nt-card-list">
+
+  <!-- NEGATIVE 0: TOPIC_TRENDING_CONVERSATION_IN_YOUR_NETWORK -->
+  <article class="nt-card nt-card--unread" aria-label="Unread notification." data-nt-card-index="0" data-view-name="notification-card-container">
+    <div class="nt-card__container">
+      <div class="nt-card__left-rail">
+        <a href="/in/cassidy%2Ddunn" aria-label="View Cassidy Dunn's profile" data-view-name="notification-card-image"></a>
+      </div>
+      <div class="display-flex flex-column flex-grow-1 mr2">
+        <a class="nt-card__headline nt-card__text--word-wrap t-black t-normal text-body-small" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A7487024171655471104&amp;highlightedUpdateType=TOPIC_TRENDING_CONVERSATION_IN_YOUR_NETWORK&amp;showCommentBox=true&amp;origin=INAPP" tabindex="0">
+          <p class="visually-hidden">Unread notification.</p>
+          <span class="nt-card__text--3-line"><span>People are engaging with<span class="white-space-pre"> </span><strong>Cassidy Dunn's</strong><span class="white-space-pre"> </span>post: a post about showing up to rooms alone</span></span>
+        </a>
+      </div>
+      <p class="nt-card__time-ago t-12 t-black--light t-normal">2h</p>
+    </div>
+  </article>
+
+  <!-- NEGATIVE 1: REACTED_TO_YOUR_COMMENT ("liked your comment") -->
+  <article class="nt-card nt-card--unread" aria-label="Unread notification." data-nt-card-index="1" data-view-name="notification-card-container">
+    <div class="nt-card__container">
+      <div class="nt-card__left-rail">
+        <a href="/in/manvi%2Djaju" aria-label="View Manvi Jaju's profile." data-view-name="notification-card-image"></a>
+      </div>
+      <div class="display-flex flex-column flex-grow-1 mr2">
+        <a class="nt-card__headline nt-card__text--word-wrap t-black t-normal text-body-small" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A7486119825950547968&amp;highlightedUpdateType=REACTED_TO_YOUR_COMMENT&amp;origin=INAPP&amp;showCommentBox=true&amp;commentUrn=urn%3Ali%3Acomment%3A%28ugcPost%3A7485452888622936064%2C7486119807084498944%29&amp;dashCommentUrn=urn%3Ali%3Afsd_comment%3A%287486119807084498944%2Curn%3Ali%3AugcPost%3A7485452888622936064%29" tabindex="0">
+          <p class="visually-hidden">Unread notification.</p>
+          <span class="nt-card__text--3-line"><strong>Manvi Jaju</strong><span class="white-space-pre"> </span>liked your comment.</span>
+        </a>
+        <button aria-hidden="true" tabindex="-1" class="artdeco-card overflow-hidden mt2" role="link" type="button">
+          <div class="nt-card__text--word-wrap nt-card__text--2-line-large text-align-start m2 t-14 t-black">
+            2,000 sign-ups a day into voice AI is a wild top of funnel, curious how much self-serves
+          </div>
+          <hr class="m0">
+          <div class="nt-card-content__body--secondary display-flex">
+            <div class="full-width display-flex flex-column p2">
+              <div class="nt-card-content__body-text nt-card__text--word-wrap nt-card__text--2-line-large t-14 t-black--light">
+                When I joined as the 8th full-time employee, we were still figuring everything out. Since then I have had a front-row seat to watch this company grow.
+              </div>
+            </div>
+          </div>
+        </button>
+      </div>
+      <p class="nt-card__time-ago t-12 t-black--light t-normal">2h</p>
+    </div>
+  </article>
+
+  <!-- POSITIVE 2: REPLIED_TO_YOUR_COMMENT — carries BOTH commentUrn (ours) and replyUrn (theirs) -->
+  <article class="nt-card nt-card--unread" aria-label="Unread notification." data-nt-card-index="2" data-view-name="notification-card-container">
+    <div class="nt-card__container">
+      <div class="nt-card__left-rail">
+        <a href="/in/mara%2Dlopez" aria-label="View Mara L.'s profile." data-view-name="notification-card-image"></a>
+      </div>
+      <div class="display-flex flex-column flex-grow-1 mr2">
+        <a class="nt-card__headline nt-card__text--word-wrap t-black t-normal text-body-small" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A7487199521425326080&amp;highlightedUpdateType=REPLIED_TO_YOUR_COMMENT&amp;origin=INAPP&amp;showCommentBox=true&amp;commentUrn=urn%3Ali%3Acomment%3A%28ugcPost%3A7486054278927835136%2C7486091099183251456%29&amp;dashCommentUrn=urn%3Ali%3Afsd_comment%3A%287486091099183251456%2Curn%3Ali%3AugcPost%3A7486054278927835136%29&amp;replyUrn=urn%3Ali%3Acomment%3A%28ugcPost%3A7486054278927835136%2C7487199472029192192%29&amp;dashReplyUrn=urn%3Ali%3Afsd_comment%3A%287487199472029192192%2Curn%3Ali%3AugcPost%3A7486054278927835136%29" tabindex="0">
+          <p class="visually-hidden">Unread notification.</p>
+          <span class="nt-card__text--3-line"><strong>Mara L.</strong><span class="white-space-pre"> </span>replied to your comment.</span>
+        </a>
+        <button aria-hidden="true" tabindex="-1" class="artdeco-card overflow-hidden mt2" role="link" type="button">
+          <div class="nt-card__text--word-wrap nt-card__text--2-line-large text-align-start m2 t-14 t-black">
+            <strong>Pat Operator</strong><span class="white-space-pre"> </span>thank you so much!! I will
+          </div>
+          <hr class="m0">
+          <div class="nt-card-content__body--secondary display-flex">
+            <div class="full-width display-flex flex-column p2">
+              <div class="nt-card-content__body-text nt-card__text--word-wrap nt-card__text--2-line-large t-14 t-black--light">
+                Happy to share that I finished first in my cohort this year! I had to learn advanced econometrics and Python in one week on my own. In a couple of weeks I will be heading abroad for an exchange semester.
+              </div>
+            </div>
+          </div>
+        </button>
+      </div>
+      <p class="nt-card__time-ago t-12 t-black--light t-normal">2h</p>
+    </div>
+  </article>
+
+  <!-- NEGATIVE 3: COMMENT_VIEWS (impressions), no profile link, chart icon -->
+  <article class="nt-card nt-card--unread" aria-label="Unread notification." data-nt-card-index="3" data-view-name="notification-card-container">
+    <div class="nt-card__container">
+      <div class="nt-card__left-rail">
+        <svg role="none" aria-hidden="true" width="48" height="48" data-test-icon="ui-chart"></svg>
+      </div>
+      <div class="display-flex flex-column flex-grow-1 mr2">
+        <a class="nt-card__headline nt-card__text--word-wrap t-black t-normal text-body-small" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A7486104455868813313&amp;highlightedUpdateType=COMMENT_VIEWS&amp;origin=INAPP&amp;commentUrn=urn%3Ali%3Acomment%3A%28activity%3A7485717706013368320%2C7486104428748419072%29&amp;dashCommentUrn=urn%3Ali%3Afsd_comment%3A%287486104428748419072%2Curn%3Ali%3Aactivity%3A7485717706013368320%29" tabindex="0">
+          <p class="visually-hidden">Unread notification.</p>
+          <span class="nt-card__text--3-line"><span>Your comment has gained<span class="white-space-pre"> </span><strong>1,162 impressions</strong>.</span></span>
+        </a>
+        <button aria-hidden="true" tabindex="-1" class="artdeco-card overflow-hidden mt2" role="link" type="button">
+          <div class="nt-card__text--word-wrap nt-card__text--2-line-large text-align-start m2 t-14 t-black">
+            120 builders in one room and so many just now meeting each other, how are you keeping them connected
+          </div>
+          <hr class="m0">
+          <div class="nt-card-content__body--secondary display-flex">
+            <div class="full-width display-flex flex-column p2">
+              <div class="nt-card-content__body-text nt-card__text--word-wrap nt-card__text--2-line-large t-14 t-black--light">
+                It does not have a shortage of talent. It has a shortage of rooms that bring that talent together.
+              </div>
+            </div>
+          </div>
+        </button>
+      </div>
+      <p class="nt-card__time-ago t-12 t-black--light t-normal">2h</p>
+    </div>
+  </article>
+
+  <!-- NEGATIVE 4: REACTED_TO_COMMENT_MENTIONING_YOU — a reaction, not a reply -->
+  <article class="nt-card" aria-label="Notification" data-nt-card-index="4" data-view-name="notification-card-container">
+    <div class="nt-card__container">
+      <div class="nt-card__left-rail">
+        <a href="/in/areeba%2Dnoor" aria-label="View Areeba Noor's profile." data-view-name="notification-card-image"></a>
+      </div>
+      <div class="display-flex flex-column flex-grow-1 mr2">
+        <a class="nt-card__headline nt-card__text--word-wrap t-black t-normal text-body-small" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A7486453761666854914&amp;highlightedUpdateType=REACTED_TO_COMMENT_MENTIONING_YOU&amp;origin=INAPP&amp;showCommentBox=true&amp;commentUrn=urn%3Ali%3Acomment%3A%28activity%3A7486432558059024384%2C7486445318327222272%29&amp;replyUrn=urn%3Ali%3Acomment%3A%28activity%3A7486432558059024384%2C7486453094537625601%29" tabindex="0">
+          <span class="nt-card__text--3-line"><strong>Areeba Noor</strong><span class="white-space-pre"> </span>and 1 other liked<span class="white-space-pre"> </span><strong>Tam D.'s</strong><span class="white-space-pre"> </span>comment that mentioned you.</span>
+        </a>
+        <button aria-hidden="true" tabindex="-1" class="artdeco-card overflow-hidden mt2" role="link" type="button">
+          <div class="nt-card__text--word-wrap nt-card__text--2-line-large text-align-start m2 t-14 t-black">
+            <strong>Pat Operator</strong><span class="white-space-pre"> </span>the latter
+          </div>
+        </button>
+      </div>
+      <p class="nt-card__time-ago t-12 t-black--light t-normal">10h</p>
+    </div>
+  </article>
+
+  <!-- POSITIVE 5: MENTIONED_YOU_IN_THIS — a comment written AT us -->
+  <article class="nt-card nt-card--unread" aria-label="Unread notification." data-nt-card-index="5" data-view-name="notification-card-container">
+    <div class="nt-card__container">
+      <div class="nt-card__left-rail">
+        <a href="/in/nathan%2Dbeck" aria-label="View Nathan B.'s profile." data-view-name="notification-card-image"></a>
+      </div>
+      <div class="display-flex flex-column flex-grow-1 mr2">
+        <a class="nt-card__headline nt-card__text--word-wrap t-black t-normal text-body-small" href="/feed/?highlightedUpdateUrn=urn%3Ali%3Aactivity%3A7486876176196509697&amp;highlightedUpdateType=MENTIONED_YOU_IN_THIS&amp;origin=INAPP&amp;showCommentBox=true&amp;commentUrn=urn%3Ali%3Acomment%3A%28activity%3A7486470336595668992%2C7486475665245118465%29&amp;dashCommentUrn=urn%3Ali%3Afsd_comment%3A%287486475665245118465%2Curn%3Ali%3Aactivity%3A7486470336595668992%29&amp;replyUrn=urn%3Ali%3Acomment%3A%28activity%3A7486470336595668992%2C7486876157951229952%29&amp;dashReplyUrn=urn%3Ali%3Afsd_comment%3A%287486876157951229952%2Curn%3Ali%3Aactivity%3A7486470336595668992%29" tabindex="0">
+          <p class="visually-hidden">Unread notification.</p>
+          <span class="nt-card__text--3-line"><strong>Nathan B.</strong><span class="white-space-pre"> </span>mentioned you in a comment.</span>
+        </a>
+        <button aria-hidden="true" tabindex="-1" class="artdeco-card overflow-hidden mt2" role="link" type="button">
+          <div class="nt-card__text--word-wrap nt-card__text--2-line-large text-align-start m2 t-14 t-black">
+            <strong>Pat Operator</strong><span class="white-space-pre"> </span>yep, I agree with that. It took me several years to get it truly off the ground
+          </div>
+          <hr class="m0">
+          <div class="nt-card-content__body--secondary display-flex">
+            <div class="full-width display-flex flex-column p2">
+              <div class="nt-card-content__body-text nt-card__text--word-wrap nt-card__text--2-line-large t-14 t-black--light">
+                Most fundraising advice tells you how to raise. Almost none of it tells you when.
+              </div>
+            </div>
+          </div>
+        </button>
+      </div>
+      <p class="nt-card__time-ago t-12 t-black--light t-normal">1d</p>
+      <div class="nt-card-settings-dropdown__content">
+        <p class="nt-card-settings-dropdown-item__headline">Change notification preferences</p>
+        <p class="nt-card-settings-dropdown-item__headline">Delete notification</p>
+      </div>
+    </div>
+  </article>
+
+</div>
