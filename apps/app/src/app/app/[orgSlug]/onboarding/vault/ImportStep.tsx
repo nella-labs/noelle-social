@@ -198,3 +198,74 @@ export function ImportStep({ orgId, orgSlug }: Props) {
         />
       </div>
 
+      <div className={styles.field}>
+        <span className={styles.label}>…or pick individual files</span>
+        <input
+          ref={filesInputRef}
+          type="file"
+          multiple
+          accept=".md,text/markdown"
+          style={{ maxWidth: "100%" }}
+          onChange={(e) => onFiles(e.target.files)}
+        />
+      </div>
+
+      {picked.length > 0 && (
+        <div className={styles.field}>
+          <span className={styles.label}>
+            Ready to upload — {picked.length} file(s),{" "}
+            {(totalBytes / 1024).toFixed(1)} KiB total
+          </span>
+          <ul
+            style={{
+              maxHeight: 180,
+              overflow: "auto",
+              margin: 0,
+              padding: "0.5rem 1rem",
+              border: "1px solid var(--ink-line, #c9b9a8)",
+              borderRadius: 6,
+              fontSize: 12,
+              fontFamily: "var(--font-mono, monospace)",
+              wordBreak: "break-all",
+            }}
+          >
+            {picked.slice(0, 50).map((f) => (
+              <li key={f.path}>{f.path}</li>
+            ))}
+            {picked.length > 50 && (
+              <li style={{ color: "var(--ink-muted, #6b574a)" }}>
+                …and {picked.length - 50} more
+              </li>
+            )}
+          </ul>
+        </div>
+      )}
+
+      {error && <div className={styles.error}>{error}</div>}
+      {progress && pending && (
+        <div className={styles.hint}>
+          Uploading {progress.done}/{progress.total}…
+        </div>
+      )}
+
+      <div className={styles.actions}>
+        <button
+          type="button"
+          className={styles.primary}
+          onClick={onUpload}
+          disabled={pending || picked.length === 0}
+        >
+          {pending ? "Importing…" : "Import to vault"}
+        </button>
+        <button
+          type="button"
+          className={styles.skip}
+          onClick={() => router.push(`/app/${orgSlug}/onboarding/vault`)}
+          disabled={pending}
+        >
+          Back to wizard
+        </button>
+      </div>
+    </div>
+  );
+}

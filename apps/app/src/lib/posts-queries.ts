@@ -198,3 +198,132 @@ export const getPostThread = cache(async (ideaId: string): Promise<PostThread | 
     limit 1
   `;
   const ideaRow = ideaRows[0];
+  if (!ideaRow) return null;
+  await assertMember(ideaRow.org_id, userId);
+
+  const draftRows = await sql<PostDraftRow[]>`
+    select
+      d.id, d.idea_id, d.platform, d.body, d.final_body, d.char_count, d.posted_url,
+      d.hook as draft_hook, d.cta, d.notes, d.category, d.stage,
+      d.quality_score, d.quality_passed, d.verifier_meta, d.status,
+      d.created_at::text as created_at,
+      i.hook as hook, i.suggested_day::text as suggested_day,
+      coalesce(i.inspiration_refs, '[]'::jsonb) as inspiration_refs
+    from noelle.post_drafts d
+    join noelle.post_ideas i on i.id = d.idea_id
+      and i.org_id = d.org_id and i.agent_instance_id = d.agent_instance_id
+    -- include 'published' so a Posted column stays visible (with "Unpost"); the
+    -- board (listPostDraftsForOrg) still archives published off the active list.
+    where d.idea_id = ${ideaId} and d.status in ('draft', 'ready', 'published')
+      and d.org_id = ${ideaRow.org_id} and d.agent_instance_id = ${ideaRow.agent_instance_id}
+    order by d.platform asc, d.created_at desc
+  `;
+
+  const notes = await sql<DrafterNoteRow[]>`
+    select id, role, body, pinned, created_at::text as created_at
+    from noelle.drafter_notes
+    where idea_id = ${ideaId} and scope = 'post'
+      and org_id = ${ideaRow.org_id} and agent_instance_id = ${ideaRow.agent_instance_id}
+    order by created_at asc
+  `;
+
+  const media = await sql<ContentMediaRow[]>`
+    select
+      id, platform, kind, mime_type, url, width, height,
+      duration_ms, bytes::int as bytes, idea_id, draft_id, caption, status,
+      created_at::text as created_at
+    from noelle.content_media
+    where idea_id = ${ideaId} and status <> 'failed'
+      and org_id = ${ideaRow.org_id}
+      and (agent_instance_id is null or agent_instance_id = ${ideaRow.agent_instance_id})
+    order by created_at desc
+  `;
+
+  const { org_id: _org, agent_instance_id: _instance, ...idea } = ideaRow;
+  return {
+    idea: { ...idea, inspiration_refs: Array.isArray(idea.inspiration_refs) ? idea.inspiration_refs : [] },
+    drafts: draftRows.map((d) => ({
+      ...d,
+      inspiration_refs: Array.isArray(d.inspiration_refs) ? d.inspiration_refs : [],
+    })),
+    media: await currentMediaLinks(ideaRow.org_id, media),
+    notes: [...notes],
+  };
+});
+
+export interface IntelligenceStatus {
+  playbookCount: number;
+  lastAnalyzedAt: string | null;
+}
+
+/**
+ * Engagement Analyst status for the Intelligence box: how many top-performer
+ * playbooks the instance has, and when the newest was distilled.
+ */
+export const getIntelligenceStatus = cache(async (
+  orgId: string,
+  instanceId: string,
+): Promise<IntelligenceStatus> => {
+  const userId = await requiredUserId();
+  await assertMember(orgId, userId);
+  const rows = await sql<{ count: string; latest: string | null }[]>`
+    select count(*)::text as count, max(p.generated_at)::text as latest
+    from noelle.watchlist_playbooks p
+    join noelle.agent_instances ai on ai.id = p.agent_instance_id and ai.org_id = p.org_id
+    where p.org_id = ${orgId} and p.agent_instance_id = ${instanceId}
+  `;
+  return {
+    playbookCount: Number(rows[0]?.count ?? 0),
+    lastAnalyzedAt: rows[0]?.latest ?? null,
+  };
+});
+
+export interface ContentMediaRow {
+  id: string;
+  platform: string | null;
+  kind: string;
+  mime_type: string | null;
+  url: string | null;
+  width: number | null;
+  height: number | null;
+  duration_ms: number | null;
+  bytes: number | null;
+  idea_id: string | null;
+  draft_id: string | null;
+  caption: string | null;
+  status: string;
+  created_at: string;
+}
+
+/**
+ * Media assets for the org's Content workspace, newest first. `platform` scopes
+ * to one platform (null = the cross-platform "All" view). Same bound-value OR
+ * predicate as the post lists — never a conditional sql fragment.
+ */
+export const listContentMediaForOrg = cache(async (
+  orgId: string,
+  platform: string | null = null,
+): Promise<ContentMediaRow[]> => {
+  const userId = await requiredUserId();
+  await assertMember(orgId, userId);
+  const rows = await sql<ContentMediaRow[]>`
+    select
+      id, platform, kind, mime_type, url, width, height,
+      duration_ms, bytes::int as bytes, idea_id, draft_id, caption, status,
+      created_at::text as created_at
+    from noelle.content_media
+    where org_id = ${orgId}
+      and status <> 'failed'
+      and (${platform}::text is null or platform = ${platform})
+    order by created_at desc
+  `;
+  return currentMediaLinks(orgId, rows);
+});
+
+// Share the verified identity owner used by queries.ts.
+import { getUserFromCookies } from "@/lib/auth-cookie";
+const requiredUserId = cache(async (): Promise<string> => {
+  const user = await getUserFromCookies();
+  if (!user) throw new Error("not signed in");
+  return user.id;
+});
