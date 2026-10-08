@@ -398,3 +398,21 @@ async function main() {
 
         await run.finish({ status: "ok", rowsProcessed: n });
       } catch (err) {
+        readyCache.reset(inst.org_id, "drafter");
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+  });
+}
+
+// Per-instance cadence for the (heavy) Pattern Breaker analysis pass. In-memory
+// is fine: it's a soft throttle, and a worker restart just re-runs the audit
+// once. The cheap refine-queue drain runs every tick regardless.
+const lastPatternAnalysisAt = new Map<string, number>();
+
+main().catch((err) => {
+  console.error("drafter fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
