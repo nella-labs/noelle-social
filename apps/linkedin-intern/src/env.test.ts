@@ -198,3 +198,35 @@ describe("loadEnv (linkedin-intern)", () => {
     for (const v of ["1", "true", "TRUE"]) {
       withEnv({ NOELLE_DRAFTER_VARIETY: v }, () => {
         expect(loadEnv().NOELLE_DRAFTER_VARIETY).toBe(true);
+      });
+    }
+  });
+
+  it("NOELLE_GEMINI_API_KEY is optional: defaults undefined (Vertex ADC path unchanged)", () => {
+    withEnv({}, () => {
+      expect(loadEnv().NOELLE_GEMINI_API_KEY).toBeUndefined();
+    });
+  });
+
+  it("NOELLE_GEMINI_API_KEY passes through when set (self-host gemini-key path)", () => {
+    withEnv({ NOELLE_GEMINI_API_KEY: "AIzaSy_test_key_1234" }, () => {
+      expect(loadEnv().NOELLE_GEMINI_API_KEY).toBe("AIzaSy_test_key_1234");
+    });
+  });
+});
+
+
+it("keeps local retrieval free of implicit remote workspace defaults", () => {
+  const original = process.env;
+  try {
+    process.env = { NOELLE_DATABASE_URL: "postgres://localhost/noelle", NOELLE_HMAC_SECRET: "x".repeat(32), NOELLE_NELLA_BACKEND: "local", NOELLE_VAULT_DIR: "/voice-vault" };
+    resetEnvForTests();
+    expect(loadEnv().NELLA_WORKSPACE).toBe("");
+    process.env.NELLA_WORKSPACE = " configured-workspace ";
+    resetEnvForTests();
+    expect(loadEnv().NELLA_WORKSPACE).toBe("configured-workspace");
+  } finally {
+    process.env = original;
+    resetEnvForTests();
+  }
+});
