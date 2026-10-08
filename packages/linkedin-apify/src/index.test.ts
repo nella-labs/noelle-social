@@ -198,3 +198,203 @@ describe("resolveVanitySlug", () => {
   it("recognises member urns and leaves real slugs alone", () => {
     expect(isMemberUrnId("ACwAABlDYv4BnnBKfPQRpeO8bEiD6KWZWZw7Z2s")).toBe(true);
     expect(isMemberUrnId("ACoAAFX4vD8BaZrzmCr01DbMFhT1VdnWcYePU94")).toBe(true);
+    expect(isMemberUrnId("kaia-tham")).toBe(false);
+    // Short "AC…" slugs are real people, not urns.
+    expect(isMemberUrnId("acme-ceo")).toBe(false);
+    expect(isMemberUrnId(null)).toBe(false);
+  });
+
+  it("matches lowercased urns — they reach us that way and were stuck unprofiled", () => {
+    // Two such rows sit in linkedin_watchlist_people today, both summary NULL /
+    // posts_analyzed 0. A case-SENSITIVE test would skip exactly the people this
+    // slug recovery exists to rescue.
+    expect(isMemberUrnId("acwaaaeiwl4bfhzj2swxsrw0ynoyjx3nnuthy_e")).toBe(true);
+    expect(isMemberUrnId("acwaad1tkembm48rdw7namxkismc-ymj2imm2ei")).toBe(true);
+  });
+
+  it("does not misread a real long vanity slug that happens to start with 'ac'", () => {
+    // Live data: a genuine 21-char slug. A {20,} rule would call this a urn.
+    expect(isMemberUrnId("achim-bonsch-a9186a38")).toBe(false);
+    expect(isMemberUrnId("accessibility-lead-x")).toBe(false);
+  });
+
+  it("mines the slug out of a post permalink and stops at the first underscore", () => {
+    expect(
+      slugFromPostUrl("https://www.linkedin.com/posts/rasel-ahmed-628b7239_some-post-activity-123-x"),
+    ).toBe("rasel-ahmed-628b7239");
+    expect(slugFromPostUrl("https://www.linkedin.com/feed/update/urn:li:activity:123")).toBeNull();
+    expect(slugFromPostUrl(null)).toBeNull();
+  });
+
+  it("prefers publicId, then the profile url, then the permalink", () => {
+    expect(resolveVanitySlug({ publicId: "kaia-tham", postUrl: "https://x/posts/other_a-activity-1" }))
+      .toBe("kaia-tham");
+    expect(
+      resolveVanitySlug({
+        publicId: "ACwAABlDYv4BnnBKfPQRpeO8bEiD6KWZWZw7Z2s",
+        profileUrl: "https://www.linkedin.com/in/al-kingsley",
+        postUrl: "https://www.linkedin.com/posts/from-post_a-activity-1",
+      }),
+    ).toBe("al-kingsley");
+    expect(
+      resolveVanitySlug({
+        publicId: "ACwAABlDYv4BnnBKfPQRpeO8bEiD6KWZWZw7Z2s",
+        profileUrl: "https://www.linkedin.com/in/ACwAABlDYv4BnnBKfPQRpeO8bEiD6KWZWZw7Z2s",
+        postUrl: "https://www.linkedin.com/posts/pallifrone_a-activity-1",
+      }),
+    ).toBe("pallifrone");
+    expect(resolveVanitySlug({ publicId: null, postUrl: null })).toBeNull();
+  });
+
+  it("omits images entirely on a text-only post (no media fields)", () => {
+    const p = normalizePost(SAMPLE)!;
+    expect("images" in p).toBe(false);
+  });
+
+  it("extracts postImages url(s), deduped and order-preserving", () => {
+    const p = normalizePost({
+      ...SAMPLE,
+      postImages: [
+        { url: "https://media.licdn.com/a.jpg", width: 800, height: 600, expiresAt: 1 },
+        { url: "https://media.licdn.com/b.jpg" },
+        { url: "https://media.licdn.com/a.jpg" }, // dupe — dropped
+      ],
+    })!;
+    expect(p.images).toEqual(["https://media.licdn.com/a.jpg", "https://media.licdn.com/b.jpg"]);
+  });
+
+  it("coalesces media from postVideo, article, and document carousel pages", () => {
+    const p = normalizePost({
+      ...SAMPLE,
+      postVideo: { thumbnailUrl: "https://media.licdn.com/thumb.jpg", videoUrl: "https://x/v.mp4" },
+      article: { image: { url: "https://media.licdn.com/article.png" } },
+      document: {
+        coverPages: [
+          { imageUrls: ["https://media.licdn.com/p1.png", "https://media.licdn.com/p2.png"] },
+          { imageUrls: ["https://media.licdn.com/p3.png"] },
+        ],
+      },
+    })!;
+    expect(p.images).toEqual([
+      "https://media.licdn.com/thumb.jpg",
+      "https://media.licdn.com/article.png",
+      "https://media.licdn.com/p1.png",
+      "https://media.licdn.com/p2.png",
+      "https://media.licdn.com/p3.png",
+    ]);
+  });
+
+  it("fails open on malformed media (no throw, no images key)", () => {
+    const p = normalizePost({
+      ...SAMPLE,
+      // every plausible field in a broken shape: non-array, missing url, non-http,
+      // non-string entries — none should land or throw.
+      postImages: [{}, { url: 42 as unknown as string }, { url: "not-a-url" }] as never,
+      postVideo: { thumbnailUrl: undefined },
+      article: { image: {} },
+      document: { coverPages: [{ imageUrls: "nope" as never }, { imageUrls: [null] as never }] },
+    })!;
+    expect("images" in p).toBe(false);
+  });
+
+  // The post-search actor returns the same shape as profile-posts EXCEPT a
+  // company author leaves publicIdentifier null (slug is in universalName) and
+  // carries author.type. Confirmed against a live post-search run.
+  it("falls back to universalName + surfaces author.type (post-search company shape)", () => {
+    const p = normalizePost({
+      id: "urn:li:activity:7471033556522381312",
+      linkedinUrl: "https://www.linkedin.com/posts/stellarph_activity-7471033556522381312",
+      content: "We ran a 5-hour AI build hackathon and shipped 7 prototypes.",
+      author: {
+        name: "StellarPH",
+        publicIdentifier: null as unknown as undefined,
+        universalName: "stellarph",
+        type: "company",
+        linkedinUrl: "https://www.linkedin.com/company/stellarph/posts",
+        info: "1,211 followers",
+      },
+      postedAt: { timestamp: 1781233204966, date: "2026-06-12T03:00:04.966Z" },
+      engagement: { likes: 1, comments: 0, shares: 0 },
+    })!;
+    expect(p.author.publicId).toBe("stellarph");
+    expect(p.author.type).toBe("company");
+    expect(p.reactions).toBe(1);
+  });
+
+  it("prefers publicIdentifier over universalName and still surfaces a member author.type", () => {
+    const p = normalizePost({
+      id: "urn:li:activity:7411033556522381312",
+      linkedinUrl: "https://www.linkedin.com/posts/jane-builder_activity-7411033556522381312",
+      content: "shipped a thing today, here's the one lesson",
+      author: {
+        name: "Jane Builder",
+        publicIdentifier: "jane-builder",
+        universalName: "jane-builder-company-page", // present but must be ignored
+        type: "member",
+        linkedinUrl: "https://www.linkedin.com/in/jane-builder",
+        info: "Founder",
+      },
+      postedAt: { timestamp: 1781233204966 },
+      engagement: { likes: 7, comments: 1 },
+    })!;
+    expect(p.author.publicId).toBe("jane-builder"); // publicIdentifier wins
+    expect(p.author.type).toBe("member");
+  });
+});
+
+describe("profilePosts", () => {
+  it("calls the profile-posts actor with the profile URL built from publicId", async () => {
+    const h = harness(() => ({ items: [SAMPLE] }));
+    const posts = await h.client.profilePosts({ publicId: "kaia-tham", maxPosts: 5 });
+    expect(h.startUrl()).toContain(`/v2/acts/${PROFILE_POSTS_ACTOR_ID}/runs`);
+    expect(h.startUrl()).toContain("token=apify_api_test");
+    expect(h.body().targetUrls).toEqual(["https://www.linkedin.com/in/kaia-tham"]);
+    expect(h.body().maxPosts).toBe(5);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.id).toBe("7300000000000000000");
+    expect(posts[0]!.author.publicId).toBe("kaia-tham");
+  });
+
+  it("accepts a full profileUrl directly", async () => {
+    const h = harness(() => ({ items: [SAMPLE] }));
+    await h.client.profilePosts({ profileUrl: "https://www.linkedin.com/in/someone/", maxPosts: 3 });
+    expect(h.body().targetUrls).toEqual(["https://www.linkedin.com/in/someone/"]);
+  });
+
+  it("filters out posts older than sinceISO", async () => {
+    const h = harness(() => ({ items: [SAMPLE] })); // SAMPLE is 2026-05-28
+    const posts = await h.client.profilePosts({ publicId: "kaia-tham", sinceISO: "2026-06-01T00:00:00Z" });
+    expect(posts).toHaveLength(0);
+  });
+
+  it("throws ApifyError on a non-2xx actor run", async () => {
+    const h = harness(() => ({ status: 402, text: "Monthly usage hard limit exceeded" }));
+    await expect(h.client.profilePosts({ publicId: "kaia-tham" })).rejects.toBeInstanceOf(ApifyError);
+  });
+
+  it("requires profileUrl or publicId", async () => {
+    const h = harness(() => ({ items: [] }));
+    await expect(h.client.profilePosts({})).rejects.toBeInstanceOf(ApifyError);
+  });
+});
+
+describe("searchPosts", () => {
+  it("calls the post-search actor with queries + author filter", async () => {
+    const h = harness(() => ({ items: [SAMPLE] }));
+    await h.client.searchPosts({
+      queries: ["ai agents"],
+      authorsPublicIdentifiers: ["kaia-tham"],
+      maxPosts: 10,
+      postedLimit: "week",
+    });
+    expect(h.startUrl()).toContain(`/v2/acts/${POST_SEARCH_ACTOR_ID}/runs`);
+    expect(h.body().searchQueries).toEqual(["ai agents"]);
+    expect(h.body().authorsPublicIdentifiers).toEqual(["kaia-tham"]);
+    expect(h.body().sortBy).toBe("date");
+    expect(h.body().postedLimit).toBe("week");
+  });
+
+  it("applies the sinceISO client-side recency floor", async () => {
+    const h = harness(() => ({ items: [SAMPLE] })); // SAMPLE is 2026-05-28
+    const recent = await h.client.searchPosts({ queries: ["x"], sinceISO: "2026-06-01T00:00:00Z" });
+    expect(recent).toHaveLength(0);
