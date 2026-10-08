@@ -998,3 +998,203 @@ describe("detectChallenge", () => {
     });
   });
 
+  it("PRECISION: an ad iframe with 'captcha' in a query param does NOT halt", () => {
+    const root = mount(
+      NEW_POST + `<iframe src="https://ads.example.com/frame?tag=captcha&campaign=recaptcha-solver"></iframe>`,
+    );
+    expect(detectChallenge(root)).toEqual({ challenge: false });
+  });
+
+  it("PRECISION: a post slug containing 'blocked' does NOT halt (path check is anchored)", () => {
+    const root = mount(NEW_POST);
+    expect(
+      detectChallenge(root, { url: "https://www.reddit.com/r/SaaS/comments/abc123/blocked_by_google_now_what/" }),
+    ).toEqual({ challenge: false });
+  });
+
+  it("PRECISION: a reCAPTCHA iframe INSIDE reputation-recaptcha stays a soft jschallenge", () => {
+    const root = mount(
+      `<reputation-recaptcha><iframe src="https://www.google.com/recaptcha/api2/anchor?k=x"></iframe></reputation-recaptcha>`,
+    );
+    expect(detectChallenge(root)).toEqual({ challenge: false, kind: "jschallenge" });
+  });
+});
+
+// ── Post availability (removed / deleted / 404 skip gate) ─────────────────────
+
+// The live bug: navigating to a filter-removed post shows a removal banner AND
+// still mounts a reply composer, so the actuator opened it and typed the draft.
+// This fixture reproduces BOTH — a shreddit-post shell whose body is the removal
+// notice, plus a live composer.
+const NEW_REMOVED = `
+  <main>
+    <shreddit-post id="t3_dead" permalink="/r/SaaS/comments/dead/removed/">
+      <h1 slot="title">[ Removed by Reddit ]</h1>
+      <div slot="text-body"><div class="md">Sorry, this post was removed by Reddit's filters.</div></div>
+    </shreddit-post>
+    <comment-composer-host>
+      <faceplate-textarea-input placeholder="Add a comment"></faceplate-textarea-input>
+    </comment-composer-host>
+    <div contenteditable="true" name="body" role="textbox"></div>
+    <button type="submit" slot="submit-button">Comment</button>
+  </main>`;
+
+describe("isPostUnavailable (removed / deleted / 404 skip gate)", () => {
+  it("new Reddit: 'removed by Reddit's filters' banner ⇒ unavailable (the screenshot case)", () => {
+    const root = mount(NEW_REMOVED);
+    const r = isPostUnavailable(root, "new");
+    expect(r.unavailable).toBe(true);
+    expect(r.reason).toBe("removed by reddit's filters");
+    expect(r.positive).toBe(true); // matched removal phrase ⇒ durable skip allowed
+    // Reproduction: a composer IS present on this dead post — the pre-fix code
+    // would have opened it and typed. The removed gate is what now prevents that.
+    expect(findComposerEntry(root, "new")).not.toBeNull();
+  });
+
+  it("new Reddit: a healthy shreddit-post + comments ⇒ available", () => {
+    const root = mount(NEW_POST + NEW_COMMENTS);
+    expect(isPostUnavailable(root, "new").unavailable).toBe(false);
+  });
+
+  it("new Reddit: a DELETED COMMENT in a live thread does NOT false-trip post-removed", () => {
+    const root = mount(
+      NEW_POST +
+        `<shreddit-comment thingid="t1_d" author="[deleted]">
+          <div slot="comment">[removed]</div>
+          <shreddit-comment-action-row><button>Reply</button></shreddit-comment-action-row>
+        </shreddit-comment>`,
+    );
+    expect(isPostUnavailable(root, "new").unavailable).toBe(false);
+  });
+
+  it("new Reddit: no shreddit-post at all (404 / interstitial) ⇒ unavailable", () => {
+    const root = mount(`<main><h1>Sorry, nobody on Reddit goes here.</h1><p>Page not found</p></main>`);
+    const r = isPostUnavailable(root, "new");
+    expect(r.unavailable).toBe(true);
+    expect(r.positive).toBe(true); // "page not found" is a matched removal phrase
+  });
+
+  it("new Reddit: a removed/deleted indicator ATTRIBUTE is positive removal evidence", () => {
+    const root = mount(
+      `<main><shreddit-post id="t3_rm" removed-by-category="moderator" permalink="/r/x/comments/rm/y/"><h1 slot="title">t</h1></shreddit-post></main>`,
+    );
+    const r = isPostUnavailable(root, "new");
+    expect(r.unavailable).toBe(true);
+    expect(r.reason).toBe("removed-attr");
+    expect(r.positive).toBe(true);
+  });
+
+  it("REGRESSION: a transient error interstitial (shell absent, NO removal phrase) is post-absent and NOT positive", () => {
+    // Reddit 5xx / CDN error pages render "something went wrong" with no
+    // shreddit-post while the content script still runs. Pre-fix, the durable
+    // markSkipped path treated this like a confirmed removal and permanently
+    // discarded a human-approved reply. It must stay a NON-positive signal so the
+    // background keeps it session-local (self-heals next run).
+    const root = mount(`<main><h1>Sorry, something went wrong.</h1><p>Try again later.</p></main>`);
+    const r = isPostUnavailable(root, "new");
+    expect(r.unavailable).toBe(true);
+    expect(r.reason).toBe("post-absent");
+    expect(r.positive).toBeFalsy();
+  });
+
+  it("new Reddit: a typographic (curly) apostrophe in the removal banner still matches", () => {
+    const root = mount(
+      `<main><shreddit-post id="t3_x"><div slot="text-body"><div class="md">This post was removed by Reddit’s filters.</div></div></shreddit-post></main>`,
+    );
+    expect(isPostUnavailable(root, "new").unavailable).toBe(true);
+  });
+
+  it("old Reddit: .thing.link.deleted ⇒ unavailable", () => {
+    const root = mount(`<div class="thing link deleted" data-fullname="t3_dead"><a class="title">[deleted]</a></div>`);
+    const r = isPostUnavailable(root, "old");
+    expect(r.unavailable).toBe(true);
+    expect(r.reason).toBe("thing-deleted");
+    expect(r.positive).toBe(true); // structural class ⇒ durable skip allowed
+  });
+
+  it("REGRESSION: old Reddit age-gate interstitial (no .thing, no removal phrase) is post-absent and NOT positive", () => {
+    // The over-18 interstitial renders no `.thing` while the content script runs
+    // fine. It must not be treated as confirmed removal — a durable skip here
+    // would permanently discard an approved reply to a healthy NSFW-gated thread.
+    const root = mount(
+      `<div class="content"><h1>You must be 18+ to view this community</h1>
+       <button>Yes, I am over eighteen</button><button>No, I am not</button></div>`,
+    );
+    const r = isPostUnavailable(root, "old");
+    expect(r.unavailable).toBe(true);
+    expect(r.reason).toBe("post-absent");
+    expect(r.positive).toBeFalsy();
+  });
+
+  it("old Reddit: a healthy post ⇒ available", () => {
+    const root = mount(OLD_POST);
+    expect(isPostUnavailable(root, "old").unavailable).toBe(false);
+  });
+
+  it("old Reddit: a [removed] post body ⇒ unavailable", () => {
+    const root = mount(`
+      <div class="thing link" data-fullname="t3_r" data-permalink="/r/x/comments/r/y/">
+        <a class="title">A removed selfpost</a>
+        <div class="entry"><div class="usertext-body"><div class="md">[removed]</div></div></div>
+      </div>`);
+    const r = isPostUnavailable(root, "old");
+    expect(r.unavailable).toBe(true);
+    expect(r.positive).toBe(true); // whole-field marker ⇒ durable skip allowed
+  });
+
+  it("FALSE-POSITIVE guard: a post BODY merely QUOTING '[removed]'/'[deleted]' does NOT trip (new Reddit)", () => {
+    // The bracket tokens are whole-field markers; as substrings they'd let a
+    // healthy meta-post about deletion feed the DURABLE markSkipped path.
+    const root = mount(
+      `<shreddit-post id="t3_meta" permalink="/r/x/comments/meta/y/">
+        <h1 slot="title">Why do I see [deleted] and [removed] all over old threads?</h1>
+        <div slot="text-body"><div class="md">Half the comments just say [removed]. Is that mods or the user?</div></div>
+      </shreddit-post>` + NEW_COMMENTS,
+    );
+    expect(isPostUnavailable(root, "new").unavailable).toBe(false);
+  });
+
+  it("FALSE-POSITIVE guard: an old-Reddit TITLE containing '[deleted]' as a substring does NOT trip", () => {
+    const root = mount(`
+      <div class="thing link" data-fullname="t3_q" data-permalink="/r/x/comments/q/y/">
+        <a class="title">TIL what [deleted] actually means on reddit</a>
+        <div class="entry"><div class="usertext-body"><div class="md">Genuinely curious about the difference.</div></div></div>
+      </div>`);
+    expect(isPostUnavailable(root, "old").unavailable).toBe(false);
+  });
+});
+
+describe("isCommentsUnavailable (locked thread / archived post skip gate)", () => {
+  it("new Reddit: the shreddit-post `locked` boolean attribute ⇒ blocked (comments-locked)", () => {
+    // Boolean attribute: present with an EMPTY value means locked.
+    const root = mount(`<shreddit-post id="t3_l" locked permalink="/r/x/comments/l/y/"><h1 slot="title">t</h1></shreddit-post>`);
+    const r = isCommentsUnavailable(root, "new");
+    expect(r.blocked).toBe(true);
+    expect(r.reason).toBe("comments-locked");
+  });
+
+  it("new Reddit: the shreddit-post `archived` attribute ⇒ blocked (post-archived)", () => {
+    const root = mount(`<shreddit-post id="t3_a" archived="" permalink="/r/x/comments/a/y/"><h1 slot="title">t</h1></shreddit-post>`);
+    const r = isCommentsUnavailable(root, "new");
+    expect(r.blocked).toBe(true);
+    expect(r.reason).toBe("post-archived");
+  });
+
+  it("new Reddit: locked=\"false\" is an explicit negation ⇒ NOT blocked", () => {
+    const root = mount(`<shreddit-post id="t3_f" locked="false"><h1 slot="title">t</h1></shreddit-post>`);
+    expect(isCommentsUnavailable(root, "new").blocked).toBe(false);
+  });
+
+  it("new Reddit: a lock banner in alert chrome (no attribute) ⇒ blocked (comments-locked)", () => {
+    const root = mount(
+      `<shreddit-post id="t3_b"><h1 slot="title">t</h1></shreddit-post>
+       <div role="alert">Locked post. New comments cannot be posted.</div>`,
+    );
+    const r = isCommentsUnavailable(root, "new");
+    expect(r.blocked).toBe(true);
+    expect(r.reason).toBe("comments-locked");
+  });
+
+  it("new Reddit: an archived banner wins the archived-specific reason", () => {
+    const root = mount(
+      `<shreddit-post id="t3_c"><h1 slot="title">t</h1></shreddit-post>
