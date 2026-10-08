@@ -398,3 +398,201 @@ function DraftEditor({
       else router.refresh();
     });
   }
+
+  const saveHook = () => { if (hook !== (draft.draft_hook ?? "")) save({ hook: hook || null }); };
+  const saveBody = () => { if (body !== (draft.final_body ?? draft.body)) save({ body }); };
+  function dismiss() {
+    setMsg(null);
+    start(async () => {
+      const res = await dismissPost({ orgSlug, id: draft.id, target: "draft" });
+      if (!res.ok) setMsg(res.error.message);
+      else router.refresh();
+    });
+  }
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(body);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setMsg("Couldn't copy — select and copy by hand.");
+    }
+  }
+
+  return (
+    <div className="draft-editor">
+      <div className="draft-editor__head">
+        <span className="draft-editor__vname" style={{ color: meta.accent }}>{meta.label}</span>
+        <span className={over ? "mono draft-editor__count is-over" : "mono draft-editor__count"}>{counterLabel}</span>
+        {draft.quality_passed != null && (
+          <span className={`mono${draft.quality_passed ? "" : " idea-quality--fail"}`}>
+            {draft.quality_passed ? "✓ verified" : "⚠ review"}
+          </span>
+        )}
+      </div>
+
+      <p className="draft-editor__title serif">{ideaTitle} <span className="draft-editor__title-plat">({meta.label})</span></p>
+
+      <label className="field">
+        <span className="field__label">Hook</span>
+        <input
+          className="input field__input"
+          value={hook}
+          placeholder="Opening line that grabs attention"
+          onChange={(e) => setHook(e.target.value)}
+          onBlur={saveHook}
+        />
+      </label>
+
+      <div className="field">
+        <div className="field__labelrow">
+          <span className="field__label">Content</span>
+          <button type="button" className="btn btn-ghost btn-xs" onClick={copy}>
+            {copied ? "Copied ✓" : "Copy"}
+          </button>
+        </div>
+        <textarea
+          className="post-draft-body input"
+          value={body}
+          onChange={(e) => setBody(e.target.value)}
+          onBlur={saveBody}
+          rows={Math.min(18, Math.max(6, Math.ceil(body.length / 50)))}
+          aria-label={`${meta.label} content`}
+        />
+      </div>
+
+      <DraftMedia
+        orgSlug={orgSlug}
+        draftId={draft.id}
+        media={media}
+        platform={meta.label}
+      />
+
+      {msg && <span className="ideas-msg mono">{msg}</span>}
+
+      <div className="draft-editor__foot">
+        {pending && <span className="mono draft-editor__saving">saving…</span>}
+        <button className="btn btn-ghost btn-sm" onClick={dismiss} disabled={pending}>
+          Dismiss
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Per-post media: attach an image (any platform) or a video (the "LinkedIn
+// video"). Uploads bind to THIS draft (content_media.draft_id) so each variant
+// carries its own asset; nothing auto-publishes.
+async function fileToBase64(file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  return btoa(binary);
+}
+
+function DraftMedia({
+  orgSlug,
+  draftId,
+  media,
+  platform,
+}: {
+  orgSlug: string;
+  draftId: string;
+  media: ContentMediaRow[];
+  platform: string;
+}) {
+  const [pending, start] = useTransition();
+  const [msg, setMsg] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const router = useRouter();
+
+  function onPick(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setMsg(null);
+    if (file.size > MAX_MEDIA_BYTES) {
+      setMsg("That file is too large (max ~11MB).");
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+    const kind = file.type.startsWith("video") ? "video" : file.type.startsWith("image") ? "image" : "other";
+    start(async () => {
+      try {
+        const dataBase64 = await fileToBase64(file);
+        const res = await uploadMedia({
+          orgSlug,
+          kind,
+          mimeType: file.type || "application/octet-stream",
+          dataBase64,
+          filename: file.name,
+          draftId,
+        });
+        if (!res.ok) setMsg(`Couldn't upload: ${res.error.message}`);
+        else router.refresh();
+      } catch {
+        setMsg("Couldn't read that file.");
+      }
+      if (inputRef.current) inputRef.current.value = "";
+    });
+  }
+
+  function remove(id: string) {
+    setMsg(null);
+    start(async () => {
+      const res = await deleteMedia({ orgSlug, id });
+      if (!res.ok) setMsg(`Couldn't remove: ${res.error.message}`);
+      else router.refresh();
+    });
+  }
+
+  return (
+    <div className="field">
+      <div className="field__labelrow">
+        <span className="field__label">Media</span>
+        <label className="btn btn-ghost btn-xs draft-media__add">
+          {pending ? "…" : media.length ? "+ Add" : "+ Image / video"}
+          <input
+            ref={inputRef}
+            type="file"
+            accept="image/*,video/*"
+            onChange={onPick}
+            disabled={pending}
+            hidden
+          />
+        </label>
+      </div>
+      {media.length > 0 ? (
+        <ul className="draft-media">
+          {media.map((m) => (
+            <li key={m.id} className="draft-media__item">
+              {m.kind === "video" && m.url ? (
+                <video src={m.url} controls className="draft-media__preview" />
+              ) : m.url ? (
+                // Raw <img>: m.url is operator-attached media on an arbitrary host.
+                <img src={m.url} alt={m.caption ?? "attached media"} className="draft-media__preview" />
+              ) : (
+                <span className="draft-media__missing mono">no preview</span>
+              )}
+              <button
+                type="button"
+                className="draft-media__del"
+                onClick={() => remove(m.id)}
+                disabled={pending}
+                title="Remove this media"
+                aria-label="Remove media"
+              >
+                ✕
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="draft-media__hint">
+          Attach an image{platform === "LinkedIn" ? " or the video for this post" : ""}. Draft-only — you post by hand.
+        </p>
+      )}
+      {msg && <span className="ideas-msg mono">{msg}</span>}
+    </div>
+  );
+}
