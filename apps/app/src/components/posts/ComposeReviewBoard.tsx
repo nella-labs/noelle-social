@@ -198,3 +198,9 @@ function ReplacingCard({ laneColor }: { laneColor: string }) {
         boxShadow: `0 0 0 1px color-mix(in oklch, ${laneColor} 30%, var(--rule))`,
         background: `color-mix(in oklch, ${laneColor} 4%, var(--paper-2))`,
       }}
+    >
+      <span style={{ width: 9, height: 9, borderRadius: "50%", background: laneColor, opacity: 0.7 }} />
+      <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--ink-muted)" }}>finding a fresh angle…</span>
+    </div>
+  );
+}

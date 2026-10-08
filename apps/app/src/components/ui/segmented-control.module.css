@@ -1,0 +1,6 @@
+.control { display: inline-flex; align-items: center; gap: 3px; flex-wrap: wrap; padding: 4px; border: 1px solid var(--rule); border-radius: 100px; background: var(--paper-2); }
+.control button { padding: 8px 12px; min-height: 32px; border: 0; border-radius: 100px; font-family: var(--body); font-size: 11px; line-height: 1.4; color: var(--ink-muted); background: transparent; cursor: pointer; }
+.control button:hover { color: var(--ink); }
+.control .active, .control .active:hover { color: var(--paper); background: var(--ink); }
+.control button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 480px) { .control { border-radius: 18px; } }
