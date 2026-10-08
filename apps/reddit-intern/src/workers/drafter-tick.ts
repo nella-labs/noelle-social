@@ -998,3 +998,203 @@ async function draftSubstantial(args: DraftCommonArgs & { tier: "T1" | "T2" | "T
     }
   }
   await postOutbound(outbound);
+  await markStatus({ leadId: lead.id, status: "drafted", meta: { ...draftsData.writer, tier, reply_kind: "substantial" } });
+  return true;
+}
+
+/**
+ * LIGHT draft: ONE short, warm, specific supportive comment (kind='reply').
+ * Returns true when a draft was posted.
+ */
+async function draftLight(args: DraftCommonArgs): Promise<boolean> {
+  const { lead, postText, payload, anchors, knowledgeAnchors, imageCaption, brand, instance, routing, runner, postOutbound, markStatus, log, verify, registerBlock, shapeBlock, genzBlock, openingMoveBlock, energyHint, siblingBlock, priorReplies, recentPhrasings, fenceUntrusted, commentTarget, patternRules } = args;
+  const prompt = renderLightPrompt({
+    postText,
+    postTitle: (payload.title ?? "").trim() || null,
+    authorName: lead.author_handle,
+    subreddit: payload.subreddit ?? null,
+    knowledgeAnchors,
+    imageCaption,
+    topComments: payload.topComments,
+    commentTarget,
+    fenceUntrusted,
+    registerBlock,
+    shapeBlock,
+    genzBlock,
+    openingMoveBlock,
+    ...(energyHint ? { energyHint } : {}),
+    ...(siblingBlock ? { siblingBlock } : {}),
+    priorReplies,
+    recentPhrasings,
+  });
+  const draftArgs = {
+    bucket: "drafter-codex",
+    routing,
+    orgId: instance.org_id,
+    instanceId: instance.id,
+    worker: "drafter" as const,
+    agentRole: "reddit_intern" as const,
+    system: buildLightDrafterSystem(instance.objective, brand, patternRules),
+  };
+  const res = await runner.draft({ ...draftArgs, prompt });
+  const parsed = LightOutput.safeParse(safeJsonParse(res.text));
+  if (!parsed.success) {
+    log.error({ leadId: lead.id, raw: res.text.slice(0, 200) }, "light drafter output schema fail");
+    await markStatus({ leadId: lead.id, status: "errored", meta: { error: "schema" } });
+    return false;
+  }
+  if ("skip" in parsed.data) {
+    log.info({ leadId: lead.id, skip_reason: parsed.data.skip }, "light drafter skipped lead");
+    await markStatus({
+      leadId: lead.id,
+      status: "skipped",
+      meta: { skip_reason: parsed.data.skip, engine: res.engine, model: res.model },
+    });
+    return false;
+  }
+
+  const prepare = (data: typeof parsed.data) => ({
+    drafts: applyReplyEmojiPolicy(data.drafts.slice(0, 1).map((draft) => ({
+      ...draft, body: stripEmDashes(draft.body),
+      angle: draft.angle === "supportive" ? "empathetic" as const : draft.angle,
+    })), postText),
+  });
+  let draftsData = { ...prepare(parsed.data), writer: { engine: res.engine, model: res.model } };
+  if (!draftsData.drafts.length) {
+    await markStatus({ leadId: lead.id, status: "skipped", meta: { reason: "empty-after-emoji-policy" } });
+    return false;
+  }
+  let verifierMeta: OutboundIn["verifierMeta"] = null;
+  let reviewContext: OutboundIn["drafts"][number]["reviewContext"];
+  if (verify?.enabled) {
+    const ctx: VerifyContext = {
+      platform: "reddit",
+      ...replyReviewSource(args),
+      voiceAnchors: anchors.map((a) => a.snippet),
+      knowledgeAnchors,
+      personProfile: null,
+      // LIGHT replies ARE a warm reaction to a win — don't hard-zero the
+      // celebration closers; they're the intended content here, not slop.
+      allowCelebration: true,
+      ...(priorReplies?.length ? { priorRepliesToPerson: priorReplies } : {}),
+      ...(recentPhrasings?.length ? { recentReplies: recentPhrasings } : {}),
+      // Learned anti-pattern rules (same enforcement as the substantial path).
+      ...(patternRules.length ? { dynamicBannedPatterns: patternRules } : {}),
+    };
+    reviewContext = OutboundFactualContextSchema.parse({ version: 1, ...ctx });
+    const calls = verify.makeCalls(lead.priority ?? false);
+    const toDrafts = (d: typeof draftsData): DraftToVerify[] =>
+      d.drafts.map((x) => ({ kind: "reply" as const, angle: x.angle, body: x.body }));
+    const { best, meta } = await runVerifyLoop({
+      initial: draftsData,
+      toDrafts,
+      regenerate: async (fixPrompt) => {
+        const r = await runner.draft({ ...draftArgs, prompt: fixPrompt });
+        const p = LightOutput.safeParse(safeJsonParse(r.text));
+        if (!p.success || "skip" in p.data) return null;
+        const candidate = prepare(p.data);
+        return candidate.drafts.length ? { ...candidate, writer: { engine: r.engine, model: r.model } } : null;
+      },
+      basePrompt: prompt,
+      ctx,
+      calls,
+      retries: verify.retries,
+      leadId: lead.id,
+      log,
+    });
+    draftsData = best;
+    verifierMeta = meta;
+  }
+
+  if (verifierMeta && verify?.voiceFloor && verifierMeta.scores.voice < verify.voiceFloor) {
+    log.info(
+      { leadId: lead.id, voice: verifierMeta.scores.voice, floor: verify.voiceFloor },
+      "light draft below voice floor; skipping instead of serving a generic comment",
+    );
+    await markStatus({
+      leadId: lead.id,
+      status: "skipped",
+      meta: { skip_reason: "low-voice", voice: verifierMeta.scores.voice, model: draftsData.writer.model },
+    });
+    return false;
+  }
+
+  // Exactly one normalized comment was selected before review.
+  const first = draftsData.drafts[0]!;
+  if (makesCommitment(first.body)) {
+    const reason = commitmentReason(detectCommitments(first.body)) || "commitment-guard";
+    log.warn({ leadId: lead.id, reason }, "commitment guard dropped a light reply");
+    await markStatus({ leadId: lead.id, status: "skipped", meta: { skip_reason: reason } });
+    return false;
+  }
+  const angle = first.angle;
+  const replyRow = {
+    id: randomUUID(),
+    kind: "reply" as const,
+    angle: angle as "empathetic" | "technical" | "contrarian" | null,
+    body: first.body,
+    charCount: first.char_count ?? [...first.body].length,
+  };
+  const outbound = buildOutbound({ lead, postText, payload, anchors, drafts: [replyRow], verifierMeta, commentTarget });
+  if (!outbound) {
+    // Every draft cleaned to empty. Skip with an ACCURATE reason rather than
+    // handing an empty set to a schema that requires min(1).
+    log.warn({ leadId: lead.id }, "every draft cleaned to empty; skipping the lead");
+    await markStatus({ leadId: lead.id, status: "skipped", meta: { reason: "empty-after-emoji-policy" } });
+    return false;
+  }
+  if (reviewContext) {
+    for (const draft of outbound.drafts) draft.reviewContext = reviewContext;
+  }
+  await postOutbound(outbound);
+  await markStatus({ leadId: lead.id, status: "drafted", meta: { ...draftsData.writer, reply_kind: "light" } });
+  return true;
+}
+
+/**
+ * Build the OutboundIn payload. CRITICAL INVARIANT: there is NO `autoSend` field
+ * — Orion is draft-only and never auto-sends. The field is omitted entirely.
+ */
+function buildOutbound(args: {
+  lead: LeadRow;
+  postText: string;
+  payload: RedditPayload;
+  anchors: Array<{ snippet: string; score: number }>;
+  drafts: Array<{ id: string; kind: "reply" | "dm"; angle: "empathetic" | "technical" | "contrarian" | null; body: string; charCount: number }>;
+  verifierMeta?: OutboundIn["verifierMeta"];
+  /** When set, every draft targets this comment (replyTarget.kind='comment'). */
+  commentTarget?: RedditTopComment | null;
+}): OutboundIn | null {
+  const { lead, postText, payload, anchors, drafts, verifierMeta, commentTarget } = args;
+  // Comment targeting: when a top comment was chosen, each draft replies UNDER
+  // that comment (the actuator opens its permalink). Absent ⇒ reply to the post
+  // (the default; replyTarget omitted). commentId has the t1_ prefix already stripped.
+  const replyTarget = commentTarget
+    ? {
+        kind: "comment" as const,
+        commentId: commentTarget.id,
+        permalink: commentTarget.permalink,
+        author: commentTarget.author,
+      }
+    : undefined;
+  // Hard deterministic backstop: strip em dashes (a top AI tell the prompt can't
+  // fully guarantee) AND any emoji outside the allowlist, then recompute char_count
+  // off the cleaned body so the inbox count matches what ships. Mirrors the X drafter.
+  const cleanedDrafts = applyReplyEmojiPolicy(
+    drafts.map((d) => ({ ...d, body: stripEmDashes(d.body) })),
+    postText,
+  ).map((d) => ({
+    ...d,
+    charCount: [...d.body].length,
+    ...(replyTarget ? { replyTarget } : {}),
+  }));
+  // NULL, not an empty drafts array: OutboundInSchema requires min(1), so an
+  // empty set throws in postOutbound. Callers skip on null instead.
+  if (cleanedDrafts.length === 0) return null;
+  return {
+    leadId: lead.external_id,
+    batchNumber: null,
+    platform: "reddit",
+    authorHandle: lead.author_handle,
+    authorId: lead.author_id ?? "0",
+    authorFollowers: null,
