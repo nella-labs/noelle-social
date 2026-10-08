@@ -198,3 +198,203 @@ describe("content locators", () => {
       stubRect(50, 60); // non-zero → visible
       const res = diagnoseCommentSubmit(document.body);
       expect(res.ok).toBe(true);
+      expect(res.observed).toMatchObject({ box: true, wf: 1, en: 1, vis: 1 });
+    });
+
+    it("a zero-rect enabled submit reports en=1,vis=0 (the layout-race bucket)", () => {
+      document.body.innerHTML = fx("comment-box-2026.html");
+      stubRect(0, 0, 0, 0); // every rect zero
+      const res = diagnoseCommentSubmit(document.body);
+      expect(res.observed).toMatchObject({ en: 1, vis: 0 });
+      expect(res.observed?.top).toBe("Comment_zr");
+    });
+  });
+
+  describe("readCommentBox (post-submit verification)", () => {
+    it("reports a populated box as NOT posted (text still sitting there)", () => {
+      document.body.innerHTML =
+        "<div role='textbox' contenteditable='true'>my reply that never landed</div>";
+      const res = readCommentBox(document.body);
+      expect(res.ok).toBe(true);
+      expect(res.observed).toMatchObject({ present: true, empty: false });
+    });
+
+    it("reports an emptied box as posted (LinkedIn cleared the composer)", () => {
+      document.body.innerHTML = "<div role='textbox' contenteditable='true'></div>";
+      const res = readCommentBox(document.body);
+      expect(res.observed).toMatchObject({ present: true, empty: true });
+    });
+
+    it("treats zero-width-space-only content as empty (posted)", () => {
+      document.body.innerHTML = `<div role='textbox' contenteditable='true'>${'\u200B'}</div>`;
+      expect(readCommentBox(document.body).observed).toMatchObject({ empty: true });
+    });
+
+    it("reports a vanished composer as posted (present:false)", () => {
+      document.body.innerHTML = "<div>composer gone after posting</div>";
+      const res = readCommentBox(document.body);
+      expect(res.ok).toBe(true);
+      expect(res.observed).toMatchObject({ present: false, empty: true });
+    });
+  });
+
+  it.each(["like", "celebrate", "support"])("retains an existing %s post reaction", (state) => {
+    document.body.innerHTML = `<main><button aria-label="Reaction button state: ${state}">Like</button></main>`;
+    stubRect(20, 30);
+    expect(locatePostLike(document.body)).toMatchObject({ ok: false, skipReason: "already-liked" });
+  });
+  it("locates the current unreacted post button", () => {
+    document.body.innerHTML = '<main><button aria-label="Reaction button state: no reaction">Like</button></main>';
+    stubRect(20, 30);
+    expect(locatePostLike(document.body)).toMatchObject({ ok: true, x: 40, y: 40 });
+  });
+
+  it("detectChallenge true on a real captcha vendor iframe", () => {
+    document.body.innerHTML = "<iframe src='https://client-api.arkoselabs.com/v2/enforcement'></iframe>";
+    expect(detectChallenge(document.body)).toBe(true);
+  });
+
+  it("detectChallenge false on ordinary content mentioning a 'security check'", () => {
+    document.body.innerHTML = "<div>please verify your identity for this security check</div>";
+    expect(detectChallenge(document.body)).toBe(false);
+  });
+
+  it("locateMessageCompose returns coords + rect when DM compose box is present", () => {
+    document.body.innerHTML = fx("dm-compose.html");
+    stubRect(20, 30);
+    const res = locateMessageCompose(document.body);
+    expect(res.ok).toBe(true);
+    expect(res.x).toBe(40); // 20 + 40/2
+    expect(res.y).toBe(40); // 30 + 20/2
+    expect(res.rect).toEqual({ x: 20, y: 30, width: 40, height: 20 });
+  });
+
+  it("locateMessageSend returns selector-not-found when msg-form absent", () => {
+    document.body.innerHTML = "<div>no form here</div>";
+    const res = locateMessageSend(document.body);
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("selector-not-found");
+  });
+
+  // `.msg-form` matches the messaging overlay that persists on EVERY LinkedIn
+  // page, including while minimised, where it measures 0x0. Without this guard
+  // rectFrom synthesizes a 4x4 box around {0,0} and the trusted click lands in
+  // the viewport corner — on LinkedIn's global nav, not a composer. That click
+  // now fires on every navigation, so the guard is what keeps the clear safe.
+  it("locateMessageCompose refuses a zero-rect (hidden) overlay instead of returning a corner click", () => {
+    document.body.innerHTML = fx("dm-compose.html");
+    stubRect(0, 0, 0, 0);
+    const res = locateMessageCompose(document.body);
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("compose-zero-rect");
+  });
+
+  it("locateMessageSend refuses a zero-rect Send for the same reason", () => {
+    document.body.innerHTML = fx("dm-compose.html");
+    stubRect(0, 0, 0, 0);
+    const res = locateMessageSend(document.body);
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("send-zero-rect");
+  });
+
+  it("readMessageCompose reports an absent composer as present:false", () => {
+    document.body.innerHTML = "<div>no form here</div>";
+    const res = readMessageCompose(document.body);
+    expect(res.ok).toBe(true);
+    expect(res.observed?.present).toBe(false);
+    expect(res.observed?.empty).toBe(true);
+  });
+
+  // The whole point of the read: an operator's half-typed DM must register as
+  // NON-empty, so runClearComposer's emptiness-first check is what decides
+  // whether the box is touched at all.
+  it("readMessageCompose distinguishes an empty box from one holding text", () => {
+    document.body.innerHTML = fx("dm-compose.html");
+    const box = document.querySelector<HTMLElement>(".msg-form [contenteditable='true']")!;
+    box.textContent = "";
+    expect(readMessageCompose(document.body).observed?.empty).toBe(true);
+    box.textContent = "half-typed message";
+    const dirty = readMessageCompose(document.body);
+    expect(dirty.observed?.present).toBe(true);
+    expect(dirty.observed?.empty).toBe(false);
+  });
+
+  // The rich editor leaves a zero-width space behind after a clear; an otherwise
+  // cleared box must still read empty or the clear loop would never converge.
+  it("readMessageCompose treats a zero-width leftover as empty", () => {
+    document.body.innerHTML = fx("dm-compose.html");
+    const box = document.querySelector<HTMLElement>(".msg-form [contenteditable='true']")!;
+    box.textContent = "​﻿";
+    expect(readMessageCompose(document.body).observed?.empty).toBe(true);
+  });
+});
+
+describe("ambient read-action locators", () => {
+  it("locateAmbientExpand finds a truncated post's see-more toggle + hints", () => {
+    document.body.innerHTML = fx("long-post.html");
+    stubRect(100, 200);
+    const res = locateAmbientExpand(document.body, makeRng(1));
+    expect(res.ok).toBe(true);
+    expect(res.rect).toEqual({ x: 100, y: 200, width: 40, height: 20 });
+    expect(res.observed?.activity_urn).toBe("urn:li:activity:7300000000000001111");
+    expect(typeof res.observed?.wordCount).toBe("number");
+  });
+
+  it("locateAmbientExpand skips when nothing is truncated", () => {
+    document.body.innerHTML = fx("feed-post.html");
+    const res = locateAmbientExpand(document.body, makeRng(1));
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("no-truncated-post");
+  });
+
+  it("locateAmbientComments finds the comments toggle on a post with a discussion", () => {
+    document.body.innerHTML = fx("commented-post.html");
+    stubRect(60, 90);
+    const res = locateAmbientComments(document.body, makeRng(2));
+    expect(res.ok).toBe(true);
+    expect(res.x).toBe(80); // 60 + 40/2
+    expect(res.observed?.activity_urn).toBe("urn:li:activity:7300000000000002222");
+  });
+
+  it("locateAmbientComments falls back to the action-bar Comment on a plain post", () => {
+    document.body.innerHTML = fx("feed-post.html");
+    stubRect(10, 20);
+    const res = locateAmbientComments(document.body, makeRng(3));
+    expect(res.ok).toBe(true); // feed-post exposes an action-bar Comment button
+  });
+
+  it("locateAmbientComments skips when no post exposes comments", () => {
+    document.body.innerHTML = "<div>nope</div>";
+    const res = locateAmbientComments(document.body, makeRng(4));
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("no-commentable-post");
+  });
+});
+
+describe("locateReaction (varied reactions from the open flyout)", () => {
+  it("returns the requested reaction's rect + observed.reaction", () => {
+    document.body.innerHTML = fx("reaction-menu.html");
+    stubRect(300, 150);
+    const res = locateReaction(document.body, "PRAISE");
+    expect(res.ok).toBe(true);
+    expect(res.rect).toEqual({ x: 300, y: 150, width: 40, height: 20 });
+    expect(res.observed?.reaction).toBe("PRAISE");
+  });
+
+  it("resolves Support (EMPATHY) too", () => {
+    document.body.innerHTML = fx("reaction-menu.html");
+    stubRect(340, 150);
+    expect(locateReaction(document.body, "EMPATHY").ok).toBe(true);
+  });
+
+  it("skips (so the caller falls back to a plain like) when the flyout isn't open", () => {
+    document.body.innerHTML = fx("feed-post.html");
+    const res = locateReaction(document.body, "PRAISE");
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("reaction-not-found(PRAISE)");
+  });
+});
+
+describe("locatePostLike (reply-also-likes)", () => {
+  it("locates the post's like button on the open post page", () => {
+    document.body.innerHTML = fx("feed-post.html"); // has an unliked React Like button
