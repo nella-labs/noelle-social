@@ -1198,3 +1198,132 @@ function newPostUnavailable(root: ParentNode): PostAvailability {
     probe += " " + ((main?.textContent ?? root.textContent) ?? "").slice(0, 4000);
   }
   const reason = matchRemovalPhrase(probe);
+  if (reason) return { unavailable: true, reason, positive: true };
+
+  // No post shell after load and NO removal phrase ⇒ could be a real 404, but
+  // could just as well be a transient error interstitial ("something went
+  // wrong", 5xx, CDN error) that self-heals — NOT positive removal evidence.
+  if (!post) return { unavailable: true, reason: "post-absent" };
+
+  return { unavailable: false };
+}
+
+function oldPostUnavailable(root: ParentNode): PostAvailability {
+  if (root.querySelector(".thing.link.deleted")) return { unavailable: true, reason: "thing-deleted", positive: true };
+
+  const post = findPost(root, "old"); // .thing.link
+  if (!post) {
+    // No `.thing` — a 404/error page, but ALSO an age-gate or transient error
+    // interstitial. Only a matched removal phrase is positive evidence; a bare
+    // absent thing (no phrase) is `post-absent` — never positive.
+    const reason = matchRemovalPhrase(root.textContent ?? "");
+    return reason ? { unavailable: true, reason, positive: true } : { unavailable: true, reason: "post-absent" };
+  }
+  // An explicit error region on a page that still has a thing.
+  const err = root.querySelector(".error");
+  if (err) {
+    const reason = matchRemovalPhrase(err.textContent ?? "");
+    if (reason) return { unavailable: true, reason, positive: true };
+  }
+  // Post present: only the post's OWN title/body may signal removal (never the
+  // comment area), so a deleted comment can't false-trip. "[removed]"/"[deleted]"
+  // count only as the WHOLE field (bracketToken), never as a quoted substring.
+  const title = postTitle(post, "old");
+  const body = postBody(post, "old");
+  const tok = bracketToken(title) ?? bracketToken(body);
+  if (tok) return { unavailable: true, reason: tok, positive: true };
+  const reason = matchRemovalPhrase(title + " " + body);
+  if (reason) return { unavailable: true, reason, positive: true };
+
+  return { unavailable: false };
+}
+
+// ── Comments availability (locked thread / archived post skip gate) ───────────
+
+export interface CommentsAvailability {
+  /** True when the thread can NEVER accept a reply from this account (locked/archived). */
+  blocked: boolean;
+  /** The cause, for the skip reason — logged so the dashboard shows WHY a draft vanished. */
+  reason?: "comments-locked" | "post-archived";
+}
+
+// A boolean-style flag attribute on the shreddit-post shell. Distinct from
+// newPostRemovedAttr (which requires a non-empty value) because Reddit sets
+// `locked`/`archived` as HTML boolean attributes — present with an EMPTY value
+// means true; only an explicit "false" negates.
+function newPostFlagAttr(post: Element, name: string): boolean {
+  const v = post.getAttribute(name);
+  return v !== null && v.trim().toLowerCase() !== "false";
+}
+
+// Lock/archive banner phrases (tested against alert/infobar chrome ONLY — see
+// bannerText below — so a post or comment merely QUOTING them can't false-trip).
+// Archived is probed before locked because the shared "new comments cannot be
+// posted" line appears in both banners; the archived-specific wording wins when
+// present, and the generic line alone is attributed to a lock (the common case).
+const ARCHIVED_RES = [
+  /archived (?:post|thread)/i,
+  /(?:post|thread) (?:has been|is|was) archived/i,
+] as const;
+const LOCKED_RES = [
+  /comments are locked/i,
+  /locked post/i,
+  /(?:post|thread) (?:has been|is|was) locked/i,
+  /locked by the moderators/i,
+  /new comments cannot be posted/i,
+  /you won'?t be able to (?:vote or )?comment/i,
+] as const;
+
+// The text of the page's alert/banner/infobar chrome. Reddit renders the
+// locked/archived notice in banner UI ([role=alert]/[role=status] on new Reddit,
+// the `.infobar` on old Reddit) — regions user content can never produce (user
+// markdown renders as plain p/li/code, never a role or an infobar class). Scoping
+// the phrase scan here is what makes a post that merely quotes "comments are
+// locked" safe (mirrors detectChallenge's alert-region scoping).
+function bannerText(root: ParentNode): string {
+  const nodes = Array.from(
+    root.querySelectorAll('[role="alert"], [role="status"], faceplate-banner, .infobar, .locked-infobar, .archived-infobar'),
+  );
+  return nodes.map((n) => n.textContent ?? "").join(" ");
+}
+
+/** The lock/archive cause named by the banner text, or null. Archived-specific first. */
+function matchBlockedPhrase(probe: string): CommentsAvailability["reason"] | null {
+  const t = normalizeText(probe);
+  for (const re of ARCHIVED_RES) if (re.test(t)) return "post-archived";
+  for (const re of LOCKED_RES) if (re.test(t)) return "comments-locked";
+  return null;
+}
+
+/**
+ * Are the target thread's comments UNAVAILABLE (locked by moderators, or the
+ * post archived) — i.e. must the actuator SKIP the reply without composing? The
+ * post itself renders fine (isPostUnavailable stays false), but no composer will
+ * ever appear — without this gate the reply attempt dies in `box-not-found` and
+ * the tick loop re-serves the same dead permalink forever.
+ *
+ * READ-ONLY, page-content-as-DATA. STRUCTURAL signals win (attribute/class set
+ * by Reddit, unreachable from user content), so the logged reason is cause-
+ * specific; the phrase fallback reads ONLY banner/alert/infobar chrome — never a
+ * post body or the comment tree — so a post quoting the banner can't false-trip
+ * (a false positive here silently drops an approved reply).
+ *
+ * New Reddit: the shreddit-post `locked`/`archived` boolean attributes, then the
+ * banner phrases. Old Reddit: the `.thing.link.locked`/`.archived` classes, then
+ * the `.infobar` phrases.
+ */
+export function isCommentsUnavailable(root: ParentNode, flavor: RedditFlavor): CommentsAvailability {
+  const post = findPost(root, flavor);
+  if (post) {
+    if (flavor === "old") {
+      if (post.classList.contains("locked")) return { blocked: true, reason: "comments-locked" };
+      if (post.classList.contains("archived")) return { blocked: true, reason: "post-archived" };
+    } else {
+      if (newPostFlagAttr(post, "locked")) return { blocked: true, reason: "comments-locked" };
+      if (newPostFlagAttr(post, "archived")) return { blocked: true, reason: "post-archived" };
+    }
+  }
+  const reason = matchBlockedPhrase(bannerText(root));
+  if (reason) return { blocked: true, reason };
+  return { blocked: false };
+}
