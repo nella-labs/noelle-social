@@ -198,3 +198,15 @@ describe.skipIf(!url)("outbound atomic tenant bundles (native PostgreSQL)", () =
     await sql`update noelle.agent_instances set status='paused'`;
     const input = payload(); delete input.owner;
     expect((await post(input)).status).toBe(200);
+  });
+
+  it("keeps a paused explicit owner eligible and an exact parallel retry idempotent", async () => {
+    await sql`update noelle.agent_instances set status='paused'`;
+    const input = payload();
+    const responses = await Promise.all(Array.from({ length: 6 }, () => post(input)));
+    expect(responses.map(r => r.status)).toEqual(Array(6).fill(200));
+    const ids = await Promise.all(responses.map(async r => (await r.json() as { approval_id: string }).approval_id));
+    expect(new Set(ids).size).toBe(1);
+    expect(await counts(sql)).toMatchObject({ leads: 1, drafts: 1, approvals: 1 });
+  });
+});

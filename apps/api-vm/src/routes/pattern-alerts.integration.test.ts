@@ -198,3 +198,16 @@ describe.skipIf(!url)("Pattern alert route current authority (native)", () => {
       expect(await response.json()).toEqual({ error: "invalid_page" });
       expect(authorized).toBe(false);
     },
+  );
+
+  it("rejects a cursor for another history view before authorization", async () => {
+    const cursor = { view: "history", createdAt: "2026-10-01T00:00:00.123456Z", id: instance };
+    expect(
+      (
+        await app.request(
+          `/api/pattern-alerts?instanceId=${instance}&cursor=${encodeURIComponent(JSON.stringify(cursor))}`,
+        )
+      ).status,
+    ).toBe(400);
+  });
+});
