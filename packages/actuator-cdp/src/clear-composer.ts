@@ -198,3 +198,9 @@ export function makeNavigateTab(d: NavigateTabDeps): (tabId: number, url: string
  * the slice — an empty body matches nothing.
  */
 export function sameDraft(boxText: string, body: string): boolean {
+  const norm = (t: string) => t.replace(/\s+/g, "").toLowerCase();
+  const a = norm(boxText);
+  const b = norm(body);
+  if (!b) return false;
+  return a.includes(b.slice(0, 40));
+}

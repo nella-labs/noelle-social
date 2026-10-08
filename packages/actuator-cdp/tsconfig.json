@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // DOM as well as ES2022: unlike @noelle/contracts this package is
+    // browser-only (it exists to talk to chrome.debugger), so the timer globals
+    // it uses for the default sleep are genuinely there at runtime.
+    "lib": ["ES2022", "DOM"],
+    "declaration": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"]
+}
