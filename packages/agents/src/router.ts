@@ -198,3 +198,89 @@ export async function routeByIntent(
 /** Distinct tags handled by ≥1 manifest on `surface`, in stable vocabulary order. */
 function collectCandidateTags(
   list: ReadonlyArray<AgentManifest>,
+  surface: CapabilitySurface,
+): CapabilityTag[] {
+  const tags = new Set<CapabilityTag>();
+  for (const m of list) {
+    const cap = m.capability;
+    if (cap === undefined || !cap.surfaces.includes(surface)) continue;
+    for (const t of cap.handles) tags.add(t);
+  }
+  return CAPABILITY_TAGS.filter((t) => tags.has(t));
+}
+
+function buildIntentClassifierMessages(
+  text: string,
+  surface: CapabilitySurface,
+  candidateTags: ReadonlyArray<CapabilityTag>,
+  list: ReadonlyArray<AgentManifest>,
+): { system: string; prompt: string } {
+  const examplesByTag = new Map<CapabilityTag, string[]>();
+  for (const m of list) {
+    const cap = m.capability;
+    if (cap === undefined || !cap.surfaces.includes(surface)) continue;
+    const examples = cap.intent_examples ?? [];
+    for (const t of cap.handles) {
+      if (!candidateTags.includes(t)) continue;
+      const arr = examplesByTag.get(t) ?? [];
+      for (const e of examples) if (!arr.includes(e)) arr.push(e);
+      examplesByTag.set(t, arr);
+    }
+  }
+  const lines = candidateTags.map((t) => {
+    const sample = (examplesByTag.get(t) ?? [])
+      .slice(0, 4)
+      .map((e) => `"${e}"`)
+      .join("; ");
+    return sample ? `- ${t} — e.g. ${sample}` : `- ${t}`;
+  });
+  const system = [
+    "You are an intent router for an AI-agent org. Map the user's request to exactly ONE capability tag from the provided list, or to \"none\" if none fit.",
+    "Rules:",
+    "- Choose ONLY from the listed tags. Never invent a tag.",
+    "- If the request does not clearly match a listed capability, answer none.",
+    'Respond ONLY with JSON: {"capability": "<tag-or-none>"}. No prose.',
+  ].join("\n");
+  const prompt = [
+    `Surface: ${surface}`,
+    "Capabilities:",
+    ...lines,
+    "",
+    `User request:\n${text}`,
+    "",
+    "Return the JSON now.",
+  ].join("\n");
+  return { system, prompt };
+}
+
+const ChosenSchema = z.object({ capability: z.string() });
+
+/** Parse the model reply; accept ONLY a tag that was actually offered. */
+function parseChosenCapability(
+  text: string,
+  candidateTags: ReadonlyArray<CapabilityTag>,
+): CapabilityTag | null {
+  const parsed = ChosenSchema.safeParse(extractJson(text));
+  if (!parsed.success) return null;
+  const raw = parsed.data.capability.trim();
+  return candidateTags.find((t) => t === raw) ?? null;
+}
+
+/** Same lenient JSON extraction plan-lanes uses (fenced ```json, or first {..}). */
+function extractJson(text: string): unknown {
+  const trimmed = text.trim().replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    const s = trimmed.indexOf("{");
+    const e = trimmed.lastIndexOf("}");
+    if (s >= 0 && e > s) {
+      try {
+        return JSON.parse(trimmed.slice(s, e + 1));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}

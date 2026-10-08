@@ -1,0 +1,31 @@
+id: video_intern
+display_name: "Video Growth Intern"
+short_description: "Studies the viral IG/TikTok creators you pick, distils what makes their videos work, and helps you plan + script your next short-form video. Draft-only — you record + post."
+icon: "video"
+default_model:
+  primary:
+    engine: bedrock
+    model: claude-sonnet-4-6
+  fallback:
+    engine: vertex
+    model: claude-sonnet-4-6
+default_bucket: drafter
+default_budget_cap_cents: 10000
+tools:
+  - nella.search
+  - leads.claim
+  - drafts.post
+hireable: true
+single_instance_per_org: false
+# Skill-to-agent routing facet (docs/agent-model.md § "Capability routing").
+# Optional + dormant: no consumer is on by default. Nova owns short-form scripts.
+capability:
+  handles:
+    - content.video.script
+  surfaces:
+    - agent_chat
+    - content
+  intent_examples:
+    - "write me a script for my next short-form video"
+    - "help me plan a TikTok / Reels video"
+    - "draft a hook and script for a video idea"
