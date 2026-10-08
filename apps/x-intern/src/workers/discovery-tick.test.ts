@@ -998,3 +998,203 @@ describe("watch-lane repoll gate (per-handle cooldown)", () => {
     const xClient = { userTweets: vi.fn().mockResolvedValue(res([tweet("1", "jane")])), searchTimeline: vi.fn().mockResolvedValue(res([])) };
     const args = { ...baseArgs(xClient, upsert), watchlist: { handles: ["jane"], keywords: [] }, repollGate: gate, watchlistOnly: true };
     await runDiscoveryTick(args);
+    await runDiscoveryTick(args);
+    expect(xClient.userTweets).toHaveBeenCalledTimes(1);
+  });
+
+  it("a pure targeting handle (not a watchlist person) is never gated", async () => {
+    const gate = createRepollGate(3600_000, () => 0);
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = { userTweets: vi.fn().mockResolvedValue(res([tweet("1", "acme")])), searchTimeline: vi.fn().mockResolvedValue(res([])) };
+    const args = { ...baseArgs(xClient, upsert), watchlist: { handles: ["acme"], keywords: [] }, watchlistPeople: [], repollGate: gate };
+    await runDiscoveryTick(args);
+    await runDiscoveryTick(args);
+    expect(xClient.userTweets).toHaveBeenCalledTimes(2);
+  });
+
+  it("gate with cooldown 0 is inert (byte-identical to no gate)", async () => {
+    const gate = createRepollGate(0, () => 0);
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = { userTweets: vi.fn().mockResolvedValue(res([tweet("1", "jane")])), searchTimeline: vi.fn().mockResolvedValue(res([])) };
+    await runDiscoveryTick({ ...baseArgs(xClient, upsert), repollGate: gate });
+    await runDiscoveryTick({ ...baseArgs(xClient, upsert), repollGate: gate });
+    expect(xClient.userTweets).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("source-ring rotation under the tick budget (sourceCursor)", () => {
+  // Regression for the #494 starvation: a budget-truncated tick restarted at the
+  // head of the fixed source list every time, so the first ~6 handles ate every
+  // tick's budget and the tail + the whole keyword lane never ran at all.
+  const log = () => ({ info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() }) as never;
+  const emptyClient = () => ({
+    userTweets: vi.fn().mockResolvedValue(res([])),
+    searchTimeline: vi.fn().mockResolvedValue(res([])),
+  });
+  const mkCursor = () => {
+    let v = 0;
+    return { get: () => v, set: (n: number) => { v = n; } };
+  };
+  // A clock that lets exactly `n` sources run under a 100ms budget: call 1 is
+  // the deadline calc (t=0), calls 2..n+1 stay at t=10 (under), the rest read
+  // t=200 (over ⇒ defer).
+  const clockFor = (n: number) => {
+    let i = 0;
+    return () => {
+      i++;
+      if (i === 1) return 0;
+      return i <= n + 1 ? 10 : 200;
+    };
+  };
+
+  it("the next tick resumes at the first budget-deferred source instead of the head", async () => {
+    const cursor = mkCursor();
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: false });
+    const xClient = emptyClient();
+    const base = {
+      instance: { id: "i", org_id: "o" } as never,
+      watchlist: { handles: ["a", "b", "c", "d"], keywords: [] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      budgetMs: 100,
+      sourceCursor: cursor,
+    };
+    await runDiscoveryTick({ ...base, log: log(), clockNow: clockFor(2) });
+    await runDiscoveryTick({ ...base, log: log(), clockNow: clockFor(2) });
+    await runDiscoveryTick({ ...base, log: log(), clockNow: clockFor(2) });
+    const polled = xClient.userTweets.mock.calls.map((c) => (c[0] as { handle: string }).handle);
+    // tick 1: a,b — tick 2 resumes: c,d — tick 3 wraps back: a,b
+    expect(polled).toEqual(["a", "b", "c", "d", "a", "b"]);
+  });
+
+  it("the keyword lane gets its turn in the ring instead of starving behind the handles", async () => {
+    const cursor = mkCursor();
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: false });
+    const xClient = emptyClient();
+    const warn2 = vi.fn();
+    const base = {
+      instance: { id: "i", org_id: "o" } as never,
+      watchlist: { handles: ["h1", "h2"], keywords: ["k1", "k2"] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      budgetMs: 100,
+      sourceCursor: cursor,
+    };
+    await runDiscoveryTick({ ...base, log: log(), clockNow: clockFor(2) });
+    await runDiscoveryTick({
+      ...base,
+      log: { info: vi.fn(), debug: vi.fn(), warn: warn2, error: vi.fn() } as never,
+      clockNow: clockFor(2),
+    });
+    // tick 1 spends its budget on the two handles; tick 2 resumes at the keywords.
+    expect(xClient.userTweets).toHaveBeenCalledTimes(2);
+    expect(xClient.searchTimeline).toHaveBeenCalledTimes(2);
+    const queries = xClient.searchTimeline.mock.calls.map((c) => (c[0] as { query: string }).query);
+    expect(queries[0]).toContain("k1");
+    expect(queries[1]).toContain("k2");
+    // tick 2's deferred tail is the two handles now sitting at the back of the ring.
+    expect(warn2).toHaveBeenCalledWith(
+      expect.objectContaining({ deferredHandles: 2, deferredKeywords: 0 }),
+      expect.stringContaining("time budget"),
+    );
+  });
+
+  it("without a cursor each tick restarts at the head (legacy behaviour)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: false });
+    const xClient = emptyClient();
+    const base = {
+      instance: { id: "i", org_id: "o" } as never,
+      watchlist: { handles: ["a", "b", "c", "d"], keywords: [] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      budgetMs: 100,
+    };
+    await runDiscoveryTick({ ...base, log: log(), clockNow: clockFor(2) });
+    await runDiscoveryTick({ ...base, log: log(), clockNow: clockFor(2) });
+    const polled = xClient.userTweets.mock.calls.map((c) => (c[0] as { handle: string }).handle);
+    expect(polled).toEqual(["a", "b", "a", "b"]);
+  });
+
+  it("a cooled-down handle advances the cursor too (visited, not deferred)", async () => {
+    // "a" is inside its repoll window ⇒ skipped for free, but it still counts as
+    // visited: the cursor advances past it (and past the three real runs), so
+    // the next tick starts at the first source the budget actually deferred.
+    const cursor = mkCursor();
+    const gate = createRepollGate(3600_000, () => 0);
+    gate.stamp("a");
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: false });
+    const xClient = emptyClient();
+    const base = {
+      instance: { id: "i", org_id: "o" } as never,
+      watchlist: { handles: [], keywords: [] },
+      watchlistPeople: [
+        { handle: "a", addedAt: "2026-01-01T00:00:00.000Z" },
+        { handle: "b", addedAt: "2026-01-02T00:00:00.000Z" },
+        { handle: "c", addedAt: "2026-01-03T00:00:00.000Z" },
+        { handle: "d", addedAt: "2026-01-04T00:00:00.000Z" },
+        { handle: "e", addedAt: "2026-01-05T00:00:00.000Z" },
+      ],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      budgetMs: 100,
+      sourceCursor: cursor,
+      repollGate: gate,
+      watchlistOnly: true,
+    };
+    await runDiscoveryTick({ ...base, log: log(), clockNow: clockFor(4) });
+    expect(xClient.userTweets.mock.calls.map((c) => (c[0] as { handle: string }).handle)).toEqual([
+      "b",
+      "c",
+      "d",
+    ]);
+    expect(cursor.get()).toBe(4); // a(cooled)+b+c+d visited; e deferred ⇒ next tick starts at e
+  });
+
+  it("a rate-starved tail is deferred, not swept: the cursor stops at the first rate-skipped source", async () => {
+    // When the RATE BUCKET (not the budget) truncates a tick, the skipped tail
+    // must be where the next tick resumes — counting rate-skips as visited
+    // wrapped the cursor back to its start and recreated head-starves-tail.
+    const cursor = mkCursor();
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: false });
+    const xClient = emptyClient();
+    const bucketFor = (n: number) => {
+      let k = 0;
+      return { tryTake: () => k++ < n };
+    };
+    const base = {
+      instance: { id: "i", org_id: "o" } as never,
+      watchlist: { handles: ["a", "b", "c", "d"], keywords: [] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      sourceCursor: cursor,
+    };
+    await runDiscoveryTick({ ...base, log: log(), rateBucket: bucketFor(2) });
+    expect(cursor.get()).toBe(2); // resumes at c, the first rate-starved source
+    await runDiscoveryTick({ ...base, log: log(), rateBucket: bucketFor(2) });
+    const polled = xClient.userTweets.mock.calls.map((c) => (c[0] as { handle: string }).handle);
+    expect(polled).toEqual(["a", "b", "c", "d"]);
+    expect(cursor.get()).toBe(0);
+  });
+
+  it("a stale cursor beyond the ring length re-normalizes (mod) and still rotates", async () => {
+    // Reachable when the ring shrinks between ticks (watchlist edits, mode
+    // shape changes): the stored value must be re-normalized, not overflow
+    // slice() into a silent head-restart.
+    const cursor = mkCursor();
+    cursor.set(7);
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: false });
+    const xClient = emptyClient();
+    await runDiscoveryTick({
+      log: log(),
+      instance: { id: "i", org_id: "o" } as never,
+      watchlist: { handles: ["a", "b", "c"], keywords: [] },
+      watchlistPeople: [],
+      xClient: xClient as never,
