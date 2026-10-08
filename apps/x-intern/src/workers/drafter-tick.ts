@@ -1198,3 +1198,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
       if ("skip" in parsed.data) {
         if (lead.priority || replyRequest) {
           // A watchlist (priority) lead must never be silently dropped. The
+          // relevance gate was bypassed and the prompt forbids skipping; if the
+          // model skips anyway we surface it as `errored` (visible in the
+          // dashboard) rather than a terminal `skipped`, so a watchlist miss is
+          // never lost. We don't fabricate a reply — but the operator sees it.
+          log.warn(
+            { leadId: lead.id, skip_reason: parsed.data.skip },
+            "drafter model tried to skip a watchlist priority lead — marking errored, not skipped",
+          );
+          await markStatus({
+            leadId: lead.id,
+            status: "errored",
+            meta: {
+              error: replyRequest ? "reply_request_model_skip" : "priority_model_skip",
+              ...(replyRequest ? { reply_request_key: replyRequest.requestKey } : {}),
+              skip_reason: parsed.data.skip,
+              engine: res.engine,
+              model: res.model,
+            },
+          });
+          continue;
+        }
+        log.info({ leadId: lead.id, skip_reason: parsed.data.skip }, "drafter skipped lead");
+        await markStatus({
+          leadId: lead.id,
+          status: "skipped",
+          meta: { skip_reason: parsed.data.skip, engine: res.engine, model: res.model },
+        });
+        continue;
+      }
+
+      // Post-draft VERIFIER (+ regenerate loop). Off by default; when enabled,
+      // grade the replies against the grounding context and, on a failing
+      // verdict, regenerate with the critique appended (up to `retries`),
+      // keeping the best-scoring attempt. A failed-then-best draft is still
+      // queued for human review; a valid per-angle pass is needed to auto-send.
+      let draftsData: typeof parsed.data = parsed.data;
+      let verifierMeta: OutboundIn["verifierMeta"] = null;
+      let verifyCtx: VerifyContext | null = null;
+      let reviewContext: OutboundIn["drafts"][number]["reviewContext"];
+      let chosenVerdict: DraftVerdict | null = null;
+      let calls: VerifierCall[] = [];
+      let attempts = 0;
+      let selectedAttempt = 0;
+      let diagnosticDropped = 0;
+      const voiceVerdicts: Array<ReturnType<typeof diagnosticVerdict>> = [];
+      const recordVoiceVerdict = (
+        verdict: DraftVerdict, phase: "initial" | "repair" | "final", attempt: number, candidate: number,
+      ) => {
+        if (!verify?.voiceFloor) return;
+        if (voiceVerdicts.length === MAX_VOICE_DIAGNOSTIC_VERDICTS) {
+          // Keep the initial verdict plus the latest results, including the
+          // final body recheck that actually drives the floor decision.
+          voiceVerdicts.splice(1, 1);
+          diagnosticDropped++;
+        }
+        voiceVerdicts.push(diagnosticVerdict(verdict, phase, attempt, candidate));
+      };
+      if (verify?.enabled) {
+        verifyCtx = {
+          platform: "x",
+          postText,
+          authorHandle: lead.author_handle,
+          // The writer learns reply voice from actual sent replies plus vault
+          // guidance. Give the judge that same evidence, with real replies first,
+          // instead of asking it to infer X reply voice from vault prose alone.
+          voiceAnchors: verifierVoiceAnchors({
+            sentReplies: examples,
+            pairedReplies: args.voiceExemplars,
+            vaultAnchors: anchors.map((a) => a.snippet),
+          }),
+          ...(styleFaithful && styleForLead ? {
+            faithfulVoiceAnchors: faithfulVerifierVoiceAnchors(styleForLead),
+          } : {}),
+          knowledgeAnchors: knowledge.map((k) => k.snippet),
+          operatorFacts,
+          ...(conversation ? { conversation } : {}),
+          personProfile: personProfile ?? null,
+          charLimit: 250,
+          // Let the judge grade whether the reply engages an image-driven post.
+          ...(imageCaption ? { imageCaption } : {}),
+          // A celebration reply is allowed to be warm/hyped — tell the judge so it
+          // doesn't ding genuine congratulations as forced cheer. Parity with Reddit.
+          // A light lead IS a congrats, so the judge must not ding genuine warmth
+          // as forced cheer — same carve-out the celebration register gets.
+          ...(postRegister === "celebration" || isLight ? { allowCelebration: true } : {}),
+          // Learned Pattern Breaker rules: phrase rules hit deterministically
+          // (auto = soft penalty, refined/manual = hard zero — the shared
+          // verifier owns that weighting), structure rules steer the judge.
+          dynamicBannedPatterns: patternRules,
+          // Per-person novelty: the judge grades whether this draft re-says a
+          // take already used with this author and regenerates if so. Empty →
+          // novelty is forced to 1.0, so a first contact is never penalised.
+          priorRepliesToPerson: priorReplies,
+          // Feed-wide diversity, ENFORCED (deterministic, no judge call): a draft
+          // too structurally alike a recent reply regenerates with a different
+          // shape, so the last ~20 replies stay varied. The prompt-side
+          // avoid-list above prevents; this leg catches what slips through.
+          recentReplies: recentPhrasings,
+        };
+        reviewContext = OutboundFactualContextSchema.parse({ version: 1, ...verifyCtx });
+        calls = browserObserved
+          ? verify.makeCalls(lead.priority ?? false, {
+              codexSubscriptionOnly: true,
+              codexReasoningEffort: "high",
+            })
+          : verify.makeCalls(lead.priority ?? false);
+        const toVerify = (d: typeof draftsData): DraftToVerify[] =>
+          d.drafts.map((x) => ({ kind: "reply" as const, angle: x.angle, body: x.body }));
+        // Score EVERY graded dimension, including novelty (per-person repetition)
+        // and diversity (feed-wide sameness). Omitting them meant a draft that
+        // failed ONLY on repetition was regenerated, the rewrite fixed the
+        // repetition, and then the fix was discarded because `total` had not
+        // improved — so the repetitive original shipped. Both are 1.0 when there
+        // is no history, so a no-memory lead ranks exactly as before.
+        const total = (v: DraftVerdict) =>
+          v.scores.voice +
+          v.scores.grounding +
+          v.scores.relevance +
+          v.scores.format +
+          v.scores.novelty +
+          v.scores.diversity;
+        const weakest = (v: DraftVerdict) => Math.min(
+          v.scores.voice,
+          v.scores.grounding,
+          v.scores.relevance,
+          v.scores.format,
+          v.scores.novelty,
+          v.scores.diversity,
+        );
+        const betterVerdict = (candidate: DraftVerdict, current: DraftVerdict) => {
+          const candidateReviewed = candidate.judgeOk === true;
+          const currentReviewed = current.judgeOk === true;
+          if (candidateReviewed !== currentReviewed) return candidateReviewed;
+          if (candidate.pass !== current.pass) return candidate.pass;
+          const candidateWeakest = weakest(candidate);
+          const currentWeakest = weakest(current);
+          return candidateWeakest > currentWeakest
+            || (candidateWeakest === currentWeakest && total(candidate) > total(current));
+        };
+        let best = draftsData;
+        let bestVerdict = await verifyTiered(toVerify(draftsData), verifyCtx, calls);
+        recordVoiceVerdict(bestVerdict, "initial", 0, 0);
+        while (!bestVerdict.pass && attempts < verify.retries) {
+          attempts++;
+          const fix = bestVerdict.fix ?? "make the replies more specific, grounded, and on-voice";
+          // Spend the stronger writer only after a real rejected browser verdict
+          // survives to the final configured retry. A judge outage never earns
+          // an escalation, and ordinary discovery keeps its existing routing.
+          const finalBrowserRepair =
+            (payload as { source?: string }).source === "extension_observed"
+            && bestVerdict.judgeOk === true
+            && attempts === verify.retries;
+          const repairInstruction = finalBrowserRepair
+            ? "\n\nFINAL BROWSER REPAIR — In the JSON body, write one compact reply in the operator's natural rhythm, with one grounded point. Keep the source specific by naming a concrete post detail, and leave hypothetical claims conditional. Keep separate anecdotes separate from claimed causes. The learned voice and pattern rules still apply: avoid the particular habits named in the review feedback, antithesis (X, not Y), and comma-joined run-ons. Keep the assigned shape unless the review feedback identifies a conflict. Capitalize the start; NO FULL STOPS. Do not invent the operator's personal experience. Keep accurate char_count and the same strict JSON shape."
+            : "";
+          const rejectedReplies = JSON.stringify(
+            best.drafts.map(({ angle, body }) => ({ angle, body })),
+          );
+          const rejectedScores = JSON.stringify(bestVerdict.scores);
+          const candidateInstruction = browserObserved
+            ? "\n\nReturn exactly THREE distinct reply candidates in `drafts`. Each candidate must independently fix every failed dimension above. Keep each reply compact, grounded, and in the supplied voice; vary the angle and wording."
+            : "";
+          const fixPrompt = `${prompt}\n\nREJECTED REPLY — edit this exact attempt instead of starting over: ${rejectedReplies}\nREJECTED SCORES: ${rejectedScores}\nREVIEW FEEDBACK — an editor rejected the previous attempt: ${fix}\nRewrite the reply to fix the failed dimensions. Keep the exact strict JSON output shape.${repairInstruction}${candidateInstruction}`;
+          let candidate: typeof draftsData | null = null;
+          try {
+            const r = await runner.draft({
+              ...draftArgs,
+              ...(finalBrowserRepair ? {
+                codexSubscriptionOnly: true,
+                codexReasoningEffort: "high" as const,
+              } : {}),
+              prompt: fixPrompt,
+            });
+            const p = DrafterOutput.safeParse(safeJsonParse(r.text));
+            if (p.success && !("skip" in p.data)) candidate = p.data;
+          } catch (e) {
+            log.warn({ leadId: lead.id, err: (e as Error).message }, "verifier regenerate failed; keeping best so far");
+            break;
+          }
+          if (!candidate) break;
+          let verdict: DraftVerdict;
+          if (browserObserved && candidate.drafts.length > 1) {
+            const reviewed = await Promise.all(candidate.drafts.slice(0, 3).map(async (draft) => ({
+              draft,
+              verdict: await verifyTiered(toVerify({ ...candidate!, drafts: [draft] }), verifyCtx!, calls),
+            })));
+            reviewed.forEach(({ verdict: reviewedVerdict }, index) =>
+              recordVoiceVerdict(reviewedVerdict, "repair", attempts, index));
+            const selected = reviewed.reduce((current, item) =>
+              betterVerdict(item.verdict, current.verdict) ? item : current);
+            candidate = { ...candidate, drafts: [selected.draft] };
+            verdict = selected.verdict;
+          } else {
+            verdict = await verifyTiered(toVerify(candidate), verifyCtx, calls);
+            recordVoiceVerdict(verdict, "repair", attempts, 0);
+          }
+          // The gate is conjunctive, so repair progress is the weakest score,
+          // not the sum. Otherwise a rewrite that fixes the blocking dimension
+          // can be discarded for slightly lowering dimensions that already pass,
+          // and the next retry receives stale feedback for the old draft.
