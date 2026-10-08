@@ -198,3 +198,78 @@ export async function runSendTick(args: RunSendTickArgs): Promise<SendOutcome[]>
           draftId: draft.draft_id,
           status: "auth_failed",
           reason: err.message,
+        });
+        // Stop the batch — every subsequent call will also fail until cookies refresh.
+        break;
+      }
+      if (err instanceof XReplyRestrictedError) {
+        replyForbiddenStreak += 1;
+        args.log.error(
+          { draftId: draft.draft_id, streak: replyForbiddenStreak, err: err.message },
+          "send refused: X reply-restriction 403 — erroring this row",
+        );
+        try {
+          await args.markErrored({ draftId: draft.draft_id, reason: err.message });
+        } catch (markErr) {
+          args.log.error(
+            { draftId: draft.draft_id, err: (markErr as Error).message },
+            "markErrored callback threw",
+          );
+        }
+        const systemic = replyForbiddenStreak >= REPLY_FORBIDDEN_TRIP;
+        outcomes.push({
+          draftId: draft.draft_id,
+          leadId: draft.lead_id,
+          status: "reply_forbidden",
+          reason: err.message,
+          systemic,
+        });
+        if (systemic) {
+          // The account/app can't reply at all. Stop consuming the queue — the
+          // caller keys its cooldown/alert off this row's `systemic` flag, and
+          // releases unattempted claims back to the review inbox.
+          args.log.error(
+            { streak: replyForbiddenStreak },
+            "consecutive reply-restriction 403s — abandoning batch as systemic",
+          );
+          break;
+        }
+        continue;
+      }
+      replyForbiddenStreak = 0;
+      if (err instanceof XRateLimitError) {
+        args.log.warn(
+          { draftId: draft.draft_id, err: err.message },
+          "send rate-limited — leaving approval as 'sent' for retry next tick",
+        );
+        outcomes.push({
+          draftId: draft.draft_id,
+          status: "rate_limited",
+          reason: err.message,
+        });
+        // Stop the batch — pounding more requests just makes the rate-limit longer.
+        break;
+      }
+      const message =
+        err instanceof XError ? err.message : (err as Error).message;
+      args.log.error(
+        { draftId: draft.draft_id, err: message },
+        "send failed — flipping approval to errored",
+      );
+      try {
+        await args.markErrored({ draftId: draft.draft_id, reason: message });
+      } catch (markErr) {
+        args.log.error(
+          { draftId: draft.draft_id, err: (markErr as Error).message },
+          "markErrored callback threw",
+        );
+      }
+      outcomes.push({
+        draftId: draft.draft_id,
+        status: "errored",
+        reason: message,
+      });
+    }
+  }
+  return outcomes;
+}
