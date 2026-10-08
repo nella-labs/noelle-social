@@ -198,3 +198,169 @@ function renderClips(clips: ClipBrief[]): string {
         (c.teardown ? `\n${renderTeardown(c.teardown)}` : ""),
     )
     .join("\n");
+}
+
+/**
+ * Learned Pattern Breaker rules rendered for a generator prompt — the operator's
+ * over-used habits (a pet phrase, a repeated shape) discovered from their corpus.
+ * Mirrors how the Lyra drafter injects them into its system prompt so a script
+ * never leans on a flagged habit. Empty when there are no active rules.
+ */
+function renderPatternRules(rules: readonly DynamicPattern[] | undefined): string {
+  if (!rules || rules.length === 0) return "";
+  return [
+    "",
+    "LEARNED PATTERNS TO AVOID (the operator over-uses these across their content; do NOT repeat them):",
+    ...rules.slice(0, 12).map((r) => `• ${r.instruction || r.label}`),
+  ].join("\n");
+}
+/**
+ * Operator's own brand/voice, pulled from the vault (BM25 snippets). Grounds
+ * generation in what they actually do + how they sound — the form comes from the
+ * watched creators, the substance + voice from here. Empty when no vault.
+ */
+function renderBrandContext(snippets: readonly string[] | undefined): string {
+  if (!snippets || snippets.length === 0) return "";
+  return [
+    "",
+    "OPERATOR'S OWN BRAND & VOICE (from their vault — match this substance + voice; the clips are only for FORM):",
+    ...snippets.map((s) => `• ${s.replace(/\s+/g, " ").slice(0, 400)}`),
+  ].join("\n");
+}
+
+// --- Ideator (Muse) ---
+const IDEATE_SYSTEM = [
+  "You are Nova, a short-form video ideation strategist. You are given the operator's distilled",
+  "VIDEO BRAND GUIDE (what consistently performs for the creators they study) and the TOP-PERFORMING",
+  "clips in their niche. Propose fresh, on-brand video IDEAS the operator could film. Each idea = a",
+  "scroll-stopping HOOK + a one-paragraph CONCEPT, grounded in the proven patterns (cite the clip ids",
+  "that inspired it in inspirationClipIds). Original substance, proven form. Never fabricate metrics.",
+  WRITING_STRUCTURE_GUIDANCE,
+  ANTI_SLOP,
+  "Output ONLY JSON: {\"ideas\":[{\"hook\":string,\"concept\":string,\"angle\":string,\"pillar\":string,\"inspirationClipIds\":[string]}]}",
+].join(" ");
+
+export interface VideoIdeator {
+  ideate(input: {
+    objective: string | null;
+    count: number;
+    profiles: UltraProfileRow[];
+    clips: ClipBrief[];
+    /** Vault brand/voice snippets to ground substance + voice (optional). */
+    brandContext?: readonly string[];
+  }): Promise<VideoIdeasOut | null>;
+}
+
+/**
+ * A bare Gemini JSON caller over the same Vertex seam — for callers that own
+ * their own prompt + schema (e.g. the harvester's objective grader). Returns the
+ * parsed JSON or null (fail-open). Keeps the Vertex auth/key plumbing in one file.
+ */
+export function createVertexJsonFn(opts: VertexOpts): JsonFn {
+  return (system, user, operation) => vertexJson(opts, system, user, operation);
+}
+
+/**
+ * Backend-agnostic ideator: builds the grounded prompt and parses the reply via
+ * the injected `JsonFn`. The worker wires `json` to claude-cli / Bedrock (with a
+ * Gemini fallback) — see `createTextJsonFn`. `createVertexIdeator` keeps the old
+ * Gemini-only construction for callers/tests that still pass VertexOpts.
+ */
+export function createIdeator(json: JsonFn): VideoIdeator {
+  return {
+    async ideate(input) {
+      const user = [
+        `OPERATOR MISSION: ${input.objective ?? "(default: grow with on-brand short-form video)"}`,
+        `PROPOSE ${input.count} IDEAS.`,
+        "",
+        "VIDEO BRAND GUIDE:",
+        renderGuide(input.profiles),
+        renderBrandContext(input.brandContext),
+        "",
+        "TOP-PERFORMING CLIPS (id @handle metrics :: caption [+ teardown]):",
+        renderClips(input.clips),
+      ].join("\n");
+      const parsed = await json(IDEATE_SYSTEM, user);
+      if (!parsed) return null;
+      const safe = VideoIdeasOutSchema.safeParse(parsed);
+      return safe.success ? safe.data : null;
+    },
+  };
+}
+
+export function createVertexIdeator(opts: VertexOpts): VideoIdeator {
+  return createIdeator((system, user) => vertexJson({ ...opts, temperature: 0.7 }, system, user));
+}
+
+// --- Scripter (Blueprint + Scribe) ---
+const SCRIPT_SYSTEM = [
+  "You are Nova, a short-form video scripter writing in the operator's voice. Given a video IDEA, the",
+  "operator's VIDEO BRAND GUIDE, and EXEMPLAR clips (their hooks / structure / pacing / transitions),",
+  "produce a complete short-form plan: a punchy spoken HOOK, a timed STRUCTURE (ordered beats with",
+  "tStart/tEnd seconds + purpose + the line to say/show), the full SCRIPT (hook → beats → CTA), and",
+  "suggested TRANSITIONS, SOUNDS, and on-screen GRAPHS. Match the proven FORM; keep the substance",
+  "original and on-brand. Never fabricate stats. Output ONLY JSON matching:",
+  '{"hook":string,"structure":[{"tStart":number,"tEnd":number,"purpose":string,"line":string}],"script":string,',
+  '"transitions":[{"at":string,"type":"cut|jump_cut|match_cut|whip_pan|zoom|crossfade|slide|speed_ramp|other"}],',
+  '"sounds":[{"name":string,"reason":string,"trending":boolean}],',
+  '"graphSpecs":[{"kind":"bar|line|time_series|stat|lower_third|kinetic_text|other","title":string,"data":[{"label":string,"value":number}],"tStart":number,"note":string}]}.',
+  "GRAPHS render as real on-screen overlays, so emit RENDERABLE content, not just a description:",
+  "for bar/line/time_series ALWAYS include `data` as 2+ {label,value} points (illustrative magnitudes are fine, never fabricate as fact);",
+  "for kinetic_text put the EXACT on-screen words in `title` (≤6 words, punchy);",
+  "for lower_third put the on-screen label in `title` and an optional sub-label in `note`.",
+  "ALWAYS set `tStart` on every graph to the SECOND it appears on screen, inside one of the structure beats' tStart/tEnd windows, so it pairs to the right line.",
+  "`note` is the editor/animation direction. Put footage the operator must film as a bracket cue INSIDE the relevant beat's `line` (e.g. line: \"...working late [B-ROLL: person at a laptop at night]\" or \"[SCREEN RECORDING: opening a blank doc]\") so each beat carries its own footage.",
+  WRITING_STRUCTURE_GUIDANCE,
+  ANTI_SLOP,
+].join(" ");
+
+export interface VideoScripter {
+  script(input: {
+    hook: string;
+    concept: string | null;
+    objective: string | null;
+    profiles: UltraProfileRow[];
+    exemplars: ClipBrief[];
+    /** Vault brand/voice snippets to ground substance + voice (optional). */
+    brandContext?: readonly string[];
+    /**
+     * Verifier fix from a failed prior attempt, appended to the prompt so the
+     * regenerate targets the exact problem (em dash, off-voice, slop). Absent on
+     * the first attempt. Mirrors the Lyra/Vega drafter's regenerate-with-critique.
+     */
+    critique?: string | null;
+    /** Learned Pattern Breaker rules to avoid (the operator's over-used habits). */
+    patternRules?: readonly DynamicPattern[];
+  }): Promise<VideoScriptOutput | null>;
+}
+
+export function createScripter(json: JsonFn): VideoScripter {
+  return {
+    async script(input) {
+      const user = [
+        `OPERATOR MISSION: ${input.objective ?? "(default)"}`,
+        `IDEA HOOK: ${input.hook}`,
+        `IDEA CONCEPT: ${input.concept ?? "(none)"}`,
+        "",
+        "VIDEO BRAND GUIDE:",
+        renderGuide(input.profiles),
+        renderBrandContext(input.brandContext),
+        "",
+        "EXEMPLAR CLIPS to emulate the FORM of (not the topic):",
+        renderClips(input.exemplars),
+        renderPatternRules(input.patternRules),
+        ...(input.critique
+          ? ["", `FIX THESE PROBLEMS from your last attempt (mandatory): ${input.critique}`]
+          : []),
+      ].join("\n");
+      const parsed = await json(SCRIPT_SYSTEM, user);
+      if (!parsed) return null;
+      const safe = VideoScriptOutputSchema.safeParse(parsed);
+      return safe.success ? sanitizeScriptOutput(safe.data) : null;
+    },
+  };
+}
+
+export function createVertexScripter(opts: VertexOpts): VideoScripter {
+  return createScripter((system, user) => vertexJson({ ...opts, temperature: 0.6 }, system, user));
+}
