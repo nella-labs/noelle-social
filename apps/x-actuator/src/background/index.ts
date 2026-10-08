@@ -598,3 +598,203 @@ async function ambientBrowse(
     await stampCompletedDiscoveryTarget({
       outcome: did,
       targetUrl: navigationTarget,
+      completedAtMs: Date.now(),
+      commitVisit: ({ completedAtMs, pendingTarget }) => chrome.storage.session.set({
+        [LAST_DISCOVERY_TARGET_KEY]: completedAtMs,
+        [PENDING_DISCOVERY_TARGET_KEY]: pendingTarget,
+      }),
+      onStampFailure: () => console.warn("[x-discovery] target read stamp failed"),
+    });
+    if (!stopped()) await observeVisibleTweets(tabId, api, budget).catch((e) => {
+      console.warn("[x-discovery] feed read failed", e);
+    });
+  }
+  if (did === "expand") s.lastAmbientReadMs = now;
+  return "browsed";
+}
+
+// Live-browser deps for reactWithVariety (src/background/engage.ts — the
+// orchestration is a plain function over these primitives so its stale-rect
+// discipline is unit-tested; only this wiring touches chrome.* / CDP). The
+// contract enforced in engage.ts: after any locate that scrolled the page, only
+// freshly-located rects are clicked, and a fallback re-locate miss delivers
+// NOTHING (the caller records a skip) instead of a blind trusted CDP click at
+// stale viewport coordinates.
+function engageDeps(tabId: number, rng: ReturnType<typeof makeRng>) {
+  return {
+    click: (rect: Rect) => actorClick(tabId, rect, rng),
+    locateEngagement: (engagement: EngagementKind, tweet_id: string | null) =>
+      send<{ ok: boolean; x?: number; y?: number; rect?: Rect }>(
+        tabId, { cmd: "locateEngagement", engagement, tweet_id },
+      ),
+    locateRepostConfirm: () =>
+      send<{ ok: boolean; x?: number; y?: number; rect?: Rect }>(
+        tabId, { cmd: "locateRepostConfirm" },
+      ),
+    dismissMenu: () => cdp.pressEscape(tabId),
+    sleep,
+  };
+}
+
+// Like one hydrated feed tweet as a human would: make sure we're on the timeline,
+// scroll-and-poll until a likeable tweet attaches, read it (dwelling proportional
+// to its length, sometimes expanding "Show more" first), then land a trusted
+// click. Returns true iff a like was actually landed; increments s.done.likes and
+// pushes the activity event on success, or a skip event on a miss. Shared by the
+// scheduled 'like' slot and idle-liking so both behave identically.
+async function likeAFeedPost(
+  tabId: number,
+  s: RunState,
+  cfg: ActuatorConfig,
+  rng: ReturnType<typeof makeRng>,
+  events: XActivityEvent[],
+  at: string,
+): Promise<boolean> {
+  // A standalone feed-like must run ON the timeline. After a reply the tab is
+  // left on a tweet permalink, where findFeedTweets finds no timeline cards →
+  // every like skipped `no-likeable-tweet(tweets=0)`. Pull it back first via
+  // the SHARED guard (ensureOnFeed, also used by the ambient browse — one
+  // isFeedUrl notion of feed-ness instead of a local regex). Best-effort — a
+  // failed nav just falls through to the scan.
+  await ensureOnFeed(tabId, rng);
+  // Scroll-and-poll: the like button only attaches once a tweet is hydrated near
+  // the viewport, so one blind scroll + immediate locate often finds nothing
+  // likeable. Retry with small scrolls + waits to let tweets hydrate.
+  type LikeLoc = {
+    ok: boolean; x?: number; y?: number; rect?: Rect;
+    observed?: {
+      tweet_id?: string; author_handle?: string;
+      wordCount?: number; hasMedia?: boolean; isTruncated?: boolean;
+      seeMoreRect?: Rect;
+    };
+    skipReason?: string;
+  };
+  let loc: LikeLoc | null = null;
+  const preferWatchlist = cfg.preferWatchlistRatio > rng.next();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (stopped()) break; // STOP mid-scan — abandon the hunt
+    await cdp.wheel(tabId, { x: 400, y: 400 }, attempt === 0 ? Math.round(rng.float(480, 820)) : Math.round(rng.float(300, 540)), rng, sleep);
+    await sleep(rng.float(450, 1350)); // let the social-action bar hydrate
+    loc = await send<LikeLoc>(tabId, { cmd: "locateLike", preferWatchlist, watchlistNames: [] }).catch(() => null);
+    if (loc?.ok && loc.x != null && loc.y != null) break;
+  }
+  if (loc?.ok && loc.x != null && loc.y != null) {
+    // Read the tweet like a human BEFORE reacting: dwell proportional to its
+    // length, and sometimes expand "Show more" then read the fuller text.
+    let wc = loc.observed?.wordCount ?? 0;
+    const media = loc.observed?.hasMedia ?? false;
+    const trunc = loc.observed?.isTruncated ?? false;
+    const seeMoreRect = loc.observed?.seeMoreRect;
+    const tweetId = loc.observed?.tweet_id ?? null;
+    const deps = engageDeps(tabId, rng);
+    let likeRect = rectFrom(loc);
+    const stop = decideStop(rng, wc, { hasMedia: media });
+    if (stop && trunc && seeMoreRect && rng.next() < 0.7) {
+      // expand-then-read: itself a strong human decoy action
+      await actorClick(tabId, seeMoreRect, rng);
+      await sleep(rng.float(300, 1100));
+      wc = Math.round(wc * 2.2); // fuller text now visible → longer read
+      // The expansion REFLOWS the tweet (its action bar moves down), so the like
+      // rect measured before the expand is stale. Re-locate the heart on the
+      // SAME tweet for a fresh rect; if it can't be re-found (tweet id unknown,
+      // card gone), skip rather than fire a trusted click at stale coordinates.
+      const fresh = await deps.locateEngagement("like", tweetId).catch(() => null);
+      if (fresh?.ok && fresh.x != null) {
+        likeRect = rectFrom(fresh);
+      } else {
+        events.push({ type: "skip", reason: "like-gone-after-expand", at });
+        return false;
+      }
+    }
+    await sleep(stop ? readingDwellMs(rng, wc, { hasMedia: media }, s.persona.wpm) : glanceMs(rng));
+    throwIfAborted(runAbort.signal); // STOP during the read → don't land the like
+    // Re-locate the like button immediately before reacting. The rect captured
+    // before the read goes STALE even without an expand: live timeline
+    // insertion and lazy media shift the card, so the pre-read coordinates can
+    // land in the tweet BODY (an @mention → a profile, a t.co link → off-site),
+    // which navigates the tab off the feed AND misses the like. Locate the
+    // heart on the SAME tweet. A miss or lost response cannot confirm the
+    // pre-read rect is still current, so skip unless fresh coordinates arrive.
+    const preClick = await deps.locateEngagement("like", tweetId).catch(() => null);
+    if (preClick?.ok !== true || preClick.x == null || preClick.y == null) {
+      events.push({ type: "skip", reason: "like-location-unavailable", at });
+      return false;
+    }
+    likeRect = rectFrom(preClick);
+    throwIfAborted(runAbort.signal); // STOP during the re-locate → don't land the like
+    const engagement = await reactWithVariety(likeRect, tweetId, cfg.engagementWeights, rng, deps);
+    if (engagement == null) {
+      // Variety attempt missed AND the fresh-rect fallback missed too (see
+      // engage.ts): nothing landed, so count nothing — a phantom s.done.likes++
+      // would burn a budgeted like on a click that never happened.
+      events.push({ type: "skip", reason: "engagement-not-landed", at });
+      return false;
+    }
+    s.done.likes++;
+    events.push({ type: "like", tweet_id: loc.observed?.tweet_id, author_handle: loc.observed?.author_handle, engagement, at });
+    return true;
+  }
+  events.push({ type: "skip", reason: loc?.skipReason ?? "like-failed", at });
+  return false;
+}
+
+// Serialize ticks so the content-script-driven loop can't overlap with the
+// alarm-driven one (overlap would double-read/write state).
+let ticking = false;
+let discoveryDrainAfterTick: number | null = null;
+async function tick() {
+  if (ticking) return;
+  ticking = true;
+  try {
+    await tickOnce();
+  } finally {
+    ticking = false;
+    if (discoveryDrainAfterTick !== null) {
+      const expectedEpoch = discoveryDrainAfterTick;
+      discoveryDrainAfterTick = null;
+      if (await browserDiscoveryEnabled() && !stopped()) {
+        await startDrain({ manual: true, curfew: false, expectedEpoch }).catch((error) =>
+          console.warn("[x-discovery] deferred drain start failed", error));
+      }
+    }
+  }
+}
+
+async function tickOnce() {
+  const s = await loadState();
+  const cfg = await getConfig();
+  if (!s || !cfg || s.status !== "running") return;
+  // Stale-run guard: if a newer run started or STOP fired since this state was
+  // written, our epoch is no longer current — bail without acting or saving so a
+  // superseded/stopped run can't spring back to life.
+  const myEpoch = s.epoch ?? 0;
+  if (myEpoch !== (await currentEpoch())) return;
+  const now = Date.now();
+  if (!withinWindow(s.startMs, s.windowHours, now)) {
+    // A persistent drain never times out on its window — roll it forward and keep
+    // ticking so it can watch for new approvals. Every other run ends here.
+    if (drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0)) {
+      s.windowHours = (now - s.startMs) / 3600_000 + DRAIN_WATCH_WINDOW_H;
+    } else {
+      await endRun("idle");
+      return;
+    }
+  }
+
+  // Reuse the run's pinned tab while it is still open, including after an
+  // accidental off-X navigation. Only re-pick if that exact tab closed.
+  const tabId = await findXTab(s.tabId);
+  if (tabId == null) return; // no tab → pause; resume next tick
+  if (s.tabId !== tabId) s.tabId = tabId; // pin (or re-pin after the old tab closed)
+  await recoverPinnedTab(tabId, async () => !stopped() && myEpoch === (await currentEpoch()));
+  const currentTab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!currentTab?.url || !isXPageUrl(currentTab.url) ||
+      (currentTab.pendingUrl && !isXPageUrl(currentTab.pendingUrl))) return;
+  await cdp.attach(tabId).catch(() => {}); // idempotent; re-attach if a detach happened
+
+  const api = new ActuatorApi(cfg);
+  const rng = makeRng((now & 0xffffffff) >>> 0);
+  await maybeReplenish(s, api, now, rng);
+
+  // challenge guard
+  const ch = await send<{ observed?: { challenge?: boolean } }>(tabId, { cmd: "detectChallenge" }).catch(() => null);
