@@ -198,3 +198,203 @@ export async function runPostDrafterTick(args: RunPostDrafterTickArgs): Promise<
       return 0;
     }
 
+    const calls = makeVerifierCalls({ force: idea.generationReviewRequired });
+    const verifyCtx: VerifyContext = {
+      // Explicit per platform. The old `x ? "x" : "linkedin"` else-branch meant a
+      // reddit target post would be verified AS LinkedIn, silently opting it into
+      // the LinkedIn-only strictVoice rules. No reddit post ideas exist today, so
+      // this is latent rather than live — but the next one added would inherit
+      // Lyra's voice bar without anyone choosing that.
+      platform: platform === "x" ? "x" : platform === "reddit" ? "reddit" : "linkedin",
+      postText: [
+        "Proposed original-post topic:",
+        idea.hook,
+        idea.thesis ?? "",
+        renderPostFactualContext(ctx),
+      ]
+        .join("\n")
+        .trim(),
+      voiceAnchors: ctx.voiceAnchors,
+      knowledgeAnchors: boundedPostKnowledgeAnchors(ctx.knowledgeAnchors),
+      charLimit: CHAR_LIMIT[platform] ?? POST_CHAR_LIMIT,
+    };
+
+    let best = firstRaw;
+    let meta: PostVerifierMeta | null = null;
+
+    if (calls.length > 0) {
+      const result = await runVerify({
+        initial: best,
+        basePrompt,
+        ctx: verifyCtx,
+        calls,
+        retries: verifyRetries,
+        regenerate: draftOnce,
+        log,
+        ideaId: idea.id,
+      });
+      best = result.best;
+      meta = result.meta;
+    }
+
+    const body = best.body;
+
+    const draft: PostDraftCreate = {
+      ideaId: idea.id,
+      platform: platform as PostDraftCreate["platform"],
+      body,
+      // Surface the chosen hook (body's first non-empty line — the prompt forces
+      // body to open with it) into its own column so the editor's HOOK field
+      // populates and visibly changes on every regen. body is unchanged.
+      hook: firstLineHook(body),
+      charCount: body.length,
+      sourceEngine: best.engine,
+      model: best.model,
+      qualityScore: meta ? avg(meta.scores) : null,
+      qualityPassed: meta ? meta.pass : null,
+      verifierMeta: meta,
+      generationRequestId: idea.generationRequestId,
+      generationComplete: generationComplete === true,
+    };
+    await sink(draft);
+    return 1;
+  }
+
+  for (const idea of ideas) {
+    // The platforms to (re)draft this tick: a pending subset (a per-platform
+    // "+ Version" / regen) or, when none is pending, every target platform.
+    const platforms =
+      idea.pendingPlatforms && idea.pendingPlatforms.length > 0
+        ? idea.pendingPlatforms
+        : idea.targetPlatforms;
+
+    // Voice / inspiration / notes are shared across an idea's platform variants,
+    // so gather once. A gather failure releases the whole idea for a retry.
+    let ctx: PostDraftContext;
+    try {
+      ctx = await gather(idea);
+    } catch (err) {
+      log.error(
+        { idea: idea.id, err: (err as Error).message },
+        "post-drafter gather failed; releasing idea",
+      );
+      await release(idea.id).catch(() => {});
+      continue;
+    }
+
+    // A fresh full generate uses the per-platform version counts (3 X + 1 LI);
+    // a per-platform "+ Version"/regen (pending subset) adds exactly one.
+    const isFreshGenerate = !(idea.pendingPlatforms && idea.pendingPlatforms.length > 0);
+
+    const plannedDrafts = platforms.reduce((sum, platform) => sum + (isFreshGenerate ? (FRESH_VERSIONS[platform] ?? 1) : 1), 0);
+    let draftedForIdea = 0;
+    let attemptsForIdea = 0;
+    for (const platform of platforms) {
+      const count = isFreshGenerate ? (FRESH_VERSIONS[platform] ?? 1) : 1;
+      for (let v = 0; v < count; v++) {
+        attemptsForIdea++;
+        // Frame each fresh X variant for a different community so the 3 X posts
+        // land distinctly (content-pipeline parity). LinkedIn/Reddit: no framing.
+        const community = platform === "x" ? communityForVariant(v) : null;
+        try {
+          const n = await draftOnePlatform({
+            platform,
+            idea,
+            ctx,
+            community,
+            generationComplete: Boolean(idea.generationRequestId && attemptsForIdea === plannedDrafts && draftedForIdea + 1 === plannedDrafts),
+          });
+          if (n) {
+            created++;
+            draftedForIdea++;
+          }
+        } catch (err) {
+          // One platform/version failing must not lose the others for this idea.
+          log.error(
+            { idea: idea.id, platform, version: v + 1, err: (err as Error).message },
+            "post-drafter platform failed; skipping",
+          );
+        }
+      }
+    }
+
+    // Explicit requests retry partial failures too: their final planned output
+    // must land before the request can complete. Keep the requested subset.
+    if (draftedForIdea === 0 || (idea.generationRequestId && draftedForIdea < plannedDrafts)) {
+      await release(idea.id).catch(() => {});
+    } else if (args.clearPending) {
+      await args.clearPending(idea.id).catch(() => {});
+    }
+  }
+
+  log.info({ created, candidates: ideas.length }, "post-drafter tick complete");
+  return created;
+}
+
+function avg(s: { voice: number; grounding: number; relevance: number; format: number }): number {
+  return Number(((s.voice + s.grounding + s.relevance + s.format) / 4).toFixed(4));
+}
+
+// The chosen hook is body's first non-empty line (the prompt forces body to open
+// with it). Extracted for the HOOK field; body is left untouched. Capped so a
+// model that ignores the line break doesn't dump the whole post into the field.
+function firstLineHook(body: string): string | null {
+  const line = body
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.length > 0);
+  if (!line) return null;
+  return line.length > 300 ? line.slice(0, 300) : line;
+}
+
+type PostAttempt = { body: string; engine: string; model: string };
+
+// Keep the selected body and its generation provenance together through repairs.
+async function runVerify(args: {
+  initial: PostAttempt;
+  basePrompt: string;
+  ctx: VerifyContext;
+  calls: VerifierCall[];
+  retries: number;
+  regenerate: (fixPrompt: string) => Promise<PostAttempt | null>;
+  log: Logger;
+  ideaId: string;
+}): Promise<{ best: PostAttempt; meta: PostVerifierMeta }> {
+  const { ctx, calls, retries, regenerate, log, ideaId } = args;
+  const toDrafts = (body: string): DraftToVerify[] => [{ kind: "post", angle: null, body }];
+  const total = (s: { voice: number; grounding: number; relevance: number; format: number }) =>
+    s.voice + s.grounding + s.relevance + s.format;
+
+  let best = args.initial;
+  let bestVerdict = await verifyTiered(toDrafts(best.body), ctx, calls);
+  let attempts = 0;
+  while (!bestVerdict.pass && attempts < retries) {
+    attempts++;
+    const fix = bestVerdict.fix ?? "make the post more specific, grounded, and on-voice";
+    const fixPrompt = `${args.basePrompt}\n\nREVIEW FEEDBACK — an editor rejected the previous original post: ${fix}\nRewrite the original post to fix this. Keep the exact strict JSON output shape ({ "body": ... }).`;
+    let candidate: PostAttempt | null = null;
+    try {
+      candidate = await regenerate(fixPrompt);
+    } catch (e) {
+      log.warn(
+        { ideaId, err: (e as Error).message },
+        "post verifier regenerate failed; keeping best",
+      );
+      break;
+    }
+    if (!candidate) break;
+    const verdict = await verifyTiered(toDrafts(candidate.body), ctx, calls);
+    if (verdict.pass || total(verdict.scores) > total(bestVerdict.scores)) {
+      best = candidate;
+      bestVerdict = verdict;
+    }
+    if (verdict.pass) break;
+  }
+  log.info(
+    { ideaId, pass: bestVerdict.pass, attempts, scores: bestVerdict.scores },
+    "post verified",
+  );
+  return {
+    best,
+    meta: toOutboundVerifierMeta(bestVerdict, attempts, { requireJudge: false }),
+  };
