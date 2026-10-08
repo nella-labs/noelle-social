@@ -1398,3 +1398,203 @@ describe("runDrafterTick comment-energy", () => {
     const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
     expect(prompt).not.toContain("THE COMMENT SECTION");
     expect(record.mock.calls.filter((c) => c[0].engine === "apify")).toHaveLength(0);
+  });
+
+  it("reframes the comment section as NEGATIVE exemplars (slop to differentiate from)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const fetchPostComments = vi.fn().mockResolvedValue([
+      { id: "c1", url: "", text: "Congrats! 🎉", authorName: "Bob", authorHeadline: null, reactions: 1, repliesCount: 0, createdAt: "" },
+      { id: "c2", url: "", text: "commenting is the real distribution channel, here's why it compounds", authorName: "Dev", authorHeadline: "Founder", reactions: 9, repliesCount: 1, createdAt: "" },
+    ]);
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [commentLead()] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      fetchPostComments,
+    });
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    // Adversarial framing, not "match the register".
+    expect(prompt).toContain("NEGATIVE exemplars");
+    expect(prompt).toContain("Do NOT blend in");
+    expect(prompt).not.toContain("Match the register of these comments");
+    // The generic "Congrats! 🎉" is surfaced before the substantive comment.
+    expect(prompt.indexOf("Congrats! 🎉")).toBeLessThan(prompt.indexOf("commenting is the real distribution channel"));
+  });
+});
+
+describe("runDrafterTick — knowledge grounding (grounded-drafting)", () => {
+  it("scopes the voice search to voiceDirs when configured (single pass, filterDirs)", async () => {
+    const { postOutbound, runner, markStatus } = deps();
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      voiceDirs: ["02-brand"],
+    });
+    expect(kb.search).toHaveBeenCalledTimes(1);
+    expect(kb.search.mock.calls[0]![2]).toEqual({ filterDirs: ["02-brand"] });
+  });
+
+  it("runs a SECOND knowledge pass and injects 'Product knowledge' into the prompt", async () => {
+    const { postOutbound, runner, markStatus } = deps();
+    const kb = {
+      search: vi.fn().mockImplementation((_q: string, _k: number, opts?: { filterDirs?: string[] }) => {
+        if (opts?.filterDirs?.includes("01-business")) {
+          return Promise.resolve([
+            { snippet: "Nella does AST-aware code search", score: 9, filePath: "01-business/x.md", startLine: 1, endLine: 1, highlights: [] },
+          ]);
+        }
+        return Promise.resolve([anchorHit(8.0)]);
+      }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      knowledgeDirs: ["01-business"],
+      knowledgeTopK: 4,
+    });
+    // Two retrieval passes: voice (no/other filterDirs) + knowledge (01-business).
+    expect(kb.search).toHaveBeenCalledTimes(2);
+    expect(kb.search.mock.calls.some((c) => c[2]?.filterDirs?.includes("01-business"))).toBe(true);
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    expect(prompt).toContain("Product knowledge");
+    expect(prompt).toContain("AST-aware code search");
+  });
+
+  it("skips the knowledge pass when no knowledge dirs are configured (one search, no block)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(kb.search).toHaveBeenCalledTimes(1);
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    expect(prompt).not.toContain("Product knowledge");
+  });
+
+  it("injects product knowledge on the LIGHT path too", async () => {
+    const { postOutbound, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    const kb = {
+      search: vi.fn().mockImplementation((_q: string, _k: number, opts?: { filterDirs?: string[] }) =>
+        opts?.filterDirs?.includes("01-business")
+          ? Promise.resolve([{ snippet: "free tier is 5K/mo", score: 9, filePath: "01-business/p.md", startLine: 1, endLine: 1, highlights: [] }])
+          : Promise.resolve([anchorHit(8.0)]),
+      ),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      knowledgeDirs: ["01-business"],
+    });
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    expect(prompt).toContain("Product knowledge");
+    expect(prompt).toContain("free tier is 5K/mo");
+  });
+});
+
+describe("runDrafterTick — vision caption (grounded-drafting)", () => {
+  it.each(["substantial", "light", "batch-light"])("defers %s before paid drafting when caption admission rejects", async (kind) => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const values: unknown[] = [];
+    const sql = Object.assign(vi.fn(async (_s: unknown, ...v: unknown[]) => { values.push(...v); return []; }),
+      { json: (x: unknown) => x });
+    const captionFn = vi.fn().mockRejectedValue(new BudgetExceededError({ layer: "instance", spent_cents: 1, cap_cents: 1, estimated_cents: 1 }));
+    expect(await runDrafterTick({
+      patternRules: [], log, instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: kind === "substantial" ? "substantial" : "light",
+        payload: { ...leadPayload, images: ["https://image.test/a.jpg"] } })] as never,
+      runner: runner as never, kb: kb as never, postOutbound, markStatus, captionFn, sql: sql as never,
+      ...(kind === "batch-light" ? { batch: { enabled: true } } : {}) })).toBe(0);
+    expect(runner.draft).not.toHaveBeenCalled();
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(values).toContainEqual({ budget_deferred: kind === "substantial" ? "substantial" : "light" });
+  });
+
+  it("captions the post's images and injects 'THE POST'S IMAGE SHOWS:' into the prompt", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const captionFn = vi.fn().mockResolvedValue("a line chart of MRR doubling over 3 months");
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { text: "we hit a milestone", images: ["https://media.licdn.com/a.jpg"] } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      captionFn,
+    });
+    expect(captionFn).toHaveBeenCalledTimes(1);
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    expect(prompt).toContain("THE POST'S IMAGE SHOWS:");
+    expect(prompt).toContain("a line chart of MRR doubling");
+  });
+
+  it("no captionFn → no image line (drafting unchanged)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { text: "post", images: ["https://media.licdn.com/a.jpg"] } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    expect(prompt).not.toContain("THE POST'S IMAGE SHOWS:");
+  });
+
+  it("fails open when the vision call throws (drafting proceeds, no image line)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const captionFn = vi.fn().mockRejectedValue(new Error("vision 500"));
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { text: "post", images: ["https://media.licdn.com/a.jpg"] } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      captionFn,
+    });
+    expect(n).toBe(1); // draft still shipped
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    expect(prompt).not.toContain("THE POST'S IMAGE SHOWS:");
+  });
+});
+
+describe("runDrafterTick — verifier (grounded-drafting)", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("privately traces only the selected browser reply and each rejected rewrite", async () => {
+    const home = mkdtempSync(join(tmpdir(), "noelle-review-trace-"));
+    const selectedId = "11111111-1111-4111-8111-111111111111";
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("NOELLE_LINKEDIN_REVIEW_TRACE_LEAD_ID", selectedId);
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
