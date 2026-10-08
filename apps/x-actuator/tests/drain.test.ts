@@ -198,3 +198,128 @@ describe("inQuietDrainGap (X)", () => {
       { kind: "like" as const, atMs: 40_000 },
       { kind: "comment" as const, atMs: 100_000 },
       // gap 2 (100k -> 200k) has NO likes -> quiet (cooldown)
+      { kind: "comment" as const, atMs: 200_000 },
+    ];
+    expect(inQuietDrainGap(plan, 50_000)).toBe(false);
+    expect(inQuietDrainGap(plan, 150_000)).toBe(true);
+  });
+
+  it("agrees with planDrainTimeline: quiet exactly where a gap has no likes", () => {
+    for (let seed = 1; seed <= 30; seed++) {
+      const plan = planDrainTimeline({ approvedComments: 12, startMs: 0, rng: makeRng(seed) });
+      const comments = plan.filter((a) => a.kind === "comment").map((a) => a.atMs).sort((a, b) => a - b);
+      for (let i = 0; i < comments.length - 1; i++) {
+        const lo = comments[i]!;
+        const hi = comments[i + 1]!;
+        const hasLikes = plan.some((a) => a.kind === "like" && a.atMs > lo && a.atMs < hi);
+        const mid = lo + Math.floor((hi - lo) / 2);
+        expect(inQuietDrainGap(plan, mid)).toBe(!hasLikes);
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-07-26 quiet re-tune (port of Lyra #497).
+//
+// The repo lesson from #471/#497: reshaping a distribution shifts its mean, and
+// a floor+ceiling that both look intact does NOT mean velocity is unchanged. So
+// these assert mean AND median on EVERY dimension the re-tune touches, against
+// the pre-re-tune constants simulated as an explicit baseline — not against
+// hand-copied numbers that could drift.
+// ---------------------------------------------------------------------------
+describe("quiet drain re-tune (#497 port) — distribution, not just bounds", () => {
+  const PRE_RETUNE_WEIGHTS = [0.34, 0.26, 0.18, 0.11, 0.11];
+  const SESSIONS = 400;
+  const REPLIES = 12;
+
+  const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+  const median = (xs: number[]) => {
+    const s = [...xs].sort((a, b) => a - b);
+    const m = s.length >> 1;
+    return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
+  };
+
+  // Simulate many sessions and collect every dimension at once.
+  function sim(patternWeights?: number[]) {
+    const likesPerSession: number[] = [];
+    const gapsAll: number[] = [];
+    const likesPerGapAll: number[] = [];
+    const sessionSpans: number[] = [];
+    for (let s = 0; s < SESSIONS; s++) {
+      const rng = makeRng(1000 + s);
+      const plan = planDrainTimeline({
+        approvedComments: REPLIES,
+        startMs: 1_000_000,
+        rng,
+        ...(patternWeights ? { patternWeights } : {}),
+      });
+      likesPerSession.push(plan.filter((a) => a.kind === "like").length);
+      gapsAll.push(...replyGaps(plan));
+      likesPerGapAll.push(...likesPerGap(plan));
+      const times = plan.map((a) => a.atMs);
+      sessionSpans.push(Math.max(...times) - Math.min(...times));
+    }
+    return { likesPerSession, gapsAll, likesPerGapAll, sessionSpans };
+  }
+
+  const now = sim();
+  const before = sim(PRE_RETUNE_WEIGHTS);
+
+  it("cuts drain like VOLUME on both mean and median", () => {
+    expect(mean(now.likesPerSession)).toBeLessThan(mean(before.likesPerSession));
+    expect(median(now.likesPerSession)).toBeLessThanOrEqual(median(before.likesPerSession));
+    // The weights-only baseline understates the change, because the `before` sim
+    // cannot also restore the old 4-8 per-gap like defaults (passing explicit
+    // like knobs disables the pattern draw entirely). So pin the GOAL absolutely:
+    // under 1 like per gap on average. Measured end-to-end against the true
+    // pre-re-tune constants (weights [.34,.26,.18,.11,.11] + full 4-8) the
+    // planned mean was ~3.06 likes/gap; it is ~0.78 now.
+    const meanLikesPerGap = mean(now.likesPerGapAll);
+    expect(meanLikesPerGap).toBeLessThan(1);
+  });
+
+  it("cuts likes PER GAP on both mean and median, and caps the worst gap at 3", () => {
+    expect(mean(now.likesPerGapAll)).toBeLessThan(mean(before.likesPerGapAll));
+    expect(median(now.likesPerGapAll)).toBeLessThanOrEqual(median(before.likesPerGapAll));
+    // Lyra's post-#497 ceiling is 3 likes in any single gap; X must not exceed it.
+    expect(Math.max(...now.likesPerGapAll)).toBeLessThanOrEqual(3);
+  });
+
+  it("never SPEEDS UP the drain — gap mean AND median both rise", () => {
+    // The trap from #497: weight shifted into a flat-capped branch sped the slow
+    // archetypes up on the duration axis even though volume fell. Cooldown draws
+    // from the NORMAL band only, so making it modal must slow things down.
+    expect(mean(now.gapsAll)).toBeGreaterThan(mean(before.gapsAll));
+    expect(median(now.gapsAll)).toBeGreaterThan(median(before.gapsAll));
+  });
+
+  it("never shortens a SESSION — span mean AND median both rise", () => {
+    expect(mean(now.sessionSpans)).toBeGreaterThan(mean(before.sessionSpans));
+    expect(median(now.sessionSpans)).toBeGreaterThan(median(before.sessionSpans));
+  });
+
+  it("plans no sub-20s reply gap (the old 1s floor put 4.4% under 10s)", () => {
+    const shortest = Math.min(...now.gapsAll);
+    expect(shortest).toBeGreaterThanOrEqual(20_000);
+    // Falsifiability for this one lives in the drainGapMs sweep below rather than
+    // in `before`: the baseline sim varies only patternWeights, so it shares the
+    // re-tuned band floor and cannot demonstrate the old 1s draws.
+  });
+
+  it("drainGapMs itself never returns under 20s across a wide sweep", () => {
+    const rng = makeRng(77);
+    for (let i = 0; i < 20_000; i++) {
+      expect(drainGapMs(rng)).toBeGreaterThanOrEqual(20_000);
+    }
+  });
+
+  it("cooldown is the MODAL gap pattern (zero-like gaps are the common case)", () => {
+    const zeroLikeShare =
+      now.likesPerGapAll.filter((n) => n === 0).length / now.likesPerGapAll.length;
+    const beforeShare =
+      before.likesPerGapAll.filter((n) => n === 0).length / before.likesPerGapAll.length;
+    expect(zeroLikeShare).toBeGreaterThan(beforeShare);
+    expect(zeroLikeShare).toBeGreaterThan(0.4);
+  });
+});
