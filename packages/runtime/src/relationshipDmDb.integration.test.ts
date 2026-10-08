@@ -198,3 +198,161 @@ describe.skipIf(!url)("relationship DM DB (integration)", () => {
     await markRelationshipDmResult(sql, {
       orgId: ids.org,
       reservationId: candidate!.reservationId,
+      status: "failed",
+      reason: "duplicate update must not change counters",
+    });
+    const [request] = await sql<Array<{ status: string; queued_count: number; judge_verdict: unknown }>>`
+      select req.status, req.queued_count, res.judge_verdict
+      from noelle.relationship_dm_requests req
+      join noelle.relationship_dm_reservations res on res.request_id = req.id
+      where req.recipient_key = 'alpha'`;
+    const judgeVerdict = typeof request?.judge_verdict === "string"
+      ? JSON.parse(request.judge_verdict)
+      : request?.judge_verdict;
+    expect(request).toMatchObject({ status: "done", queued_count: 1 });
+    expect(judgeVerdict).toEqual({ pass: true, reason: "Specific saved detail" });
+  });
+
+  it("does not exceed requested count while a reservation is still processing", async () => {
+    await addPost("x", "alpha", ids.x, 1);
+    await addPost("x", "beta", ids.x, 1);
+    await sql`insert into noelle.relationship_dm_requests
+      (org_id, agent_instance_id, platform, requested_count)
+      values (${ids.org}, ${ids.x}, 'x', 1)`;
+    expect(await claim("x", ids.x, 5, false)).toHaveLength(1);
+    expect(await claim("x", ids.x, 5, false)).toEqual([]);
+    const [request] = await sql<Array<{ status: string; reservations: number }>>`
+      select req.status, count(res.id)::int as reservations
+      from noelle.relationship_dm_requests req
+      left join noelle.relationship_dm_reservations res on res.request_id = req.id
+      group by req.id`;
+    expect(request).toEqual({ status: "running", reservations: 1 });
+  });
+
+  it("completes no-candidate requests without reserving anyone", async () => {
+    await sql`insert into noelle.relationship_dm_requests
+      (org_id, agent_instance_id, platform, recipient_key, requested_count)
+      values (${ids.org}, ${ids.x}, 'x', 'missing-person', 1)`;
+    await expect(claim("x", ids.x, 5, false)).resolves.toEqual([]);
+    const [request] = await sql<Array<{ status: string; reason: string | null; reservations: number }>>`
+      select req.status, req.reason, count(res.id)::int as reservations
+      from noelle.relationship_dm_requests req
+      left join noelle.relationship_dm_reservations res on res.request_id = req.id
+      group by req.id`;
+    expect(request).toEqual({
+      status: "done",
+      reason: "No eligible saved-context recipients matched this request",
+      reservations: 0,
+    });
+  });
+
+  it("requested claims still obey the shared X daily cap", async () => {
+    for (let i = 0; i < 20; i++) await addPost("x", `requested${i}`, ids.x, i);
+    await sql`insert into noelle.relationship_dm_requests
+      (org_id, agent_instance_id, platform, requested_count)
+      values (${ids.org}, ${ids.x}, 'x', 20)`;
+    expect(await claim("x", ids.x, 40, false)).toHaveLength(15);
+  });
+
+  it("keeps profile context when a person has many saved posts", async () => {
+    for (let i = 0; i < 25; i++) await addPost("x", "prolific", ids.x, i);
+    await sql`insert into noelle.x_watchlist_profiles
+      (org_id, agent_instance_id, handle, summary, topics, posts_analyzed)
+      values (${ids.org}, ${ids.x}, 'prolific', 'Builds small developer tools and writes informal jokes', '[]', 25)`;
+    const [candidate] = await claim("x");
+    expect(candidate!.context.some((e) => e.kind === "profile")).toBe(true);
+    expect(candidate!.context.filter((e) => e.kind === "post")).toHaveLength(6);
+  });
+
+  it("blocks aliases from same-batch fsd matches and prior DMs known only by fsd", async () => {
+    await sql`insert into noelle.linkedin_watchlist_people (org_id, agent_instance_id, fsd_profile_id, public_id, name) values (${ids.org}, ${ids.li}, 'samefsd', 'vanity', 'Vanity')`;
+    await sql`insert into noelle.linkedin_watchlist_profiles (org_id, agent_instance_id, fsd_profile_id, public_id, summary, topics, posts_analyzed) values (${ids.org}, ${ids.li}, 'samefsd', 'new-vanity', 'Stable profile context survives public id changes', ${sql.json([] as never)}, 1)`;
+    await addPost("linkedin", "old-vanity", ids.li, 1, "samefsd");
+    const [aliasClaim] = await claim("linkedin");
+    expect(aliasClaim?.context.some((e) => e.text.includes("old-vanity"))).toBe(true);
+    expect(aliasClaim?.context.some((e) => e.text.includes("Stable profile context"))).toBe(true);
+    await sql`truncate noelle.relationship_dm_reservations cascade`;
+    await addDm("old-vanity", "pending", "samefsd");
+    expect(await claim("linkedin")).toEqual([]);
+  });
+
+  it.each(["mismatched lead", "foreign instance", "sibling mismatch"])(
+    "does not suppress a requested recipient using a %s DM reference", async (caseName) => {
+      await addPost("x", "target", ids.x);
+      await addPost("x", "other", ids.x);
+      await addPost("x", "target", ids.other, 2);
+      const [target] = await sql`select id from noelle.leads where external_id='x-target-1'`;
+      const [other] = await sql`select id from noelle.leads where external_id='x-other-1'`;
+      const approvalAgent = caseName === "sibling mismatch" ? ids.other : ids.x;
+      if (caseName === "foreign instance") {
+        await sql`insert into noelle.organizations(id,slug,name) values
+          ('00000000-0000-4000-8000-000000000002','foreign','Foreign')`;
+        await sql`update noelle.agent_instances set org_id='00000000-0000-4000-8000-000000000002' where id=${ids.x}`;
+      }
+      const [draft] = await sql`insert into noelle.drafts(org_id,lead_id,payload) values
+        (${ids.org},${caseName === "mismatched lead" ? other!.id : target!.id},${sql.json({ kind: "dm", body: "prior DM" })}) returning id`;
+      await sql`insert into noelle.approvals(org_id,agent_instance_id,draft_id,lead_id,status)
+        values (${ids.org},${approvalAgent},${draft!.id},${target!.id},'pending')`;
+      await sql`insert into noelle.relationship_dm_requests(org_id,agent_instance_id,platform,recipient_key,requested_count)
+        values (${ids.org},${ids.other},'x','target',1)`;
+      expect((await claim("x", ids.other, 1, false)).map((r) => r.authorHandle)).toEqual(["target"]);
+    });
+
+  it("does not mix unrelated same-handle profiles across platforms", async () => {
+    await addPost("x", "alex", ids.x);
+    await sql`insert into noelle.linkedin_watchlist_profiles (org_id, agent_instance_id, fsd_profile_id, public_id, summary, topics, posts_analyzed) values (${ids.org}, ${ids.li}, 'li-alex', 'alex', 'Unrelated LinkedIn Alex', ${sql.json([] as never)}, 1)`;
+    const [candidate] = await claim("x", ids.x, 1);
+    expect(candidate?.context.some((e) => e.id.startsWith("profile:linkedin:"))).toBe(false);
+  });
+
+  it("blocks linked recipients across platforms", async () => {
+    await sql`insert into noelle.persons (id, org_id, display_name) values ('30000000-0000-4000-8000-000000000004', ${ids.org}, 'Same Human')`;
+    await sql`insert into noelle.person_social_accounts (org_id, person_id, platform, handle) values
+      (${ids.org}, '30000000-0000-4000-8000-000000000004', 'linkedin', 'same-li'),
+      (${ids.org}, '30000000-0000-4000-8000-000000000004', 'x', 'samex')`;
+    await addPost("linkedin", "same-li", ids.li);
+    await addPost("x", "samex", ids.x);
+    expect(await claim("linkedin", ids.li, 1)).toHaveLength(1);
+    expect(await claim("x", ids.x, 1)).toEqual([]);
+  });
+
+  it("serializes concurrent claims under both shared daily org caps", async () => {
+    for (let i = 0; i < 20; i++) await addPost("x", `person${i}`, i < 10 ? ids.x : ids.other, i);
+    const xClaimed = (await Promise.all([claim("x", ids.x, 10), claim("x", ids.other, 10)])).flat();
+    expect(xClaimed).toHaveLength(15);
+    await sql`truncate noelle.relationship_dm_reservations, noelle.leads cascade`;
+    for (let i = 0; i < 45; i++)
+      await addPost("linkedin", `li${i}`, i < 23 ? ids.li : ids.other, i);
+    const liClaimed = (
+      await Promise.all([claim("linkedin", ids.li, 30), claim("linkedin", ids.other, 30)])
+    ).flat();
+    expect(liClaimed).toHaveLength(40);
+    expect(new Set(liClaimed.map((c) => c.authorHandle)).size).toBe(40);
+  });
+
+  it("failed attempts consume today's budget but retry on a later Bogota day; queued is permanent", async () => {
+    await addPost("x", "retryme", ids.x);
+    const [first] = await claim("x", ids.x, 1);
+    await markRelationshipDmResult(sql, {
+      orgId: ids.org,
+      reservationId: first!.reservationId,
+      status: "failed",
+      reason: "model error",
+    });
+    expect(await claim("x", ids.x, 1)).toEqual([]);
+    await sql`update noelle.relationship_dm_reservations set reserved_for_date = reserved_for_date - 1`;
+    const [second] = await claim("x", ids.x, 1);
+    await markRelationshipDmResult(sql, {
+      orgId: ids.org,
+      reservationId: second!.reservationId,
+      status: "queued",
+    });
+    await markRelationshipDmResult(sql, {
+      orgId: ids.org,
+      reservationId: second!.reservationId,
+      status: "failed",
+    });
+    await sql`update noelle.relationship_dm_reservations set reserved_for_date = reserved_for_date - 1`;
+    expect(await claim("x", ids.x, 1)).toEqual([]);
+  });
+});

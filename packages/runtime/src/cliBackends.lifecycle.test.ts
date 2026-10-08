@@ -198,3 +198,10 @@ describe("native CLI deadline ownership", () => {
       if (home) expect(existsSync(home)).toBe(false);
     } finally {
       if (child && child.exitCode === null && child.signalCode === null) {
+        const closed = new Promise<void>(resolve => child!.once("close", () => resolve()));
+        child.kill("SIGKILL"); await closed;
+      }
+      if (home) rmSync(home, { recursive: true, force: true });
+    }
+  }, 10_000);
+});

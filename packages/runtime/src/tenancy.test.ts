@@ -198,3 +198,36 @@ describe("isOrgMember (QueryExecutor branch)", () => {
     };
     await expect(isOrgMember(exec, "u-1", "org-1")).resolves.toBe(false);
   });
+
+  it("passes org_id then user_id as params $1,$2", async () => {
+    let capturedSql: string | undefined;
+    let capturedParams: ReadonlyArray<unknown> | undefined;
+    const exec: QueryExecutor = async (sql, params) => {
+      capturedSql = sql;
+      capturedParams = params;
+      return [{ user_id: "u-7" }];
+    };
+    await isOrgMember(exec, "u-7", "org-42");
+    expect(capturedSql).toMatch(/noelle\.org_members/);
+    expect(capturedSql).toMatch(/org_id = \$1/);
+    expect(capturedSql).toMatch(/user_id = \$2/);
+    expect(capturedParams).toEqual(["org-42", "u-7"]);
+  });
+});
+
+describe("assertOrgMember (QueryExecutor branch)", () => {
+  it("resolves without throwing when the executor returns a row", async () => {
+    const exec: QueryExecutor = async () => [{ user_id: "u-1" }];
+    await expect(
+      assertOrgMember(exec, "u-1", "org-1"),
+    ).resolves.toBeUndefined();
+  });
+
+  it("throws OrgMembershipError when the executor returns no rows", async () => {
+    const exec: QueryExecutor = async () => [];
+    const err = await assertOrgMember(exec, "u-1", "org-1").catch((e) => e);
+    expect(err).toBeInstanceOf(OrgMembershipError);
+    expect(err.userId).toBe("u-1");
+    expect(err.orgId).toBe("org-1");
+  });
+});
