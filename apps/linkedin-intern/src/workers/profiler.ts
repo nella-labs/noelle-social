@@ -198,3 +198,38 @@ async function main() {
             playbooks = await runAnalystTick({
               log,
               instance: inst,
+              ranked,
+              freshHandles,
+              batch: env.LINKEDIN_ANALYST_BATCH,
+              runner,
+              upsertPlaybook: (p) => upsertPlaybook(sql, p),
+            });
+          }
+        } catch (err) {
+          // Non-fatal: a failed analyst pass must never stall profiling.
+          log.warn({ instance: inst.id, err: (err as Error).message }, "analyst pass failed");
+        }
+
+        await run.finish({ status: "ok", rowsProcessed: profiled + playbooks });
+      } catch (err) {
+        // Apify rate/usage limits are transient — defer to the next tick.
+        if (err instanceof ApifyError && (err.status === 429 || err.status === 402)) {
+          log.info(
+            { instance: inst.id, status: err.status },
+            "apify rate/usage limit; deferring to next tick",
+          );
+          await run.finish({ status: "ok", rowsProcessed: 0 });
+          return;
+        }
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+  });
+}
+
+main().catch((err) => {
+  console.error("profiler fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});

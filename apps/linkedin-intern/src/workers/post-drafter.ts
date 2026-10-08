@@ -198,3 +198,167 @@ async function main() {
           try {
             knowledgeAnchors = await gatherPostKnowledgeAnchors(
               sharedKb,
+              query,
+              parseIncludeDirs(env.NOELLE_KNOWLEDGE_DIRS),
+              env.NOELLE_DRAFTER_KNOWLEDGE_TOPK,
+            );
+          } catch (err) {
+            log.warn({ err: (err as Error).message }, "post-drafter factual search failed");
+          }
+        }
+        const externalIds = idea.inspirationRefs
+          .map((r) => r.leadId)
+          .filter((x): x is string => Boolean(x));
+        const inspirationExcerpts = await getInspirationPostTexts(sql, {
+          agentInstanceId: inst.id,
+          externalIds,
+        });
+        const chatGuidance = await getIdeaChatGuidance(sql, idea.id);
+        return {
+          hook: idea.hook,
+          thesis: idea.thesis,
+          angle: idea.angle,
+          pillar: idea.pillar,
+          voiceAnchors,
+          knowledgeAnchors,
+          inspirationExcerpts,
+          hookPatterns,
+          standingRules,
+          chatGuidance,
+        };
+      };
+
+      const makeVerifierCalls = (opts?: { force?: boolean }): VerifierCall[] => {
+        if (!env.NOELLE_POST_VERIFY && !opts?.force) return [];
+        const call: VerifierCall = async (system, prompt) => {
+          const res = await runner.draft({
+            bucket: "post-drafter",
+            routing,
+            orgId: inst.org_id,
+            instanceId: inst.id,
+            worker: "post-verifier",
+            agentRole,
+            system,
+            prompt,
+          });
+          return res.text;
+        };
+        return [call];
+      };
+
+      const bus = busForInstance(inst);
+      const run = await recordRun({ sql, kind: "post-drafter", bus });
+      try {
+        const n = await runPostDrafterTick({
+          log,
+          instance: inst,
+          ideas,
+          gather,
+          runner,
+          agentRole,
+          routing,
+          makeVerifierCalls,
+          verifyRetries: env.NOELLE_POST_VERIFY_RETRIES,
+          sink: (draft) => draftsClient.postDraft(draft),
+          release: (ideaId) => releaseIdeaToApproved(sql, ideaId),
+          clearPending: (ideaId) => clearPendingPlatforms(sql, ideaId),
+          cta: {
+            product: env.NOELLE_POSTS_CTA_PRODUCT || undefined,
+            url: env.NOELLE_POSTS_CTA_URL || undefined,
+            tagline: env.NOELLE_POSTS_CTA_TAGLINE || undefined,
+          },
+          stylePool: style.stylePool,
+          styleUltraProfiles: style.styleUltraProfiles,
+          postStyleEnabled: style.postStyleEnabled,
+          styleConfig: style.styleConfig,
+        });
+        await run.finish({ status: "ok", rowsProcessed: n });
+      } catch (err) {
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+  });
+}
+
+interface PostStyleInputs {
+  stylePool: StyleExemplarRow[];
+  styleUltraProfiles: UltraProfileRow[];
+  postStyleEnabled: boolean;
+  /** Config override for selectStyleExemplars (pinned mode bumps exemplars). */
+  styleConfig?: unknown;
+}
+
+/**
+ * Load the post-lane STYLE inputs (kind='post', LinkedIn corpus) for one instance.
+ * PINNED mode wins over AUTO and over the env gate; both fail open to no style.
+ * X-owned (Vega) instances have no LinkedIn style corpus, so the queries just
+ * return empty for them — a harmless no-op.
+ */
+async function loadPostStyleInputs(
+  sql: ReturnType<typeof noelleDb>,
+  inst: { id: string; account_feeder_config?: unknown },
+  postStyleFlag: boolean,
+  poolLimit: number,
+): Promise<PostStyleInputs> {
+  const off: PostStyleInputs = { stylePool: [], styleUltraProfiles: [], postStyleEnabled: false };
+  const pinnedHandle = readPinnedHandle(inst.account_feeder_config);
+
+  if (pinnedHandle) {
+    const [pool, profile] = await Promise.all([
+      listStyleExemplarsForHandle(sql, {
+        agentInstanceId: inst.id,
+        platform: "linkedin",
+        kind: "post",
+        handle: pinnedHandle,
+        limit: poolLimit,
+      }),
+      getUltraProfileForHandle(sql, {
+        agentInstanceId: inst.id,
+        platform: "linkedin",
+        handle: pinnedHandle,
+      }),
+    ]);
+    // Pinned source with no post corpus yet → fail open to no style (don't silently
+    // fall back to the blend the operator explicitly opted out of).
+    if (pool.length === 0) return off;
+    return {
+      stylePool: pool,
+      styleUltraProfiles: profile ? [profile] : [],
+      postStyleEnabled: true,
+      styleConfig: pinnedSelectConfig(inst.account_feeder_config),
+    };
+  }
+
+  if (!postStyleFlag) return off;
+  const parsed = AccountFeederConfigSchema.safeParse(
+    inst.account_feeder_config && typeof inst.account_feeder_config === "object"
+      ? inst.account_feeder_config
+      : {},
+  );
+  const minPerformancePercentile = parsed.success
+    ? parsed.data.minPerformancePercentile
+    : AccountFeederConfigSchema.parse({}).minPerformancePercentile;
+  const [pool, profiles] = await Promise.all([
+    listStyleExemplars(sql, {
+      agentInstanceId: inst.id,
+      platform: "linkedin",
+      kind: "post",
+      limit: poolLimit,
+      minPerformancePercentile,
+    }),
+    listUltraProfiles(sql, { agentInstanceId: inst.id, platform: "linkedin" }),
+  ]);
+  return {
+    stylePool: pool,
+    styleUltraProfiles: profiles,
+    postStyleEnabled: true,
+    styleConfig: inst.account_feeder_config,
+  };
+}
+
+main().catch((err) => {
+  console.error("post-drafter fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
