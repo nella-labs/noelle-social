@@ -198,3 +198,203 @@ async function main() {
       const postOutbound = (body: Parameters<typeof outbound.postOutbound>[0]) =>
         outbound.postOutbound(body, { orgId: inst.org_id, agentInstanceId: inst.id });
       // Two lanes:
+      //  - Watchlist lane (priority leads): always-on while watchlist_enabled,
+      //    one reply per watched person, bypasses the goal + backpressure caps.
+      //  - Keyword lane (non-priority leads): only when the instance is active
+      //    and the drafter is enabled, respecting goal + backpressure.
+      const active = inst.status !== "paused";
+      const watchlistLaneOn = isWorkerEnabled(inst, "watchlist");
+      const keywordLaneOn = active && isWorkerEnabled(inst, "drafter");
+      const relationshipDmLaneOn = isRelationshipDmsLaneEnabled(inst);
+      // Autosend quality levers: when the master flag is on, an auto_send_enabled
+      // instance auto-engages voice-variety + the reply-diversity gate even if
+      // their per-lever flags are off. Default OFF → each lever governed only by
+      // its own flag (byte-identical to today). See lib/autosend-quality.ts.
+      const quality = resolveAutosendQuality({
+        varietyFlag: env.NOELLE_DRAFTER_VARIETY,
+        diversityGateFlag: env.NOELLE_REPLY_DIVERSITY_GATE,
+        autoEnable: env.NOELLE_AUTOSEND_QUALITY_AUTOENABLE,
+        autoSendEnabled: inst.auto_send_enabled,
+      });
+      const bus = busForInstance(inst);
+      const run = await recordRun({ sql, kind: "drafter", bus });
+      try {
+        // Admit a complete current rule set before any writer work or new claims.
+        const patternRules = await loadActivePatternRules(sql, {
+          orgId: inst.org_id,
+          agentInstanceId: inst.id,
+          role: "x_intern",
+        });
+        // Recover leads stranded at 'drafting' by a crash/restart mid-claim —
+        // without this they are invisible to every future claim (see reapStaleClaims).
+        const reaped = await reapStaleClaims(sql, {
+          agentInstanceId: inst.id,
+          claimedStatus: "drafting",
+          requeueStatus: "classified",
+        });
+        if (reaped.requeued || reaped.expired) {
+          log.warn({ org_id: inst.org_id, ...reaped }, "reaped stale drafting claims");
+        }
+        const relationshipDmDrafted = await runRelationshipDmsForInstance({
+          sql,
+          instance: inst,
+          runner,
+          postOutbound,
+          log,
+        });
+        const relationshipDmOnly = relationshipDmLaneOn && !watchlistLaneOn && !keywordLaneOn;
+        const claimed: Awaited<ReturnType<typeof claimLeadsForDrafting>> = [];
+        const watchlistAuthors: Array<{ author: string; leadId: string }> = [];
+
+        const replyRequests = await claimReplyRequestLeads(sql, {
+          agentInstanceId: inst.id,
+          cap: 5,
+        });
+        let dmRequests: Awaited<ReturnType<typeof claimDmRequestLeads>> = [];
+        if (relationshipDmOnly) {
+          dmRequests = await claimDmRequestLeads(sql, {
+            agentInstanceId: inst.id,
+            cap: 5,
+          });
+          if (dmRequests.length === 0 && replyRequests.length === 0) {
+            await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted });
+            return;
+          }
+        }
+        // Freshness sweep (X_REPLY_MAX_AGE_HOURS, 0 = off): 'classified' leads
+        // whose target tweet aged past the ceiling can never be claimed (0088
+        // RPC predicate) — skip them out so they stop eating backlog-cap
+        // headroom and the queue reads as live conversations only.
+        if (env.X_REPLY_MAX_AGE_HOURS > 0) {
+          const agedOut = await expireStaleClassifiedLeads(sql, {
+            agentInstanceId: inst.id,
+            maxAgeHours: env.X_REPLY_MAX_AGE_HOURS,
+          });
+          if (agedOut > 0) {
+            log.warn(
+              { org_id: inst.org_id, agedOut, maxAgeHours: env.X_REPLY_MAX_AGE_HOURS },
+              "skipped classified leads with aged-out target tweets",
+            );
+          }
+          // Reply is the browser-actuator path (not the API send worker, which
+          // is where this sweep used to live but is stopped): expire pending +
+          // never-posted reply approvals whose target tweet aged out, so the
+          // actionable-x feed and the inbox only ever hold fresh, actionable
+          // replies. Runs unconditionally (even paused/send-disabled) — a stale
+          // reply is dead regardless of send state.
+          const expired = await expireStaleApprovals(sql, {
+            agentInstanceId: inst.id,
+            maxAgeHours: env.X_REPLY_MAX_AGE_HOURS,
+          });
+          if (expired.pending || expired.limbo) {
+            log.warn(
+              { org_id: inst.org_id, ...expired, maxAgeHours: env.X_REPLY_MAX_AGE_HOURS },
+              "expired stale reply approvals (target tweet aged out)",
+            );
+          }
+        }
+
+        // On-demand DM requests run independent of the reply lanes + pause — the
+        // operator flagged these people for a one-off DM (dashboard "Generate
+        // DM"). Claimed every tick so they generate even with both lanes off.
+        if (!relationshipDmOnly) {
+          dmRequests = await claimDmRequestLeads(sql, {
+            agentInstanceId: inst.id,
+            cap: 5,
+          });
+        }
+
+        // Drafting is serial. Claim one at a time so fresh leads can compete
+        // for the next tick; the SQL claim still enforces the 12-active cap.
+        const observedLeads = !relationshipDmOnly && (watchlistLaneOn || keywordLaneOn)
+          ? await claimObservedLeadsForDrafting(sql, { agentInstanceId: inst.id, cap: 1 })
+          : [];
+        const observedAuthors = new Set(observedLeads.map((lead) => lead.author_handle.toLowerCase()));
+        const withoutObservedAuthor = async (legacy: LeadRow[]): Promise<LeadRow[]> => {
+          const distinct: LeadRow[] = [];
+          for (const lead of legacy) {
+            if (observedAuthors.has(lead.author_handle.toLowerCase())) {
+              // Both claims happen before the observed draft creates an approval.
+              // Return a same-author legacy claim so it cannot draft in parallel.
+              await markLeadStatus(sql, { leadId: lead.id, status: "classified" });
+            } else {
+              distinct.push(lead);
+            }
+          }
+          return distinct;
+        };
+
+        // Watchlist lane — one newest reply per watched person without a pending
+        // reply. No goal/backpressure gate: watched accounts are always-on.
+        if (watchlistLaneOn) {
+          const wl = await withoutObservedAuthor(await claimWatchlistLeadsForDrafting(sql, {
+            agentInstanceId: inst.id,
+            cap: WATCHLIST_PENDING_CAP,
+            maxAgeHours: env.X_REPLY_MAX_AGE_HOURS,
+          }));
+          claimed.push(...wl);
+          for (const l of wl) watchlistAuthors.push({ author: l.author_handle, leadId: l.id });
+        }
+
+        // Keyword lane — gated on active + goal + backpressure (existing rules).
+        if (keywordLaneOn) {
+          const goal = await enforceGoal(sql, inst);
+          let keywordBlocked = Boolean(goal?.paused);
+          if (goal?.paused) {
+            log.info(
+              {
+                org_id: inst.org_id,
+                produced: goal.produced,
+                target: goal.target,
+                stalled: goal.stalled,
+              },
+              goal.stalled
+                ? "goal STALLED (no new replies for the stall window) — auto-paused; keyword lane off, watchlist lane continues"
+                : "goal reached — keyword lane paused (watchlist lane continues)",
+            );
+          }
+          if (!keywordBlocked) {
+            const cap = effectiveDraftsCap(inst);
+            if (cap != null) {
+              const pending = await countPendingApprovalsForInstance(sql, inst.id);
+              if (pending >= cap) {
+                keywordBlocked = true;
+                log.info({ org_id: inst.org_id, pending, cap }, "keyword lane paused: pending at cap");
+              }
+            }
+          }
+          if (!keywordBlocked) {
+            const kw = await withoutObservedAuthor(await claimLeadsForDrafting(sql, {
+              agentInstanceId: inst.id,
+              batch: 3,
+              maxAgeHours: env.X_REPLY_MAX_AGE_HOURS,
+            }));
+            claimed.push(...kw);
+          }
+        }
+
+        if (claimed.length === 0 && observedLeads.length === 0 && dmRequests.length === 0 && replyRequests.length === 0) {
+          await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted });
+          return;
+        }
+
+        // Resolve the knowledge base for this tick. local/gcs are shared from
+        // boot; the legacy http backend needs a per-org key, fetched here and
+        // wrapped as a KnowledgeBase.
+        let kb: KnowledgeBase;
+        if (sharedKb) {
+          kb = sharedKb;
+        } else {
+          let nellaKey = "";
+          await readyCache.ensure(inst.org_id, "drafter", async () => {
+            nellaKey = await secrets.getForOrg(inst.org_id, "nella-api-key");
+          });
+          if (!nellaKey) nellaKey = await secrets.getForOrg(inst.org_id, "nella-api-key");
+          kb = knowledgeBaseFromNella(createNellaClient({ apiKey: nellaKey, baseUrl: env.NELLA_BASE_URL }), kbWorkspace);
+        }
+
+        // Vision caption: when a lead carries post images, caption them so the
+        // text-only drafter can react to the visual. We build the captionFn from
+        // the org's BYO Gemini key (the same key family the classifier uses);
+        // NOT_FOUND is the common case and just disables vision (captionImages
+        // returns empty context on transport failure). Secret errors disable
