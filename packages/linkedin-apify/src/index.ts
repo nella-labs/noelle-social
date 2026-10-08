@@ -398,3 +398,203 @@ function slugFromUrl(url: string | undefined): string | null {
   const m = url.match(/linkedin\.com\/in\/([^/?#]+)/i);
   return m ? decodeURIComponent(m[1]!) : null;
 }
+
+/**
+ * True when `id` is an opaque LinkedIn member URN id (`ACwAA…`, `ACoAA…`) rather
+ * than a human vanity slug. The actor sometimes returns one of these in
+ * `publicIdentifier` for members with a restricted/absent vanity URL. Such an id
+ * is NOT usable as `linkedin.com/in/<slug>` for the posts actor, so the profiler
+ * would back off with "no public_id" forever — see `resolveVanitySlug`.
+ */
+export function isMemberUrnId(id: string | null | undefined): boolean {
+  // Case-INSENSITIVE: these ids reach us lowercased through some paths (two such
+  // rows sit in linkedin_watchlist_people today, both stuck unprofiled), and a
+  // case-sensitive test would leave exactly the people this is meant to rescue.
+  //
+  // The length floor is what keeps real slugs out. Every member id observed is
+  // exactly 39 chars; ordinary vanity slugs are far shorter, and a real one like
+  // `achim-bonsch-a9186a38` (21) would be misread as a urn under a {20,} rule.
+  // 30+ is comfortably above every real slug and tolerates id-length drift.
+  return typeof id === "string" && /^ac[a-z0-9_-]{28,}$/i.test(id.trim());
+}
+
+/** Vanity slug out of a post permalink (linkedin.com/posts/<slug>_…), or null. */
+export function slugFromPostUrl(url: string | null | undefined): string | null {
+  if (typeof url !== "string") return null;
+  // Vanity slugs are [a-z0-9-] — the first `_` always ends the slug and starts
+  // the post's text fragment. `/feed/update/urn:…` permalinks carry no slug.
+  const m = url.match(/linkedin\.com\/posts\/([^_/?#]+)_/i);
+  return m ? decodeURIComponent(m[1]!) : null;
+}
+
+/**
+ * Best available `linkedin.com/in/<slug>` key for a person, preferring a real
+ * vanity slug over an opaque member URN id. Order: a non-URN publicId, the
+ * profile URL's slug, the post permalink's slug, then the URN as a last resort
+ * (better than null — some URN ids still resolve).
+ *
+ * Why this exists: profiling is keyed on the slug (`profilePosts({publicId})`),
+ * so a person whose `publicIdentifier` came back as a URN was unprofilable even
+ * though their own post URL spells the slug out.
+ */
+export function resolveVanitySlug(args: {
+  publicId?: string | null;
+  profileUrl?: string | null;
+  postUrl?: string | null;
+}): string | null {
+  const pid = args.publicId?.trim() || null;
+  if (pid && !isMemberUrnId(pid)) return pid;
+  const fromProfile = slugFromUrl(args.profileUrl ?? undefined);
+  if (fromProfile && !isMemberUrnId(fromProfile)) return fromProfile;
+  const fromPost = slugFromPostUrl(args.postUrl);
+  if (fromPost && !isMemberUrnId(fromPost)) return fromPost;
+  return pid;
+}
+
+/** Strip the urn:li:fsd_profile: prefix when the actor returns a full urn. */
+function stripFsdPrefix(id: string | undefined): string | null {
+  if (typeof id !== "string" || !id) return null;
+  return id.replace(/^urn:li:fsd_profile:/, "");
+}
+
+export function normalizeProfile(item: ApifyProfileItem): CandidateProfile | null {
+  const publicId =
+    item.publicIdentifier ?? item.username ?? slugFromUrl(item.linkedinUrl) ?? null;
+  const name = (item.name ?? [item.firstName, item.lastName].filter(Boolean).join(" ")).trim();
+  // Headline for the ICP gate: prefer the current-role titles (the precise
+  // signal), then any explicit headline/occupation, then the summary/bio. Short
+  // mode returns none of headline/occupation, so currentPositions/summary carry it.
+  const positionsText = Array.isArray(item.currentPositions)
+    ? item.currentPositions
+        .map((p) => p?.title ?? p?.position ?? p?.companyName)
+        .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+        .join(" · ")
+    : "";
+  const headline =
+    [positionsText, item.headline, item.occupation, item.summary]
+      .map((s) => (typeof s === "string" ? s.trim() : ""))
+      .find((s) => s.length > 0) ?? null;
+  // Need at least a way to address the person (slug) — otherwise we can't fetch
+  // their posts, so the candidate is useless.
+  if (!publicId) return null;
+  return {
+    publicId,
+    name: name.length > 0 ? name : null,
+    headline,
+    url: item.linkedinUrl ?? null,
+    fsdProfileId: stripFsdPrefix(item.id),
+  };
+}
+
+export function normalizeComment(item: ApifyCommentItem): LinkedInComment | null {
+  const text = (item.commentary ?? "").trim();
+  if (!text) return null;
+  const reactions = reactionTotal(item.reactionTypeCounts);
+  const createdAt = readSourceTimestamp(item.createdAt)
+    ?? readSourceEpochTimestamp(item.createdAt, "milliseconds");
+  return {
+    id: String(item.id ?? item.linkedinUrl ?? text.slice(0, 32)),
+    url: item.linkedinUrl ?? "",
+    text,
+    authorName: item.actor?.name ?? null,
+    authorHeadline: item.actor?.position ?? null,
+    reactions,
+    repliesCount: readSourceCount(item.numComments),
+    createdAt,
+  };
+}
+
+/**
+ * Map one profile-comments actor item (a comment the profile AUTHORED) into the
+ * shared LinkedInComment shape. Sibling to normalizeComment but for the
+ * different profile-comments layout: reactions = sum of engagement.reactions[]
+ * counts (falling back to engagement.likes when the breakdown is absent),
+ * repliesCount = engagement.comments, timestamp from createdAt (ISO) or
+ * createdAtTimestamp (unix ms). authorName/headline are the target profile
+ * (item.actor) — i.e. WHO wrote the comment, which is exactly the voice we want.
+ * Returns null for an empty body (same contract as normalizeComment).
+ */
+export function normalizeAuthoredComment(item: ApifyAuthoredCommentItem): LinkedInComment | null {
+  const text = (item.commentary ?? "").trim();
+  if (!text) return null;
+  const eng = item.engagement ?? {};
+  // Prefer the per-type reaction breakdown; fall back to the flat like count.
+  const reactions: number | null = Array.isArray(eng.reactions)
+    ? reactionTotal(eng.reactions)
+    : readSourceCount(eng.likes);
+  const createdAt = readSourceTimestamp(item.createdAt)
+    ?? readSourceEpochTimestamp(item.createdAt, "milliseconds")
+    ?? readSourceEpochTimestamp(item.createdAtTimestamp, "milliseconds");
+  return {
+    id: String(item.id ?? item.linkedinUrl ?? text.slice(0, 32)),
+    url: item.linkedinUrl ?? "",
+    text,
+    authorName: item.actor?.name ?? null,
+    authorHeadline: item.actor?.position ?? null,
+    reactions,
+    repliesCount: readSourceCount(eng.comments),
+    createdAt,
+  };
+}
+
+export function createApifyLinkedInClient(opts: CreateApifyLinkedInClientOpts): ApifyLinkedInClient {
+  const transport = createApifyTransport({
+    token: opts.token,
+    ...(opts.baseUrl ? { baseUrl: opts.baseUrl } : {}),
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    errorFactory: (message, status) => new ApifyError(message, status),
+  });
+  const profilePostsActorId = opts.profilePostsActorId ?? PROFILE_POSTS_ACTOR_ID;
+  const postSearchActorId = opts.postSearchActorId ?? POST_SEARCH_ACTOR_ID;
+  const postCommentsActorId = opts.postCommentsActorId ?? POST_COMMENTS_ACTOR_ID;
+  const profileSearchActorId = opts.profileSearchActorId ?? PROFILE_SEARCH_ACTOR_ID;
+  const profileCommentsActorId = opts.profileCommentsActorId ?? PROFILE_COMMENTS_ACTOR_ID;
+
+  async function runActorSync<T = ApifyPostItem>(actorId: string, actor: string, input: unknown, itemLimit: number): Promise<T[]> {
+    const result = await transport.runActor({ actorId, actor, input, itemLimit });
+    return result.items as T[];
+  }
+
+  function normalizeAll(items: ApifyPostItem[], maxPosts: number, sinceISO?: string): LinkedInPost[] {
+    const since = readSourceTimestamp(sinceISO);
+    const seen = new Set<string>();
+    const out: LinkedInPost[] = [];
+    for (const item of items) {
+      const p = normalizePost(item);
+      if (!p || seen.has(p.id)) continue;
+      if (since !== null && p.postedAt !== null && p.postedAt <= since) continue;
+      seen.add(p.id);
+      out.push(p);
+    }
+    return out.slice(0, maxPosts);
+  }
+
+  return {
+    drainLastRunUsd: transport.drainLastRunUsd,
+    drainRunReceipts: transport.drainRunReceipts,
+    async profilePosts({ profileUrl, publicId, maxPosts = 5, sinceISO, includeReposts = false }) {
+      transport.beginOperation();
+      const target = profileUrl ?? (publicId ? publicIdToUrl(publicId) : undefined);
+      if (!target) throw new ApifyError("profilePosts requires profileUrl or publicId", 0);
+      const since = readSourceTimestamp(sinceISO);
+      const items = await runActorSync(profilePostsActorId, "linkedin-profile-posts", {
+        targetUrls: [target],
+        maxPosts,
+        includeReposts,
+        ...(since ? { postedLimitDate: since } : {}),
+      }, maxPosts);
+      return normalizeAll(items, maxPosts, sinceISO);
+    },
+
+    async searchPosts({ queries, authorsPublicIdentifiers, maxPosts = 10, postedLimit, sinceISO }) {
+      transport.beginOperation();
+      assertApifyItemLimit(maxPosts * queries.length, (message, status) => new ApifyError(message, status));
+      const items = await runActorSync(postSearchActorId, "linkedin-post-search", {
+        searchQueries: queries,
+        ...(authorsPublicIdentifiers ? { authorsPublicIdentifiers } : {}),
+        maxPosts,
+        sortBy: "date",
+        ...(postedLimit ? { postedLimit } : {}),
+      }, maxPosts);
+      return normalizeAll(items, maxPosts, sinceISO);
