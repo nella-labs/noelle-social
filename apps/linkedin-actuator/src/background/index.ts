@@ -2398,3 +2398,203 @@ async function checkSelfReload(opts?: { receiverSlotIsCurrent(): Promise<boolean
   // `runActive` alone would block self-updates forever. The periodic alarm
   // requires empty pools. A serialized receiver read can have queued comments
   // in drain mode, but has no send in flight; scheduled runs and queued DMs keep
+  // their existing protection. Both paths require a resume path: drain intent
+  // (checkDrainResume) or lights-out auto-drain. That makes the self-update
+  // invisible instead of a silent stop (the bug: reload wiped the run, nothing
+  // restarted).
+  const quiet = !!s && s.commentPool.length === 0 && s.dmPool.length === 0;
+  const willResume =
+    parseDrainIntent(store[DRAIN_INTENT_KEY]) !== null || (cfg.autonomous === true && cfg.autoDrain === true);
+  const decide = shouldReloadBuildAtReceiver({
+    runActive: s?.status === "running",
+    poolsEmpty: quiet,
+    hasResumePath: willResume,
+    serializedReceiverSlot: opts !== undefined,
+    mode: s?.mode,
+    dmPoolSize: s?.dmPool.length ?? 0,
+    embeddedStamp: typeof __BUILD_STAMP__ === "string" ? __BUILD_STAMP__ : null,
+    servedStamp: served?.stamp ?? null,
+    lastAttemptedStamp: (store[RELOAD_STAMP_KEY] as string | undefined) ?? null,
+  });
+  if (!decide || (opts && !(await opts.receiverSlotIsCurrent()))) return false;
+  await chrome.storage.local.set({ [RELOAD_STAMP_KEY]: served!.stamp });
+  console.info("[self-reload] newer build on disk; reloading extension", {
+    from: __BUILD_STAMP__,
+    to: served!.stamp,
+  });
+  chrome.runtime.reload();
+  return true;
+}
+
+// Fire-and-forget liveness pulse to the Chrome Bridge sink (observability only;
+// see docs/chrome-bridge.md). Reads current run state so the heartbeat reports
+// running vs idle without any per-transition wiring. `force` bypasses the 60s
+// throttle for the 5-min autonomy alarm. Never touches the send path.
+async function pulseBridge(force: boolean): Promise<void> {
+  const cfg = await getConfig().catch(() => null);
+  if (!cfg) return;
+  const s = await loadState().catch(() => null);
+  const state = s?.status === "running" ? "running" : "idle";
+  await bridgePulse(cfg, state, { session_id: s?.sessionId }, force);
+}
+
+// ── Remote start/stop of the actuator (the "hands" master switch, 0089) ──────
+// The operator's intent lives on agent_instances.actuator_desired_state; the
+// extension long-polls it (GET /api/actuator/intent) and reconciles its run
+// lifecycle to match, in near-real-time. See docs/actuator-remote-control.md.
+//
+// REMOTE_STATE_KEY mirrors the applied intent locally so the autonomy gates honor
+// it synchronously and it survives SW death; 'stopped' hard-gates all autonomy,
+// 'running' is the persistent drain, absent = no remote override.
+const REMOTE_STATE_KEY = "actuator.remoteState";
+// The commandAt (epoch-ms) of the last remote intent this extension applied, so
+// the long-poll blocks until a genuine change (kept for observability/debug; the
+// live loop tracks `since` in memory and forces a fresh reconcile on cold start).
+const LAST_COMMAND_AT_KEY = "actuator.remoteCommandAt";
+
+// The gate the autonomy paths consult. Fail-OPEN on a storage error (return
+// false): the real stop enforcement is the cleared DRAIN_INTENT_KEY + STOP stamps
+// applyRemoteIntent writes at stop time (which don't depend on this read), so a
+// transient storage blip must not halt a normally-running actuator.
+async function remoteStopped(): Promise<boolean> {
+  try {
+    const s = await chrome.storage.local.get(REMOTE_STATE_KEY);
+    return s[REMOTE_STATE_KEY] === "stopped";
+  } catch {
+    return false;
+  }
+}
+
+// Reconcile the LIVE run to the operator's remote intent. Idempotent — safe to
+// call on every long-poll return and after any SW restart. The GATE
+// (REMOTE_STATE_KEY) is level-triggered (always re-asserted); the STOP *action*
+// (endRun) is EDGE-triggered — it fires only on the transition INTO 'stopped', so
+// a re-apply never kills a one-shot manual Run the operator started afterward.
+//   'stopped' → clear the standing drain intent, stamp today's STOP (so a
+//               lights-out `autonomous` config can't relaunch it, matching a local
+//               STOP), and end any live run: the hands go down and stay down.
+//   'running' → set the Full-auto standing intent (clearing a same-day STOP) and
+//               let checkDrainResume resume the drain BEHIND the existing health +
+//               challenge-cooldown + curfew safety gates.
+//   null      → no remote override: clear the mirror; local autonomy governs.
+async function applyRemoteIntent(desired: "running" | "stopped" | null): Promise<void> {
+  const cfg = await getConfig();
+  if (!cfg) return;
+  const prevStore = await chrome.storage.local.get(REMOTE_STATE_KEY).catch(() => ({}));
+  const prev = (prevStore as Record<string, unknown>)[REMOTE_STATE_KEY];
+
+  if (desired === "stopped") {
+    await chrome.storage.local.set({ [REMOTE_STATE_KEY]: "stopped" });
+    await chrome.storage.local.remove([DRAIN_INTENT_KEY, DISCOVERY_CANARY_KEY]);
+    await chrome.storage.local.set({
+      [AUTO_START_DAY_KEY]: localDayKey(new Date()),
+      [STOP_DAY_KEY]: localDayKey(new Date()),
+    });
+    if (prev !== "stopped") {
+      const s = await loadState().catch(() => null);
+      if (s?.status === "running") await endRun("stopped").catch(() => {});
+    }
+  } else if (desired === "running") {
+    await chrome.storage.local.set({ [REMOTE_STATE_KEY]: "running" });
+    await chrome.storage.local.remove(STOP_DAY_KEY); // a remote start clears a prior same-day STOP
+    // Preserve the operator's curfew choice when a drain intent already exists (a
+    // local Drain click = curfew off, Full-auto = on), so re-applying a published
+    // 'running' never flips a Drain to curfew-on. A phone-initiated start with no
+    // local intent defaults to curfew ON (unattended → don't reply overnight).
+    const existing = parseDrainIntent((await chrome.storage.local.get(DRAIN_INTENT_KEY))[DRAIN_INTENT_KEY]);
+    // Carry `notifications` through too: a phone/dashboard "start" re-applied
+    // over an Auto-notifications intent must resume the SWEEP, not silently
+    // downgrade it to a plain drain.
+    await chrome.storage.local.set({
+      [DRAIN_INTENT_KEY]: { curfew: existing?.curfew ?? true, notifications: existing?.notifications === true },
+    });
+    await checkDrainResume(); // resumes the drain behind the health/challenge/curfew gate
+  } else {
+    await chrome.storage.local.remove(REMOTE_STATE_KEY);
+  }
+
+  // Ack the actuator's ACTUAL run state so the dashboard shows reality, not just
+  // intent. Best-effort — a telemetry failure must never break the loop.
+  const after = await loadState().catch(() => null);
+  const runState: "running" | "idle" = after?.status === "running" ? "running" : "idle";
+  await new ActuatorApi(cfg).ackIntent(runState).catch(() => {});
+}
+
+// Singleton guard for the intent loop (in-memory; resets on SW death, so
+// ensureIntentLoop re-arms it after any restart — driven by onStartup and the 30s
+// tick alarm). At most one loop runs per service-worker lifetime.
+let intentLoopRunning = false;
+function ensureIntentLoop(): void {
+  if (intentLoopRunning) return;
+  intentLoopRunning = true;
+  void runIntentLoop().finally(() => {
+    intentLoopRunning = false;
+  });
+}
+
+// The near-real-time remote control channel. A cold start forces `since=0` so the
+// FIRST poll returns the current standing intent immediately and reconciles (in
+// case a SW death/self-reload wiped the run); thereafter `since` tracks the last
+// applied commandAt so the poll blocks until a genuine change. Fail-open: a null
+// (down api-vm / parse error) backs off ~4s and retries; the 30s alarm re-arms
+// this loop if the SW was killed during that gap. The in-flight long-poll keeps
+// the MV3 service worker alive between reconciles.
+async function runIntentLoop(): Promise<void> {
+  let since = 0; // cold-start: force an immediate reconcile of the current intent
+  for (;;) {
+    const cfg = await getConfig().catch(() => null);
+    if (!cfg?.instanceId || !cfg.apiBaseUrl || !cfg.token) {
+      await plainSleep(15_000);
+      continue;
+    }
+    const intent = await new ActuatorApi(cfg).fetchIntent(since).catch(() => null);
+    if (!intent) {
+      await plainSleep(4000);
+      continue;
+    }
+    since = intent.commandAt ?? since;
+    await chrome.storage.local.set({ [LAST_COMMAND_AT_KEY]: since }).catch(() => {});
+    await applyRemoteIntent(intent.desired).catch((e) =>
+      console.warn("[intent] apply failed:", e instanceof Error ? e.message : e),
+    );
+  }
+}
+
+// The priority channel wakes the existing actor when a browser-observed post
+// has a Jev qualification and a genuine passing review. It never sends directly:
+// tick() remains the only action runner, with its curfew, challenge, pacing,
+// duplicate, and STOP guards. The in-flight long poll also keeps MV3 awake.
+let priorityLoopRunning = false;
+function ensurePriorityLoop(): void {
+  if (priorityLoopRunning) return;
+  priorityLoopRunning = true;
+  void runPriorityLoop().finally(() => { priorityLoopRunning = false; });
+}
+
+async function runPriorityLoop(): Promise<void> {
+  let epoch = 0;
+  let since = 0;
+  for (;;) {
+    await restoreRunAfterWorkerRestart();
+    const cfg = await getConfig().catch(() => null);
+    const state = await loadState().catch(() => null);
+    if (!cfg || state?.status !== "running" || stopped() || !(await browserDiscoveryEnabled())) {
+      pendingPriority = null;
+      epoch = 0;
+      since = 0;
+      await plainSleep(5000);
+      continue;
+    }
+    if (state.epoch !== epoch) {
+      epoch = state.epoch;
+      since = Math.max(0, state.startMs - 1000);
+    }
+    const requestStartedAt = Date.now();
+    const ready = await new ActuatorApi(cfg).fetchPriorityReady(since).catch(async (error) => {
+      if (Date.now() - lastPriorityErrorMs >= 60_000) {
+        lastPriorityErrorMs = Date.now();
+        await reportBrowserDiscovery({
+          at: new Date().toISOString(), instanceId: cfg.instanceId,
+          result: "failed", stage: "priority", observed: 0, accepted: 0, duplicates: 0, invalid: 0,
+          error: discoveryError(error),
+        });
