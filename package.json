@@ -1,0 +1,43 @@
+{
+  "name": "noelle",
+  "version": "0.0.1-alpha.0",
+  "description": "Social growth workspace for X, LinkedIn, Reddit and video channels.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nella-labs/noelle-social.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nella-labs/noelle-social/issues"
+  },
+  "private": true,
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint && pnpm lint:sst && pnpm lint:reply-variation",
+    "lint:sst": "node scripts/lint-sst.mjs",
+    "build:email": "node scripts/build-supabase-templates.mjs",
+    "typecheck": "turbo typecheck",
+    "test": "turbo test",
+    "ci:local": "bash scripts/ci-local.sh",
+    "ci:full": "bash scripts/ci-local.sh --full",
+    "hooks:install": "bash scripts/install-githooks.sh",
+    "hooks:check": "bash scripts/install-githooks.sh --check",
+    "format": "prettier --write \"**/*.{ts,tsx,md,json,yml,yaml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,md,json,yml,yaml}\"",
+    "lint:reply-variation": "node scripts/verify-reply-variation-review.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.4",
+    "@types/node": "^25.9.3",
+    "eslint": "^10.4.0",
+    "prettier": "^3.3.3",
+    "turbo": "^2.3.3",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "8.60.1",
+    "vite": "^6.4.2"
+  }
+}
