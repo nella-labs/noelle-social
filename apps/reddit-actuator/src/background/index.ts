@@ -798,3 +798,203 @@ async function tickOnce() {
   if (tabId == null) return; // no tab → pause; resume next tick
   if (s.tabId !== tabId) s.tabId = tabId; // pin (or re-pin after the old tab closed)
   await cdp.attach(tabId).catch(() => {}); // idempotent; re-attach if a detach happened
+
+  const api = new ActuatorApi(cfg);
+  const rng = makeRng((now & 0xffffffff) >>> 0);
+  await maybeReplenish(s, api, now, rng);
+
+  // challenge guard — only a HARD challenge (verify/lock/throttle) halts; the
+  // transient JS-challenge reports challenge:false and is waited out.
+  const ch = await send<{ observed?: ChallengeResult }>(tabId, { cmd: "detectChallenge" }).catch(() => null);
+  if (ch?.observed?.challenge) {
+    await endRun("halted-challenge");
+    await api.logActivity(s.sessionId, [{ type: "skip", reason: "challenge", at: new Date(now).toISOString() }]).catch(() => {});
+    return;
+  }
+
+  const idx = dueActionIndex(s.actions, now);
+  if (idx < 0) {
+    // Persistent drain: when every slot is done, keep re-checking the server queue
+    // (paced, ~DRAIN_WATCH_POLL_MS) so approvals made after the inbox emptied get
+    // fresh slots and go out with no re-click. maybeExtendDrain appends slots +
+    // bumps drainRounds only when supply exists; an empty check is a no-op.
+    if (
+      drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0) &&
+      s.actions.every((a) => a.executed) &&
+      now - (s.lastDrainWatchMs ?? 0) >= DRAIN_WATCH_POLL_MS
+    ) {
+      s.lastDrainWatchMs = now;
+      await maybeExtendDrain(s, cfg, api, now, rng);
+    }
+
+    // SUPPLY GATE: with nothing to send (both pools empty) a live run goes QUIET —
+    // no idle-likes, no ambient browsing. Without this, a run whose pipeline had
+    // run dry still burned engagement every tick: 2026-07-20 Lyra logged 346 likes
+    // against 3 comments in a day, 359/43 the day before. The watch-poll above
+    // still runs, so the moment an approval lands the run picks it up and the
+    // normal in-gap liking resumes.
+    if (pipelineIsDry(s.commentPool.length, s.dmPool.length)) {
+      s.lastEvent = "nothing to send — idle (no likes while the pipeline is empty)";
+      await saveIfCurrent(s);
+      return;
+    }
+    // Nothing due. Mirror the LinkedIn idle-like path: slip an idle ENGAGEMENT into
+    // the wait when the operator opted in and the rolling-15-min cap + ~60s min-gap
+    // allow (canUpvote), otherwise ambient-browse (scroll + read decoys). Idle-only,
+    // rate-capped — there are NO scheduled like/vote slots (targetLikes stays 0).
+    // The engagement is ALMOST ALWAYS a plain UPVOTE; when the operator opts into
+    // engagementWeights it is OCCASIONALLY a post-SAVE (a private bookmark — NOT a
+    // vote, so it never touches the vote-manipulation clause a downvote would). A
+    // save consumes the SAME canUpvote budget as an upvote (canUpvote is the shared
+    // gate — no extra velocity), and FALLS BACK to a plain upvote on any miss.
+    // A missed engagement (nothing in view) falls back to ambient browse so the
+    // wait still looks alive. SAVE-ONLY — never a downvote.
+    let engaged = false;
+    if (canUpvote(s, cfg, now)) {
+      s.lastUpvoteAttemptMs = now; // pace off the attempt, not just a hit (the scan is costly)
+      // Never engage from a /comments/ permalink (the just-replied thread) — pull
+      // the tab back to a feed first so the engagement lands on unrelated content.
+      await ensureOnFeedForUpvote(tabId, cfg, rng).catch(() => {});
+      const eng = await engageWithVariety(cfg.engagementWeights, rng, engageDeps(tabId, rng, s.persona.wpm))
+        .catch(() => ({ ok: false as const }));
+      if (eng.ok) {
+        engaged = true;
+        const saved = eng.engagement === "save";
+        // Record the successful engagement against the SHARED upvote budget (a save
+        // is idle-only, exactly like an upvote), then trim to the rolling window so
+        // the array can't grow unbounded and the ≤10/15-min cap + min-gap read a
+        // bounded set.
+        (s.upvoteAtMs ??= []).push(now);
+        s.upvoteAtMs = s.upvoteAtMs.filter((t) => t > now - REDDIT_UPVOTE_WINDOW_MS);
+        const inWin = upvotesInWindow(s.upvoteAtMs, now, REDDIT_UPVOTE_WINDOW_MS);
+        const cap = cfg.upvotesPer15Min ?? REDDIT_DEFAULTS.upvotesPer15Min;
+        s.lastEvent = `${saved ? "saved" : "upvoted"} a post (${inWin}/${cap} in 15m)`;
+        await api.logActivity(s.sessionId, [{
+          // The activity TYPE stays "upvote" (the idle-engagement primitive that
+          // consumed the budget); the optional `engagement` discriminator is added
+          // ONLY for a save, so the default upvote-only payload is byte-identical.
+          type: "upvote", at: new Date(now).toISOString(),
+          ...(saved ? { engagement: "save" as const } : {}),
+          ...(eng.post_id ? { post_id: eng.post_id } : {}),
+          ...(eng.subreddit ? { subreddit: eng.subreddit } : {}),
+        }]).catch(() => {});
+      }
+    }
+    if (!engaged) await ambientBrowse(s, cfg, tabId, rng, now);
+    // STOP race: a stop/halt may have landed during the (now longer) engagement /
+    // ambient read — don't resurrect the run by writing "running" back over it.
+    const cur = await loadState();
+    if (cur && cur.status !== "running") return;
+    const nextAt = Math.min(...s.actions.filter((a) => !a.executed).map((a) => a.atMs));
+    const inSec = Number.isFinite(nextAt) ? Math.max(0, Math.round((nextAt - now) / 1000)) : 0;
+    if (!engaged) s.lastEvent = `browsing — next action in ~${inSec}s`;
+    await saveIfCurrent(s);
+    return;
+  }
+
+  const action = s.actions[idx]!;
+  const events: RedditActivityEvent[] = [];
+  const at = new Date(now).toISOString();
+  const windowEndMs = s.startMs + s.windowHours * 3600_000;
+  const isWrite = action.kind === "comment"; // Reddit plans ONLY reply slots — never like/dm
+
+  // Overnight write-curfew hard floor (single switch in ../lib/curfew.ts). It is
+  // currently DISABLED — isWriteCurfew always returns false, so this never fires
+  // and writes run at any hour; re-enable there to restore the overnight window.
+  if (isWrite && isWriteCurfew(now)) {
+    const d = deferLater(action, now, windowEndMs, rng);
+    action.atMs = d.atMs;
+    events.push({ type: "skip", reason: "curfew", at });
+    s.lastEvent = "curfew — deferred the reply";
+    await saveIfCurrent(s);
+    await api.logActivity(s.sessionId, events).catch(() => {});
+    return;
+  }
+
+  // Warm-up: for the first warmupSuppressMs of the session, no writes — arrive,
+  // scroll, and read first (a human doesn't fire the instant they land). Defer
+  // the slot, run a short ambient browse, then skip.
+  if (isWrite && now - s.startMs < s.warmupSuppressMs) {
+    const d = deferLater(action, now, windowEndMs, rng);
+    action.atMs = d.atMs;
+    await ambientBrowse(s, cfg, tabId, rng, now);
+    // STOP race during the (now longer) warm-up read.
+    const cur = await loadState();
+    if (cur && cur.status !== "running") return;
+    events.push({ type: "skip", reason: "warming-up", at });
+    s.lastEvent = "warming up — reading first";
+    await saveIfCurrent(s);
+    await api.logActivity(s.sessionId, events).catch(() => {});
+    return;
+  }
+
+  // STOP (or a superseding Run) may have landed during the awaits above
+  // (replenish, challenge probe). Re-check the epoch before touching Reddit so
+  // a just-stopped run never fires one last action.
+  if (myEpoch !== (await currentEpoch())) return;
+
+  // Reddit min-reply-spacing hard floor (default 240s / 4 min). Scheduled runs
+  // only — drain is an explicit "post everything now" operator action. A reply
+  // that would land too soon after the previous one is deferred to the floor (plus
+  // a little jitter), never fired.
+  if (s.mode !== "drain" && !replySpacingOk(s.lastReplyMs, now, REDDIT_DEFAULTS.minReplySpacingMs)) {
+    const nextAt = (s.lastReplyMs ?? now) + REDDIT_DEFAULTS.minReplySpacingMs + Math.round(rng.float(0, 60_000));
+    action.atMs = Math.min(windowEndMs, nextAt);
+    events.push({ type: "skip", reason: "min-spacing", at });
+    s.lastEvent = "spacing replies (240s floor)";
+    await saveIfCurrent(s);
+    await api.logActivity(s.sessionId, events).catch(() => {});
+    return;
+  }
+
+  try {
+    // Reddit is REPLY-ONLY: the single write action is a reply (under a post or a
+    // comment). There is deliberately NO like/vote branch anywhere.
+    const item = s.commentPool.shift();
+    if (!item) {
+      // supply-aware: defer this slot later in the window, do NOT execute
+      const d = deferLater(action, now, windowEndMs, rng);
+      action.atMs = d.atMs;
+      events.push({ type: "skip", reason: "reply-awaiting-supply", at });
+    } else if (postDedupKey(item.url) && (s.actionedKeys ?? []).includes(postDedupKey(item.url)!)) {
+      // Per-THREAD guard: already replied in this thread this session. Orion can
+      // queue >1 draft for one thread (a post-target and a comment-target, or two
+      // comment targets), and two comments by one account in one thread is a
+      // classic subreddit-ban trigger. Keyed on the t3 post id (postDedupKey) so
+      // cosmetically-different permalinks still collapse. The server's persistent
+      // dedup-by-thread covers the cross-session case; this is the fast in-run
+      // guard. Drop the extra draft (mark done), never post it.
+      s.doneDraftIds.push(item.draftId);
+      action.executed = true;
+      events.push({ type: "skip", reason: "duplicate-post", at });
+      s.lastEvent = "skipped duplicate thread — already replied";
+    } else {
+      const outcome = await doReply(tabId, item, cfg, rng, s.persona.wpm);
+      if (outcome.kind === "ok") {
+        // Record success LOCALLY FIRST, PERSIST it, THEN tell the server. A
+        // markSent failure can no longer cost us the local record — which would
+        // re-queue this still-pending approval and post a DUPLICATE comment.
+        recordReplySuccess(s, action, item, now);
+        // Stamp the thread's t3 post id onto the reply event. This is the durable
+        // dedup-by-thread record (ports #420): written at post time via this
+        // logActivity call — independent of markSent — so it survives a failed
+        // markSent, and /api/actionable-reddit filters future pulls against it so
+        // this thread is never replied to again.
+        const tid = postIdFrom(item.url);
+        events.push({
+          type: "reply", at,
+          approval_id: item.approvalId,
+          ...(tid ? { post_id: tid } : {}),
+          ...(item.commentId ? { comment_id: item.commentId } : {}),
+        });
+        s.lastEvent = `replied (${s.done.comments}/${s.targets.comments})`;
+        await saveIfCurrent(s); // durable before the network call
+        // markSent with retry/backoff; a persistent failure is logged, never thrown.
+        await markSentWithRetry(api, item.approvalId, s.sessionId, rng, sleep);
+        // Drain mode: return to the feed after replying so the gap's ambient
+        // browsing lands on content, not the just-replied thread's page.
+        if (s.mode === "drain") await navigateTab(tabId, REDDIT_FEED_URL, rng).catch(() => {});
+      } else if (outcome.kind === "unknown") {
+        recordReplyHold(s, action, item);
+        s.lastEvent = "reply outcome unknown — held without retry";
+        await saveIfCurrent(s);
