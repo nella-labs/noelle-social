@@ -1598,3 +1598,203 @@ describe("runDrafterTick", () => {
   // score means the scoring call failed, not that the lead is junk (over 90 days
   // 399 `label=other` leads carry a score and 193 do not), so the lead now
   // proceeds to drafting where the relevance gate and verifier still apply.
+  it("drafts a non-priority lead the classifier could not score (null) — fails OPEN", async () => {
+    const search = vi.fn().mockResolvedValue([]);
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "Lnull", external_id: "xn", payload: { text: "unscored post" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: "other", classifier_score: null, priority: false },
+      ],
+      runner: { draft: vi.fn() } as never,
+      kb: { search } as never,
+      postOutbound: vi.fn(),
+      markStatus,
+      qualityThreshold: 0.5,
+    });
+    // It got past the QUALITY gate: the drafter ran its grounding search, which
+    // the old fail-closed path short-circuited before reaching.
+    expect(search).toHaveBeenCalled();
+    // If it is skipped at all it must be by a LATER gate (relevance/verifier),
+    // never for the quality score it never had.
+    for (const call of markStatus.mock.calls) {
+      const reason = (call[0] as { meta?: { skip_reason?: string } })?.meta?.skip_reason ?? "";
+      expect(reason).not.toContain("below-quality-threshold");
+    }
+  });
+
+  it("drafts a PRIORITY (watchlist) lead even with a null score (quality gate bypassed)", async () => {
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({ drafts: [{ angle: "empathetic", body: "e", char_count: 1 }] }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const n = await runDrafterTick({
+      log: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "Lpri", external_id: "xp", payload: { text: "watchlist post" }, author_handle: "u", author_id: null, status: "drafting", tier: "T1", classifier_label: "watchlist", classifier_score: null, priority: true },
+      ],
+      runner: runner as never,
+      kb: { search: vi.fn().mockResolvedValue([{ path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] }]) } as never,
+      postOutbound,
+      markStatus,
+      qualityThreshold: 0.5,
+    });
+    expect(n).toBe(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips lead when nella returns zero anchors (treated as score=0, below any positive threshold)", async () => {
+    const postOutbound = vi.fn();
+    const draft = vi.fn();
+    const runner = { draft };
+    const nella = { search: vi.fn().mockResolvedValue([]) };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "Lzero", external_id: "xzero", payload: { text: "completely unrelated text" }, author_handle: "u", author_id: null, status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+
+    expect(n).toBe(0);
+    expect(draft).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leadId: "Lzero",
+        status: "skipped",
+        meta: expect.objectContaining({ top_anchor_score: 0, relevance_threshold: 1.5 }),
+      }),
+    );
+  });
+
+  it("marks the lead errored with reason='budget_exceeded' when the runner throws BudgetExceededError", async () => {
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const postOutbound = vi.fn().mockResolvedValue({ id: "x", approval_id: "y" });
+    const runner = {
+      draft: vi.fn(async () => {
+        throw new BudgetExceededError({
+          layer: "instance",
+          spent_cents: 9999,
+          cap_cents: 10000,
+          estimated_cents: 200,
+        });
+      }),
+    };
+    // High-score anchor so the relevance gate lets the lead through to the runner.
+    const nella = {
+      search: vi.fn(async () => [
+        { path: "p.md", snippet: "strong", score: 5.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+
+    await runDrafterTick({
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never,
+      instance: { id: "inst_1", org_id: "org_1" } as never,
+      claimedLeads: [
+        {
+          id: "lead_1",
+          external_id: "ext_1",
+          payload: { text: "Hi, I'm asking about agent frameworks" },
+          author_handle: "test",
+          author_id: "1",
+          tier: null,
+          classifier_label: null,
+          classifier_score: null,
+          status: "classified",
+        },
+      ] as never,
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+
+    // postOutbound must NOT have been called — the call never reached
+    // the network, no draft exists.
+    expect(postOutbound).not.toHaveBeenCalled();
+
+    expect(markStatus).toHaveBeenCalledTimes(1);
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({
+        leadId: "lead_1",
+        status: "errored",
+        meta: expect.objectContaining({
+          error: "budget_exceeded",
+          layer: "instance",
+          spent_cents: 9999,
+          cap_cents: 10000,
+        }),
+      }),
+    );
+  });
+
+  it("does not retry on BudgetExceededError — runner is called exactly once", async () => {
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const runner = {
+      draft: vi.fn(async () => {
+        throw new BudgetExceededError({
+          layer: "org",
+          spent_cents: 30000,
+          cap_cents: 30000,
+          estimated_cents: 5,
+        });
+      }),
+    };
+    // High-score anchor so the relevance gate lets the lead through to the runner.
+    const nella = {
+      search: vi.fn(async () => [
+        { path: "p.md", snippet: "strong", score: 5.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+
+    await runDrafterTick({
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never,
+      instance: { id: "inst_1", org_id: "org_1" } as never,
+      claimedLeads: [
+        {
+          id: "lead_2",
+          external_id: "ext_2",
+          payload: { text: "Another lead" },
+          author_handle: "x",
+          author_id: "1",
+          tier: null,
+          classifier_label: null,
+          classifier_score: null,
+          status: "classified",
+        },
+      ] as never,
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound: vi.fn(),
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+  });
+
+  it("injects a watchlist person's objective into the draft system prompt (normalizing @/case)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "d", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e", char_count: 1 },
+            { angle: "technical", body: "t", char_count: 1 },
+            { angle: "contrarian", body: "c", char_count: 1 },
