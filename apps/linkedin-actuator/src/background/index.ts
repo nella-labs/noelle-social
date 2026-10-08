@@ -1598,3 +1598,203 @@ function navigateTab(
    * false makes the navigation a no-op.
    */
   stillWanted?: () => Promise<boolean>,
+  /**
+   * The DM body this run typed, for the hops that follow a DM. Passed through to
+   * clearComposer so the return-to-feed hop empties OUR message text before
+   * navigating away from it — without it, an assume-sent verdict (or a missed
+   * confirmation) leaves the full DM in the box and the hop raises the exact
+   * dialog this function exists to prevent. See clearComposer's ownDmBody: the
+   * clear still refuses to touch a draft it cannot prove it wrote.
+   */
+  ownDmBody?: string,
+): Promise<void> {
+  return makeNavigateTab({
+    clearComposer: (id) => clearComposer(id, rng, ownDmBody),
+    updateTab: async (id, u) => {
+      await chrome.tabs.update(id, { url: u });
+    },
+    // Handed to the helper rather than checked inside updateTab, so it also
+    // runs BEFORE the clear: bailing only at the navigation would still have
+    // wiped the operator's draft on the way to a hop we then abandon.
+    ...(stillWanted ? { shouldProceed: stillWanted } : {}),
+  })(tabId, url);
+}
+
+/**
+ * Wrapper around the real reply/comment flow: whatever happens, a comment that
+ * did NOT land must not leave its text in the box (see clearComposer). `finally`
+ * rather than a check on the result, so a STOP unwinding mid-flow is covered too.
+ */
+async function doComment(
+  tabId: number, item: PoolItem, rng: ReturnType<typeof makeRng>, wpm: number,
+  claim: () => Promise<CommentClaim>,
+): Promise<ActionResult> {
+  let res: ActionResult | undefined;
+  try {
+    res = await doCommentInner(tabId, item, rng, wpm, claim);
+    return res;
+  } finally {
+    if (res?.kind !== "ok") await clearComposer(tabId, rng, undefined, item.commentUrn ?? undefined);
+  }
+}
+
+async function doCommentInner(
+  tabId: number, item: PoolItem, rng: ReturnType<typeof makeRng>, wpm: number,
+  claim: () => Promise<CommentClaim>,
+): Promise<ActionResult> {
+  await navigateTab(tabId, item.url, rng);
+  await waitTabComplete(tabId);
+  // Read the target post like a human before replying — dwell proxied from a
+  // ~60-word read at this session's pace (we don't have the post's wc here).
+  await sleep(readingDwellMs(rng, Math.max(0, Math.round(rng.normal(60, 40))), {}, wpm));
+  // Deleted/unavailable post → the permalink shows "This post cannot be
+  // displayed" and will NEVER render a composer. Report it as permanent so the
+  // caller drops the draft instead of re-navigating to the dead post every slot.
+  const state = await send<{ observed?: { unavailable?: boolean } }>(tabId, { cmd: "detectPostUnavailable" }).catch(() => null);
+  if (state?.observed?.unavailable) return { kind: "unavailable", detail: "post-unavailable" };
+  // Comments restricted to connections ("Only connections can comment on this
+  // post. You can still react or share it.") — shown IN PLACE of the composer, so
+  // no comment box ever renders. Permanent for this account: drop it (permanent
+  // like unavailable → the caller marks it skipped server-side) instead of the
+  // box-not-found retry loop that burned 3 tries then gave up.
+  const restricted = await send<{ observed?: { restricted?: boolean } }>(tabId, { cmd: "detectCommentRestricted" }).catch(() => null);
+  if (restricted?.observed?.restricted) return { kind: "unavailable", detail: "comment-restricted" };
+  // ── THREADED REPLY ───────────────────────────────────────────────────────
+  // A notification lead answers a specific person under THEIR comment. This
+  // path never touches the post-level composer: posting a conversation reply
+  // there is not a reply, it is a second top-level comment from the operator on
+  // a thread he already commented on (five of those went live before the dedup
+  // was tightened). Every step below FAILS rather than degrading, and the
+  // failures are transient so the draft is retried on a later slot instead of
+  // being silently published in the wrong place.
+  if (item.commentUrn) {
+    const urn = item.commentUrn;
+
+    // REACH the comment before looking for it. The first threaded runs all
+    // failed on `comment-not-found`, and the locator was never the problem:
+    // LinkedIn renders only a handful of comments and hides the rest behind
+    // "See 33 more comments", so the one we were sent to answer simply was not
+    // in the DOM. Get to it the way a person does — follow the deep link, then
+    // expand and scroll until it appears.
+    const deep = commentDeepLink(item.url, activityUrnFrom(item.url), urn);
+    if (deep !== item.url) {
+      await navigateTab(tabId, deep, rng);
+      await waitTabComplete(tabId);
+      await sleep(rng.float(900, 2000)); // the thread expands + scrolls itself
+    }
+
+    let reply = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect; skipReason?: string }>(
+      tabId, { cmd: "locateCommentReply", commentUrn: urn },
+    );
+    // Up to 4 rounds of "expand a bit more, read a bit further". Bounded so a
+    // genuinely absent comment costs one slot rather than the whole run.
+    for (let i = 0; i < 4 && (!reply.ok || reply.x == null); i++) {
+      throwIfAborted(runAbort.signal);
+      const more = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect }>(
+        tabId, { cmd: "locateLoadMoreComments" },
+      ).catch(() => ({ ok: false }) as { ok: boolean; x?: number; y?: number; rect?: Rect });
+      if (more.ok && more.x != null) {
+        await cdp.moveAndClick(tabId, rectFrom(more), rng, sleep);
+        await sleep(rng.float(700, 1600)); // the next page of comments renders
+      } else {
+        // No expander left: the rest is lazy-rendered, so read further down.
+        await cdp.wheel(tabId, { x: 500, y: 420 }, Math.round(rng.float(500, 1100)), rng, sleep);
+        await sleep(rng.float(400, 900));
+      }
+      reply = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect; skipReason?: string }>(
+        tabId, { cmd: "locateCommentReply", commentUrn: urn },
+      );
+    }
+    if (!reply.ok || reply.x == null) {
+      // Still absent after expanding: deleted, or buried deeper than we will
+      // dig. Transient — a later slot retries rather than posting at post level.
+      return { kind: "failed", detail: `thread-${reply.skipReason ?? "reply-button-not-found"}` };
+    }
+    await cdp.moveAndClick(tabId, rectFrom(reply), rng, sleep); // opens ITS reply box
+    await sleep(rng.float(500, 1400)); // the box mounts + focuses
+
+    const composer = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect; skipReason?: string }>(
+      tabId, { cmd: "locateReplyComposer", commentUrn: urn },
+    );
+    if (!composer.ok || composer.x == null) {
+      return { kind: "failed", detail: `thread-${composer.skipReason ?? "composer-not-found"}` };
+    }
+    await cdp.moveAndClick(tabId, rectFrom(composer), rng, sleep); // focus it
+    throwIfAborted(runAbort.signal); // STOP before we type anything
+    await cdp.typeText(tabId, item.body, rng, sleep);
+    await sleep(rng.float(400, 2000));
+    throwIfAborted(runAbort.signal); // STOP before we publish
+
+    // The submit resolves ONLY inside a real reply box (its label is "Reply";
+    // the post composer's is "Comment") and, when we know the name, only when
+    // the box's pre-filled mention chip names the person we mean to answer.
+    const rsub = await send<{ ok: boolean; x?: number; y?: number; rect?: Rect; skipReason?: string }>(
+      tabId,
+      {
+        cmd: "locateReplySubmit",
+        commentUrn: urn,
+        ...(item.commentAuthorName ? { expectMention: item.commentAuthorName } : {}),
+      },
+    );
+    if (!rsub.ok || rsub.x == null) {
+      return { kind: "failed", detail: `thread-${rsub.skipReason ?? "submit-not-found"}` };
+    }
+    throwIfAborted(runAbort.signal);
+    const reserved = await claim();
+    if (reserved !== "claimed") return { kind: reserved === "unavailable" ? "claim-unavailable" : "claim-denied" };
+    throwIfAborted(runAbort.signal);
+    await cdp.moveAndClick(tabId, rectFrom(rsub), rng, sleep);
+    await sleep(rng.float(900, 2200));
+    // A dirty or unreadable target is an uncertain dispatched attempt. Keep its
+    // claim without reporting a sent reply or sending another submit gesture.
+    for (let i = 0; i < 8; i++) {
+      if (await commentPosted(tabId, urn)) return { kind: "ok" };
+      if (stopped()) break;
+      if (i < 7) await sleep(400);
+    }
+    return { kind: "failed", detail: "thread-not-confirmed", claimed: true };
+  }
+
+  const box = await locateOrOpenCommentBox({
+    locateBox: () => send<{ ok: boolean; x?: number; y?: number; rect?: Rect; skipReason?: string }>(
+      tabId, { cmd: "locateCommentBox" },
+    ),
+    locateAction: () => send<{ ok: boolean; x?: number; y?: number; rect?: Rect; skipReason?: string }>(
+      tabId, { cmd: "locatePostCommentAction" },
+    ),
+    canContinue: async () => {
+      throwIfAborted(runAbort.signal);
+      const guard = await send<{ observed?: { challenge?: boolean } }>(
+        tabId, { cmd: "detectChallenge" },
+      ).catch(() => null);
+      return guard?.observed?.challenge === false;
+    },
+    openAction: async (action) => {
+      throwIfAborted(runAbort.signal);
+      await cdp.moveAndClick(tabId, rectFrom(action), rng, sleep);
+      await sleep(rng.float(500, 1400)); // the post composer mounts after its action
+    },
+    waitForRetry: () => sleep(rng.float(350, 700)),
+  });
+  if (!box.ok || box.x == null) {
+    // No composer. Re-check the restriction banner (it can render a beat after the
+    // dwell): a restricted post is permanent (drop), everything else is transient.
+    const r2 = await send<{ observed?: { restricted?: boolean } }>(tabId, { cmd: "detectCommentRestricted" }).catch(() => null);
+    if (r2?.observed?.restricted) return { kind: "unavailable", detail: "comment-restricted" };
+    return { kind: "failed", detail: `box-${box.skipReason ?? "not-found"}` };
+  }
+  await cdp.moveAndClick(tabId, rectFrom(box), rng, sleep); // focus the box
+  throwIfAborted(runAbort.signal); // STOP before we type anything
+  await cdp.typeText(tabId, item.body, rng, sleep);
+  await sleep(rng.float(400, 2000));
+  throwIfAborted(runAbort.signal); // STOP before we post the comment
+  const sub = await submitComment(tabId, rng, claim, item.body);
+  if (sub.claim && sub.claim !== "claimed") {
+    return { kind: sub.claim === "unavailable" ? "claim-unavailable" : "claim-denied" };
+  }
+  return sub.ok ? { kind: "ok" } : { kind: "failed", detail: sub.detail, claimed: sub.claim === "claimed" };
+}
+
+// Read the composer state: has the just-typed comment posted? LinkedIn clears the
+// box on a successful post, so an empty (or vanished) box = landed, a populated
+// box = did NOT land. Any read error is treated as "not confirmed" (caller retries
