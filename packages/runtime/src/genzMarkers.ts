@@ -198,3 +198,123 @@ export function markersForEnergy(
   opts: MarkerPoolOpts = {},
 ): readonly GenZMarker[] {
   const platformPool = GENZ_MARKERS.filter(
+    (marker) =>
+      marker.platforms == null ||
+      (opts.platform != null && marker.platforms.includes(opts.platform)),
+  );
+  const loudAllowed = energy != null && !LOUD_BLOCKED_ENERGIES.includes(energy);
+  if (opts.plainOnly || !loudAllowed) {
+    return platformPool.filter((marker) => marker.tier === "plain");
+  }
+  return platformPool;
+}
+
+/**
+ * Pick ONE marker by weighted random choice over the pool reachable under
+ * `energy`, minus `exclude` (the markers recently handed out, so the feed does
+ * not say "ngl" five replies running). The remaining weights are renormalized
+ * by walking the reduced pool's total. Returns null when the pool is empty
+ * after exclusions, which the caller treats as "no marker this time" rather
+ * than falling back to a repeat.
+ */
+export function pickGenZMarker(
+  rng: () => number = Math.random,
+  energy: PostEnergy | null = null,
+  exclude?: readonly string[] | null,
+  opts: MarkerPoolOpts = {},
+): GenZMarker | null {
+  const excluded = new Set(exclude ?? []);
+  const pool = markersForEnergy(energy, opts).filter((m) => !excluded.has(m.id));
+  if (pool.length === 0) return null;
+  const total = pool.reduce((acc, m) => acc + m.weight, 0);
+  const r = rng() * total;
+  let cumulative = 0;
+  for (const m of pool) {
+    cumulative += m.weight;
+    if (r < cumulative) return m;
+  }
+  return pool[pool.length - 1]!;
+}
+
+/**
+ * Render the marker block injected into the reply prompt.
+ *
+ * The wording carries the whole "measured" design: ONE marker, permission to
+ * drop it, an explicit ban on stacking, and a restatement of the cosplay ban so
+ * the block cannot be read as licence for the tier it deliberately excludes.
+ * Platform-neutral, so all three interns render the same block.
+ */
+export function renderGenZMarkerBlock(marker: GenZMarker): string {
+  return [
+    "SPOKEN REGISTER FOR THIS REPLY (a permission, not an order — applies to the public reply only, never a DM)",
+    `You may use this ONE marker, once: ${marker.directive}`,
+    "Rules, and they are what keep this from reading as an adult doing an impression: use it AT MOST once, never two markers in one reply, and DROP IT ENTIRELY if the reply does not have a natural place for it. A marker wedged in where it does not belong is more obviously machine-written than a reply with no slang at all. It must not become the point of the reply, which still has to say something real.",
+    "If you are drafting SEVERAL replies in this one response (one per angle, or one per post), the marker belongs to AT MOST ONE of them. Do not open every draft with it: three replies that all start the same way is the exact repetition this is meant to avoid, and each of them ships as its own separate reply.",
+    "This does not unban the cosplay tier. \"no cap\", \"rizz\", \"it's giving\", \"fr fr\", \"based\", \"slay\", \"bussin\" and \"ate\" stay banned. Every other rule (no em dashes, no corporate verbs, no reframe/negative parallelism, no echoing the post, English only, the emoji allowlist) is untouched.",
+  ].join("\n");
+}
+
+/**
+ * Stateful rotation: remembers the last `memory` markers handed out and excludes
+ * them from the next pick, on top of any energy filtering. One instance per
+ * worker process, so "the feed does not repeat a marker" holds across ticks and
+ * not just within one.
+ *
+ * `memory` defaults to 4 against a plain pool of 6, so MIN_MARKER_CANDIDATES
+ * always remain. `next` additionally trims the remembered list whenever it
+ * would empty the pool, so a caller passing an oversized memory (or a future
+ * narrower pool) degrades to a shorter window instead of returning null
+ * forever, which would silently switch the whole lane off.
+ */
+/**
+ * The smallest candidate pool a marker pick may run against. At one candidate
+ * the pick is deterministic and the lane repeats on a fixed cycle, which no
+ * "no repeat within the window" assertion can see.
+ */
+const MIN_MARKER_CANDIDATES = 2;
+
+export function createGenZMarkerRotation(
+  memory = 4,
+  opts: MarkerPoolOpts = {},
+): {
+  next: (rng?: () => number, energy?: PostEnergy | null) => GenZMarker | null;
+} {
+  const recent: string[] = [];
+  return {
+    next(rng: () => number = Math.random, energy: PostEnergy | null = null): GenZMarker | null {
+      // Trim the memory when it would leave too few candidates. plainOnly
+      // leaves 6 markers, and a memory at or above that would starve the
+      // rotation to null forever — the lane would silently switch itself off.
+      //
+      // The floor is MIN_MARKER_CANDIDATES, not 1, and it matters: at exactly
+      // one candidate the "rotation" is a deterministic cycle, which is the
+      // thing the lane exists to prevent, and every "no repeat within the
+      // window" test still passes while it happens. The shape rotation this
+      // mirrors uses the same floor for the same reason.
+      const poolSize = markersForEnergy(energy, opts).length;
+      const usable = Math.min(recent.length, Math.max(0, poolSize - MIN_MARKER_CANDIDATES));
+      const picked = pickGenZMarker(rng, energy, recent.slice(recent.length - usable), opts);
+      if (picked) {
+        recent.push(picked.id);
+        while (recent.length > memory) recent.shift();
+      }
+      return picked;
+    },
+  };
+}
+
+/**
+ * Read the marker lane's rate off the environment.
+ *
+ * Enabled by default. `NOELLE_GENZ_MARKERS=0` disables the lane;
+ * `NOELLE_GENZ_MARKER_RATE` (0..1) retunes the share. A malformed rate falls
+ * back to the default rather than silently disabling the lane.
+ */
+export function genzMarkerRateFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  if (env["NOELLE_GENZ_MARKERS"] === "0") return 0;
+  const raw = env["NOELLE_GENZ_MARKER_RATE"];
+  if (raw == null || raw === "") return DEFAULT_MARKER_RATE;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 1) return DEFAULT_MARKER_RATE;
+  return n;
+}
