@@ -1798,3 +1798,203 @@ async function cmdVegaStyle(args: Args, dbUrl: string, orgSlug: string): Promise
   const rawHandle = (args._[3] ?? "").trim();
   const shownHandle = rawHandle.replace(/^@/, "").toLowerCase();
 
+  if (sub === "add") {
+    if (!rawHandle) { ui.err("usage: noelle vega style add <handle> [--display <name>] [--note <note>]"); return 1; }
+    const r = await vegaStyleAddSource({
+      dbUrl, orgSlug, handle: rawHandle,
+      displayName: str(args.flags, "display") ?? null,
+      note: str(args.flags, "note") ?? null,
+    });
+    if (!r.found) { ui.err(`No x_intern (Vega) instance for org "${orgSlug}".`); return 1; }
+    ui.ok(`Added X style source @${shownHandle}. Pull it with \`noelle vega style run\`.`);
+    return 0;
+  }
+  if (sub === "remove" || sub === "disable") {
+    if (!rawHandle) { ui.err("usage: noelle vega style remove <handle>"); return 1; }
+    const r = await vegaStyleRemoveSource({ dbUrl, orgSlug, handle: rawHandle });
+    if (!r.found) { ui.err(`No x_intern (Vega) instance for org "${orgSlug}".`); return 1; }
+    ui.ok(r.removed ? `Disabled X style source @${shownHandle}.` : "No such X style source.");
+    return 0;
+  }
+  if (sub === "pin") {
+    if (!rawHandle) { ui.err("usage: noelle vega style pin <handle>"); return 1; }
+    const r = await vegaStylePin({ dbUrl, orgSlug, handle: rawHandle });
+    if (!r.found) { ui.err(`No x_intern (Vega) instance for org "${orgSlug}".`); return 1; }
+    ui.ok(`Pinned Vega's voice to @${shownHandle}. Set NOELLE_DRAFTER_STYLE=1, then \`noelle vega style run\` to learn it.`);
+    return 0;
+  }
+  if (sub === "unpin") {
+    const r = await vegaStyleUnpin({ dbUrl, orgSlug });
+    if (!r.found) { ui.err(`No x_intern (Vega) instance for org "${orgSlug}".`); return 1; }
+    ui.ok("Unpinned — Vega blends the FORM of all enabled style sources.");
+    return 0;
+  }
+  if (sub === "run") {
+    const r = await vegaStyleRun({ dbUrl, orgSlug });
+    if (!r.found) { ui.err(`No x_intern (Vega) instance for org "${orgSlug}".`); return 1; }
+    ui.ok("Feeder run requested — the account-feeder worker pulls the sources on its next poll.");
+    return 0;
+  }
+  // list (default)
+  const s = await vegaStyleList({ dbUrl, orgSlug });
+  if (!s.found) { ui.err(`No x_intern (Vega) instance for org "${orgSlug}".`); return 1; }
+  ui.step("Vega style — Account Feeder (voice of our posts)");
+  ui.plain(`  pinned voice    ${s.pinnedStyleHandle ? "@" + s.pinnedStyleHandle : "none (blend of all enabled sources)"}`);
+  ui.plain(`  last pull       ${s.lastRunAt ?? "never"}`);
+  ui.plain(`  corpus posts    ${s.stylePostCount}`);
+  ui.plain(`  ultra profiles  ${s.ultraProfileCount}`);
+  if (s.sources.length === 0) {
+    ui.warn("No style sources yet — add one with `noelle vega style add <handle>`.");
+  } else {
+    ui.plain("  sources:");
+    for (const src of s.sources) {
+      ui.plain(
+        `    · @${src.handle}${src.displayName ? " (" + src.displayName + ")" : ""} — ${src.enabled ? "enabled" : "disabled"}${src.lastPulledAt ? ", pulled " + src.lastPulledAt : ""}`,
+      );
+    }
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// lyra — LinkedIn-intern (Lyra) on-demand tools. Today: `followup`, the
+// connection follow-up — name someone you just connected with and Lyra scrapes
+// their posts + authored comments and prints a brief (common ground, talking
+// points, genuine questions, a warm follow-up DM). Draft-only, like all of Lyra.
+// Thin wrapper: it execs apps/linkedin-intern/run.sh, which loads ~/.noelle/.env
+// and runs the one-shot worker on this (residential) VM.
+// ---------------------------------------------------------------------------
+async function cmdLyra(args: Args): Promise<number> {
+  const sub = args._[1];
+  if (sub !== "followup") {
+    ui.err(`unknown lyra subcommand: ${sub ?? "(none)"} — try: noelle lyra followup <profile-url>`);
+    return 1;
+  }
+  // The person is positional (`noelle lyra followup <url>`) or `--person <url>`.
+  const person = str(args.flags, "person") ?? args._[2];
+  if (!person) {
+    ui.err(
+      "usage: noelle lyra followup <profile URL | /in/slug | slug> [--posts N] [--comments N] [--json]",
+    );
+    return 1;
+  }
+  const repoRoot = str(args.flags, "repo") ? expandHome(str(args.flags, "repo")!) : findRepoRoot();
+  const appDir = resolve(repoRoot, "apps/linkedin-intern");
+  const runSh = resolve(appDir, "run.sh");
+  const passthru = ["followup", "--person", person];
+  if (str(args.flags, "posts")) passthru.push("--posts", str(args.flags, "posts")!);
+  if (str(args.flags, "comments")) passthru.push("--comments", str(args.flags, "comments")!);
+  if (bool(args.flags, "json")) passthru.push("--json");
+  // run.sh loads ~/.noelle/.env for the one-shot and streams stdout straight to
+  // the terminal (inherit). allowFailure so we return the worker's exit code
+  // instead of throwing on a non-zero (e.g. "no posts found").
+  const r = await run(runSh, passthru, { cwd: appDir, inherit: true, allowFailure: true });
+  if (r.code === 78) {
+    ui.err("Lyra isn't built yet — run `noelle up --workers` (or build apps/linkedin-intern) first.");
+  }
+  return r.code;
+}
+
+// ---------------------------------------------------------------------------
+// brand — operator questions + message styles (tailors replies + DMs)
+// ---------------------------------------------------------------------------
+async function cmdBrand(args: Args): Promise<number> {
+  const p = ensureHome();
+  const config = loadConfig() ?? defaultConfig();
+  const secrets = loadOrCreateSecrets(p);
+  const dbUrl = adminUrlFor(config, secrets);
+  const sub = args._[1] ?? "show";
+
+  if (sub === "init") {
+    const r = initBrandFile(p);
+    if (r.created) {
+      ui.ok(`Scaffolded ${r.path}`);
+      ui.info("Answer the questions in it (persona, product, pitch policy, reply/DM styles, Q&A),");
+      ui.info("then run `noelle brand apply` (or `noelle up` re-applies it automatically).");
+    } else {
+      ui.info(`${r.path} already exists — edit it, then \`noelle brand apply\`.`);
+    }
+    return 0;
+  }
+  if (sub === "apply") {
+    let brand;
+    try {
+      brand = loadBrandFile(p);
+    } catch (err) {
+      ui.err((err as Error).message);
+      return 1;
+    }
+    const n = await applyBrand({ dbUrl, orgSlug: config.orgSlug, brand });
+    if (n === 0) {
+      ui.err(`No drafting instances for org "${config.orgSlug}" — run \`noelle init\` first.`);
+      return 1;
+    }
+    ui.ok(
+      `Brand config applied to ${n} drafting instance${n === 1 ? "" : "s"} (X / LinkedIn / Reddit).`,
+    );
+    if (!brandConfigHasContent(brand))
+      ui.warn("Config is effectively empty — drafter will use the generic voice.");
+    return 0;
+  }
+  // show (default)
+  const brand = await showBrand({ dbUrl, orgSlug: config.orgSlug });
+  if (!brand) {
+    ui.err(`No x_intern instance for org "${config.orgSlug}".`);
+    return 1;
+  }
+  ui.step("Vega brand config (live, from DB)");
+  ui.plain(JSON.stringify(brand, null, 2));
+  if (!brandConfigHasContent(brand))
+    ui.warn("Empty — run `noelle brand init` then `noelle brand apply`.");
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// rollup — aggregate llm_calls → org_spend_month (so the nav-pill / billing
+// figures match live spend). Hits the app's /api/cron/sync-spend route, which
+// is the canonical (and only) writer of org_spend_month. Run by the
+// noelle-spend-rollup pm2 process with --watch; also runnable one-shot.
+// ---------------------------------------------------------------------------
+async function runRollupOnce(config: SelfHostConfig, cronSecret: string): Promise<boolean> {
+  const url = `http://127.0.0.1:${config.ports.app}/api/cron/sync-spend`;
+  try {
+    const res = await fetch(url, {
+      headers: cronSecret ? { Authorization: `Bearer ${cronSecret}` } : {},
+      signal: AbortSignal.timeout(15_000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function cmdRollup(args: Args): Promise<number> {
+  const p = ensureHome();
+  const config = loadConfig() ?? defaultConfig();
+  const secrets = loadOrCreateSecrets(p);
+  const intervalMs = Number(str(args.flags, "interval-ms") ?? 5 * 60_000);
+
+  if (bool(args.flags, "watch")) {
+    ui.info(
+      `spend-rollup watching (every ${Math.round(intervalMs / 1000)}s) → ${`:${config.ports.app}/api/cron/sync-spend`}`,
+    );
+    // Run forever; pm2 keeps this process online. Each tick is best-effort —
+    // a transient app restart just means the next tick catches up.
+    // eslint-disable-next-line no-constant-condition
+    for (;;) {
+      await runRollupOnce(config, secrets.cronSecret);
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+  }
+  const ok = await runRollupOnce(config, secrets.cronSecret);
+  ui.plain(ok ? "spend rollup ok" : "spend rollup failed (is the dashboard up?)");
+  return ok ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// http helpers
+// ---------------------------------------------------------------------------
+async function probeHttp(url: string): Promise<boolean> {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+    return res.status < 500;
