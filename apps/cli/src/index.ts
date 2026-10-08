@@ -1198,3 +1198,203 @@ async function runDeployNative(
     } catch (e) {
       ui.warn(
         `[deploy] reddit-actuator build failed; extension stays on its previous build: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+
+    // The Chrome Bridge extension is a deploy artifact too (same wxt toolchain
+    // as the actuators): its build refreshes dist-unpacked (the Chrome load
+    // path) + the build stamp that drives the ext's self-reload. Build it
+    // separately and NON-FATALLY for the same reason — a wedged wxt toolchain
+    // must never block the server fleet; the ext just stays on its previous
+    // build (self-reload sees no new stamp) until fixed. The chrome-bridge
+    // SERVER + actuator-doctor are plain tsc apps, built by the `-r` pass above.
+    try {
+      await run("pnpm", ["--filter", "@noelle/chrome-bridge-ext", "build"], { cwd: repoRoot, inherit: true });
+    } catch (e) {
+      ui.warn(
+        `[deploy] chrome-bridge-ext build failed; extension stays on its previous build: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+
+    updateStage("restart");
+    // Restart active or failed apps, dashboard included — `next start` reads
+    // .next only at boot, so without a restart it serves the previous bundle.
+    const targets = pm2DeployRestartTargets(await pm2Status(repoRoot), repoRoot);
+    if (targets.length === 0) {
+      // A deliberately stopped stack (`noelle down`) is not a failure: record
+      // the refreshed build, skip smoke, stay quiet. On auto ticks the
+      // self-heal gate above already restored a CRASHED stack before we got
+      // here, so an empty fleet at this point means the marker is present (or
+      // a manual deploy against a stopped stack, which is attended).
+      markDeployed(sha);
+      ui.info(
+        `[deploy] pm2 has no noelle apps (stack is down); build refreshed to ${sha.slice(0, 8)}, nothing to restart or smoke-check.`,
+      );
+      return 0;
+    }
+    ui.step(`[deploy] restarting ${targets.length} apps`);
+    // Pass the ecosystem path so a refreshed .env actually reaches the fleet;
+    // a name-based restart keeps whatever env the daemon captured at first start.
+    const restart = await pm2RestartMany(
+      repoRoot,
+      targets,
+      existsSync(home.ecosystem) ? home.ecosystem : undefined,
+    );
+    if (restart && restart.code !== 0) {
+      const detail = (restart.stderr || restart.stdout).trim().slice(-300);
+      ui.warn(`[deploy] built ${sha.slice(0, 8)} but pm2 restart FAILED. ${detail}`);
+      ui.info("lastBuiltSha not advanced; the next tick retries.");
+      await failDeploy("pm2 restart failed");
+      return 1;
+    }
+
+    // Smoke: the dashboard and api-vm must answer HTTP after the restart. A
+    // deploy that leaves either port dead must page and retry, never advance
+    // the stamp as if it shipped. The app gets the same 90s `noelle up`
+    // allows: a cold `next start` right after a full-fleet restart needs it.
+    updateStage("smoke");
+    const [apiOk, appOk] = await Promise.all([
+      waitForHttp(`http://127.0.0.1:${config.ports.apiVm}/health`, 60_000),
+      waitForHttp(`http://127.0.0.1:${config.ports.app}/`, 90_000),
+    ]);
+    if (!apiOk || !appOk) {
+      const dead = [
+        apiOk ? null : `api-vm :${config.ports.apiVm}`,
+        appOk ? null : `dashboard :${config.ports.app}`,
+      ]
+        .filter(Boolean)
+        .join(", ");
+      ui.warn(`[deploy] smoke check FAILED after restart (${dead}).`);
+      ui.info("lastBuiltSha not advanced; the next tick rebuilds and retries.");
+      await failDeploy(`smoke failed (${dead})`);
+      return 1;
+    }
+
+    markDeployed(sha);
+    ui.ok(
+      `[deploy] done → ${sha.slice(0, 8)} built + ${targets.length} apps restarted + smoke ok (native).`,
+    );
+    return 0;
+  } catch (err) {
+    // Build or git failures land here. Page (first failure of the sha only),
+    // then rethrow so the exit stays non-zero and lastBuiltSha stays put.
+    await failDeploy(`build failed: ${(err as Error).message.slice(0, 160)}`);
+    throw err;
+  } finally {
+    releaseLock(process.pid);
+  }
+}
+
+/** Compare two paths as the same real checkout (symlink-safe, fail-soft). */
+function sameCheckout(a: string, b: string): boolean {
+  const norm = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  return norm(a) === norm(b);
+}
+
+// `noelle sync` — the LaunchAgent entrypoint. Keep the name; route to runDeploy.
+async function cmdSync(args: Args): Promise<number> {
+  return runDeploy(args, { auto: true });
+}
+
+async function cmdDeploy(args: Args): Promise<number> {
+  if (!requireDarwinHost("deploy")) return 2;
+  const sub = args._[1] ?? "run";
+  const vm = str(args.flags, "vm") ?? "default";
+
+  if (sub === "status") return deployStatus(vm, args);
+  if (sub === "log") {
+    const { logPath } = await import("./lib/autoupdate.js");
+    const p = logPath();
+    if (!existsSync(p)) {
+      ui.info("No deploy log yet (the auto-update agent hasn't run).");
+      return 0;
+    }
+    ui.step("Recent deploys");
+    for (const line of readFileSync(p, "utf8").trim().split("\n").slice(-40)) ui.plain(`  ${line}`);
+    return 0;
+  }
+  // default: manual kick (same locked pipeline, auto:false)
+  return runDeploy(args, { auto: false });
+}
+
+async function deployStatus(vm: string, args: Args): Promise<number> {
+  const repoRoot = str(args.flags, "repo") ? expandHome(str(args.flags, "repo")!) : findRepoRoot();
+
+  // Native install: no VM. Compare local HEAD against the local build stamp.
+  const hostConfig = loadConfig();
+  if (isNativeRuntime(hostConfig)) {
+    const head = (
+      await run("git", ["-C", repoRoot, "rev-parse", "HEAD"], { allowFailure: true })
+    ).stdout.trim();
+    let builtSha: string | null = null;
+    let builtAt = "";
+    const stampPath = resolve(repoRoot, DEPLOY_STAMP_FILE);
+    if (existsSync(stampPath)) {
+      try {
+        const s = JSON.parse(readFileSync(stampPath, "utf8"));
+        builtSha = s?.sha ?? null;
+        builtAt = s?.builtAt ?? "";
+      } catch {
+        /* no/invalid stamp — builtSha stays null */
+      }
+    }
+    const short = (s: string) => (s.length >= 8 ? s.slice(0, 8) : s || "(unknown)");
+    ui.step("Deploy status (native)");
+    ui.plain(`  local HEAD    ${short(head)}`);
+    ui.plain(
+      `  last built    ${builtSha ? short(builtSha) : "(never built — run noelle sync)"}${builtAt ? `  (${builtAt})` : ""}`,
+    );
+    if (builtSha && builtSha === head) ui.ok("✓ workers built from the current HEAD.");
+    else ui.warn("⚠ HEAD moved since the last build — run noelle sync to rebuild the workers.");
+    return 0;
+  }
+
+  const originR = await run("git", ["-C", repoRoot, "ls-remote", "origin", "main"], {
+    allowFailure: true,
+  });
+  const origin = originR.stdout.trim().split(/\s+/)[0] ?? "(unknown)";
+  const macR = await run("git", ["-C", repoRoot, "rev-parse", "HEAD"], { allowFailure: true });
+  const mac = macR.stdout.trim() || "(unknown)";
+
+  const stampR = await limaShell(vm, `cat ~/noelle/${DEPLOY_STAMP_FILE} 2>/dev/null`);
+  let vmSha: string | null = null;
+  let vmBuiltAt = "";
+  try {
+    const s = JSON.parse(stampR.stdout.trim());
+    if (s?.sha) {
+      vmSha = s.sha as string;
+      vmBuiltAt = s.builtAt ?? "";
+    }
+  } catch {
+    /* no/invalid stamp — vmSha stays null */
+  }
+
+  const p = lockPath();
+  const lock = existsSync(p) ? parseLock(readFileSync(p, "utf8")) : null;
+
+  const short = (s: string) => (s.length >= 8 ? s.slice(0, 8) : s);
+  ui.step(`Deploy status (VM "${vm}")`);
+  ui.plain(`  origin/main   ${short(origin)}`);
+  ui.plain(
+    `  Mac HEAD      ${short(mac)}${mac === origin ? " ✓" : " ⚠ behind origin (fetch will ff on next deploy)"}`,
+  );
+  ui.plain(
+    `  VM running    ${vmSha ? short(vmSha) : "(no stamp — never shipped or pre-stamp deploy)"}${vmBuiltAt ? `  (built ${vmBuiltAt})` : ""}`,
+  );
+  ui.plain(
+    `  deploy lock   ${lock ? `HELD pid ${lock.pid} @ ${lock.host} — stage ${lock.stage}` : "free"}`,
+  );
+
+  if (lock) ui.info("⏳ a deploy is running.");
+  else if (vmSha && vmSha === origin) ui.ok("✓ VM is in sync with origin/main.");
+  else
+    ui.warn(
+      "⚠ VM is behind origin/main — a deploy is pending (or the last one failed). Check `noelle deploy log`.",
+    );
+  return 0;
