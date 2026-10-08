@@ -1,0 +1,17 @@
+<!--
+  x.com's dead-permalink /status/ page: navigating to a reply target whose post
+  was deleted (or whose author is gone/suspended) renders the error cell instead
+  of the tweet + composer. The actuator must detect it and DROP the draft rather
+  than retry the dead permalink every slot. Captured copy: "Hmm...this page
+  doesn’t exist. Try searching for something else."
+-->
+<div id="react-root">
+  <main role="main">
+    <div data-testid="primaryColumn">
+      <div data-testid="error-detail">
+        <span>Hmm...this page doesn’t exist. Try searching for something else.</span>
+        <a href="/explore" role="link">Search</a>
+      </div>
+    </div>
+  </main>
+</div>
