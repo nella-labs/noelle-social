@@ -198,3 +198,203 @@ async function finishStart(state: RunState, run: PendingStart): Promise<number |
   return state.epoch;
 }
 function reserveStop(): Promise<number> {
+  runAbort.abort();
+  return bumpEpoch();
+}
+
+async function startRun(
+  params: { windowHours: number; targetComments: number; targetLikes: number },
+  opts?: { curfew?: boolean; expectedEpoch?: number },
+  run = reserveStart(opts?.expectedEpoch),
+): Promise<number | null> {
+  const epoch = await activateStart(run);
+  if (epoch === null) return null;
+  const cfg = await getConfig();
+  if (!cfg) throw new Error("not configured");
+  if (!(await startIsCurrent(run, epoch))) return null;
+  const api = new ActuatorApi(cfg);
+  const queue = await api.fetchQueue();
+  if (!(await startIsCurrent(run, epoch))) return null;
+  const rng = makeRng((Date.now() & 0xffffffff) >>> 0);
+  const startMs = Date.now();
+
+  // Session persona + warm-up window: drawn once at run start and held for the
+  // whole session (the "session-level entropy" that prevents a repeated
+  // signature). persona.wpm threads into every reading-dwell call below.
+  const persona = makeSessionPersona((Date.now() & 0xffffffff) >>> 0);
+  // Warm-up suppresses writes for the first N ms (arrive/read before acting). Cap
+  // it at 10% of the window so a short run isn't dominated by warm-up — a 30-min
+  // window warms up ≤3 min, not the full ~4 min a long run would.
+  const warmupSuppressMs = Math.min(
+    warmupSuppressWritesMs(rng),
+    Math.round(params.windowHours * 3600_000 * 0.1),
+  );
+
+  // Multi-day warm-up: a newly-automated identity ramps to full volume over ~4
+  // weeks. Persist the automation start once (first run), then scale the daily
+  // caps by the ramp multiplier so early sessions run lighter.
+  const startStore = await chrome.storage.local.get("actuator.automationStartMs");
+  let automationStartMs = startStore["actuator.automationStartMs"] as number | undefined;
+  if (typeof automationStartMs !== "number") {
+    automationStartMs = startMs;
+    if (!(await runIfCurrent(epoch, () => chrome.storage.local.set({ "actuator.automationStartMs": automationStartMs })))) return null;
+  }
+  const warm = warmupCapMultiplier(automationStartMs, startMs);
+  const effectiveCaps = {
+    likes: Math.max(1, Math.round(cfg.caps.likes * warm)),
+    comments: Math.round(cfg.caps.comments * warm),
+    dms: Math.round(cfg.caps.dms * warm),
+  };
+
+  const { actions: planned } = planTimeline({
+    params, approvedDms: queue.dms.length, caps: effectiveCaps, startMs,
+    deepNightTaper: cfg.deepNightTaper, maxWritesPerHour: cfg.maxWritesPerHour ?? 8,
+    // Plan AROUND the curfew when this run has one, so slots are not laid down
+    // inside the band only to be deferred one by one at execution time.
+    curfewEnabled: opts?.curfew === true,
+    rng,
+  });
+  const actions: SlotAction[] = planned.map((a) => ({ kind: a.kind, atMs: a.atMs, executed: false }));
+
+  // Pin the actuated tab NOW (preferring one already on /home) and remember it
+  // on the run, so ticks keep driving this same tab while it stays open —
+  // instead of re-picking tabs[0] every tick and following whichever x.com tab
+  // sorts first.
+  const tabId = await findXTab();
+  const state: RunState = {
+    sessionId: crypto.randomUUID(), epoch, startMs, windowHours: params.windowHours, actions,
+    persona, warmupSuppressMs, tabId: tabId ?? undefined, curfewEnabled: opts?.curfew === true,
+    targets: {
+      likes: actions.filter((a) => a.kind === "like").length,
+      comments: actions.filter((a) => a.kind === "comment").length,
+      dms: actions.filter((a) => a.kind === "dm").length,
+    },
+    done: { likes: 0, comments: 0, dms: 0 },
+    commentPool: queue.comments.map((c) => ({ approvalId: c.approval_id, draftId: c.draft_id, body: c.body, url: c.target.url })),
+    dmPool: queue.dms.map((d) => ({ approvalId: d.approval_id, draftId: d.draft_id, body: d.body, url: d.target.url })),
+    doneDraftIds: [], lastPollMs: startMs, status: "running",
+  };
+  return finishStart(state, run);
+}
+
+// Drain mode: post ALL approved replies a short gap apart (random 20–60s / 1–2 min),
+// filling each gap with 4–8 likes + ambient browsing. Reuses the whole tick engine
+// — it just builds a drain schedule and flags the run mode:"drain" (which makes each
+// reply return to the x.com feed so the gap browses + likes). Newest tweet first
+// (the /api/actionable-x queue is served newest-post-first). Epoch-based supersede,
+// same as startRun — no warm-up suppression (drain is an explicit operator action).
+async function startDrain(opts?: { manual?: boolean; curfew?: boolean; notifications?: boolean; expectedEpoch?: number },
+  run = reserveStart(opts?.expectedEpoch),
+): Promise<number | null> {
+  const epoch = await activateStart(run);
+  if (epoch === null) return null;
+  const cfg = await getConfig();
+  if (!cfg) throw new Error("not configured");
+  if (!(await startIsCurrent(run, epoch))) return null;
+  const api = new ActuatorApi(cfg);
+  const queue = await api.fetchQueue();
+  if (!(await startIsCurrent(run, epoch))) return null;
+  const rng = makeRng((Date.now() & 0xffffffff) >>> 0);
+  const startMs = Date.now();
+  const persona = makeSessionPersona((Date.now() & 0xffffffff) >>> 0);
+  // Per-session drain temperament, drawn from its OWN seed (NOT the wall-clock-
+  // reseeded tick rng) so the plan stream is untouched. Persisted on RunState so
+  // every auto-continue round shares the same mood (see maybeExtendDrain).
+  const drainStyle = pickDrainArchetype(makeRng((Date.now() ^ 0x9e3779b1) >>> 0));
+
+  const nComments = queue.comments.length;
+  // drainStyle carries the archetype-shaped subset of DrainOpts, so spread it in.
+  // shortBandProb is the ONE field combined with the operator's cfg knob by MIN
+  // (placed AFTER the spread so it wins): the archetype can only ever LOWER the
+  // short-band share, never raise the operator's lights-out setting — the drain
+  // never runs faster than min(cfg, default).
+  const planned = planDrainTimeline({
+    approvedComments: nComments, startMs, rng,
+    ...drainStyle,
+    shortBandProb: Math.min(cfg.drainShortBandProb ?? 0.55, drainStyle.shortBandProb),
+  });
+  const actions: SlotAction[] = planned.map((a) => ({ kind: a.kind, atMs: a.atMs, executed: false }));
+  const lastAt = actions.reduce((m, a) => Math.max(m, a.atMs), startMs);
+  const windowHours = (lastAt - startMs) / 3600_000 + 0.15; // pad so the last slot fits
+
+  const tabId = await findXTab(); // pin for the run (reused via s.tabId in tickOnce)
+  const state: RunState = {
+    sessionId: crypto.randomUUID(), epoch, startMs, windowHours, actions,
+    persona, drainStyle, warmupSuppressMs: 0, mode: "drain", manualDrain: opts?.manual === true, curfewEnabled: opts?.curfew === true, notifications: opts?.notifications === true, tabId: tabId ?? undefined,
+    targets: {
+      likes: actions.filter((a) => a.kind === "like").length,
+      comments: nComments,
+      dms: 0,
+    },
+    done: { likes: 0, comments: 0, dms: 0 },
+    commentPool: queue.comments.map((c) => ({ approvalId: c.approval_id, draftId: c.draft_id, body: c.body, url: c.target.url })),
+    dmPool: [],
+    doneDraftIds: [], lastPollMs: startMs, status: "running",
+  };
+  return finishStart(state, run);
+}
+
+// DELIBERATELY NO auto-enable/auto-disable of reply_send_enabled here — this is
+// where the LinkedIn actuator differs and its pattern must NOT be ported. On
+// LinkedIn the column has no consumer outside the actuator queue routes, so the
+// extension can treat it as per-run consent. On X it is the MASTER GATE of the
+// x-intern official-API send worker (apps/x-intern/src/workers/send.ts): once
+// true, that worker's tick fires ANY auto_send_target_at-stamped pending
+// approval via the official API — an unattended SECOND sender armed over the
+// same approval pool as this extension (duplicate public posts). And disabling
+// it at run end would silently revoke the operator's STANDING dashboard consent
+// (killing Vega's API autosend after any manual actuator run). So the browser
+// actuator never writes the flag: consent for the X actuator is the operator
+// flipping reply sending on the Vega agent page (docs/x-actuator-plan.md), and
+// the org-wide panic-stop stays the single authority over the column.
+
+async function endRun(status: RunState["status"], terminal = reserveStop()): Promise<number> {
+  const term = await terminal;
+  // Abort immediately when STOP is reserved, then recheck the owned controller
+  // after the epoch write: a start may have activated while that write waited.
+  if (!(await runIfCurrent(term, async () => {
+    runAbort.abort();
+    if (status === "halted-challenge") {
+      await chrome.storage.local.set({ [CHALLENGE_DAY_KEY]: localDayKey(new Date()) });
+    }
+  }))) return term;
+  const s = await loadState();
+  if (s) {
+    s.status = status;
+    s.epoch = term;
+    if (!(await saveIfCurrent(s))) return term;
+    // Detach every tab this run attached (it may have re-pinned after its tab
+    // closed) — a single re-looked-up detach could miss one and leave the
+    // "Extension is debugging this browser" banner up after the run halts.
+    if (term === await currentEpoch()) await cdp.detachAll();
+    // shortfall logging (no silent truncation)
+    const cfg = await getConfig();
+    if (cfg) {
+      const api = new ActuatorApi(cfg);
+      // NOTE: no enableSend(false) here — the X actuator never touches
+      // reply_send_enabled (see the block comment above endRun). Disabling it
+      // would revoke the operator's standing dashboard consent and kill the
+      // x-intern API autosend pipeline after any manual actuator run.
+      const events: XActivityEvent[] = [];
+      const at = new Date(Date.now()).toISOString();
+      const miss = shortfall(s.targets.comments, s.done.comments);
+      if (miss > 0) events.push({ type: "skip", reason: `shortfall-replies-${miss}`, at });
+      if (events.length) await api.logActivity(s.sessionId, events).catch(() => {});
+    }
+  }
+  await runIfCurrent(term, async () => { await chrome.alarms.clear(ALARM); });
+  return term;
+}
+
+// Drain auto-continue. A drain plans a FIXED number of reply slots (the queue
+// size at start), so it used to STOP after that first batch even when the inbox
+// still held approvals — the ones that arrived mid-run, or that were re-queued
+// after a transient failure ("the actuator stopped before finishing the
+// approvals inbox"). When every planned slot is done, re-fetch the queue and, if
+// pending replies remain, APPEND a fresh batch of comment+like slots and extend
+// the window — so one operator Drain clears the WHOLE inbox without a manual
+// re-trigger. Returns true iff it extended (caller keeps the run running).
+// Bounded by MAX_DRAIN_ROUNDS. Naturally self-limiting: an empty queue (nothing
+// left, or sending disabled server-side) returns false → the drain ends;
+// replies that keep failing hit the per-draft retry cap → doneDraftIds →
+// filtered out of the next fetch → remaining reaches 0.
