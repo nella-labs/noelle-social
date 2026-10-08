@@ -198,3 +198,203 @@ describe("shouldHaltForChallenge (P5 circuit-breaker)", () => {
     expect(shouldHaltForChallenge({ flagEnabled: true, recentChallengeCount: null })).toBe(true);
   });
   it("flag disabled is a true no-op regardless of count", () => {
+    expect(shouldHaltForChallenge({ flagEnabled: false, recentChallengeCount: 5 })).toBe(false);
+    expect(shouldHaltForChallenge({ flagEnabled: false, recentChallengeCount: null })).toBe(false);
+  });
+});
+
+describe("capActionablePerAuthor (P5 per-author daily cap)", () => {
+  const empty: ReadonlySet<string> = new Set();
+  // Build a reply row spread from base, with distinct approval_id/lead_id.
+  const reply = (over: Partial<JoinedRow>): JoinedRow => ({ ...base, ...over });
+  const cap = (rows: JoinedRow[], args: { cap: number; writtenHandles?: ReadonlySet<string>; writtenIds?: ReadonlySet<string> }) =>
+    capActionablePerAuthor(buildActionable(rows), rows, {
+      cap: args.cap,
+      writtenHandles: args.writtenHandles ?? empty,
+      writtenIds: args.writtenIds ?? empty,
+    });
+
+  it("cap=1 collapses two comments from the same author to the newest (first) one", () => {
+    const r1 = reply({ approval_id: "a-1", lead_id: "l-1" }); // newest first in rows order
+    const r2 = reply({ approval_id: "a-2", lead_id: "l-2" });
+    const out = cap([r1, r2], { cap: 1 });
+    expect(out.comments).toHaveLength(1);
+    expect(out.comments[0]!.approval_id).toBe("a-1");
+  });
+
+  it("cap=1 across a comment AND a dm to the same author → only one survives", () => {
+    const r1 = reply({ approval_id: "a-1", lead_id: "l-1" }); // comment
+    const r2 = reply({ approval_id: "a-2", lead_id: "l-2", draft_payload: { kind: "dm", body: "hi", dm_send_approved: true } });
+    const out = cap([r1, r2], { cap: 1 });
+    expect(out.comments.length + out.dms.length).toBe(1);
+  });
+
+  it("two different authors, cap=1 → both kept", () => {
+    const r1 = reply({ approval_id: "a-1", lead_id: "l-1", author_handle: "jane-doe", author_id: "fsd-jane", lead_payload: { authorPublicId: "jane-doe", postUrl: base.lead_payload!.postUrl } });
+    const r2 = reply({ approval_id: "a-2", lead_id: "l-2", author_handle: "bob", author_id: "fsd-bob", lead_payload: { authorPublicId: "bob", postUrl: base.lead_payload!.postUrl } });
+    const out = cap([r1, r2], { cap: 1 });
+    expect(out.comments).toHaveLength(2);
+  });
+
+  it("writtenHandles excludes an author already actioned today; a different author is still served", () => {
+    const r1 = reply({ approval_id: "a-1", lead_id: "l-1", author_handle: "jane-doe", author_id: "fsd-jane", lead_payload: { authorPublicId: "jane-doe", postUrl: base.lead_payload!.postUrl } });
+    const r2 = reply({ approval_id: "a-2", lead_id: "l-2", author_handle: "bob", author_id: "fsd-bob", lead_payload: { authorPublicId: "bob", postUrl: base.lead_payload!.postUrl } });
+    const out = cap([r1, r2], { cap: 1, writtenHandles: new Set(["jane-doe"]) });
+    expect(out.comments).toHaveLength(1);
+    expect(out.comments[0]!.approval_id).toBe("a-2");
+  });
+
+  it("cross-lane exclusion by author_id even when handle is null", () => {
+    const r1 = reply({
+      approval_id: "a-1", lead_id: "l-1", author_handle: null, author_id: "fsd-a",
+      lead_payload: { authorPublicId: null, postUrl: base.lead_payload!.postUrl },
+    });
+    const out = cap([r1], { cap: 1, writtenIds: new Set(["fsd-a"]) });
+    expect(out.comments).toHaveLength(0);
+  });
+
+  it("cap=2 keeps two writes for one author, drops the 3rd", () => {
+    const rows = ["a-1", "a-2", "a-3"].map((id, i) => reply({ approval_id: id, lead_id: `l-${i}` }));
+    const out = cap(rows, { cap: 2 });
+    expect(out.comments).toHaveLength(2);
+    expect(out.comments.map((c) => c.approval_id)).toEqual(["a-1", "a-2"]);
+  });
+
+  it("fail-safe: cap=0 / NaN treated as 1", () => {
+    const rows = [reply({ approval_id: "a-1", lead_id: "l-1" }), reply({ approval_id: "a-2", lead_id: "l-2" })];
+    expect(cap(rows, { cap: 0 }).comments).toHaveLength(1);
+    expect(cap(rows, { cap: NaN }).comments).toHaveLength(1);
+  });
+
+  it("unknown-author rows never merge and are never excluded by the written sets", () => {
+    const r1 = reply({
+      approval_id: "a-1", lead_id: "l-1", author_handle: null, author_id: null,
+      lead_payload: { authorPublicId: null, postUrl: base.lead_payload!.postUrl },
+    });
+    const r2 = reply({
+      approval_id: "a-2", lead_id: "l-2", author_handle: null, author_id: null,
+      lead_payload: { authorPublicId: null, postUrl: base.lead_payload!.postUrl },
+    });
+    const out = cap([r1, r2], { cap: 1, writtenHandles: new Set(["jane-doe"]), writtenIds: new Set(["fsd-jane-doe"]) });
+    expect(out.comments).toHaveLength(2);
+  });
+});
+
+describe("dedupeAlreadyCommented (persistent dedup-by-link)", () => {
+  const urn = "urn:li:activity:7300000000000000000"; // base's post URN
+  const otherUrn = "urn:li:activity:7399999999999999999";
+
+  it("drops a comment whose post URN is already commented on", () => {
+    const built = buildActionable([base]);
+    expect(built.comments).toHaveLength(1);
+    const out = dedupeAlreadyCommented(built, new Set([urn]));
+    expect(out.comments).toHaveLength(0);
+  });
+
+  it("keeps a comment whose post URN is NOT in the commented set", () => {
+    const built = buildActionable([base]);
+    const out = dedupeAlreadyCommented(built, new Set([otherUrn]));
+    expect(out.comments).toHaveLength(1);
+  });
+
+  it("empty commented set is an identity passthrough", () => {
+    const built = buildActionable([base]);
+    const out = dedupeAlreadyCommented(built, new Set());
+    expect(out.comments).toHaveLength(1);
+  });
+
+  it("keeps a comment with no derivable activity_urn (nothing to dedup by link)", () => {
+    // A post URL with no urn:li:activity → target.activity_urn is null → never dropped.
+    const link = "https://www.linkedin.com/posts/jane-doe_some-slug-abcd";
+    const built = buildActionable([{ ...base, lead_payload: { authorPublicId: "jane-doe", url: link } }]);
+    expect(built.comments[0]!.target.activity_urn).toBeNull();
+    const out = dedupeAlreadyCommented(built, new Set([urn]));
+    expect(out.comments).toHaveLength(1);
+  });
+
+  it("blocks a slug-URL post whose activity id was already replied to", () => {
+    // The replied-set holds normalized urns (urn:li:activity:<external_id>); a
+    // fresh queue item on the SAME post via the slug URL must still be dropped.
+    const id = "7481524546924343296";
+    const link = `https://www.linkedin.com/posts/jane_slug-activity-${id}-ek0Y`;
+    const built = buildActionable([{ ...base, lead_payload: { authorPublicId: "jane", original_post_url: link } }]);
+    expect(built.comments[0]!.target.activity_urn).toBe(`urn:li:activity:${id}`);
+    const out = dedupeAlreadyCommented(built, new Set([`urn:li:activity:${id}`]));
+    expect(out.comments).toHaveLength(0);
+  });
+
+  // THE INCIDENT. A conversation reply used to be exempted from this dedup, on
+  // the reasoning that answering someone who replied to us is a second comment
+  // on that post by design. That is only true if the answer can be THREADED
+  // under their comment — and Lyra's actuator posts at POST level. So the
+  // exemption did not thread anything: it published a SECOND top-level comment
+  // from the operator on a thread he had already commented on. Five reached
+  // LinkedIn before it was caught.
+  it("drops a conversation reply to an already-commented post — no duplicate top-level comment", () => {
+    const built = buildActionable([base]);
+    expect(built.comments).toHaveLength(1);
+    const out = dedupeAlreadyCommented(built, new Set([urn]));
+    expect(out.comments).toHaveLength(0);
+  });
+
+  it("the exemption parameter, if ever passed, is still scoped to the given lead ids", () => {
+    // Kept as a parameter for a future caller that genuinely CAN thread. This
+    // pins that it never widens to other leads on the same post.
+    const other: JoinedRow = {
+      ...base,
+      approval_id: "66666666-6666-6666-6666-666666666666",
+      lead_id: "77777777-7777-7777-7777-777777777777",
+    };
+    const built = buildActionable([base, other]);
+    const out = dedupeAlreadyCommented(built, new Set([urn]), new Set([base.lead_id]));
+    expect(out.comments.map((c) => c.lead_id)).toEqual([base.lead_id]);
+  });
+
+  it("never touches DMs (profile-targeted, not post-targeted)", () => {
+    const built = buildActionable([{ ...base, draft_payload: { kind: "dm", body: "hi", dm_send_approved: true } }]);
+    expect(built.dms).toHaveLength(1);
+    const out = dedupeAlreadyCommented(built, new Set([urn]));
+    expect(out.dms).toHaveLength(1);
+  });
+
+  // THE INTERLOCK. Being exempt from "do not comment twice on this post" is
+  // only legitimate if we are not commenting on the post at all — i.e. the item
+  // carries a threading target the actuator will actually use. The first
+  // version exempted every conversation reply and published five duplicate
+  // top-level comments on the operator's own threads.
+  it("keeps a conversation reply that CAN thread", () => {
+    const built = buildActionable([base]);
+    built.comments[0]!.target.comment_urn = "urn:li:comment:7487199472029192192";
+    const threaded = new Set(
+      built.comments.filter((c) => Boolean(c.target.comment_urn)).map((c) => c.lead_id),
+    );
+    expect(dedupeAlreadyCommented(built, new Set([urn]), threaded).comments).toHaveLength(1);
+  });
+
+  it("still drops one that CANNOT thread — no target, no exemption", () => {
+    const built = buildActionable([base]);
+    expect(built.comments[0]!.target.comment_urn ?? null).toBeNull();
+    const threaded = new Set(
+      built.comments.filter((c) => Boolean(c.target.comment_urn)).map((c) => c.lead_id),
+    );
+    expect(threaded.size).toBe(0);
+    expect(dedupeAlreadyCommented(built, new Set([urn]), threaded).comments).toHaveLength(0);
+  });
+
+  it("drops only the already-commented post, keeps a fresh one in the same batch", () => {
+    const fresh: JoinedRow = {
+      ...base,
+      approval_id: "44444444-4444-4444-4444-444444444444",
+      lead_id: "55555555-5555-5555-5555-555555555555",
+      lead_payload: { authorPublicId: "bob", postUrl: `https://www.linkedin.com/feed/update/${otherUrn}/` },
+    };
+    const built = buildActionable([base, fresh]);
+    expect(built.comments).toHaveLength(2);
+    const out = dedupeAlreadyCommented(built, new Set([urn]));
+    expect(out.comments).toHaveLength(1);
+    expect(out.comments[0]!.target.activity_urn).toBe(otherUrn);
+  });
+});
+
+describe("activity payload validation", () => {
+  it("rejects an empty events array", () => {
