@@ -198,3 +198,78 @@ describe.skipIf(!url)("PgWorkQueue (integration)", () => {
 
   it("enqueue delaySeconds hides the job until due", async () => {
     const q = makeQueue<string>();
+    await q.enqueue("future", { delaySeconds: 3600 });
+    expect(await q.claim({ batchSize: 5 })).toEqual([]);
+    expect(await q.depth()).toBe(0);
+  });
+
+  it("delivers oldest-available first and isolates logical queues", async () => {
+    const a = makeQueue<string>({ queue: "t.a" });
+    const b = makeQueue<string>({ queue: "t.b" });
+    await a.enqueue("a1");
+    await a.enqueue("a2");
+    await b.enqueue("b1");
+
+    const claimed = await a.claim({ batchSize: 10 });
+    expect(claimed.map((c) => c.job)).toEqual(["a1", "a2"]);
+    expect(await b.depth()).toBe(1);
+  });
+
+  it("perKeyMax caps one key's share of a batch", async () => {
+    const q = makeQueue<{ org_id: string; n: number }>();
+    await q.enqueue({ org_id: "org-a", n: 1 });
+    await q.enqueue({ org_id: "org-a", n: 2 });
+    await q.enqueue({ org_id: "org-a", n: 3 });
+    await q.enqueue({ org_id: "org-b", n: 4 });
+
+    const claimed = await q.claim({ batchSize: 10, perKeyMax: { org_id: 2 } });
+    const byOrg = new Map<string, number>();
+    for (const c of claimed) byOrg.set(c.job.org_id, (byOrg.get(c.job.org_id) ?? 0) + 1);
+    expect(byOrg.get("org-a")).toBe(2);
+    expect(byOrg.get("org-b")).toBe(1);
+    expect(claimed).toHaveLength(3);
+  });
+
+  it("perKeyMax with multiple keys ANDs the caps", async () => {
+    const q = makeQueue<{ org_id: string; kind: string; n: number }>();
+    // Insertion order = rank order (available_at, id).
+    await q.enqueue({ org_id: "a", kind: "x", n: 1 }); // org a #1, kind x #1 → eligible
+    await q.enqueue({ org_id: "a", kind: "x", n: 2 }); // org a #2 ok, kind x #2 → blocked by kind cap
+    await q.enqueue({ org_id: "b", kind: "x", n: 3 }); // org b #1 ok, kind x #3 → blocked by kind cap
+    await q.enqueue({ org_id: "b", kind: "y", n: 4 }); // org b #2 ok, kind y #1 → eligible
+
+    const claimed = await q.claim({ batchSize: 10, perKeyMax: { org_id: 2, kind: 1 } });
+    expect(claimed.map((c) => c.job.n).sort()).toEqual([1, 4]);
+  });
+
+  it("concurrent claimers never double-claim (FOR UPDATE SKIP LOCKED)", async () => {
+    const q = makeQueue<{ i: number }>();
+    for (let i = 0; i < 20; i++) await q.enqueue({ i });
+
+    const batches = await Promise.all(
+      Array.from({ length: 4 }, () => q.claim({ batchSize: 10 })),
+    );
+    const ids = batches.flat().map((c) => c.job.i);
+    expect(ids).toHaveLength(20);
+    expect(new Set(ids).size).toBe(20);
+  });
+
+  it("concurrent claimers never double-claim on the perKeyMax path either", async () => {
+    // The perKey branch locks through a ranked-CTE join and must repeat the
+    // claimability predicate at the locking level (see the comment in
+    // claim()) — this drives that branch under real concurrency.
+    const q = makeQueue<{ i: number; org_id: string }>();
+    for (let i = 0; i < 20; i++) await q.enqueue({ i, org_id: `org-${i % 4}` });
+
+    const batches = await Promise.all(
+      Array.from({ length: 4 }, () => q.claim({ batchSize: 10, perKeyMax: { org_id: 3 } })),
+    );
+    const ids = batches.flat().map((c) => c.job.i);
+    expect(new Set(ids).size).toBe(ids.length); // no id delivered twice
+    for (const batch of batches) {
+      const perOrg = new Map<string, number>();
+      for (const c of batch) perOrg.set(c.job.org_id, (perOrg.get(c.job.org_id) ?? 0) + 1);
+      for (const n of perOrg.values()) expect(n).toBeLessThanOrEqual(3);
+    }
+  });
+});

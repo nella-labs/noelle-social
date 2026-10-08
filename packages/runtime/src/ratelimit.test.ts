@@ -198,3 +198,107 @@ describe("getRateLimit", () => {
     expect(r).toBeInstanceOf(MemoryTokenBucket);
   });
 
+  it("returns UpstashTokenBucket for driver=upstash when env is set", () => {
+    const prevUrl = process.env.UPSTASH_REDIS_REST_URL;
+    const prevTok = process.env.UPSTASH_REDIS_REST_TOKEN;
+    process.env.UPSTASH_REDIS_REST_URL = "https://example.upstash.io";
+    process.env.UPSTASH_REDIS_REST_TOKEN = "t";
+    try {
+      const r = getRateLimit({ capacity: 1, refillPerSecond: 1 }, "upstash");
+      expect(r).toBeInstanceOf(UpstashTokenBucket);
+    } finally {
+      if (prevUrl === undefined) delete process.env.UPSTASH_REDIS_REST_URL;
+      else process.env.UPSTASH_REDIS_REST_URL = prevUrl;
+      if (prevTok === undefined) delete process.env.UPSTASH_REDIS_REST_TOKEN;
+      else process.env.UPSTASH_REDIS_REST_TOKEN = prevTok;
+    }
+  });
+
+  it("throws when upstash creds missing", () => {
+    const prevUrl = process.env.UPSTASH_REDIS_REST_URL;
+    const prevTok = process.env.UPSTASH_REDIS_REST_TOKEN;
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    try {
+      expect(() =>
+        getRateLimit({ capacity: 1, refillPerSecond: 1 }, "upstash"),
+      ).toThrow(/UPSTASH_REDIS_REST_URL/);
+    } finally {
+      if (prevUrl !== undefined) process.env.UPSTASH_REDIS_REST_URL = prevUrl;
+      if (prevTok !== undefined) process.env.UPSTASH_REDIS_REST_TOKEN = prevTok;
+    }
+  });
+});
+
+describe("enforce() + rateLimitedResponse()", () => {
+  beforeEach(() => {
+    _resetRateLimitRegistryForTests();
+  });
+
+  it("returns allowed for a fresh key under capacity", async () => {
+    const r = await enforce("user:1", {
+      bucket: "test:fresh",
+      capacity: 3,
+      refillPerSecond: 0,
+      driver: "memory",
+    });
+    expect(r.allowed).toBe(true);
+    if (r.allowed) expect(r.bucket).toBe("test:fresh");
+  });
+
+  it("memoizes the bucket so repeated enforce() calls share state", async () => {
+    for (let i = 0; i < 3; i++) {
+      await enforce("user:2", {
+        bucket: "test:shared",
+        capacity: 3,
+        refillPerSecond: 0,
+        driver: "memory",
+      });
+    }
+    const denied = await enforce("user:2", {
+      bucket: "test:shared",
+      capacity: 3,
+      refillPerSecond: 0,
+      driver: "memory",
+    });
+    expect(denied.allowed).toBe(false);
+    if (!denied.allowed) {
+      expect(denied.retryAfterMs).toBeGreaterThanOrEqual(0);
+      expect(denied.bucket).toBe("test:shared");
+    }
+  });
+
+  it("respects cost > 1", async () => {
+    await enforce("user:3", {
+      bucket: "test:cost",
+      capacity: 5,
+      refillPerSecond: 0,
+      cost: 4,
+      driver: "memory",
+    });
+    const denied = await enforce("user:3", {
+      bucket: "test:cost",
+      capacity: 5,
+      refillPerSecond: 0,
+      cost: 2,
+      driver: "memory",
+    });
+    expect(denied.allowed).toBe(false);
+  });
+
+  it("rateLimitedResponse() builds a 429 envelope with Retry-After in seconds", () => {
+    const r = rateLimitedResponse({ bucket: "x:y", retryAfterMs: 2500 });
+    expect(r.status).toBe(429);
+    expect(r.headers["Retry-After"]).toBe("3");
+    expect(r.headers["X-RateLimit-Bucket"]).toBe("x:y");
+    expect(r.headers["X-RateLimit-Retry-After-Ms"]).toBe("2500");
+    expect(r.body.error).toBe("rate_limited");
+    expect(r.body.bucket).toBe("x:y");
+    expect(r.body.retry_after_ms).toBe(2500);
+  });
+
+  it("rateLimitedResponse() floors Retry-After at 1 second", () => {
+    const r = rateLimitedResponse({ bucket: "x:y", retryAfterMs: 100 });
+    expect(r.headers["Retry-After"]).toBe("1");
+  });
+});
