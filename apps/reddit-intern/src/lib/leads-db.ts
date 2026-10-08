@@ -198,3 +198,203 @@ export async function claimLeadsForDrafting(
     set status = 'drafting', updated_at = now()
     where id in (
       select id from noelle.leads
+      where agent_instance_id = ${args.agentInstanceId}
+        and status = 'classified'
+        and priority = false
+      order by (payload->>'posted_at') desc nulls last, created_at desc
+      for update skip locked
+      limit ${args.batch}
+    )
+    returning id, external_id, payload, author_handle, author_id, tier, classifier_label, classifier_score, status, priority
+  `;
+  return [...rows];
+}
+
+/**
+ * Claim priority=TRUE classified leads — profile-first (Feeder A), ICP-vetted
+ * keyword authors, and any future watchlist-pinned people. Per the 0035 split,
+ * the keyword claim above excludes priority leads, so WITHOUT this they'd sit at
+ * 'classified' forever. The RPC takes one newest lead per author (skipping
+ * authors who already have a pending non-DM reply), up to `cap` authors.
+ * RPC: infra/cloudsql/schema/0035_watchlist_drafting_rpc.sql.
+ */
+export async function claimWatchlistLeadsForDrafting(
+  sql: Sql,
+  args: { agentInstanceId: string; cap: number },
+): Promise<LeadRow[]> {
+  const rows = await sql<LeadRow[]>`
+    select * from noelle.claim_watchlist_leads_for_drafting(${args.agentInstanceId}::uuid, ${args.cap})
+  `;
+  return [...rows];
+}
+
+/**
+ * How many posts discovery has EXTRACTED today for this instance — every lead
+ * created today, regardless of how the classifier later graded it. Discovery
+ * stops fetching once this reaches LINKEDIN_DAILY_EXTRACT_CAP. `current_date`
+ * uses the DB session timezone (UTC on the VM), which is the same clock the
+ * created_at default writes with, so the day boundary is consistent.
+ */
+export async function countExtractedToday(
+  sql: Sql,
+  agentInstanceId: string,
+): Promise<number> {
+  const rows = await sql<{ count: string }[]>`
+    select count(*)::text as count
+    from noelle.leads
+    where agent_instance_id = ${agentInstanceId}
+      and created_at::date = current_date
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
+/**
+ * How many leads of a given reply_kind the drafter has DELIVERED today for this
+ * instance — counted by joining approvals back to their lead and matching the
+ * lead's classifier_label, with the approval created today. Used to enforce the
+ * per-kind daily draft caps (LINKEDIN_DAILY_SUBSTANTIAL_CAP /
+ * LINKEDIN_DAILY_LIGHT_CAP). `light` and `substantial` are independent buckets.
+ *
+ * Counts via noelle.approvals (which has created_at; noelle.drafts only has
+ * synced_at) and DISTINCT lead_id — a substantial lead yields up to 3 reply
+ * approvals + 1 DM approval; the cap is "N posts/day", i.e. N leads, not N rows.
+ */
+export async function countDraftedTodayByKind(
+  sql: Sql,
+  args: { agentInstanceId: string; replyKind: ReplyKindValue },
+): Promise<number> {
+  const rows = await sql<{ count: string }[]>`
+    select count(distinct a.lead_id)::text as count
+    from noelle.approvals a
+    join noelle.leads l on l.id = a.lead_id
+    where a.agent_instance_id = ${args.agentInstanceId}
+      and l.classifier_label = ${args.replyKind}
+      and a.created_at::date = current_date
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
+/**
+ * Backpressure read 1/2 — how many drafts are still waiting for the operator to
+ * approve/skip for this agent instance. Consulted at the top of discovery +
+ * drafter ticks before any cookie fetch or LLM call.
+ */
+export async function countPendingApprovalsForInstance(
+  sql: Sql,
+  agentInstanceId: string,
+): Promise<number> {
+  const rows = await sql<{ count: string }[]>`
+    select count(*)::text as count
+    from noelle.approvals
+    where agent_instance_id = ${agentInstanceId}
+      and status = 'pending'
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
+/**
+ * Backpressure read 2/2 — how many leads are "in flight" (not yet resolved into
+ * a draft or skipped). Only discovery consults this, to avoid piling fresh leads
+ * on top of a backlog the classifier/drafter haven't drained yet.
+ */
+export async function countLeadBacklogForInstance(
+  sql: Sql,
+  agentInstanceId: string,
+): Promise<number> {
+  const rows = await sql<{ count: string }[]>`
+    select count(*)::text as count
+    from noelle.leads
+    where agent_instance_id = ${agentInstanceId}
+      and status in ('new', 'classifying', 'classified', 'drafting')
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
+export async function markLeadStatus(
+  sql: Sql,
+  args: { leadId: string; status: "drafted" | "errored" | "skipped"; meta?: Record<string, unknown> },
+): Promise<void> {
+  await sql`
+    update noelle.leads
+    set status = ${args.status},
+        payload = payload || ${sql.json((args.meta ?? {}) as JSONValue)}::jsonb,
+        updated_at = now()
+    where id = ${args.leadId}
+  `;
+}
+
+/**
+ * On-demand DM requests — claim leads the operator flagged for a one-off DM
+ * (payload.dm_requested = true, set by the dashboard "Generate DM" action).
+ * Atomically clears the flag as it claims (so each request generates once) and
+ * skips leads that already have a pending DM approval. Independent of the reply
+ * lane + the auto-DM toggle: runs whenever the drafter ticks, so the operator
+ * gets their DM regardless of pipeline state. Mirrors x-intern.
+ */
+export async function claimDmRequestLeads(
+  sql: Sql,
+  args: { agentInstanceId: string; cap: number },
+): Promise<LeadRow[]> {
+  const rows = await sql<LeadRow[]>`
+    update noelle.leads l
+    set payload = payload - 'dm_requested', updated_at = now()
+    where l.id in (
+      select c.id
+      from noelle.leads c
+      where c.agent_instance_id = ${args.agentInstanceId}
+        and c.payload->>'dm_requested' = 'true'
+        and not exists (
+          select 1 from noelle.approvals a
+          left join noelle.drafts d on d.id = a.draft_id
+          where a.lead_id = c.id
+            and a.status = 'pending'
+            and coalesce(d.payload->>'kind', 'reply') = 'dm'
+        )
+      order by c.updated_at desc
+      limit ${args.cap}
+      for update skip locked
+    )
+    returning l.id, l.external_id, l.payload, l.author_handle, l.author_id,
+              l.tier, l.classifier_label, l.classifier_score, l.status, l.priority
+  `;
+  return [...rows];
+}
+
+/**
+ * A claim older than this is provably orphaned. Each worker kind runs as a
+ * single process per instance and drafts/classifies its whole batch well inside
+ * 45 minutes (the SKIP LOCKED in the claim RPCs is a concurrency safety net,
+ * not the topology), so a lead still mid-claim after this long has no living
+ * owner.
+ */
+const STALE_CLAIM_MINUTES = 45;
+
+/**
+ * Strands older than this exit as 'skipped' instead of retrying — a reply
+ * drafted two days after the post reads as necro-engagement, not conversation.
+ */
+const STALE_CLAIM_EXPIRE_HOURS = 48;
+
+/**
+ * Recover leads stranded mid-claim by a worker crash or restart. The claim RPCs
+ * flip status ('new'→'classifying', 'classified'→'drafting') and the worker
+ * later writes the terminal outcome — but a process death between the two
+ * leaves the lead invisible to every future claim (claims only pick the
+ * pre-claim status), so it is lost silently. Merge-driven deploys restart every
+ * worker, making this a steady leak (2026-07-19: 159 leads stranded at
+ * 'drafting'/'classifying' across the three interns).
+ *
+ * Fresh strands go back to `requeueStatus` for a retry; ones past the expiry
+ * horizon are marked 'skipped' with a payload.stale_claim marker so the
+ * dashboard can tell them apart from classifier skips. Runs at the top of every
+ * worker tick; the usual match is zero rows.
+ */
+export async function reapStaleClaims(
+  sql: Sql,
+  args: {
+    agentInstanceId: string;
+    /** The mid-claim status this worker owns. */
+    claimedStatus: "classifying" | "drafting";
+    /** The pre-claim status a fresh strand is returned to. */
+    requeueStatus: "new" | "classified";
+  },
