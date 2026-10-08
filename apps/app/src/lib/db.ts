@@ -198,3 +198,203 @@ function makeWifClient(): ReturnType<typeof postgres> {
 
 function makeLocalClient(): ReturnType<typeof postgres> {
   const url = process.env.NOELLE_DATABASE_URL;
+  if (!url) {
+    throw new Error(
+      "No DB credentials: set the WIF env quintuple (NOELLE_GCP_PROJECT_NUMBER, " +
+        "NOELLE_GCP_POOL_ID, NOELLE_GCP_PROVIDER_ID, NOELLE_GCP_SA_EMAIL, " +
+        "NOELLE_CLOUDSQL_INSTANCE) for Vercel runtime, or NOELLE_DATABASE_URL " +
+        "for the local-dev password fallback.",
+    );
+  }
+  // Derive SSL from the URL's sslmode. The managed fallback (Cloud SQL public
+  // IP) uses `sslmode=require`; a self-hosted local Postgres offers no TLS and
+  // passes `sslmode=disable`. Anything other than `disable` keeps requiring SSL,
+  // so prod behaviour is unchanged.
+  const ssl = /[?&]sslmode=disable\b/.test(url) ? false : "require";
+  return postgres(url, {
+    max: 1,
+    idle_timeout: 10,
+    max_lifetime: 60 * 30,
+    ssl,
+    // See makeWifClient: bound query/connect time so a slow DB throws (→ a
+    // recoverable error page) instead of hanging the render indefinitely.
+    connect_timeout: 10,
+    connection: { search_path: "noelle,public", statement_timeout: 8000 },
+    onnotice: () => {},
+  });
+}
+
+/**
+ * Lazy singleton. The client is built on the FIRST tagged-template call,
+ * not at module load — Next.js loads every page module during
+ * `next build` for static analysis, and at that moment we have neither
+ * the WIF env vars nor NOELLE_DATABASE_URL. Throwing then breaks the build.
+ * Throwing on first real query (in the request lifecycle, where env is
+ * populated) is correct.
+ *
+ * Path selection: presence of the WIF env-var quintuple is the signal for
+ * "this is a Vercel runtime configured for WIF" — once that's true, we do
+ * NOT fall back to NOELLE_DATABASE_URL on failure. Silent password fallback
+ * is what hid the broken WIF path for 9 days; failing loud beats failing
+ * encrypted.
+ */
+let pendingClient: Promise<ReturnType<typeof postgres>> | null = null;
+let resolvedClient: ReturnType<typeof postgres> | null = null;
+let pendingBuild: ClientBuild | null = null;
+let lazyClient: ReturnType<typeof postgres> | null = null;
+let prepareClient: ((build: ClientBuild) => Promise<void>) | undefined;
+const readReconnects = new WeakMap<ReturnType<typeof postgres>, number>();
+let readReconnectVersion = 0;
+
+function wifEnvPresent(): boolean {
+  return Boolean(
+    process.env.NOELLE_GCP_PROJECT_NUMBER &&
+      process.env.NOELLE_GCP_POOL_ID &&
+      process.env.NOELLE_GCP_PROVIDER_ID &&
+      process.env.NOELLE_GCP_SA_EMAIL &&
+      process.env.NOELLE_CLOUDSQL_INSTANCE,
+  );
+}
+
+function getLazyClient(): ReturnType<typeof postgres> {
+  if (resolvedClient) return resolvedClient;
+  if (globalThis.__noelleSql) return (resolvedClient = globalThis.__noelleSql);
+  return lazyClient ??= wifEnvPresent() ? makeWifClient() : makeLocalClient();
+}
+
+function getClient(): Promise<ReturnType<typeof postgres>> {
+  if (resolvedClient || globalThis.__noelleSql) return Promise.resolve(getLazyClient());
+  if (!pendingClient) {
+    const build: ClientBuild = { active: true };
+    pendingBuild = build;
+    // Defer factories until pendingClient is assigned, so synchronous failure
+    // cannot reinstall a rejected acquisition promise. Preparation generations
+    // share the unopened pool; only their unpublished connectors are disposable.
+    pendingClient = Promise.resolve().then(async () => {
+      const client = getLazyClient();
+      await withTimeout(Promise.resolve().then(() => prepareClient?.(build)), CLIENT_BUILD_TIMEOUT_MS, "cloud-sql client build");
+      if (!build.active || pendingBuild !== build) throw new Error("Database client build was superseded");
+      resolvedClient = client;
+      globalThis.__noelleSql = client;
+      globalThis.__noelleConnector = build.connector;
+      pendingBuild = null;
+      return client;
+    }).catch((error) => {
+      build.active = false;
+      try { build.connector?.close(); } catch { /* unpublished connector cleanup */ }
+      if (pendingBuild === build) {
+        pendingBuild = null;
+        pendingClient = null;
+      }
+      throw error;
+    });
+  }
+  return pendingClient;
+}
+
+function acquireClient(): Promise<ReturnType<typeof postgres>> {
+  return runWithRetry(getClient, { reset: () => {}, label: "cloud-sql client acquisition" });
+}
+
+type NativeQuery = postgres.PendingQuery<postgres.Row[]>;
+
+/** Keep the native Query prototype so embedded fragments remain fragments. */
+function pendingQuery(query: NativeQuery): NativeQuery {
+  let result: Promise<postgres.RowList<postgres.Row[]>> | undefined;
+  const dispatch = () => result ??= acquireClient().then(() =>
+    withTimeout(Promise.resolve(query), QUERY_ATTEMPT_TIMEOUT_MS, "cloud-sql query"),
+  );
+  const proxy = new Proxy(query, {
+    get(target, property, receiver) {
+      if (property === "then" || property === "catch" || property === "finally") {
+        return (...args: unknown[]) => Reflect.apply(Reflect.get(dispatch(), property), result, args);
+      }
+      // Native execute/forEach/cursor use this.handle(). Gate that same entry
+      // point and keep their native chain/iterator receivers intact.
+      if (property === "handle") return dispatch;
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value !== "function" || property === "constructor") return value;
+      return (...args: unknown[]) => Reflect.apply(value, receiver, args);
+    },
+  });
+  return proxy;
+}
+
+// Helpers construct synchronous native builders from the same lazy pool. A
+// query observes one cached, bounded dispatch; merely embedding it does no I/O.
+export const sql = new Proxy(function () {} as unknown as ReturnType<typeof postgres>, {
+  get(_target, property) {
+    if (property === "begin") return (...args: unknown[]) => acquireClient().then((client) =>
+      withTimeout(Reflect.apply(client.begin, client, args), QUERY_ATTEMPT_TIMEOUT_MS, "cloud-sql transaction"),
+    );
+    if (property === "unsafe" || property === "file") return (...args: unknown[]) =>
+      pendingQuery(Reflect.apply(Reflect.get(getLazyClient(), property), getLazyClient(), args));
+    // No application caller uses listener/subscription/streaming owners. These
+    // dispatching pool methods must still prepare before entering the driver.
+    if (property === "reserve" || property === "listen" || property === "notify" || property === "subscribe" || property === "largeObject") {
+      return (...args: unknown[]) => acquireClient().then((client) =>
+        withTimeout(Reflect.apply(Reflect.get(client, property), client, args), QUERY_ATTEMPT_TIMEOUT_MS, "cloud-sql operation"),
+      );
+    }
+    const client = getLazyClient();
+    const value = Reflect.get(client, property);
+    return typeof value === "function" ? value.bind(client) : value;
+  },
+  apply(_target, _receiver, args) {
+    const first = args[0];
+    const tagged = Array.isArray(first) && Object.prototype.hasOwnProperty.call(first, "raw");
+    if (!tagged) return Reflect.apply(getLazyClient(), undefined, args);
+    return pendingQuery(Reflect.apply(getLazyClient(), undefined, args));
+  },
+}) as ReturnType<typeof postgres>;
+
+/** One query in an enforced READ ONLY transaction; only these dispatches may retry. */
+export async function readSql<T extends readonly (object | undefined)[] = postgres.Row[]>(
+  template: TemplateStringsArray,
+  ...parameters: readonly postgres.ParameterOrFragment<never>[]
+): Promise<postgres.RowList<T>> {
+  return runWithRetry(async () => {
+    const client = await acquireClient();
+    // After a disconnect, let the driver's ordinary query lifecycle reconnect
+    // before reserving. postgres.js 3.4.9 can strand a reconnecting reservation
+    // after an active query's FATAL response; this fixed literal has no writes.
+    const reconnect = readReconnects.get(client);
+    if (reconnect !== undefined) {
+      await client`select 1`;
+      if (readReconnects.get(client) === reconnect) readReconnects.delete(client);
+    }
+    let connection: postgres.ReservedSql | undefined;
+    let inTransaction = false;
+    let disconnected = false;
+    try {
+      connection = await client.reserve();
+      // Explicit reservation avoids postgres.js begin() trying to ROLLBACK a
+      // disconnected socket. All commands use this same reserved connection.
+      await connection`begin read only`;
+      inTransaction = true;
+      await connection`set local idle_in_transaction_session_timeout='10s'`;
+      const rows = await connection<T>(template, ...parameters);
+      await connection`commit`;
+      inTransaction = false;
+      return rows;
+    } catch (error) {
+      // Server statement errors leave a healthy transaction needing rollback.
+      // Transport failures belong to the driver's socket disposal lifecycle.
+      disconnected = isRetryableReadError(error);
+      if (disconnected) readReconnects.set(client, ++readReconnectVersion);
+      if (connection && inTransaction && !disconnected) {
+        try { await connection`rollback`; } catch { /* preserve the query failure */ }
+      }
+      throw error;
+    } finally {
+      // postgres.js onclose already releases a disconnected reservation.
+      // Calling its public release afterward would move a closed socket back
+      // into the open queue. Healthy connections still release explicitly.
+      if (!disconnected) connection?.release();
+    }
+  }, {
+    reset: () => {},
+    isRetryable: isRetryableReadError,
+    timeoutMs: QUERY_ATTEMPT_TIMEOUT_MS,
+    label: "cloud-sql read-only query",
+  }) as Promise<postgres.RowList<T>>;
