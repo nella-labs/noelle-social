@@ -1,0 +1,200 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      '@eslint/js':
+        specifier: 9.39.4
+        version: 9.39.4
+      '@types/node':
+        specifier: ^25.9.3
+        version: 25.9.3
+      eslint:
+        specifier: ^10.4.0
+        version: 10.4.0(jiti@2.7.0)
+      prettier:
+        specifier: ^3.3.3
+        version: 3.8.3
+      turbo:
+        specifier: ^2.3.3
+        version: 2.9.14
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      typescript-eslint:
+        specifier: 8.60.1
+        version: 8.60.1(eslint@10.4.0(jiti@2.7.0))(typescript@6.0.3)
+      vite:
+        specifier: ^6.4.2
+        version: 6.4.2(@types/node@25.9.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.22.4)(yaml@2.9.0)
+
+  apps/actuator-doctor:
+    dependencies:
+      '@noelle/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      pino:
+        specifier: ^9.5.0
+        version: 9.14.0
+      postgres:
+        specifier: ^3.4.0
+        version: 3.4.9
+      zod:
+        specifier: ^3.23.8
+        version: 3.25.76
+    devDependencies:
+      '@types/node':
+        specifier: ^25.9.3
+        version: 25.9.3
+      tsx:
+        specifier: ^4.22.4
+        version: 4.22.4
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.6
+        version: 4.1.6(@types/node@25.9.3)(jsdom@29.1.1)(vite@6.4.3(@types/node@25.9.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.22.4)(yaml@2.9.0))
+
+  apps/api-vm:
+    dependencies:
+      '@google-cloud/storage':
+        specifier: ^7.19.0
+        version: 7.19.0
+      '@hono/node-server':
+        specifier: ^1.13.5
+        version: 1.19.14(hono@4.12.19)
+      '@noelle/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@noelle/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
+      '@noelle/secrets':
+        specifier: workspace:*
+        version: link:../../packages/secrets
+      '@noelle/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      '@noelle/x-client':
+        specifier: workspace:*
+        version: link:../../packages/x-client
+      ai:
+        specifier: ^7.0.107
+        version: 7.0.107(zod@3.25.76)
+      hono:
+        specifier: ^4.6.10
+        version: 4.12.19
+      jose:
+        specifier: ^5.9.6
+        version: 5.10.0
+      postgres:
+        specifier: ^3.4.0
+        version: 3.4.9
+      zod:
+        specifier: ^3.23.8
+        version: 3.25.76
+    devDependencies:
+      '@types/node':
+        specifier: ^25.9.3
+        version: 25.9.3
+      tsx:
+        specifier: ^4.22.4
+        version: 4.22.4
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.6
+        version: 4.1.6(@types/node@25.9.3)(jsdom@29.1.1)(vite@6.4.3(@types/node@25.9.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.22.4)(yaml@2.9.0))
+
+  apps/app:
+    dependencies:
+      '@aws-sdk/client-sesv2':
+        specifier: ^3.1050.0
+        version: 3.1050.0
+      '@fontsource/instrument-serif':
+        specifier: ^5.1.0
+        version: 5.2.8
+      '@fontsource/jetbrains-mono':
+        specifier: ^5.1.0
+        version: 5.2.8
+      '@fontsource/manrope':
+        specifier: 5.2.8
+        version: 5.2.8
+      '@google-cloud/cloud-sql-connector':
+        specifier: ^1.7.0
+        version: 1.10.0
+      '@noelle/agents':
+        specifier: workspace:*
+        version: link:../../packages/agents
+      '@noelle/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@noelle/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
+      '@noelle/secrets':
+        specifier: workspace:*
+        version: link:../../packages/secrets
+      '@noelle/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      '@noelle/ui':
+        specifier: workspace:*
+        version: link:../../packages/ui
+      '@remotion/player':
+        specifier: ^4.0.484
+        version: 4.0.484(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
+      '@supabase/ssr':
+        specifier: ^0.10.3
+        version: 0.10.3(@supabase/supabase-js@2.105.4)
+      '@supabase/supabase-js':
+        specifier: ^2.105.4
+        version: 2.105.4
+      '@vercel/analytics':
+        specifier: ^2.0.1
+        version: 2.0.1(next@16.2.6(@babel/core@7.29.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7))(react@19.2.7)
+      class-variance-authority:
+        specifier: ^0.7.1
+        version: 0.7.1
+      clsx:
+        specifier: ^2.1.1
+        version: 2.1.1
+      google-auth-library:
+        specifier: ^10.6.2
+        version: 10.6.2
+      lucide-react:
+        specifier: ^1.16.0
+        version: 1.16.0(react@19.2.7)
+      next:
+        specifier: 16.2.6
+        version: 16.2.6(@babel/core@7.29.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
+      postgres:
+        specifier: ^3.4.0
+        version: 3.4.9
+      react:
+        specifier: 19.2.7
+        version: 19.2.7
+      react-dom:
+        specifier: 19.2.7
+        version: 19.2.7(react@19.2.7)
+      remotion:
+        specifier: ^4.0.484
+        version: 4.0.484(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
+      server-only:
+        specifier: 0.0.1
+        version: 0.0.1
+      tailwind-merge:
+        specifier: ^2.5.4
+        version: 2.6.1
+      zod:
+        specifier: ^3.23.8
+        version: 3.25.76
+    devDependencies:
+      '@tailwindcss/postcss':
