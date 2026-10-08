@@ -598,3 +598,203 @@ export function buildLightDrafterSystem(
   const useBrand = brand != null && brandConfigHasContent(brand);
   // When the operator has a brand, prepend WHO they are (persona/voice) but keep
   // the light, no-pitch instructions authoritative. We deliberately do NOT pass
+  // the product/pitch policy block — a light reply never pitches.
+  const parts = useBrand
+    ? [browserReply ? renderBrowserReplyBrand(brand) : renderLightBrandBlock(brand), "", SYSTEM_LINKEDIN_LIGHT]
+    : [SYSTEM_LINKEDIN_LIGHT];
+  if (mission) {
+    parts.push(
+      "",
+      "OPERATOR MISSION (for tone only)",
+      `The operator framed this agent's job as: "${mission}". Let it colour your voice, but a light reply is still a genuine congrats with NO pitch and NO product mention.`,
+    );
+  }
+  if (person) {
+    parts.push(
+      "",
+      "PER-PERSON CONTEXT (who you're congratulating)",
+      person,
+      // No shape carve-out: this helper builds the INTRO/congrats context block,
+      // which never carries an assigned shape.
+      "Use this only to make the congrats land as a peer who knows them. Keep it to ONE short comment, no pitch.",
+    );
+  }
+  // STYLE block AFTER per-person context — FORM only, and a light reply is still
+  // ONE short congrats (the block changes shape/rhythm, never the length rule).
+  if (styleBlock) {
+    parts.push("", styleBlock);
+  }
+  if (patternBlock) {
+    parts.push("", patternBlock);
+  }
+  if (browserReply) {
+    const exemplarBlock = voiceExemplars?.length ? renderVoiceExemplars(voiceExemplars) : "";
+    if (exemplarBlock) parts.push(exemplarBlock);
+    const shape = useSentReplyVoice ? browserReplyShape(style, faithful) : "";
+    if (shape) parts.push("", shape);
+    if (exemplarBlock) parts.push("", BROWSER_REPLY_OPERATOR_VOICE);
+    parts.push("", BROWSER_REPLY_GROUNDING);
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Light-mode brand block: persona/voice ONLY (name + bio + any voice notes). The
+ * product, pitch policy, and Q&A are intentionally omitted — a light reply
+ * celebrates, it never sells.
+ */
+function renderLightBrandBlock(brand: BrandConfig): string {
+  const lines: string[] = ["OPERATOR BRAND (who you are — voice only; do NOT pitch in a light reply)"];
+  if (brand.persona?.name)
+    lines.push(
+      `You ARE ${brand.persona.name}. Write in the FIRST PERSON as ${brand.persona.name} ("I", "me", "my") — never refer to ${brand.persona.name} in the third person or narrate them by name as if they were someone else.`,
+    );
+  if (brand.persona?.bio) lines.push(`About you: ${brand.persona.bio}`);
+  if (brand.reply_style?.voice_notes) lines.push(`Voice notes: ${brand.reply_style.voice_notes}`);
+  if (brand.reply_style?.never_do?.length) {
+    lines.push(`Additional NEVER-DO: ${brand.reply_style.never_do.join("; ")}.`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Heuristic "genericness" score for a single comment — higher = more generic /
+ * low-effort, the kind of slop we want surfaced FIRST as a negative exemplar.
+ * Pure + deterministic (no LLM): short comments, pure-congrats phrasing, and
+ * emoji-only / emoji-heavy reactions score high. Used to sort the sample so the
+ * drafter sees the most "do NOT sound like this" comments up top.
+ */
+function genericness(text: string): number {
+  const t = text.trim();
+  const lower = t.toLowerCase();
+  let score = 0;
+  // Short comments are usually low-effort reactions.
+  if (t.length <= 20) score += 3;
+  else if (t.length <= 60) score += 1;
+  // Canned congrats / engagement-bait phrasing.
+  const CANNED = [
+    "congrats", "congratulations", "well said", "great post", "love this",
+    "couldn't agree", "couldnt agree", "so true", "this is great", "amazing",
+    "awesome", "nice work", "great work", "well done", "thanks for sharing",
+    "100%", "spot on", "this.", "preach", "facts", "huge",
+  ];
+  if (CANNED.some((p) => lower.includes(p))) score += 2;
+  // Emoji-only or emoji-dominant reactions (no real text).
+  const stripped = t.replace(/[\p{Extended_Pictographic}\s]/gu, "");
+  if (stripped.length === 0) score += 4;
+  else if (stripped.length <= 5) score += 2;
+  return score;
+}
+
+/**
+ * Render the COMMENT SECTION block for the drafter prompt from the existing
+ * comments on the post (fetched via the post-comments actor). Returns "" when
+ * there are none. The sample is capped and each comment truncated to keep the
+ * prompt bounded; `totalCount` conveys how saturated the conversation is.
+ *
+ * The framing is DELIBERATELY adversarial: the existing comments are presented
+ * as the generic, low-effort "slop" the operator's reply must DIFFERENTIATE
+ * from — negative exemplars, not a register to blend into. The most generic
+ * comments (short + congrats/emoji-only) are surfaced first so the model sees
+ * the worst offenders up top. This is the crowd-negatives variant of "read the
+ * room": read it, then say something the crowd did NOT.
+ */
+export function renderCommentDigest(
+  comments: Array<{
+    text: string;
+    authorName?: string | null;
+    authorHeadline?: string | null;
+    reactions?: number | null;
+  }>,
+  totalCount: number,
+  sampleMax = 12,
+): string {
+  if (comments.length === 0) return "";
+  // Surface the most generic comments first — those are the clearest "do NOT
+  // sound like this" exemplars. Stable within equal genericness (preserves the
+  // most-engaged-first order the fetcher passed in).
+  const ranked = comments
+    .map((c, i) => ({ c, i, g: genericness(c.text) }))
+    .sort((a, b) => b.g - a.g || a.i - b.i)
+    .map((x) => x.c);
+  const sample = ranked.slice(0, sampleMax).map((c) => {
+    const who = c.authorName ?? "someone";
+    const role = c.authorHeadline ? `, ${c.authorHeadline}` : "";
+    const r = typeof c.reactions === "number" && c.reactions > 0 ? ` (${c.reactions} reactions)` : "";
+    const text = c.text.length > 220 ? `${c.text.slice(0, 217)}…` : c.text;
+    return `- "${text}" — ${who}${role}${r}`;
+  });
+  const moreShown = comments.length < totalCount ? `(…and ${totalCount - comments.length} more not shown)` : "";
+  return [
+    "THE COMMENT SECTION — these are the generic, low-effort replies to AVOID sounding like",
+    `This post already has ${totalCount} comment${totalCount === 1 ? "" : "s"}. Here is a sample (the most generic / canned ones first) — treat these as NEGATIVE exemplars:`,
+    ...sample,
+    moreShown,
+    "Most replies under this post will sound exactly like the comments above: hollow congrats, agreement, restating the post. Do NOT blend in with them. Say the one specific thing they did NOT say — a concrete observation, a real opinion, a sharp question. You may build on or gently push back against a genuinely high-signal comment, but never echo, paraphrase, or match the register of the slop. Your comment must add something every comment above missed.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+// ---- INTRO DM (one-time relationship-building outreach) ------------------
+// A single warm intro DM per watchlist person, ever. Its ONLY purpose is to
+// start a relationship beyond replying to their posts: a genuine peer note that
+// references their work and ASKS ABOUT THE PROJECT THEY'RE WORKING ON. There is
+// NO pitch — this is relationship-building, not outreach. Default-OFF behind an
+// env flag (LINKEDIN_INTRO_DM_ENABLED); paced by a daily cap. Draft-only like
+// everything Lyra does. Reuses the SAME NEVER-DO voice rules as SYSTEM_LINKEDIN_BASE.
+export const SYSTEM_LINKEDIN_INTRO = `You are writing ONE warm, first-touch LinkedIn DM for the operator to a person he's connected to. Use the configured profile goal and supplied voice context; do not invent shared history.
+
+${WRITING_STRUCTURE_GUIDANCE}
+
+PURPOSE — relationship, not outreach
+This is NOT a reply to a post and it is NOT a pitch. It is a genuine peer note to start a real relationship. You reference something specific about what this person works on, and you ASK what they're currently building or working on right now. That curious question is the whole point — you want to learn about their project, not sell them anything.
+
+WHAT TO WRITE
+- Open with a casual greeting plus their first name on its own line ("Hey Maya").
+- Reference something specific from who they are / what they work on (a topic, the kind of thing they build). Keep it light and real, like you've been paying attention, not like you scraped a profile.
+- ASK what they're building or working on right now. Make it the heart of the DM: warm, curious, open-ended ("what are you building these days?", "what's the thing you're heads-down on right now?"). One clear question.
+- A soft, low-pressure closer is welcome ("would love to hear about it whenever").
+
+NO PITCH — HARD RULE
+Do NOT mention any product, any link, any install line, any CTA, or anything you're selling. Not even softly. This message exists only to open a genuine conversation and learn about their work. If you feel the urge to pitch, delete it. A peer-to-peer "what are you working on?" with zero sell is exactly right.
+
+VOICE (the thing everyone gets wrong)
+Direct. Specific. Human. Warm but never corporate. It should read like the operator actually typed it to one person, curious about them. English only. Honest and a little informal beats polished.
+
+${EMOJI_RULE}
+
+${NO_COMMITMENTS_RULE}
+
+${ANTI_AI_RULES}
+
+NEVER DO
+- Em dashes (—, –, ―, --). Use commas, parentheses, or periods.
+- Any pitch, product mention, link, install line, or CTA (see NO PITCH above).
+- Reframe / negative parallelism (HARD BAN): no "not X, it's Y", "isn't just X, it's Y", "the real X is Y", or a rhetorical-question pivot. State the positive thing directly.
+- Choppy AI cadence (short. clipped. fragments.). Glue clauses with commas and connectors (and, but, so, because) so it reads like one person talking, and lean first-person.
+- "As a fellow founder…", "fellow builder", or any "as a X myself" framing. Just talk to them.
+- Corporate verbs: unlock, empower, leverage, streamline, delight, supercharge, revolutionize, seamless, synergy, cutting-edge, next-generation.
+- "to be honest" / "honestly" as a reflexive hedge-opener (starting a comment with it, or leaning on it every line). A single natural "honestly" or "tbh" as texture is fine — but never as a throat-clearing opener or a verbal tic; when it's just hedging, cut it and say the thing directly.
+- Hollow engagement-bait or flattery ("huge fan", "love your work", "your content is fire"). Be specific or say nothing.
+- Any emoji outside 💀 😭 😛, and even those sparingly.
+- Non-English text.
+
+SHAPE
+- Fragmented: 3 to 5 short chunks separated by blank lines (use literal \\n between chunks inside the JSON string). Never one block of prose.
+- Length: aim 300 to 550 characters, hard max 700. Short is good — this is a first touch, not an essay.
+
+OUTPUT FORMAT — STRICT JSON, NO MARKDOWN FENCES, NO PREAMBLE
+The very first character of your response MUST be \`{\` and the last \`}\`. Output exactly:
+
+  {"body":"…","char_count":N}
+
+\`body\` is the DM (greeting + specific reference + the question about their work, fragmented with literal \\n between chunks). \`char_count\` must equal the actual length of \`body\`. Output nothing else — no drafts array, no dm wrapper, no skip.`;
+
+/**
+ * Render the user prompt for the one-time intro DM to a watchlist person. Feeds
+ * the person's name + what they work on (headline + generated profile
+ * summary/topics/tone/engagement notes + the operator's per-person objective) so
+ * the model can reference something specific and ask a grounded question about
+ * their current project. Mirrors how buildPersonDirective threads the profile.
+ */
