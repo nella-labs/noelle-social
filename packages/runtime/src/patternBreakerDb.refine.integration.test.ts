@@ -198,3 +198,61 @@ describe.skipIf(!url)("Durable refinement dispatch and result authority (native)
             and wait_event_type='Lock' and query like '%agent_instances%'`;
             expect(row?.n).toBeGreaterThan(0);
           },
+          { timeout: 800 },
+        );
+        if (field === "org_id")
+          await lock`update noelle.agent_instances set org_id=${reboundOrg} where id=${instance}`;
+        else await lock`update noelle.agent_instances set role='video_intern' where id=${instance}`;
+        await lock`commit`;
+        expect(await result).toBe(false);
+      } finally {
+        await lock`rollback`.catch(() => {});
+        lock.release();
+        await result.catch(() => {});
+      }
+      expect((await sql`select source from noelle.pattern_rules where id=${r}`)[0]?.source).toBe(
+        "auto",
+      );
+    },
+  );
+
+  it("uses the database claim across independent worker pools", async () => {
+    const r = await rule();
+    await alert(r);
+    const [item] = await queue();
+    const parents = Array.from({ length: 4 }, () =>
+      postgres(url!, {
+        max: 1,
+        onnotice: () => {},
+        connection: { application_name: "pattern-native" },
+      }),
+    );
+    try {
+      const results = await Promise.all(
+        parents.map((parent) => owner.claimRefinement(parent, scope, item!)),
+      );
+      expect(results.filter(Boolean)).toHaveLength(1);
+    } finally {
+      await Promise.all(parents.map((parent) => parent.end()));
+    }
+  });
+  it("rejects a changed rule source even when a direct write omitted its timestamp", async () => {
+    const r = await rule();
+    await alert(r);
+    const c = await claim();
+    await sql`update noelle.pattern_rules set source='manual' where id=${r}`;
+    expect(await apply(c)).toBe(false);
+    expect(
+      (await sql`select instruction,source from noelle.pattern_rules where id=${r}`)[0]?.source,
+    ).toBe("manual");
+  });
+  it("does not promote an unchanged instruction from observed auto to hard refined", async () => {
+    const r = await rule();
+    await alert(r);
+    const captured = await claim();
+    expect(await apply(captured, captured.current_instruction)).toBe(false);
+    expect(
+      (await sql`select instruction,source from noelle.pattern_rules where id=${r}`)[0],
+    ).toEqual({ instruction: captured.current_instruction, source: "auto" });
+  });
+});
