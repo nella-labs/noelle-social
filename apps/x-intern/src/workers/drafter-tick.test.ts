@@ -2398,3 +2398,203 @@ describe("runDrafterTick voice variety (NOELLE_DRAFTER_VARIETY)", () => {
     // that is worse than the problem — shipping "" violates body.min(1) and
     // THROWS, and on LinkedIn's batched path that throw re-runs the whole batch
     // (duplicate approvals plus duplicate paid calls); filtering to an empty
+    // list throws the same way; filtering and letting the "no replies left"
+    // branch handle it kills the lead, discards the DM, and blames the
+    // commitment guard.
+    //
+    // So the policy keeps ONE draft under allowlist-only stripping. Asserted on
+    // what postOutbound RECEIVES, not inside an `if` that may never run — the
+    // first version of this test guarded its only real assertion behind
+    // `if (postOutbound.mock.calls.length > 0)`, which was never true.
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const runner = mkRunner();
+    runner.draft = vi.fn().mockResolvedValue({
+      text: JSON.stringify({
+        drafts: [{ angle: "empathetic", body: "\u{1F480}", char_count: 1 }],
+        dm: { body: "hey\n\nsaw this\n\nlmk", char_count: 20 },
+      }),
+      engine: "bedrock",
+      model: "m",
+    });
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    const drafts = postOutbound.mock.calls[0]![0].drafts as Array<{ kind: string; body: string }>;
+    expect(drafts.length).toBeGreaterThan(0);
+    for (const d of drafts) expect(d.body.trim().length).toBeGreaterThan(0);
+    // The reply survives as a reply row. (Whether a DM row is appended depends
+    // on the auto-DM toggle, which this test does not enable, so it is not
+    // asserted here — the point under test is that the outbound is not empty
+    // and the lead is not killed.)
+    expect(drafts.some((d) => d.kind === "reply")).toBe(true);
+    expect(markStatus).not.toHaveBeenCalledWith(
+      expect.objectContaining({ status: "errored" }),
+    );
+  });
+
+  it("never injects a register and a shape at the same time (they both claim length)", async () => {
+    for (const energyOn of [true, false]) {
+      const runner = mkRunner();
+      await runDrafterTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [mkLead()] as never,
+        runner: runner as never,
+        kb: mkKb() as never,
+        postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+        markStatus: vi.fn().mockResolvedValue(undefined),
+        variety: { enabled: true, rng: () => 0.25 },
+        ...(energyOn ? { energy: { enabled: true } } : {}),
+      });
+      const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+      const hasRegister = prompt.includes("ASSIGNED REGISTER FOR THIS REPLY");
+      const hasShape = prompt.includes("THIS REPLY'S ASSIGNED SHAPE");
+      expect(hasRegister && hasShape).toBe(false);
+      expect(hasRegister || hasShape).toBe(true);
+    }
+  });
+
+  it("rotates the shape across consecutive leads (no two in a row the same)", async () => {
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        { ...mkLead(), id: "l1", external_id: "x1" },
+        { ...mkLead(), id: "l2", external_id: "x2" },
+        { ...mkLead(), id: "l3", external_id: "x3" },
+      ] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      variety: { enabled: true, rng: makeLcgForShapes(5) },
+    });
+    const directives = runner.draft.mock.calls.map((c) => {
+      const p = (c as unknown as [{ prompt: string }])[0].prompt;
+      const m = /THIS REPLY'S ASSIGNED SHAPE[^\n]*\n([^\n]+)/.exec(p);
+      return m ? m[1]! : "";
+    });
+    expect(directives.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < directives.length; i++) {
+      expect(directives[i]).not.toBe(directives[i - 1]);
+    }
+  });
+
+  it("injects the per-person do-not-repeat list and passes it to the verifier", async () => {
+    const runner = mkRunner();
+    const verifyCalls: unknown[] = [];
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      getPriorReplies: async () => ["the exact take i already used on them"],
+      verify: {
+        enabled: true,
+        retries: 0,
+        makeCalls: () => [
+          (_s: string, _p: string) => {
+            verifyCalls.push(_p);
+            return Promise.resolve(
+              JSON.stringify({
+                scores: { voice: 1, grounding: 1, relevance: 1, novelty: 1 },
+                reasons: [],
+              }),
+            );
+          },
+        ],
+      },
+    } as never);
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("ALREADY sent to this person");
+    expect(prompt).toContain("the exact take i already used on them");
+    // The name of this test is "passes it to the verifier", so actually assert
+    // that: the judge prompt must carry the prior replies, or deleting
+    // priorRepliesToPerson from verifyCtx would leave this green.
+    expect(verifyCalls.length).toBeGreaterThan(0);
+    expect(String(verifyCalls[0])).toContain("the exact take i already used on them");
+  });
+
+  it("injects the feed-wide avoid-list, fetched once per tick for many leads", async () => {
+    const runner = mkRunner();
+    const getRecentPhrasings = vi.fn().mockResolvedValue(["a stock opener i keep reusing"]);
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        { ...mkLead(), id: "l1", external_id: "x1" },
+        { ...mkLead(), id: "l2", external_id: "x2" },
+        { ...mkLead(), id: "l3", external_id: "x3" },
+      ] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      getRecentPhrasings,
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("most recent replies across the whole feed");
+    expect(prompt).toContain("a stock opener i keep reusing");
+    // Fetched ONCE for the whole tick, not once per lead.
+    expect(getRecentPhrasings).toHaveBeenCalledTimes(1);
+  });
+
+  it("omits both memory blocks when there is no history (byte-identical first contact)", async () => {
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      getPriorReplies: async () => [],
+      getRecentPhrasings: async () => [],
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("ALREADY sent to this person");
+    expect(prompt).not.toContain("most recent replies across the whole feed");
+  });
+
+  it("survives a memory-fetch failure without dropping the lead (fail-open)", async () => {
+    const runner = mkRunner();
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      getPriorReplies: async () => {
+        throw new Error("db down");
+      },
+      getRecentPhrasings: async () => {
+        throw new Error("db down");
+      },
+    });
+    expect(postOutbound).toHaveBeenCalled();
+  });
+
+  it("adds an OPENING MOVE only on a shape that leaves the opener free", async () => {
+    const pick = async (shapeId: string) => {
+      const runner = mkRunner();
+      await runDrafterTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [mkLead()] as never,
+        runner: runner as never,
