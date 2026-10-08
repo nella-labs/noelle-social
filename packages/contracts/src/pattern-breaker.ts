@@ -198,3 +198,11 @@ export function decodePatternCursor(value: unknown): unknown {
 export const PatternRefineInputSchema = z.object({
   note: z.string().max(600).optional(),
   expectedRequestId: UuidSchema.optional(),
+});
+export type PatternRefineInput = z.infer<typeof PatternRefineInputSchema>;
+
+export const PatternRefineResultSchema = z.object({
+  ruleId: UuidSchema,
+  instruction: z.string().min(8).max(600),
+});
+export type PatternRefineResult = z.infer<typeof PatternRefineResultSchema>;
