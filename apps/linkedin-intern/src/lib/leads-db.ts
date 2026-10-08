@@ -398,3 +398,203 @@ export async function countExtractedToday(sql: Sql, agentInstanceId: string): Pr
  * How many leads of a given reply_kind the drafter has DELIVERED today for this
  * instance — counted by joining approvals back to their lead and matching the
  * lead's classifier_label, with the approval created today. Used to enforce the
+ * per-kind daily draft caps (LINKEDIN_DAILY_SUBSTANTIAL_CAP /
+ * LINKEDIN_DAILY_LIGHT_CAP). `light` and `substantial` are independent buckets.
+ *
+ * Counts via noelle.approvals (which has created_at; noelle.drafts only has
+ * synced_at) and DISTINCT lead_id — a substantial lead yields up to 3 reply
+ * approvals + 1 DM approval; the cap is "N posts/day", i.e. N leads, not N rows.
+ */
+export async function countDraftedTodayByKind(
+  sql: Sql,
+  args: { agentInstanceId: string; replyKind: ReplyKindValue },
+): Promise<number> {
+  const rows = await sql<{ count: string }[]>`
+    select count(distinct a.lead_id)::text as count
+    from noelle.approvals a
+    join noelle.leads l on l.id = a.lead_id
+    where a.agent_instance_id = ${args.agentInstanceId}
+      and l.classifier_label = ${args.replyKind}
+      and a.created_at::date = current_date
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
+/**
+ * Backpressure read 1/2 — how many reply drafts are still waiting for the
+ * operator or actuator for this agent instance. DMs have their own review lane
+ * and must not stop reply discovery, classification, or drafting.
+ */
+export async function countPendingApprovalsForInstance(
+  sql: Sql,
+  agentInstanceId: string,
+): Promise<number> {
+  const rows = await sql<{ count: string }[]>`
+    select count(*)::text as count
+    from noelle.approvals a
+    join noelle.drafts d on d.id = a.draft_id
+    where a.agent_instance_id = ${agentInstanceId}
+      and a.status = 'pending'
+      and coalesce(d.payload->>'kind', 'reply') <> 'dm'
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
+/**
+ * Backpressure read 2/2 — how many leads are "in flight" (not yet resolved into
+ * a draft or skipped). Only discovery consults this, to avoid piling fresh leads
+ * on top of a backlog the classifier/drafter haven't drained yet.
+ */
+export async function countLeadBacklogForInstance(
+  sql: Sql,
+  agentInstanceId: string,
+): Promise<number> {
+  const rows = await sql<{ count: string }[]>`
+    select count(*)::text as count
+    from noelle.leads
+    where agent_instance_id = ${agentInstanceId}
+      and status in ('new', 'classifying', 'classified', 'drafting')
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
+/**
+ * One-off reply requests — claim leads the operator explicitly asked to draft
+ * through MCP (payload.reply_requested = true). This is independent of reply
+ * lane state: the worker drains it even while paused/replies are off. The claim
+ * keeps the request marker until completion so crash recovery and the drafter
+ * can inject guidance and tag the outbound request key. A matching completed
+ * draft blocks duplicate generation for the same key.
+ */
+export async function claimReplyRequestLeads(
+  sql: Sql,
+  args: { agentInstanceId: string; cap: number },
+): Promise<LeadRow[]> {
+  const rows = await sql<LeadRow[]>`
+    update noelle.leads l
+    set status = 'drafting', updated_at = now()
+    where l.id in (
+      select c.id
+      from noelle.leads c
+      where c.agent_instance_id = ${args.agentInstanceId}
+        and c.status = 'classified'
+        and c.payload->>'reply_requested' = 'true'
+        and c.payload->'reply_request'->>'request_key' is not null
+        and not exists (
+          select 1 from noelle.approvals a
+          left join noelle.drafts d on d.id = a.draft_id
+          where a.lead_id = c.id
+            and coalesce(d.payload->>'kind', 'reply') <> 'dm'
+            and d.payload->>'reply_request_key' = c.payload->'reply_request'->>'request_key'
+        )
+      order by c.updated_at desc
+      limit ${args.cap}
+      for update skip locked
+    )
+    returning l.id, l.external_id, l.payload, l.author_handle, l.author_id,
+              l.tier, l.classifier_label, l.classifier_score, l.status, l.priority
+  `;
+  return [...rows];
+}
+
+export async function markLeadStatus(
+  sql: Sql,
+  args: {
+    leadId: string;
+    status: "drafted" | "errored" | "skipped" | "observed";
+    meta?: Record<string, unknown>;
+  },
+): Promise<void> {
+  await sql`
+    update noelle.leads
+    set status = ${args.status},
+        payload = payload || ${sql.json((args.meta ?? {}) as JSONValue)}::jsonb
+          || case when payload ? 'reply_request' then '{"reply_requested":false}'::jsonb else '{}'::jsonb end,
+        updated_at = now()
+    where id = ${args.leadId}
+  `;
+}
+
+/**
+ * On-demand DM requests — claim leads the operator flagged for a one-off DM
+ * (payload.dm_requested = true, set by the dashboard "Generate DM" action).
+ * Atomically clears the flag as it claims (so each request generates once) and
+ * skips leads that already have a pending DM approval. Independent of the reply
+ * lane + the auto-DM toggle: runs whenever the drafter ticks, so the operator
+ * gets their DM regardless of pipeline state. Mirrors x-intern.
+ */
+export async function claimDmRequestLeads(
+  sql: Sql,
+  args: { agentInstanceId: string; cap: number },
+): Promise<LeadRow[]> {
+  const rows = await sql<LeadRow[]>`
+    update noelle.leads l
+    set payload = payload - 'dm_requested', updated_at = now()
+    where l.id in (
+      select c.id
+      from noelle.leads c
+      where c.agent_instance_id = ${args.agentInstanceId}
+        and c.payload->>'dm_requested' = 'true'
+        and not exists (
+          select 1 from noelle.approvals a
+          left join noelle.drafts d on d.id = a.draft_id
+          where a.lead_id = c.id
+            and a.status = 'pending'
+            and coalesce(d.payload->>'kind', 'reply') = 'dm'
+        )
+      order by c.updated_at desc
+      limit ${args.cap}
+      for update skip locked
+    )
+    returning l.id, l.external_id, l.payload, l.author_handle, l.author_id,
+              l.tier, l.classifier_label, l.classifier_score, l.status, l.priority
+  `;
+  return [...rows];
+}
+
+/**
+ * A claim older than this is provably orphaned. Each worker kind runs as a
+ * single process per instance and drafts/classifies its whole batch well inside
+ * 45 minutes (the SKIP LOCKED in the claim RPCs is a concurrency safety net,
+ * not the topology), so a lead still mid-claim after this long has no living
+ * owner.
+ */
+const STALE_CLAIM_MINUTES = 45;
+
+/**
+ * Strands older than this exit as 'skipped' instead of retrying — a reply
+ * drafted two days after the post reads as necro-engagement, not conversation.
+ */
+const STALE_CLAIM_EXPIRE_HOURS = 48;
+
+type DraftingRecovery = { requeued: number; reconciled: number; approvalsRepaired: number };
+
+/**
+ * The outbound API saves drafts and approvals in separate statements, then the
+ * writer marks the lead drafted. A crash in either gap can leave a saved reply
+ * occupying a drafting slot. Repair only missing approvals for reply drafts,
+ * then reconcile those leads; both steps are safe to repeat after another crash.
+ * A DM draft does not finish the public reply claim.
+ */
+async function reconcileSavedReplyDrafts(
+  sql: Sql,
+  agentInstanceId: string,
+  before: Date | null,
+): Promise<{ reconciled: number; approvalsRepaired: number }> {
+  const cutoff = before?.toISOString() ?? null;
+  const approvals = await sql<{ id: string }[]>`
+    insert into noelle.approvals (org_id, agent_instance_id, draft_id, lead_id, status)
+    select l.org_id, l.agent_instance_id, d.id, l.id, 'pending'
+    from noelle.leads l
+    join noelle.drafts d on d.lead_id = l.id and d.org_id = l.org_id
+    where l.agent_instance_id = ${agentInstanceId}
+      and l.status = 'drafting'
+      and l.updated_at < coalesce(${cutoff}::timestamptz, now() - make_interval(mins => ${STALE_CLAIM_MINUTES}))
+      and coalesce(d.payload->>'kind', 'reply') = 'reply'
+      and not exists (select 1 from noelle.approvals a where a.draft_id = d.id)
+    on conflict (draft_id) do nothing
+    returning id
+  `;
+  const leads = await sql<{ id: string }[]>`
+    update noelle.leads l
+    set status = 'drafted',
