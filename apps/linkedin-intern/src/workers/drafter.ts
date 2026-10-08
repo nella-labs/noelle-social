@@ -798,3 +798,35 @@ const lastPatternAnalysisAt = new Map<string, number>();
  * Extract the Account Feeder `minPerformancePercentile` floor from an instance's
  * account_feeder_config so the style-pool query can apply it server-side.
  * Defensive: a missing/malformed config falls back to the schema default (0 = no
+ * floor) and never throws. The full config (incl. maxStyleExemplars /
+ * varietyTemperature) is also handed to the selector for the per-lead sampling.
+ */
+function feederConfigPercentile(config: unknown): number {
+  const parsed = AccountFeederConfigSchema.safeParse(
+    config && typeof config === "object" ? config : {},
+  );
+  return parsed.success
+    ? parsed.data.minPerformancePercentile
+    : AccountFeederConfigSchema.parse({}).minPerformancePercentile;
+}
+
+/**
+ * Extract the Account Feeder `batchLightLeads` flag from an instance's
+ * account_feeder_config. Defensive: a missing/malformed config falls back to
+ * the schema default (true). Only effective when NOELLE_DRAFTER_BATCH is also
+ * ON — set to false per-instance to opt out of batching even when the env flag
+ * is enabled.
+ */
+function feederConfigBatchLight(config: unknown): boolean {
+  const parsed = AccountFeederConfigSchema.safeParse(
+    config && typeof config === "object" ? config : {},
+  );
+  return parsed.success
+    ? parsed.data.batchLightLeads
+    : AccountFeederConfigSchema.parse({}).batchLightLeads;
+}
+
+main().catch((err) => {
+  console.error("drafter fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
