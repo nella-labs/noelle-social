@@ -198,3 +198,86 @@ function ClipCard({ clip, onOpen }: { clip: VideoClipRow; onOpen: () => void }) 
                 background: "var(--ink)",
                 color: "var(--paper)",
               }}
+            >
+              deep
+            </span>
+          ) : null}
+        </div>
+        {/* Signals the card opens Nova's teardown — without it the thumbnail
+            reads as "play the reel", so the analysis was undiscoverable. */}
+        <span
+          style={{
+            position: "absolute",
+            top: 8,
+            right: 8,
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+            fontFamily: "var(--mono)",
+            fontSize: 9,
+            letterSpacing: "0.04em",
+            textTransform: "uppercase",
+            padding: "2px 7px",
+            borderRadius: 999,
+            background: "rgba(20,16,8,0.7)",
+            color: "#fff",
+          }}
+        >
+          ⊞ teardown
+        </span>
+        <span
+          style={{
+            position: "absolute",
+            bottom: 8,
+            right: 8,
+            fontFamily: "var(--mono)",
+            fontSize: 10,
+            padding: "2px 7px",
+            borderRadius: 999,
+            background: "rgba(20,16,8,0.7)",
+            color: "#fff",
+          }}
+        >
+          ▸ {fmtCount(clip.views)}
+        </span>
+      </div>
+      <div style={{ padding: "10px 12px" }}>
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "var(--ink)",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          @{clip.author_handle}
+        </div>
+        <div
+          style={{
+            fontSize: 11,
+            color: "var(--ink-muted)",
+            marginTop: 4,
+            lineHeight: 1.35,
+            display: "-webkit-box",
+            WebkitLineClamp: 2,
+            WebkitBoxOrient: "vertical",
+            overflow: "hidden",
+          }}
+        >
+          {clip.caption || "—"}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
+          <span className="tag" style={{ height: 18 }}>
+            {clip.source_kind}
+          </span>
+          <ReachBadge multiple={rm} views={clip.views} followers={clip.author_follower_count} size="xs" />
+          <span style={{ marginLeft: "auto", fontFamily: "var(--mono)", fontSize: 9.5, color: "var(--ink-soft)" }}>
+            ♥ {fmtCount(clip.likes)}
+          </span>
+        </div>
+      </div>
+    </button>
+  );
+}
