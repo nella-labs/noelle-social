@@ -198,3 +198,203 @@ function envelopeAt(tau: number, impulses: Impulse[]): number {
  *   `correctFrom` == overshoot (the dense low-velocity correction back to the
  *   click point is dispatched by the CDP layer). `points` END at `to`.
  */
+export function mousePlan(
+  from: Point,
+  to: Point,
+  targetSize: number,
+  rng: Rng,
+): { points: Point[]; sleepsMs: number[]; overshoot: Point; correctFrom: Point } {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const D = Math.hypot(dx, dy) || 1;
+  const W = Math.max(targetSize, 1);
+
+  // --- Fitts movement time ---
+  // Means unchanged (never faster on average); σ widened and the ceiling raised
+  // 900→1200 so a fraction of moves are slow, deliberate travels (heavy tail)
+  // instead of every move sharing one narrow MT band. Floor 180 unchanged.
+  const a = rng.normal(150, 55);
+  const b = rng.normal(140, 45);
+  const MT = clamp(a + b * Math.log2(D / W + 1), 180, 1200);
+
+  // --- point count: ~18 at 300px → ~36 at 600px, plus a per-move ±~3 jitter so
+  //     the interpolation density is NOT a deterministic function of distance
+  //     (a fixed D→N map is a fingerprint). Clamped [2,40]. ---
+  const N = clamp(Math.round(18 + ((D - 300) / 300) * 18 + rng.normal(0, 3)), 2, 40);
+
+  // --- spatial cubic Bézier with both control points off ONE side of chord ---
+  // unit perpendicular to the chord
+  const ux = dx / D;
+  const uy = dy / D;
+  const px = -uy; // perpendicular
+  const py = ux;
+  const side = rng.next() < 0.5 ? 1 : -1;
+  // curvature widened 40–70 → 40–105 px (both controls independent) so the path
+  // arc-height varies a lot move-to-move; the 40 px floor keeps every move
+  // clearly curved (a near-straight path is the bot tell we're avoiding).
+  const off1 = side * rng.float(40, 105);
+  const off2 = side * rng.float(40, 105);
+  // control points near 1/3 and 2/3 of the chord, pushed perpendicular
+  const c1: Point = {
+    x: from.x + dx * 0.33 + px * off1,
+    y: from.y + dy * 0.33 + py * off1,
+  };
+  const c2: Point = {
+    x: from.x + dx * 0.66 + px * off2,
+    y: from.y + dy * 0.66 + py * off2,
+  };
+  const bezier = (t: number): Point => {
+    const mt = 1 - t;
+    const w0 = mt * mt * mt;
+    const w1 = 3 * mt * mt * t;
+    const w2 = 3 * mt * t * t;
+    const w3 = t * t * t;
+    return {
+      x: w0 * from.x + w1 * c1.x + w2 * c2.x + w3 * to.x,
+      y: w0 * from.y + w1 * c1.y + w2 * c2.y + w3 * to.y,
+    };
+  };
+
+  // --- arc-length lookup table over the Bézier ---
+  const LUT_N = 256;
+  const lutT: number[] = [];
+  const lutArc: number[] = [];
+  let prev = bezier(0);
+  lutT.push(0);
+  lutArc.push(0);
+  let acc = 0;
+  for (let i = 1; i <= LUT_N; i++) {
+    const t = i / LUT_N;
+    const pt = bezier(t);
+    acc += Math.hypot(pt.x - prev.x, pt.y - prev.y);
+    lutT.push(t);
+    lutArc.push(acc);
+    prev = pt;
+  }
+  const totalArc = acc || D;
+  // invert arc-length → t
+  const tAtArc = (arc: number): number => {
+    if (arc <= 0) return 0;
+    if (arc >= totalArc) return 1;
+    // binary search in lutArc
+    let lo = 0;
+    let hi = lutArc.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (lutArc[mid]! < arc) lo = mid + 1;
+      else hi = mid;
+    }
+    const i1 = lo;
+    const i0 = Math.max(0, i1 - 1);
+    const a0 = lutArc[i0]!;
+    const a1 = lutArc[i1]!;
+    const span = a1 - a0 || 1;
+    const frac = (arc - a0) / span;
+    return lutT[i0]! + (lutT[i1]! - lutT[i0]!) * frac;
+  };
+
+  // --- velocity envelope (drives both timing and density) ---
+  const impulses = buildEnvelope(rng);
+
+  // --- emit N points at cosine-eased arc fractions (denser near endpoints,
+  //     i.e. where velocity is low) ---
+  const points: Point[] = [];
+  const arcFracs: number[] = [];
+  for (let i = 0; i < N; i++) {
+    const u = i / (N - 1);
+    // cosine ease: spacing ∝ sin(πu) → small at the ends, large in the middle,
+    // so more sample points land near the (low-velocity) endpoints.
+    const s = 0.5 - 0.5 * Math.cos(Math.PI * u);
+    arcFracs.push(s);
+    const t = tAtArc(s * totalArc);
+    points.push(bezier(t));
+  }
+  // pin the final emitted point exactly on `to`
+  points[points.length - 1] = { x: to.x, y: to.y };
+
+  // --- non-uniform sleeps from the envelope: dt = Δarc / v(midpoint) ---
+  // First compute raw dt per segment, then scale so Σdt == MT.
+  const rawDt: number[] = [0];
+  for (let i = 1; i < N; i++) {
+    const dArc = (arcFracs[i]! - arcFracs[i - 1]!) * totalArc;
+    const midTau = (arcFracs[i]! + arcFracs[i - 1]!) / 2;
+    const v = envelopeAt(midTau, impulses);
+    rawDt.push(dArc / v);
+  }
+  const rawTotal = rawDt.reduce((s, d) => s + d, 0) || 1;
+  const sleepsMs = rawDt.map((d) => (d / rawTotal) * MT);
+
+  // --- overshoot beyond `to` along the travel direction ---
+  // |normal(7,4)| guarantees a positive along-travel component (always overshoots
+  // in the direction of motion); the sign randomness lives in a small perpendicular
+  // wobble so it doesn't undershoot back toward `from`.
+  // along-travel overshoot spread widened (σ 4→5.5) and the perpendicular wobble
+  // widened (0–3 → 0–6 px) so the landing scatter past the target has more
+  // magnitude AND directional variety. Still always overshoots forward.
+  const along = Math.abs(rng.normal(7, 5.5));
+  const perpWobble = (rng.next() < 0.5 ? 1 : -1) * rng.float(0, 6);
+  const overshoot: Point = {
+    x: to.x + ux * along + px * perpWobble,
+    y: to.y + uy * along + py * perpWobble,
+  };
+
+  return { points, sleepsMs, overshoot, correctFrom: overshoot };
+}
+
+// ===========================================================================
+// SCROLL ENGINE (§3a) — momentum/inertia scroll as a sequence of gestures.
+// Replaces the uniform planScrollSteps. Pure, seeded by an injected Rng.
+// ===========================================================================
+
+export type ScrollGesture = {
+  kind: "flick" | "slow-drag" | "micro-nudge" | "back-scroll";
+  deltas: number[];
+  interDeltaMs: number[];
+  postDwellMs?: number;
+};
+
+/**
+ * Plan a sequence of scroll gestures whose net scroll ≈ totalPx. Each gesture is
+ * drawn from a weighted mixture whose weights are themselves RE-DRAWN once per
+ * call (centered on flick 0.45 / slow-drag 0.40 / micro-nudge 0.10 /
+ * back-scroll 0.05, but jittered so no two scrolls share an identical gesture-
+ * type balance — a fixed mixture is a session-level fingerprint).
+ *
+ * - FLICK: momentum. Peak v0 = logNormal median 1800 px/s clamp[800,3600]; emit
+ *   a decelerating delta series (×0.95/frame at ~16.7 ms, with wider vsync jitter
+ *   and the odd dropped frame) until |delta|<2px or the gesture target (logNormal
+ *   median 650px clamp[200,1800]) is reached.
+ * - SLOW-DRAG: deltaY = normal(90,30) clamp[40,150], 3–9 notches, inter-notch
+ *   gap logNormal median 140 ms clamp[60,700] (heavy right tail = reading pauses).
+ * - MICRO-NUDGE: 1–3 notches of normal(50,18) clamp[20,100].
+ * - BACK-SCROLL: one negative delta normal(190,85) clamp[60,420]; it decrements
+ *   the progress counter so the loop re-covers that ground (net scroll stays on
+ *   totalPx instead of quietly under-shooting it).
+ *
+ * Every emitted deltaY is jittered ±8% and no two consecutive deltas inside a
+ * gesture are ever equal. Inter-gesture transit dwell = gamma(k=2,θ=460) ms
+ * clamp[80,6000], attached as the previous gesture's `postDwellMs`.
+ */
+export function planScrollGestures(
+  rng: Rng,
+  totalPx: number,
+  _contentHints?: { wordCount?: number; hasMedia?: boolean }[],
+): ScrollGesture[] {
+  const gestures: ScrollGesture[] = [];
+  let scrolled = 0;
+  // safety bound so a pathological draw can't loop forever
+  let guard = 0;
+  const maxGestures = 400;
+
+  // jitter a delta ±8% and force it to differ from the previous one
+  const jittered = (raw: number, prevSigned: number | undefined): number => {
+    let d = raw + (rng.next() * 2 - 1) * 0.08 * raw;
+    // guarantee inequality with the previous signed delta
+    if (prevSigned !== undefined && d === prevSigned) {
+      d += d >= 0 ? 0.5 : -0.5;
+    }
+    return d;
+  };
+
+  // Per-plan mixture weights (drawn once so each scroll has its OWN gesture-type
+  // balance instead of the identical 0.45/0.40/0.10/0.05 split every time — a
