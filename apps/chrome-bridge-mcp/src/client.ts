@@ -198,3 +198,22 @@ export class BridgeClient {
       if (e && e.code === "ENOENT") {
         return {
           ok: false,
+          error: `No actuator-doctor report at ${path}.`,
+          hint: "The doctor may not have run yet. Start it with `noelle doctor start` (see `noelle doctor status`).",
+        } satisfies BridgeError;
+      }
+      return {
+        ok: false,
+        error: `Cannot read ${path}: ${e instanceof Error ? e.message : String(e)}`,
+      } satisfies BridgeError;
+    }
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      return {
+        ok: false,
+        error: `Doctor report at ${path} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+      } satisfies BridgeError;
+    }
+  }
+}
