@@ -198,3 +198,203 @@ function TextDraftsStudio({
             {style && style.sources.length > 0 && (
               <div style={{ marginBottom: 10 }}>
                 <StylePicker
+                  orgSlug={orgSlug}
+                  instanceId={style.instanceId}
+                  sources={style.sources}
+                  current={style.pinnedStyleHandle}
+                />
+              </div>
+            )}
+            <DrafterChat key={selected.idea_id} orgSlug={orgSlug} ideaId={selected.idea_id} notes={selNotes} />
+          </>
+        ) : (
+          <>
+            <div className="eyebrow" style={{ marginBottom: 8 }}>Live preview</div>
+            {selected ? (
+              <Preview draft={selected} userName={userName} userHandle={userHandle} />
+            ) : (
+              <div className="card" style={{ padding: 24, textAlign: "center", color: "var(--ink-soft)", fontSize: 12.5 }}>
+                Pick a draft to preview it here.
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── List card ───────────────────────────────────────────────────────────
+function ListCard({ draft, active, onClick }: { draft: PostDraftRow; active: boolean; onClick: () => void }) {
+  const lane = LANE_BY_ID[draft.platform] ?? LANE_BY_ID.x;
+  const st = STATUS_META[(draft.status as StatusKey)] ?? STATUS_META.draft;
+  const hook = draft.draft_hook || draft.hook || "Untitled draft";
+  return (
+    <button onClick={onClick}
+            style={{ width: "100%", textAlign: "left", border: 0, cursor: "pointer",
+                     background: active ? "var(--paper-2)" : "transparent",
+                     boxShadow: active ? "0 0 0 1px color-mix(in oklch, var(--accent) 40%, var(--rule))" : "none",
+                     borderRadius: 10, padding: "10px 11px", marginBottom: 4, display: "block" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
+        <span style={{ width: 7, height: 7, borderRadius: "50%", background: lane.color }} />
+        <span style={{ fontFamily: "var(--mono)", fontSize: 9.5, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--ink-muted)" }}>{lane.label}</span>
+        <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 4, fontFamily: "var(--mono)", fontSize: 9, color: st.color }}>
+          <span style={{ width: 5, height: 5, borderRadius: "50%", background: st.color }} />{st.label}
+        </span>
+      </div>
+      <div style={{ fontSize: 13, lineHeight: 1.3, color: "var(--ink)",
+                    display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+        {hook}
+      </div>
+      {draft.suggested_day && (
+        <div style={{ marginTop: 6, display: "inline-flex", alignItems: "center", gap: 4, fontFamily: "var(--mono)", fontSize: 9,
+                      color: "var(--ink-muted)", background: "var(--paper-deep)", padding: "1px 7px", borderRadius: 999 }}>
+          ◷ {shortDay(draft.suggested_day)}
+        </div>
+      )}
+    </button>
+  );
+}
+
+// ─── Editor ──────────────────────────────────────────────────────────────
+function Editor({
+  orgSlug, draft, today, media, onMediaChanged, onCleared, onPrev, onNext, navPos, onRefine,
+}: {
+  orgSlug: string;
+  draft: PostDraftRow;
+  today: string;
+  media: ContentMediaRow[];
+  onMediaChanged: () => void;
+  onCleared: () => void;
+  onPrev?: () => void;
+  onNext?: () => void;
+  navPos: { idx: number; total: number } | null;
+  onRefine: () => void;
+}) {
+  const lane = LANE_BY_ID[draft.platform] ?? LANE_BY_ID.x;
+  const isX = draft.platform === "x";
+  const [hook, setHook] = useState(draft.draft_hook ?? "");
+  // LinkedIn/Reddit split the editor into Hook + Content: `content` edits the post
+  // BODY minus its leading hook line (so the hook isn't shown twice) and save
+  // recombines them (joinHook) into byte-identical `body`.
+  const [content, setContent] = useState(stripLeadingHook(draft.final_body ?? draft.body, draft.draft_hook));
+  // X is one atomic ≤280 post — no hook/content split. Edit the whole thing in a
+  // single "Post" field; its first line doubles as the stored hook (list + regen).
+  const [post, setPost] = useState(draft.final_body ?? draft.body);
+  const [cta, setCta] = useState(draft.cta ?? "");
+  const [notes, setNotes] = useState(draft.notes ?? "");
+  const [category, setCategory] = useState<Category | "">(isCategory(draft.category ?? "") ? (draft.category as Category) : "");
+  const [pending, startTransition] = useTransition();
+  const [saved, setSaved] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const { copy: copyText, copiedKey, copyError } = useCopy();
+  const flash = () => { setSaved(true); setTimeout(() => setSaved(false), 1400); };
+
+  const isReady = draft.status === "ready";
+  const isPosted = draft.status === "published";
+
+  // The full post body — what actually gets posted/stored — and the hook line,
+  // resolved per platform. For X the single "Post" field IS the body and its first
+  // line is the hook; otherwise it's the recombined hook + content.
+  const fullBody = isX ? post : joinHook(hook, content);
+  const effectiveHook = isX ? hookFromBody(post) : hook;
+  const origBody = draft.final_body ?? draft.body;
+
+  const patchChanged = async () => {
+    const res = await patchPostDraft({
+      orgSlug,
+      draftId: draft.id,
+      hook: effectiveHook !== (draft.draft_hook ?? "") ? effectiveHook : undefined,
+      body: fullBody !== origBody ? fullBody : undefined,
+      cta: cta !== (draft.cta ?? "") ? cta : undefined,
+      notes: notes !== (draft.notes ?? "") ? notes : undefined,
+      category: category && category !== draft.category ? category : undefined,
+    });
+    if (!res.ok) setMsg(res.error.message);
+    return res.ok;
+  };
+
+  const saveDraft = () => { setMsg(null); startTransition(async () => { if (await patchChanged()) flash(); }); };
+  const markReady = () => {
+    setMsg(null);
+    startTransition(async () => {
+      if (!(await patchChanged())) return;
+      const res = await markReadyPost({ orgSlug, draftId: draft.id, editedBody: fullBody });
+      if (!res.ok) setMsg(res.error.message); else flash();
+    });
+  };
+  const markPosted = () => {
+    setMsg(null);
+    startTransition(async () => {
+      if (!(await patchChanged())) return;
+      const res = await markPostedPost({ orgSlug, draftId: draft.id });
+      if (!res.ok) setMsg(res.error.message);
+    });
+  };
+  // Scheduling is idea-level (the X + LinkedIn variants of an idea move together).
+  const schedule = (day: string | null) => {
+    setMsg(null);
+    startTransition(async () => {
+      const res = await schedulePostIdea({ orgSlug, ideaId: draft.idea_id, day });
+      if (!res.ok) setMsg(res.error.message); else flash();
+    });
+  };
+  // The board shows the LATEST version per (idea, platform); dismiss the whole
+  // set (scope:"set") so the card leaves the board instead of resurfacing an
+  // older version (which made these look undeletable).
+  const dismiss = () => { startTransition(async () => { const res = await dismissPost({ orgSlug, id: draft.id, target: "draft", scope: "set" }); if (res.ok) onCleared(); else setMsg(res.error.message); }); };
+  const copy = () => {
+    setMsg(null);
+    startTransition(async () => {
+      if (!(await patchChanged())) return;
+      await copyText([fullBody, cta].filter(Boolean).join("\n\n"));
+    });
+  };
+
+  return (
+    <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+      {/* header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "13px 18px", borderBottom: "1px solid var(--rule-soft)" }}>
+        <Avatar role={lane.role ?? "x-intern"} size={26} accent={lane.color} />
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 13.5, fontWeight: 500 }}>Post · {lane.label}</div>
+          <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--ink-muted)" }}>{lane.agent} · {draft.status}</div>
+        </div>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+          {saved && <span style={{ fontSize: 11, color: "var(--ok)", fontFamily: "var(--mono)" }}>✓ saved</span>}
+          {navPos && (
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+              <button className="btn btn-sm" onClick={onPrev} disabled={!onPrev} aria-label="Previous draft" style={{ padding: "0 9px" }}>‹</button>
+              <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--ink-muted)", minWidth: 40, textAlign: "center" }}>{navPos.idx} / {navPos.total}</span>
+              <button className="btn btn-sm" onClick={onNext} disabled={!onNext} aria-label="Next draft" style={{ padding: "0 9px" }}>›</button>
+            </div>
+          )}
+          <button className="btn btn-sm" onClick={onRefine} title="Talk to the drafter">✎ Refine</button>
+          <button onClick={dismiss} disabled={pending} title="Remove this draft" aria-label="Remove draft"
+                  style={{ width: 30, height: 28, border: 0, borderRadius: 7, background: "transparent", color: "var(--ink-soft)", cursor: "pointer", fontSize: 14 }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = "color-mix(in oklch, var(--danger) 14%, var(--paper))"; e.currentTarget.style.color = "var(--danger)"; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--ink-soft)"; }}>🗑</button>
+        </div>
+      </div>
+
+      <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 16 }}>
+        {draft.verifier_meta && <VerifierTraceCard meta={draft.verifier_meta} />}
+
+        {isX ? (
+          // X is one atomic ≤280 post — a single field for the whole thing, no
+          // dead "Content" box. Mirrors the live preview (no separate hook line).
+          <Field label="Post" hint={`${fullBody.length} / 280`}>
+            <textarea value={post} onChange={(e) => setPost(e.target.value)} rows={7}
+                      placeholder="Write the whole post. ≤280 — the first line is the hook."
+                      style={{ ...inputStyle, resize: "vertical", lineHeight: 1.6 }} />
+          </Field>
+        ) : (
+          <>
+            <Field label="Hook">
+              <input value={hook} onChange={(e) => setHook(e.target.value)} placeholder="Open with a verb…" style={inputStyle} />
+            </Field>
+
+            <Field label="Content">
+              <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={7}
+                        placeholder="Write the body. Concrete > abstract." style={{ ...inputStyle, resize: "vertical", lineHeight: 1.6 }} />
+            </Field>
