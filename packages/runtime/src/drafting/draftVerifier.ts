@@ -398,3 +398,203 @@ const READER_TELLS: Array<{ re: RegExp; label: string; exemptWhenGroup1?: boolea
   // The possessive lookbehind exempts OWNED, sourced data ("our benchmark data
   // shows a 3x speedup") — naming your source is the fix this rule asks for, so
   // firing on it contradicted the reason string.
+  // Ownership is checked by CAPTURE, not by lookbehind. The lookbehind version
+  // was wrong in both directions: it exempted unsourced claims whenever any
+  // possessive appeared within five words ("your competitor keeps claiming the
+  // data shows growth"), and it still fired on genuinely sourced data whenever a
+  // non-word char intervened ("our in-house data shows", "the operator's benchmark data
+  // shows") — the exact contradiction of its own reason string. Group 1 is the
+  // owner and must sit within three tokens of the data noun; the hit is exempt
+  // when it is present. \S+ (not \w+) so hyphens and slashes don't break it, and
+  // \w+'s so a named source counts as naming your source.
+  // Three guards, each earned by a defect:
+  //  - the intervening-token class EXCLUDES sentence punctuation AND the
+  //    separators exclude newlines, so an owner in a previous sentence or
+  //    paragraph can no longer reach across ("that was your call. the data shows
+  //    otherwise", "i loved your post\n\nthe data shows a 3x lift" were both
+  //    exempt). Punctuation alone was not enough: a paragraph break is pure
+  //    whitespace, so \s+ walked straight over it.
+  //  - the negative lookahead rejects is/has contractions, which English spells
+  //    identically to a possessive ("here's what the data shows", "it's clear the
+  //    data shows a problem" were both read as owned).
+  //  - \w+(?:'s|s') accepts a PLURAL possessive, so a named plural source counts
+  //    ("the founders' data shows churn is down" was firing — the rule demanding
+  //    you name a source while rejecting one).
+  { re: /(\b(?:our|my|your|his|her|their|its|(?!(?:it|that|there|here|what|who|he|she|let|one|everyone|someone|something|nothing|today|now|this)'s\b)\w+(?:'s|s'))[^\S\n]+(?:[^\s.,;:!?)\]]+[^\S\n]+){0,2})?\b(studies|research|data|the numbers)\s+(show|shows|showed)\b/i, label: "vague authority ('studies show') — name the source or own the claim", exemptWhenGroup1: true },
+  { re: /\b(experts?|observers?|analysts?|researchers?)\s+(say|says|said|argue[sd]?|note[sd]?|agree[sd]?|suggest(s|ed)?|point(s|ed)? to)\b/i, label: "vague authority ('experts say') — name the source or own the claim" },
+  { re: /\bhere'?s (the kicker|where it gets)\b/i, label: "false suspense ('here's the kicker') — deliver the content, delete the drumroll" },
+  { re: /\bthe best part\?/i, label: "false suspense ('the best part?') — deliver the content, delete the drumroll" },
+  { re: /\b(pivotal|watershed|defining)\s+moment\b/i, label: "grandiosity ('pivotal moment') — scale the claim to what the facts support" },
+  { re: /\benduring legacy\b|\bthe next era\b|\bparadigm shift\b/i, label: "grandiosity ('enduring legacy' / 'the next era' / 'paradigm shift') — mundane is credible" },
+];
+
+// references/wordbank.md tier 1 — "kill on sight". Only the unambiguous entries
+// are deterministic here; anything with a real technical sense in the operator's world
+// stays prompt-only (see the note above) so a genuine "robust parser" survives.
+const WORDBANK_TIER1: RegExp[] = [
+  /\b(delve|delves|delving)\b/i,
+  // 'leverage' is VERB-ONLY. Every occurrence in the operator's real post corpus
+  // was the founder-sense NOUN ("know your leverage", "that's the leverage"),
+  // including a published post — a 100% false-positive rate on production data.
+  // INFLECTED FORMS ONLY. Bare "leverage" is genuinely ambiguous in this
+  // operator's world: the founder-sense noun is core vocabulary ("know your
+  // leverage", "operating leverage", "gained leverage over suppliers",
+  // "financial leverage", "maximum leverage"), and two successive attempts to
+  // separate it from the verb by neighbouring words both failed — a right-hand
+  // object list re-caught the noun before a relative clause, and a left-hand
+  // determiner list still caught it after an adjective or verb. Determiners,
+  // adjectives, and verbs can all precede the noun, so position cannot decide it.
+  // "leverages/leveraged/leveraging" are unambiguously the verb. Bare "leverage"
+  // joins robust/ecosystem/profound as prompt-only.
+  /\b(leverages|leveraged|leveraging)\b/i,
+  /\b(utilize[ds]?|utilizing|facilitate[ds]?|streamline[ds]?|bolster(s|ed)?)\b/i,
+  // 'elevate' verb-only: "elevated p99 latency" is an ordinary adjective.
+  /\b(showcase[ds]?|elevat(e|es|ing)|empower(s|ed|ing)?|unleash(es|ed)?|garner(s|ed)?|revolutioniz(e|es|ed|ing))\b/i,
+  /\b(transcend(s|ed)?|underpin(s|ned)?|exemplif(y|ies|ied)|reimagine[ds]?)\b/i,
+  // 'underscore' verb-only: the noun is the CHARACTER and the library
+  // ("snake_case is all underscores", "underscore.js").
+  /\bunderscor(e|es|ed|ing)\s+(the|its|how|a|that|why|just)\b/i,
+  // 'realm', 'beacon' and 'endeavor' dropped to prompt-only under the same
+  // technical/proper-noun principle already applied to 'ecosystem': a keycloak
+  // realm, a beacon endpoint, and Endeavor (the LatAm accelerator) are all real.
+  /\b(tapestry|paradigm|synergy|testament|interplay|intricacies|myriad|plethora|advancements)\b/i,
+  /\b(pivotal|seamless(ly)?|vibrant|intricate|meticulous(ly)?|nuanced|cutting[- ]edge|transformative)\b/i,
+  /\b(game[- ]chang(er|ing)|groundbreaking|unparalleled|invaluable|multifaceted|commendable|poignant)\b/i,
+  // 'next-generation' hyphen-only: the plain-space form matched "the next
+  // generation of devs in medellin", which is ordinary English.
+  /\b(unwavering|unyielding|timeless|ever[- ]evolving|fast[- ]paced|next-generation)\b/i,
+  // 'embark' and 'intertwined' removed: "she embarked on a new role at stripe"
+  // is a LinkedIn promotion post, i.e. exactly Lyra's target content, and
+  // "their roadmaps are intertwined with ours" is ordinary English. Same
+  // carve-out principle as robust/ecosystem/profound.
+  /\b(illuminate[ds]?|synthesize[ds]?|elucidate[ds]?|espouse[ds]?)\b/i,
+  // 'profound', 'relentless' and 'tireless' are prompt-only, same carve-out as
+  // 'robust'/'ecosystem': the sweep caught "Profound Documents" (a product name
+  // — the case-insensitive match hit a proper noun) and "the relentless-questions
+  // thing is such a green flag" (ordinary praise). Adjectives with everyday
+  // non-slop uses do not belong in a hard-zero list.
+  /\bindelible\b/i,
+  /\bin today'?s (fast[- ]paced|digital|ever)\b/i,
+  /\bit('s| is) (important|worth) (to note|noting)\b/i,
+  /\bplays? a (pivotal|crucial|key) role\b/i,
+  /\bstands? as a testament\b/i,
+  /\bnavigat(e|ing) the complexities\b/i,
+  /\b(in conclusion|in summary|at its core|a key takeaway|paving the way)\b/i,
+  /\b(valuable insights?|deeper understanding|shed(s|ding)? light on)\b/i,
+  /\b(furthermore|moreover|that being said|look no further)\b/i,
+  // Removed: 'when it comes to' and sentence-initial 'Additionally' are ordinary
+  // English ("when it comes to hiring, i just look at what they shipped"), and
+  // 'not only...but also' double-charged with the reframe penalty that already
+  // covers negative parallelism.
+  /\bhope this (email|message) finds you well\b/i,
+  /\blet'?s (unpack|explore|break (it|this) down)\b/i,
+  /\bdeep[- ]dive into\b/i,
+];
+
+/**
+ * Blank out DOUBLE-quoted spans before the tell sweep.
+ *
+ * Single quotes are deliberately NOT handled, in either form. Straight ' is
+ * ambiguous with the apostrophe and cannot be disambiguated by position:
+ * elisions ('21, 'em, 'til) open a span and plural possessives (founders')
+ * close it. Curly ‘…’ looked safe but is not — smart-quote autocorrect maps a
+ * WORD-LEADING apostrophe to ‘ (the "'90s problem"), so "back in the ‘90s
+ * studies show growth wasn’t real" blanked 31 characters and scored a clean 1.00
+ * with no reason attached. Both variants therefore produce the worst failure
+ * mode available here, a SILENT false negative, and neither earns its keep:
+ * across 1689 live drafts there are zero curly quotes of any kind. A quoted tell
+ * in single quotes now costs a regenerate, which is the cheap direction to be
+ * wrong in.
+ * These bans are about the writer's OWN voice; a quoted phrase is attributed to
+ * someone else. Found on a real draft that quoted a post's slop in order to mock
+ * it ("experts pointed to, experts noted, experts underscored" is a consultation
+ * that produced verbs) — hard-zeroing that is backwards, it is the good version.
+ * Replaced with spaces rather than removed so adjacent words can't fuse into a
+ * phrase that wasn't there.
+ *
+ * Known limits, accepted deliberately:
+ *  - It applies ONLY to this sweep, not to SLOP_PHRASES or the em-dash check.
+ *    Extending it there would change behavior for Vega and Orion, which this
+ *    LinkedIn-scoped change does not touch.
+ *  - Quoting a banned phrase silences the check. Echoing the post is separately
+ *    banned in the prompt, and the drafter is never told this exemption exists,
+ *    so it is a narrow surface rather than a usable evasion route.
+ */
+function stripQuotedSpans(body: string): string {
+  return (
+    body
+      // Double quotes only, and the open/close classes are mixed on purpose so a
+      // straight-open/curly-close pair (autocorrect produces these) still strips.
+      .replace(/["“][^"”\n]*["”]/g, (m) => " ".repeat(m.length))
+  );
+}
+
+/**
+ * Hits from the anti-ai skill's reader-mode families. Empty unless the caller
+ * opted into strict voice (LinkedIn today).
+ *
+ * Capped at ANTI_AI_MAX_REASONS. The score is already zero after the first hit,
+ * so extra reasons buy nothing — and they cost twice: every reason is
+ * concatenated verbatim into the drafter's regenerate prompt, and the caller
+ * truncates the reason list to 8 for the approval card a human reads. Some
+ * bodies legitimately hit three of these at once ("stands as a testament" trips
+ * the copula dodge plus two wordbank entries), which without a cap would push
+ * distinct, more useful reasons off the card entirely.
+ */
+const ANTI_AI_MAX_REASONS = 3;
+
+/**
+ * Fold curly quotes to their straight equivalents. Every pattern above spells
+ * contractions with a straight `'?` ("that'?s the point"), so a curly U+2019
+ * would slip the ENTIRE significance-marker family — "here's the thing" is
+ * caught, "here’s the thing" is not. No draft in the live corpus uses curly
+ * apostrophes today (0/1646), so this is latent rather than live, but the
+ * failure mode is a silent drop to zero signal if a model or a paste ever
+ * introduces them, which is exactly the kind of gap that never gets noticed.
+ * Every substitution is 1 char for 1 char, so offsets and lengths are preserved
+ * for the quote-stripper that runs next.
+ */
+function normalizeQuotes(body: string): string {
+  return body.replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
+}
+
+function antiAiTellHits(raw: string): string[] {
+  // Order matters: strip curly-quoted spans FIRST (normalizeQuotes folds ’ to '
+  // and would destroy the only unambiguous single-quote signal), then fold what
+  // is left so the straight-quote patterns match curly contractions.
+  const body = normalizeQuotes(stripQuotedSpans(raw));
+  const markers: string[] = [];
+  const tells: string[] = [];
+  const words: string[] = [];
+
+  for (const p of SIGNIFICANCE_MARKERS) {
+    if (p.re.test(body)) {
+      markers.push(`significance-marking meta commentary: ${p.label} — DELETE the sentence outright (don't reword it); if the detail matters, hit it again instead of announcing that it mattered`);
+    }
+  }
+  for (const p of READER_TELLS) {
+    if (p.exemptWhenGroup1) {
+      // Must scan ALL matches, not just the first. String.match without /g
+      // returns only the earliest one, so "our data shows a lift but studies
+      // show the opposite" exempted on the sourced clause and silently hid the
+      // unsourced one. Fire when ANY occurrence lacks an ownership prefix.
+      const all = [...body.matchAll(new RegExp(p.re.source, `${p.re.flags}g`))];
+      if (all.length === 0 || all.every((m) => m[1])) continue;
+    } else if (!p.re.test(body)) {
+      continue;
+    }
+    tells.push(`AI construction: ${p.label}`);
+  }
+  for (const re of WORDBANK_TIER1) {
+    const m = body.match(re);
+    if (m) words.push(`tier-1 AI vocabulary ("${m[0].trim()}") — use the word you'd say out loud, or a concrete noun from their world`);
+  }
+
+  // Round-robin across the families rather than concatenating them. Straight
+  // concatenation meant significance markers always filled the cap and buried
+  // every construction and vocabulary hit, so a draft with one of each got a fix
+  // prompt covering only a third of its problems and burned extra regenerates.
+  const hits: string[] = [];
+  for (let i = 0; hits.length < ANTI_AI_MAX_REASONS; i++) {
+    const round = [markers[i], tells[i], words[i]].filter((r): r is string => r != null);
+    if (round.length === 0) break;
