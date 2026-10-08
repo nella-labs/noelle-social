@@ -198,3 +198,203 @@ export function createLinkedInClient(opts: CreateLinkedInClientOpts): LinkedInCl
   const jitterMs = opts.jitterMs ?? minDelayMs;
   const maxCallsPerHour = opts.maxCallsPerHour ?? 0;
   const now = opts.nowImpl ?? Date.now;
+  const clientVersion = opts.clientVersion ?? DEFAULT_CLIENT_VERSION;
+  const profilePostsQueryId = opts.profilePostsQueryId ?? DEFAULT_PROFILE_POSTS_QUERY_ID;
+  const profilePostsSectionType = opts.profilePostsSectionType ?? DEFAULT_PROFILE_POSTS_SECTION;
+  const profilePostsPageType = opts.profilePostsPageType ?? DEFAULT_POSTS_PAGE_TYPE;
+  const liTrack = JSON.stringify({
+    clientVersion,
+    mpVersion: clientVersion,
+    osName: "web",
+    timezoneOffset: -5,
+    timezone: "America/Bogota",
+    deviceFormFactor: "DESKTOP",
+    mpName: "voyager-web",
+  });
+
+  const jar = new Map<string, string>();
+  jar.set("li_at", opts.liAt);
+  for (const [k, v] of Object.entries(opts.extraCookies ?? {})) jar.set(k, v);
+
+  // If the caller supplies a current JSESSIONID (captured from the same browser
+  // session as li_at), use it directly and skip minting via /feed/ entirely.
+  // /feed/ minting is the rate-limit-sensitive surface; supplying the pair
+  // sidesteps it. Re-mint via /feed/ still happens only on a genuine session
+  // death. The csrf-token is the JSESSIONID with surrounding quotes stripped.
+  let csrf: string | null = null;
+  const bypassMode = Boolean(opts.jsessionid);
+  if (opts.jsessionid) {
+    const quoted = opts.jsessionid.startsWith('"') ? opts.jsessionid : `"${opts.jsessionid}"`;
+    jar.set("JSESSIONID", quoted);
+    csrf = opts.jsessionid.replace(/"/g, "");
+  }
+
+  function cookieHeader(): string {
+    return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+  }
+
+  /** Mint (or reuse) a fresh JSESSIONID bound to li_at. Cached until reset(). */
+  async function ensureSession(): Promise<void> {
+    if (csrf) return;
+    // In bypass mode the caller supplied the JSESSIONID — do NOT fall back to
+    // /feed/ minting (that re-mint under suspicion is what gets li_at logged out
+    // with "li_at=delete me"). Surface expiry so the operator supplies a fresh
+    // pair instead of burning the token.
+    if (bypassMode) {
+      throw new LinkedInAuthError(
+        "supplied JSESSIONID expired — provide a fresh li_at + JSESSIONID pair",
+        401,
+      );
+    }
+    const res = await fetchImpl(MINT_URL, {
+      method: "GET",
+      redirect: "manual",
+      headers: {
+        "user-agent": ua,
+        accept: "text/html,application/xhtml+xml",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br",
+        cookie: cookieHeader(),
+      },
+    });
+    // Read Set-Cookie from headers only; do not download the (~9 MB) feed body.
+    const setCookies =
+      typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+    try {
+      await res.body?.cancel();
+    } catch {
+      /* ignore */
+    }
+    for (const line of setCookies) {
+      const kv = cookieFromSetCookie(line);
+      if (kv) jar.set(kv[0], kv[1]);
+    }
+    const jsession = jar.get("JSESSIONID");
+    if (!jsession) {
+      throw new LinkedInAuthError("could not mint JSESSIONID (li_at invalid or IP blocked)", 401);
+    }
+    csrf = jsession.replace(/"/g, "");
+  }
+
+  function reset(): void {
+    csrf = null;
+    jar.delete("JSESSIONID");
+  }
+
+  let lastCallAt = 0;
+  const callTimes: number[] = []; // timestamps of calls in the last rolling hour
+  async function pace(): Promise<void> {
+    const t0 = now();
+    // Per-hour cap: prune the window, then refuse (don't sleep an hour) if full.
+    if (maxCallsPerHour > 0) {
+      const cutoff = t0 - 3_600_000;
+      while (callTimes.length > 0 && callTimes[0]! < cutoff) callTimes.shift();
+      if (callTimes.length >= maxCallsPerHour) {
+        throw new LinkedInRateLimitError(
+          `hourly call cap reached (${maxCallsPerHour}/h) — backing off`,
+          429,
+        );
+      }
+    }
+    const since = t0 - lastCallAt;
+    const wait = Math.max(0, minDelayMs - since) + Math.floor(Math.random() * jitterMs);
+    if (wait > 0) await doSleep(wait);
+    const t1 = now();
+    lastCallAt = t1;
+    callTimes.push(t1);
+  }
+
+  async function voyagerGet(
+    path: string,
+    opts: { retry?: boolean; headers?: Record<string, string> } = {},
+  ): Promise<unknown> {
+    const retry = opts.retry ?? true;
+    await ensureSession();
+    await pace();
+    const res = await fetchImpl(`${VOYAGER_BASE}${path}`, {
+      method: "GET",
+      redirect: "manual",
+      headers: {
+        "user-agent": ua,
+        accept: "application/vnd.linkedin.normalized+json+2.1",
+        "accept-language": "en-US,en;q=0.9",
+        "x-restli-protocol-version": "2.0.0",
+        "x-li-lang": "en_US",
+        "x-li-track": liTrack,
+        "csrf-token": csrf as string,
+        referer: "https://www.linkedin.com/feed/",
+        cookie: cookieHeader(),
+        ...(opts.headers ?? {}),
+      },
+    });
+    if (res.status === 200) {
+      return res.json();
+    }
+    const bodyText = await res.text().catch(() => "");
+    const isCsrf = /csrf/i.test(bodyText);
+    // Only re-mint when the SESSION is genuinely dead: a 302 to login, a 401, or
+    // a 403 whose body is the CSRF-check failure. A plain 403/4xx on a specific
+    // endpoint is NOT a session problem — surface it instead of re-minting
+    // /feed/ in a loop (re-mint storms are exactly what gets the cookie
+    // throttled). Re-mint at most once.
+    const sessionDead = res.status === 302 || res.status === 401 || (res.status === 403 && isCsrf);
+    if (sessionDead && retry) {
+      reset();
+      return voyagerGet(path, { retry: false, ...(opts.headers ? { headers: opts.headers } : {}) });
+    }
+    if (res.status === 429) throw new LinkedInRateLimitError();
+    const snippet = bodyText.slice(0, 160).replace(/\s+/g, " ").trim() || "(no body)";
+    if (sessionDead || res.status === 401 || res.status === 403) {
+      throw new LinkedInAuthError(`linkedin ${res.status}: ${snippet}`, res.status);
+    }
+    throw new LinkedInError(`linkedin voyager ${res.status}: ${snippet}`, res.status);
+  }
+
+  function parseProfileEntity(e: Record<string, unknown>): LinkedInProfile | null {
+    const urn =
+      (e.entityUrn as string) ?? (e.dashEntityUrn as string) ?? (e["*miniProfile"] as string) ?? "";
+    if (!/fsd_profile:|fs_miniProfile:/.test(urn)) return null;
+    const first = (e.firstName as string) ?? "";
+    const last = (e.lastName as string) ?? "";
+    const name = `${first} ${last}`.trim() || null;
+    const headline =
+      (e.headline as string) ?? (e.occupation as string) ?? (e.title as string) ?? null;
+    return {
+      fsdProfileId: stripFsdPrefix(urn),
+      publicId: (e.publicIdentifier as string) ?? null,
+      name,
+      headline,
+    };
+  }
+
+  return {
+    async me() {
+      const json = await voyagerGet("/me");
+      const miniRef =
+        (json as { data?: { ["*miniProfile"]?: string } })?.data?.["*miniProfile"] ?? "";
+      let fsd = stripFsdPrefix(miniRef);
+      let name: string | null = null;
+      for (const e of entitiesOf(json)) {
+        const p = parseProfileEntity(e);
+        if (p) {
+          if (!fsd) fsd = p.fsdProfileId;
+          name = p.name ?? name;
+          break;
+        }
+      }
+      if (!fsd) throw new LinkedInAuthError("could not resolve own profile from /me", 403);
+      return { fsdProfileId: fsd, name };
+    },
+
+    async resolveProfile(slugOrUrl) {
+      const slug = profileSlug(slugOrUrl);
+      const json = await voyagerGet(
+        `/identity/dash/profiles?q=memberIdentity&memberIdentity=${encodeURIComponent(slug)}`,
+      );
+      for (const e of entitiesOf(json)) {
+        const p = parseProfileEntity(e);
+        if (p && (p.publicId === slug || !p.publicId)) return p;
+      }
+      // Fall back to the first profile entity if the slug didn't match exactly.
+      for (const e of entitiesOf(json)) {
+        const p = parseProfileEntity(e);
