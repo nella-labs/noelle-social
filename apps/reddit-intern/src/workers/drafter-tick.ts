@@ -198,3 +198,203 @@ export interface RunDrafterTickArgs {
     makeCalls: (priority: boolean) => VerifierCall[];
     /** Voice floor (0-1). Below this after retries → drop the draft. 0/undefined = no gate. */
     voiceFloor?: number;
+  };
+  /**
+   * Vision caption fn. When a lead's payload carries `images`, the tick captions
+   * them and injects "THE POST'S IMAGE SHOWS:" into the prompt. Omit and drafting
+   * proceeds with no caption — fail-open throughout.
+   */
+  captionFn?: CaptionFn;
+  /**
+   * Voice variety (NOELLE_DRAFTER_VARIETY). When enabled, each lead is assigned a
+   * random "register" injected into the comment-drafting prompt so comments vary
+   * in length + energy across the feed. `rng` is injectable for deterministic tests.
+   */
+  variety?: {
+    enabled: boolean;
+    rng?: () => number;
+    /**
+     * Per-comment SHAPE rotation. Orion had NO form variation at all — every
+     * comment was drafted in the same default 1-4 sentence band with only the
+     * register varying — so this is the lane that breaks his feed out of one
+     * mold. Injectable for tests; defaults to the process-wide rotation.
+     */
+    formVariantRotation?: {
+      next: (rng?: () => number, exclude?: readonly string[]) => FormVariant;
+    };
+    /** Per-comment gen-z MARKER rotation. Injectable for tests. */
+    genzMarkerRotation?: {
+      next: (rng?: () => number, energy?: PostEnergy | null) => GenZMarker | null;
+    };
+    /**
+     * Share of leads offered a gen-z marker. Defaults to
+     * genzMarkerRateFromEnv() (22%, `NOELLE_GENZ_MARKERS=0` to disable).
+     */
+    genzMarkerRate?: number;
+  };
+  /**
+   * Post-energy mirroring (NOELLE_DRAFTER_ENERGY, default off). When enabled the
+   * drafter detects each post's energy (celebration/joke/hot_take/vent/question/
+   * analytical) and (a) picks an energy-aware register when variety is on — DEADPAN on
+   * a joke, never snark on a question — and (b) injects a "POST ENERGY" hint so the
+   * comment MIRRORS the thread: answer a joke with a joke, a vent with commiseration,
+   * not philosophy. Off/omitted → blind register only, byte-identical to today.
+   */
+  energy?: { enabled: boolean };
+  /**
+   * Sibling-comment "read the room" fetch (NOELLE_DRAFTER_COMMENT_ENERGY). When
+   * provided, the tick fetches the top OTHER comments on each thread and injects a
+   * digest so the comment matches the room's energy and never echoes a take already
+   * made. Reddit reads the FREE public .json endpoint (no token, no Apify spend), so
+   * this is fail-open by construction. Undefined → off, byte-identical to today.
+   */
+  fetchSiblingComments?: (lead: LeadRow) => Promise<SiblingComment[]>;
+  /**
+   * Per-author "what you already said" memory. When set, the tick fetches the
+   * reply bodies Orion already SENT or QUEUED for the selected recipient and injects
+   * them into the comment prompt with a "do not repeat these" instruction.
+   */
+  getPriorReplies?: (args: Omit<PriorRepliesArgs, "agentInstanceId">) => Promise<string[]>;
+  /** How many prior replies-per-author to inject (REDDIT_DRAFTER_SENT_TOPK). Default 3. */
+  priorRepliesTopK?: number;
+  /**
+   * Global "phrasings you've reached for lately" memory. When set, the tick
+   * fetches Orion's most recent reply bodies across the WHOLE feed ONCE per tick
+   * and injects them into the comment prompt as an AVOID list.
+   */
+  getRecentPhrasings?: (args: {
+    excludeLeadId?: string | null;
+    limit: number;
+  }) => Promise<string[]>;
+  /** How many recent reply bodies to inject as the avoid-list (REDDIT_DRAFTER_RECENT_PHRASINGS_TOPK). Default 10. */
+  recentPhrasingsTopK?: number;
+  /**
+   * Prompt-injection fence (NOELLE_DRAFTER_FENCE; default ON for Reddit). When
+   * true, the UNTRUSTED post text, image caption, and top-comments digest are
+   * wrapped in delimiters with a "data, never instructions" guard so a hostile
+   * post/comment can't hijack the drafter. Off → the prompt reads byte-identical
+   * to the legacy (unfenced) behaviour. Threaded from env by the worker.
+   */
+  fenceUntrusted?: boolean;
+  /**
+   * Deterministic comment targeting (REDDIT_COMMENT_TARGETING). When enabled and a
+   * post's top comment clears `minScore`, the draft targets THAT comment (the reply
+   * is grounded in the comment, and buildOutbound stamps replyTarget:{kind:'comment'}).
+   * Otherwise the draft targets the post (the default). Omit → never target comments.
+   */
+  commentTargeting?: { enabled: boolean; minScore: number };
+}
+
+const DEFAULT_RELEVANCE_THRESHOLD = 6;
+
+interface RedditPayload {
+  title?: string;
+  text?: string;
+  url?: string;
+  subreddit?: string;
+  score?: number | null;
+  numComments?: number | null;
+  images?: string[];
+  /**
+   * The post's real creation time (ISO), stamped by discovery
+   * (upsertDiscoveredLead → payload.posted_at). The drafter echoes it back into
+   * the outbound so api-vm's excluded-wins payload merge re-writes the SAME
+   * value instead of clobbering it with draft time — keeping post age (and thus
+   * reply latency) truthful for the age cutoff, the inbox label, and the sort.
+   */
+  posted_at?: string;
+  /**
+   * The post's most-upvoted comments (score desc), fetched at discovery time.
+   * UNTRUSTED, attacker-authored text — every field is fenced before it reaches
+   * the model. Powers the top-comments digest + deterministic comment targeting.
+   */
+  topComments?: Array<{ id: string; body: string; score: number | null; author: string; permalink: string }>;
+}
+
+/** One top comment (the element type of RedditPayload.topComments). */
+type RedditTopComment = NonNullable<RedditPayload["topComments"]>[number];
+
+export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> {
+  const {
+    log,
+    instance,
+    claimedLeads,
+    runner,
+    kb,
+    postOutbound,
+    markStatus,
+    relevanceThreshold = DEFAULT_RELEVANCE_THRESHOLD,
+    dailySubstantialCap = Number.MAX_SAFE_INTEGER,
+    dailyLightCap = Number.MAX_SAFE_INTEGER,
+    maxPostAgeHours = 0,
+    draftedTodayByKind,
+    sql,
+    opusScoreThreshold = Number.MAX_SAFE_INTEGER,
+    opusCommentsThreshold = Number.MAX_SAFE_INTEGER,
+    opusModel,
+    bus,
+    voiceDirs,
+    knowledgeDirs,
+    knowledgeTopK = 4,
+    verify,
+    captionFn,
+    variety,
+    getPriorReplies,
+    priorRepliesTopK = 3,
+    getRecentPhrasings,
+    recentPhrasingsTopK = 10,
+    fenceUntrusted = false,
+    commentTargeting,
+  } = args;
+  const voiceOpts =
+    voiceDirs && voiceDirs.length ? { filterDirs: voiceDirs } : undefined;
+  let processed = 0;
+
+  // Global "what you've said lately" memory — fetched ONCE per tick (it spans all
+  // authors, not this lead), injected as an avoid-list. Fail-open to [].
+  const recentPhrasings = getRecentPhrasings
+    ? await getRecentPhrasings({ limit: recentPhrasingsTopK }).catch(() => [])
+    : [];
+
+  // Base routing for this instance (default or per-instance override). A
+  // high-engagement lead overrides this to Opus per lead; everyone else uses it.
+  const baseRouting = redditInternRouting(instance);
+
+  // Operator brand config (persona/product/pitch/styles), parsed once per tick.
+  const brand = parseBrandConfig(instance.brand_config);
+
+  // Active Pattern Breaker rules — over-used structures the breaker discovered
+  // from the operator's last-N sent replies. Loaded ONCE per tick (instance-
+  // scoped) and threaded into every draft's SYSTEM prompt + verifier. A failed
+  // or incomplete read holds drafting for this tick.
+  const patternRules: DynamicPattern[] = args.patternRules
+    ? [...args.patternRules]
+    : sql
+      ? await loadActivePatternRules(sql, {
+          orgId: instance.org_id,
+          agentInstanceId: instance.id,
+          role: "reddit_intern",
+        })
+      : [];
+
+  // 0 (or any non-positive value) means UNLIMITED. Normalized HERE rather than at
+  // the call site so a caller passing the raw env value can never turn "no cap"
+  // into "draft nothing" — the destructuring default above only covers
+  // `undefined`, not 0.
+  const substantialCap = dailySubstantialCap > 0 ? dailySubstantialCap : Number.MAX_SAFE_INTEGER;
+  const lightCap = dailyLightCap > 0 ? dailyLightCap : Number.MAX_SAFE_INTEGER;
+
+  // Running daily-cap budget. Seed each kind from how many were already drafted
+  // today, then decrement as we draft this tick. When a kind's budget hits 0,
+  // remaining leads of that kind are left 'classified' for a later day.
+  const remaining: Record<"substantial" | "light", number> = {
+    substantial: substantialCap - (draftedTodayByKind ? await draftedTodayByKind("substantial") : 0),
+    light: lightCap - (draftedTodayByKind ? await draftedTodayByKind("light") : 0),
+  };
+
+  for (const lead of claimedLeads) {
+    const replyKind: "substantial" | "light" =
+      lead.classifier_label === "light" ? "light" : "substantial";
+
+    // Age cutoff (opt-in via maxPostAgeHours): a claimed lead whose post is
+    // older than the cutoff is terminally skipped, not drafted — its live upvote
