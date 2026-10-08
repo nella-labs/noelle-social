@@ -998,3 +998,175 @@ describe("POST /api/drafts/:id/unskip", () => {
 
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ error: "automatic_review_rejected" });
+    const updateCalls = (fakeSql as unknown as { __calls: SqlCall[] }).__calls.filter((call) =>
+      /update noelle\.approvals/i.test(call.text),
+    );
+    expect(updateCalls).toHaveLength(0);
+  });
+
+  it("still restores a manually skipped DM", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-dm-skipped",
+        org_id: "org-1",
+        draft_id: "draft-dm",
+        lead_id: null,
+        status: "skipped",
+        decided_at: "2026-09-20T00:00:00.000Z",
+        decided_by: "user-1",
+        lead_external_id: null,
+        draft_kind: "dm",
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-dm-skipped/unskip", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: "pending" });
+  });
+
+  it("409s when the approval was already sent (not reversible)", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-sent",
+        org_id: "org-1",
+        draft_id: "draft-y",
+        lead_id: "lead-y",
+        status: "sent",
+        decided_at: "2026-06-10T00:00:00.000Z",
+        lead_external_id: null,
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-sent/unskip", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(409);
+  });
+});
+
+
+describe("manual X reply reservations", () => {
+  const approval = { id: "appr-A", org_id: "org-1", draft_id: "draft-A", lead_id: "lead-1",
+    agent_instance_id: "owning-vega", status: "pending", decided_at: null, lead_external_id: "123" };
+  const sendRequest = { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ body: "a useful reply", edited: false }) };
+
+  it("dispatches only one of two concurrent Send requests", async () => {
+    const sql = makeFakeSql({ approval, siblingIds: [] });
+    let attempts = 0;
+    const app = await buildApp({ sql, xClient: makeXClientStub({ reply: async () => {
+      attempts++;
+      await Promise.resolve();
+      return { id: "456", url: "https://x.com/me/status/456" };
+    } }) });
+    const responses = await Promise.all([
+      app.request("/api/drafts/appr-A/send", sendRequest),
+      app.request("/api/drafts/appr-A/send", sendRequest),
+    ]);
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+    expect(attempts).toBe(1);
+  });
+
+  it.each([new XWriteUncertainError("response lost"), new Error("socket reset")])(
+    "retains an uncertain target reservation for %s", async (failure) => {
+      const sql = makeFakeSql({ approval, siblingIds: [] });
+      let attempts = 0;
+      const app = await buildApp({ sql, xClient: makeXClientStub({ reply: async () => {
+        attempts++;
+        throw failure;
+      } }) });
+      const first = await app.request("/api/drafts/appr-A/send", sendRequest);
+      expect(first.status).toBe(502);
+      expect(await first.json()).toMatchObject({ error: "x_write_uncertain" });
+      expect((await app.request("/api/drafts/appr-A/send", sendRequest)).status).toBe(409);
+      expect(attempts).toBe(1);
+    });
+
+  it("keeps a confirmed target reserved when receipt persistence fails", async () => {
+    const sql = makeFakeSql({ approval, siblingIds: [], txError: "database write failed" });
+    let attempts = 0;
+    const app = await buildApp({ sql, xClient: makeXClientStub({ reply: async () => {
+      attempts++;
+      return { id: "456", url: "https://x.com/me/status/456" };
+    } }) });
+    expect((await app.request("/api/drafts/appr-A/send", sendRequest)).status).toBe(500);
+    expect((await app.request("/api/drafts/appr-A/send", sendRequest)).status).toBe(409);
+    expect(attempts).toBe(1);
+  });
+
+  it("releases a definite rejection so the operator can retry", async () => {
+    const sql = makeFakeSql({ approval, siblingIds: [] });
+    let attempts = 0;
+    const app = await buildApp({ sql, xClient: makeXClientStub({ reply: async () => {
+      if (++attempts === 1) throw new XAuthError();
+      return { id: "456", url: "https://x.com/me/status/456" };
+    } }) });
+    expect((await app.request("/api/drafts/appr-A/send", sendRequest)).status).toBe(503);
+    expect((await app.request("/api/drafts/appr-A/send", sendRequest)).status).toBe(200);
+    expect(attempts).toBe(2);
+  });
+
+  it("looks up credentials only for the approval's owning X instance", async () => {
+    const sql = makeFakeSql({ approval, siblingIds: [] });
+    const app = await buildApp({ sql });
+    expect((await app.request("/api/drafts/appr-A/send", sendRequest)).status).toBe(200);
+    const lookup = (sql as unknown as { __calls: SqlCall[] }).__calls.find((call) =>
+      call.text.includes("select id, x_api_write_enabled"));
+    expect(lookup?.text).toMatch(/where id =/);
+    expect(lookup?.values).toContain("owning-vega");
+  });
+});
+
+
+describe("manual official API write accounting", () => {
+  const approval = { id: "appr-A", org_id: "org-1", draft_id: "draft-A", lead_id: "lead-1",
+    status: "pending", decided_at: null, lead_external_id: "123" };
+  const request = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ body: "reply", edited: false }) };
+
+  it("counts a human-authorized API write against the shared counter", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ data: { id: "456" } }), { status: 201 }));
+    const sql = makeFakeSql({ approval, siblingIds: [], apiWrite: true });
+    const app = await buildApp({ sql });
+    expect((await app.request("/api/drafts/appr-A/send", request)).status).toBe(200);
+    const reservation = (sql as unknown as { __calls: SqlCall[] }).__calls.find((call) => call.text.includes("insert into noelle.x_api_write_budget"));
+    expect(reservation?.values).toContain(true);
+    expect(reservation?.values).toContain("org-1");
+  });
+
+  it("refunds known rejection budget but keeps an ambiguous dispatched write charged", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 401 }));
+    const rejectedSql = makeFakeSql({ approval, siblingIds: [], apiWrite: true });
+    const rejectedApp = await buildApp({ sql: rejectedSql });
+    expect((await rejectedApp.request("/api/drafts/appr-A/send", request)).status).toBe(503);
+    expect((rejectedSql as unknown as { __calls: SqlCall[] }).__calls.some((call) => call.text.includes("update noelle.x_api_write_budget"))).toBe(true);
+    fetch.mockRejectedValue(new Error("response lost"));
+    const uncertainSql = makeFakeSql({ approval, siblingIds: [], apiWrite: true });
+    const uncertainApp = await buildApp({ sql: uncertainSql });
+    expect((await uncertainApp.request("/api/drafts/appr-A/send", request)).status).toBe(502);
+    expect((uncertainSql as unknown as { __calls: SqlCall[] }).__calls.some((call) => call.text.includes("update noelle.x_api_write_budget"))).toBe(false);
+  });
+
+  it("releases the undispatched target but retains unknown budget after reservation response loss", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected network call"));
+    const sql = makeFakeSql({ approval, siblingIds: [], apiWrite: true, budgetError: true });
+    const app = await buildApp({ sql });
+    const response = await app.request("/api/drafts/appr-A/send", request);
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({ error: "x_write_budget_unavailable" });
+    expect(fetch).not.toHaveBeenCalled();
+    const calls = (sql as unknown as { __calls: SqlCall[] }).__calls;
+    expect(calls.some((call) => call.text.includes("release_x_reply_claim"))).toBe(true);
+    expect(calls.some((call) => call.text.includes("update noelle.x_api_write_budget"))).toBe(false);
+  });
+});
