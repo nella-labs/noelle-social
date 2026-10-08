@@ -198,3 +198,203 @@ async function embedDocumentsBatched(
   base: VoyageContextEmbedOptions,
 ): Promise<Array<number[][] | null>> {
   const out: Array<number[][] | null> = new Array(documents.length).fill(null);
+  let i = 0;
+  while (i < documents.length) {
+    const batchDocs: string[][] = [];
+    const batchIdx: number[] = [];
+    let chars = 0;
+    while (i < documents.length) {
+      const doc = documents[i]!;
+      const docChars = doc.reduce((s, c) => s + c.length, 0);
+      // Always take at least one document; otherwise stop when the budget is hit.
+      if (batchDocs.length > 0 && chars + docChars > MAX_CONTEXT_EMBED_CHARS) break;
+      batchDocs.push(doc);
+      batchIdx.push(i);
+      chars += docChars;
+      i++;
+      if (chars >= MAX_CONTEXT_EMBED_CHARS) break;
+    }
+    const res = await voyageContextEmbed(batchDocs, base);
+    if (res.length === batchDocs.length) {
+      for (let k = 0; k < batchIdx.length; k++) out[batchIdx[k]!] = res[k]!;
+    }
+    // else: this batch failed open ([]) — its docs stay null.
+  }
+  return out;
+}
+
+function defaultVoyageEmbedder(cfg: {
+  model: string;
+  outputDimension: number;
+  apiKey?: string;
+  endpoint?: string;
+  fetchImpl?: typeof fetch;
+}): KbDenseEmbedder {
+  // Build the shared embed-option bag once (prune undefined for
+  // exactOptionalPropertyTypes). Credentials are still re-resolved per call
+  // inside voyageContextEmbed, so key rotation is handled.
+  const base: VoyageContextEmbedOptions = {
+    model: cfg.model,
+    outputDimension: cfg.outputDimension,
+  };
+  if (cfg.apiKey !== undefined) base.apiKey = cfg.apiKey;
+  if (cfg.endpoint !== undefined) base.endpoint = cfg.endpoint;
+  if (cfg.fetchImpl !== undefined) base.fetchImpl = cfg.fetchImpl;
+  return {
+    embedDocuments: (documents) => embedDocumentsBatched(documents, base),
+    embedQuery: (query) => voyageContextEmbedQuery(query, base),
+  };
+}
+
+/**
+ * Resolve the dense lane from explicit options merged over env defaults.
+ * Returns `null` when the lane is disabled — the factory then runs the
+ * unchanged pure-BM25 path. Resolved once at KB construction (matching how the
+ * services read their config); per-call credential freshness lives in the
+ * Voyage clients.
+ */
+function resolveKbDense(opts?: KbDenseOptions): ResolvedDense | null {
+  const enabled = opts?.enabled ?? envFlag(process.env["NOELLE_KB_DENSE"]);
+  if (!enabled) return null;
+
+  const model = opts?.model ?? process.env["NOELLE_KB_DENSE_MODEL"] ?? DEFAULT_DENSE_MODEL;
+  const outputDimension =
+    opts?.outputDimension ?? envPositiveInt(process.env["NOELLE_KB_DENSE_DIM"]) ?? DEFAULT_DENSE_DIM;
+  const embedder =
+    opts?.embedder ??
+    defaultVoyageEmbedder({
+      model,
+      outputDimension,
+      ...(opts?.apiKey !== undefined ? { apiKey: opts.apiKey } : {}),
+      ...(opts?.endpoint !== undefined ? { endpoint: opts.endpoint } : {}),
+      ...(opts?.fetchImpl !== undefined ? { fetchImpl: opts.fetchImpl } : {}),
+    });
+
+  const resolved: ResolvedDense = {
+    embedder,
+    rerank: opts?.rerank ?? envFlag(process.env["NOELLE_KB_DENSE_RERANK"]),
+    rrfK: opts?.rrfK ?? 60,
+    poolSize: opts?.poolSize ?? envPositiveInt(process.env["NOELLE_KB_DENSE_POOL"]) ?? DEFAULT_DENSE_POOL,
+  };
+  if (opts?.fetchImpl !== undefined) resolved.fetchImpl = opts.fetchImpl;
+  return resolved;
+}
+
+/** Group a flat chunk list into per-file documents (chunk bodies) plus, for
+ * each document, the flat indices of its chunks. Embedding a file's chunks
+ * together is what makes each vector context-aware. */
+function groupChunksByFile(chunks: ReadonlyArray<MarkdownChunk>): {
+  documents: string[][];
+  docChunkIndices: number[][];
+} {
+  const documents: string[][] = [];
+  const docChunkIndices: number[][] = [];
+  const byFile = new Map<string, number>();
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i]!;
+    let pos = byFile.get(c.filePath);
+    if (pos === undefined) {
+      pos = documents.length;
+      byFile.set(c.filePath, pos);
+      documents.push([]);
+      docChunkIndices.push([]);
+    }
+    documents[pos]!.push(c.body);
+    docChunkIndices[pos]!.push(i);
+  }
+  return { documents, docChunkIndices };
+}
+
+/**
+ * Embed the whole corpus (per-file, contextualized) and build the in-memory
+ * dense index. Fail-open: any error ⇒ `null`, and the KB serves pure BM25.
+ */
+async function buildDenseForCorpus(
+  chunks: ReadonlyArray<MarkdownChunk>,
+  dense: ResolvedDense,
+): Promise<DenseIndex | null> {
+  if (chunks.length === 0) return buildDenseIndex([]);
+  try {
+    const { documents, docChunkIndices } = groupChunksByFile(chunks);
+    const perDoc = await dense.embedder.embedDocuments(documents);
+    // Visibility for the #1 silent failure: the dense lane is ENABLED and the
+    // corpus is non-empty, yet the contextualized embed returned nothing. Almost
+    // always a mis-pointed VOYAGE_CONTEXT_ENDPOINT (a gateway that doesn't proxy
+    // /contextualizedembeddings) or a bad key — the embedder fail-opens to [] with
+    // no log, so every agent quietly runs pure BM25 while believing dense is on.
+    // Warn once per rebuild so it's diagnosable instead of invisible.
+    if (documents.length > 0 && perDoc.length === 0) {
+      console.warn(
+        "[kb-dense] voyage-context-4 returned no vectors for a non-empty corpus — " +
+          "the dense lane is SILENTLY falling back to BM25. Check VOYAGE_CONTEXT_ENDPOINT " +
+          "(must implement /contextualizedembeddings) and VOYAGE_CONTEXT_API_KEY/VOYAGE_API_KEY.",
+      );
+    }
+    const vectors: Array<number[] | null> = new Array(chunks.length).fill(null);
+    for (let d = 0; d < documents.length; d++) {
+      const docVecs = perDoc[d];
+      if (!docVecs) continue;
+      const idxs = docChunkIndices[d]!;
+      for (let c = 0; c < idxs.length; c++) {
+        const v = docVecs[c];
+        if (Array.isArray(v) && v.length > 0) vectors[idxs[c]!] = v;
+      }
+    }
+    return buildDenseIndex(vectors);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Gate-safety guarantee for hybrid mode. Mutates `ordered` so the chunk with
+ * the highest BM25 score sits within the first `topK` positions. This keeps
+ * `max(KbHit.score)` over the returned hits equal to the pure-BM25 maximum, so
+ * the drafter's relevance gate (which skips on `max(anchor.score) < threshold`)
+ * behaves identically whether or not the dense lane is on. Dense-only chunks
+ * carry score 0 and therefore can never raise — only fail to lower — the gate.
+ */
+function ensureTopBm25InWindow(
+  ordered: number[],
+  bm25Score: ReadonlyMap<number, number>,
+  topK: number,
+): void {
+  if (ordered.length <= topK || topK < 1) return;
+  let bestPos = -1;
+  let bestScore = -Infinity;
+  for (let p = 0; p < ordered.length; p++) {
+    const s = bm25Score.get(ordered[p]!) ?? 0;
+    if (s > bestScore) {
+      bestScore = s;
+      bestPos = p;
+    }
+  }
+  if (bestPos < topK) return; // already inside the returned window
+  const [best] = ordered.splice(bestPos, 1);
+  ordered.splice(topK - 1, 0, best!);
+}
+
+/**
+ * Hybrid search: fuse the BM25 lexical ranking with the dense contextualized
+ * ranking (RRF), optionally rerank the fused top pool, then project to KbHits.
+ *
+ * Fail-open: the dense lane only adds signal. A failed query-embed yields no
+ * dense ranking and the result collapses to BM25 order; a rerank error keeps
+ * the fused order. The reported score is the chunk's BM25 score (0 for a
+ * dense-only chunk) so the relevance gate is unaffected (see
+ * `ensureTopBm25InWindow`).
+ */
+async function hybridSearch(
+  built: BuiltIndex,
+  dense: ResolvedDense,
+  query: string,
+  topK: number,
+  filterDirs: string[] | undefined,
+): Promise<KbHit[]> {
+  if (!built.dense) return [];
+  // Pool must be at least as wide as the pure path would scan, so hybrid never
+  // sees fewer BM25 candidates (and the gate's max BM25 score is preserved).
+  const pool = Math.max(dense.poolSize, scopedCandidateTopK(topK, filterDirs));
+
+  // --- BM25 lane: keep each hit's score (for the gate) + highlights (snippet).
+  const bm25 = built.index.search(query, pool);
