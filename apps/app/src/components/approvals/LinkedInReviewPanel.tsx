@@ -198,3 +198,113 @@ function Variant({
   const original = view.body ?? "";
   const copied = copiedKey === view.approvalId;
   // Manual edits persist before copy or acknowledgment so the selected body
+  // remains available to the existing learning path.
+  const [draft, setDraft] = React.useState<string>(original);
+  const seededFor = React.useRef<string>(original);
+  React.useEffect(() => {
+    if (seededFor.current !== original) {
+      seededFor.current = original;
+      setDraft(original);
+    }
+  }, [original]);
+  const edited = draft !== original;
+
+  const [editError, setEditError] = React.useState<string | null>(null);
+  const [copyPending, startCopy] = React.useTransition();
+  const persistEdit = async () => {
+    setEditError(null);
+    if (!edited) return true;
+    if (!draft.trim()) { setEditError("The draft is empty."); return false; }
+    try {
+      const res = await saveDraftEdit({ orgSlug, approvalId: view.approvalId, body: draft });
+      if (!res.ok) setEditError(res.error.message);
+      return res.ok;
+    } catch {
+      setEditError("Couldn't save the edit — retry before recording a send.");
+      return false;
+    }
+  };
+
+  return (
+    <div className="angle" style={{ cursor: "default" }}>
+      <h4>
+        <span className="num">{isDM ? "DM" : `0${index + 1}`}</span>
+        <span>{label}</span>
+        {edited ? (
+          <span className="tag" style={{ color: "var(--accent)", fontSize: 10.5 }}>
+            edited
+          </span>
+        ) : null}
+        {!isDM ? (
+          <StyleSourceBadge
+            styleSource={view.styleSource}
+            className="tag tag-info"
+            style={{ fontSize: 10 }}
+          />
+        ) : null}
+        <span style={{ marginLeft: "auto", color: "var(--ink-soft)" }}>
+          {draft.length} chars
+        </span>
+      </h4>
+      <textarea
+        className="input"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        rows={isDM ? 4 : 3}
+        spellCheck
+        aria-label={isDM ? "Editable DM body" : "Editable reply body"}
+        placeholder="Edit the draft before you copy + send it…"
+        style={{
+          width: "100%",
+          minHeight: isDM ? 96 : 72,
+          resize: "vertical",
+          fontSize: 14,
+          lineHeight: 1.5,
+          fontFamily: "inherit",
+          whiteSpace: "pre-wrap",
+        }}
+      />
+      <div
+        style={{
+          display: "flex",
+          gap: 10,
+          marginTop: 14,
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={() => startCopy(async () => {
+            if (await persistEdit()) await copy(draft, view.approvalId);
+          })}
+          disabled={copyPending || !draft.trim()}
+          title="Copy this draft. Mark sent after you send it on LinkedIn."
+        >
+          {copied ? "Copied ✓" : copyPending ? "Saving…" : "Copy"}
+        </button>
+        {edited ? (
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={() => setDraft(original)}
+            title="Discard your edit and restore Lyra's original draft"
+          >
+            Reset to draft
+          </button>
+        ) : null}
+        <span className="grow-phone" style={{ marginLeft: "auto" }}>
+          <MarkSentButton
+            orgSlug={orgSlug}
+            approvalId={view.approvalId}
+            nextHref={nextHref}
+            listHref={listHref}
+            beforeMarkSent={persistEdit}
+          />
+        </span>
+      </div>
+      {editError ? <span role="status" className="tag" style={{ color: "var(--danger)" }}>{editError}</span> : null}
+    </div>
+  );
+}
