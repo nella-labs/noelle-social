@@ -198,3 +198,64 @@ export async function claimRelationshipDmCandidates(
         where request_id = ${request.id} and status = 'reserved'`;
       if (Number(pending?.count ?? 0) === 0) {
         await tx`update noelle.relationship_dm_requests
+          set status = 'done', reason = coalesce(reason, 'No eligible saved-context recipients matched this request'), completed_at = now()
+          where id = ${request.id}`;
+      }
+    }
+    const out: RelationshipDmCandidate[] = [];
+    for (const row of rows)
+      out.push({
+        reservationId: row.reservation_id,
+        requestId: row.request_id,
+        authorId: row.author_id ?? row.author_handle,
+        authorHandle: row.author_handle,
+        name: row.name,
+        profileUrl: row.profile_url ?? defaultProfileUrl(args.platform, row.author_handle),
+        context: await relationshipEvidence(tx, {
+          orgId: args.orgId,
+          platform: args.platform,
+          authorHandle: row.author_handle,
+          authorId: row.author_id,
+        }),
+      });
+    return out;
+  });
+}
+
+export async function markRelationshipDmResult(
+  sql: Sql,
+  args: {
+    orgId: string;
+    reservationId: string;
+    status: "queued" | "skipped" | "failed";
+    reason?: string | undefined;
+    judgeVerdict?: { pass: boolean; reason: string; judgeProvider?: "jev" | "legacy" | "none"; judgeOk?: boolean } | undefined;
+  },
+): Promise<void> {
+  const verdict = args.judgeVerdict ?? (args.reason ? { pass: false, reason: args.reason } : null);
+  await sql.begin(async (tx) => {
+    const rows = await tx<{ request_id: string | null }[]>`
+      update noelle.relationship_dm_reservations
+      set status = ${args.status}, reason = ${args.reason ?? null},
+        judge_verdict = ${verdict ? JSON.stringify(verdict) : null}::jsonb,
+        updated_at = now()
+      where org_id = ${args.orgId} and id = ${args.reservationId} and status = 'reserved'
+      returning request_id::text`;
+    const requestId = rows[0]?.request_id;
+    if (!requestId) return;
+    await tx`
+      update noelle.relationship_dm_requests
+      set processed_count = processed_count + 1,
+        queued_count = queued_count + case when ${args.status} = 'queued' then 1 else 0 end,
+        skipped_count = skipped_count + case when ${args.status} = 'skipped' then 1 else 0 end,
+        failed_count = failed_count + case when ${args.status} = 'failed' then 1 else 0 end,
+        status = case when processed_count + 1 >= requested_count then 'done' else 'running' end,
+        completed_at = case when processed_count + 1 >= requested_count then now() else completed_at end,
+        reason = coalesce(${args.reason ?? null}, reason)
+      where org_id = ${args.orgId} and id = ${requestId}`;
+  });
+}
+
+function defaultProfileUrl(platform: RelationshipDmPlatform, handle: string): string {
+  return platform === "x" ? `https://x.com/${handle}` : `https://www.linkedin.com/in/${handle}/`;
+}
