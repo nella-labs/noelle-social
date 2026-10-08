@@ -3998,3 +3998,203 @@ export async function listPendingLinkedInApprovals(
     left join noelle.leads  l on l.id = d.lead_id
     left join noelle.linkedin_watchlist_people wp
       on wp.agent_instance_id = a.agent_instance_id
+     and wp.fsd_profile_id = l.author_id
+    where a.agent_instance_id = ${inst.id}
+      and (${status} = 'all' or a.status = ${status})
+      and (${watchlist} = 'all'
+           or (${watchlist} = 'only' and l.priority = true)
+           or (${watchlist} = 'exclude' and (l.priority is null or l.priority = false)))
+      and (${lastBatchSince}::timestamptz is null
+           or a.created_at >= ${lastBatchSince}::timestamptz)
+    order by
+      case when ${sort} = 'oldest' then a.created_at end asc nulls last,
+      a.created_at desc
+    limit ${limit}
+  `;
+  const views = rows
+    .map(toLinkedInApprovalView)
+    .filter((v) => v.body != null && v.body.trim().length > 0);
+  // Collapse to one entry per author+post (keyed by approval's lead via publicId
+  // + postText), preferring a reply. We key on the source post so the 3 reply
+  // angles + the DM for one post become a single inbox row.
+  return opts.dedupe === false ? views : dedupeLinkedInByPost(views);
+}
+
+/** One entry per source post, reply preferred over DM. Preserves order. */
+function dedupeLinkedInByPost(views: LinkedInApprovalView[]): LinkedInApprovalView[] {
+  const seen = new Map<string, LinkedInApprovalView>();
+  const out: LinkedInApprovalView[] = [];
+  for (const v of views) {
+    const key = `${v.authorPublicId ?? ""}::${v.postUrl ?? v.postText ?? v.approvalId}`;
+    const existing = seen.get(key);
+    if (!existing) {
+      seen.set(key, v);
+      out.push(v);
+      continue;
+    }
+    if (existing.kind === "dm" && v.kind === "reply") {
+      const idx = out.indexOf(existing);
+      if (idx !== -1) out[idx] = v;
+      seen.set(key, v);
+    }
+  }
+  return out;
+}
+
+/** Person identity for a LinkedIn view: public id first, then display name. */
+function linkedinPersonKey(v: LinkedInApprovalView): string | null {
+  return v.authorPublicId ?? v.authorName ?? null;
+}
+
+/** Post recency for a LinkedIn view: posted_at, falling back to approval time. */
+function linkedinPostedAtMs(v: LinkedInApprovalView): number {
+  const raw = v.postedAt ?? v.createdAt;
+  const t = raw ? Date.parse(raw) : NaN;
+  return Number.isFinite(t) ? t : 0;
+}
+
+/**
+ * Collapse each connection down to just their most-recent post.
+ *
+ * Lyra reacts to every post from every watched connection, so an active person
+ * can fill the inbox with several drafts at once. With this on, we keep one
+ * post-row per person — the newest by the post's `posted_at` (falling back to
+ * the approval's created_at). Ties keep whichever the input ordered first.
+ * Views with no resolvable person identity pass through untouched.
+ *
+ * Input is the already-per-post-deduped view list (dedupeLinkedInByPost), so
+ * this is the second, person-level collapse layered on top of it.
+ */
+export function keepLatestLinkedInPostPerPerson(
+  views: LinkedInApprovalView[],
+): LinkedInApprovalView[] {
+  const newestByPerson = new Map<string, number>();
+  for (const v of views) {
+    const k = linkedinPersonKey(v);
+    if (!k) continue;
+    const t = linkedinPostedAtMs(v);
+    const best = newestByPerson.get(k);
+    if (best == null || t > best) newestByPerson.set(k, t);
+  }
+  const emitted = new Set<string>();
+  return views.filter((v) => {
+    const k = linkedinPersonKey(v);
+    if (!k) return true;
+    if (linkedinPostedAtMs(v) !== newestByPerson.get(k)) return false;
+    if (emitted.has(k)) return false;
+    emitted.add(k);
+    return true;
+  });
+}
+
+/**
+ * Like keepLatestLinkedInPostPerPerson, but keeps EVERY row of each person's
+ * newest post — not just one. Use this on the un-deduped view list that feeds
+ * the Speedrun (one view per reply angle / DM), where dropping all but one row
+ * would strip a post's other angles. Keeps every view whose post time matches
+ * its author's newest, so toLinkedInSpeedrunDrafts still groups a full card.
+ */
+export function keepLatestLinkedInPostRowsPerPerson(
+  views: LinkedInApprovalView[],
+): LinkedInApprovalView[] {
+  const newestByPerson = new Map<string, number>();
+  for (const v of views) {
+    const k = linkedinPersonKey(v);
+    if (!k) continue;
+    const t = linkedinPostedAtMs(v);
+    const best = newestByPerson.get(k);
+    if (best == null || t > best) newestByPerson.set(k, t);
+  }
+  return views.filter((v) => {
+    const k = linkedinPersonKey(v);
+    if (!k) return true;
+    return linkedinPostedAtMs(v) === newestByPerson.get(k);
+  });
+}
+
+/** Full LinkedIn approval detail: the clicked approval + all its post siblings. */
+export interface LinkedInApprovalDetail {
+  /** The representative approval (the one in the URL). */
+  primary: LinkedInApprovalView;
+  /** Every reply angle for the same post (each its own approval), pending-first order. */
+  replies: LinkedInApprovalView[];
+  /** The DM for the same post, if one was drafted. */
+  dm: LinkedInApprovalView | null;
+  /** The owning agent instance id (for revalidation / links). */
+  instanceId: string;
+  /**
+   * Relationship-scout verdict for this post's author (noelle.leads.vip_signal),
+   * or null when the scout didn't flag them. Surfaced as a loud banner above the
+   * draft so the operator pauses before "Mark sent" on a high-leverage person.
+   */
+  vipSignal: VipSignal | null;
+}
+
+/**
+ * One LinkedIn approval by id, with every sibling approval for the same post
+ * (the 3 reply angles + the DM are separate approval rows). Tenancy: fetches
+ * the approval's org first, then assertMember before returning anything.
+ */
+export async function getLinkedInApprovalDetail(
+  approvalId: string,
+): Promise<LinkedInApprovalDetail | null> {
+  const userId = await getRequiredUserId();
+
+  // Resolve the approval's org + instance + lead first (one round trip), then
+  // guard membership on the resolved org_id.
+  const head = await readSql<Array<{ org_id: string; agent_instance_id: string; lead_id: string | null }>>`
+    select a.org_id, a.agent_instance_id, d.lead_id
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    where a.id = ${approvalId}
+    limit 1
+  `;
+  const h = head[0];
+  if (!h) return null;
+  await assertMember(h.org_id, userId);
+
+  // Pull every approval tied to the same lead (all reply angles + the DM). When
+  // the approval has no lead (shouldn't happen for a drafter row, but guard it),
+  // fall back to just the clicked approval.
+  const rows = await readSql<LinkedInJoinedRow[]>`
+    select
+      a.id            as approval_id,
+      a.status        as status,
+      a.created_at    as created_at,
+      d.payload       as draft_payload,
+      l.payload       as lead_payload,
+      l.author_handle as lead_author_handle,
+      l.vip_signal    as lead_vip_signal,
+      wp.name         as wp_name,
+      wp.headline     as wp_headline
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    left join noelle.linkedin_watchlist_people wp
+      on wp.agent_instance_id = a.agent_instance_id
+     and wp.fsd_profile_id = l.author_id
+    where a.agent_instance_id = ${h.agent_instance_id}
+      and (${h.lead_id}::uuid is not null and d.lead_id = ${h.lead_id}
+           or a.id = ${approvalId})
+    order by a.created_at asc
+  `;
+  const views = rows
+    .map(toLinkedInApprovalView)
+    .filter((v) => v.body != null && v.body.trim().length > 0);
+  if (views.length === 0) return null;
+
+  const primary =
+    views.find((v) => v.approvalId === approvalId) ??
+    views.find((v) => v.kind === "reply") ??
+    views[0];
+  const replies = views.filter((v) => v.kind === "reply");
+  const dm = views.find((v) => v.kind === "dm") ?? null;
+
+  // All siblings share one lead, so the scout verdict is the same on each — take
+  // the primary's (fall back to any sibling that carries it).
+  const vipSignal =
+    primary.vipSignal ?? views.find((v) => v.vipSignal != null)?.vipSignal ?? null;
+
+  return { primary, replies, dm, instanceId: h.agent_instance_id, vipSignal };
+}
+
