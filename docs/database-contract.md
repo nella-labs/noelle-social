@@ -398,3 +398,127 @@ create table noelle.worker_runs (
   rows_processed  integer      not null default 0 check (rows_processed >= 0),
   error_message   text         null
 );
+
+create index worker_runs_kind_finished_at_idx
+  on noelle.worker_runs (kind, finished_at desc nulls last);
+```
+
+---
+
+### 2.10 `noelle.video_recording_briefs`
+
+Added by migration `0080_video_recording_briefs.sql`. One phone-readable **recording brief** per operator-approved video draft, produced by Nova's sixth worker, the **`briefer`** (the "media intern"). The briefer claims `video_drafts` with `status='ready'` that have no brief yet, generates a structured brief through the same text seam as the scripter, renders it to markdown, and writes one row here. It only reads `ready` drafts and writes this table — it never mutates the ideas→drafts pipeline.
+
+Key columns: `draft_id` (**unique**, FK → `video_drafts` on delete cascade — one brief per draft; a manual regenerate overwrites), `idea_id`, `platform`, `runtime_target` (seconds), `brief` (jsonb — the structured `RecordingBriefOutput`), `brief_md` (the ≤600-word markdown), `forge_followups` (int, the count of on-the-day notes flagged `forgeWouldHelp` — computed deterministically by the tick, not the model), `source_engine`/`model`, `status` (default `ready`). Indexes: `(agent_instance_id, created_at desc)` + the unique `draft_id`. `grant … to noelle_app`; `tg_set_updated_at` trigger.
+
+Gated by the `NOELLE_BRIEFER` flag (default **OFF**): the table exists but stays empty until the briefer worker is enabled. Supersedes the never-deployed Paperclip `media-intern`.
+
+---
+
+### 2.11 `noelle.work_queue`
+
+Added by migration `0087_work_queue.sql`. The durable job queue behind `PgWorkQueue` (`packages/runtime/src/queue.ts`) — the retry / dead-letter / orphan-reclaim primitive described in `docs/scalability.md` § Pluggable WorkQueue. One table serves every logical queue, discriminated by the `queue` column; jobs are an opaque `job jsonb` payload.
+
+Key columns: `queue` (logical queue name), `seq` (identity — FIFO total order, tie-breaks `available_at` collisions), `job` (jsonb payload — always written via `($n::text)::jsonb` and read via `job::text`, see the double-encode note in queue.ts), `key` (optional idempotency key; partial unique index on `(queue, key)` makes a duplicate enqueue a no-op), `attempts` (incremented at claim), `available_at` (earliest next delivery), `claim_id` + `claimed_until` (the live claim token and its TTL — an expired claim makes the row claimable again, which is the orphan-reclaim path for workers that die mid-job), `dead_at` (dead-lettered: stamped by `nack` when attempts exhaust the queue's `maxAttempts`, or lazily by the next `claim()` for exhausted orphans that never got a nack). Claim hot path is served by the partial index `(queue, available_at, seq) where dead_at is null`.
+
+Tenant scoping stays in app code, same as every table here: callers run `assertOrgMember` before enqueueing, and per-org claim fairness reads `job->>'org_id'` via `ClaimOptions.perKeyMax`. `grant select, insert, update, delete … to noelle_app`. As of 0087 no production worker enqueues into it yet — the existing per-table status-transition claims still run the pipeline; this is the primitive for moving them over.
+
+---
+
+## 3. Shared functions
+
+### 3.1 `noelle.tg_set_updated_at()`
+
+```sql
+create or replace function noelle.tg_set_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+```
+
+### 3.2 Lead claim RPC (today)
+
+The drafter (and classifier) claim leads in batches using `FOR UPDATE SKIP LOCKED`. The function lives in the database for atomicity. Its return shape includes the `priority` column (added in `0018_x_watchlist_people.sql`, via DROP + CREATE since the return type changed) so the drafter can skip its relevance gate for watchlist leads:
+
+```sql
+create function noelle.claim_leads_for_drafting(
+  p_agent_instance_id uuid,
+  p_batch             integer
+)
+returns table (
+  id                uuid,
+  external_id       text,
+  payload           jsonb,
+  author_handle     text,
+  author_id         text,
+  tier              text,
+  classifier_label  text,
+  classifier_score  numeric,
+  status            text,
+  priority          boolean
+)
+language sql
+as $$
+  update noelle.leads
+  set status = 'drafting', updated_at = now()
+  where id in (
+    select id from noelle.leads
+    where agent_instance_id = p_agent_instance_id
+      and status = 'classified'
+    order by created_at asc
+    for update skip locked
+    limit p_batch
+  )
+  returning id, external_id, payload, author_handle, author_id, tier,
+            classifier_label, classifier_score, status, priority;
+$$;
+```
+
+Notes: parameter is `p_batch` (no default); it's `language sql` (not plpgsql) and scopes by `agent_instance_id` only (the instance is already org-bound). The `priority` column was added to the return list in `0018_x_watchlist_people.sql` via DROP + CREATE (return-type change). `security definer` was only useful when RLS was on; without RLS it's plain `security invoker`. Phase 5 replaces these claim functions with Pub/Sub subscriptions on `noelle.leads.classified`, `noelle.drafts.created`, etc.
+
+**Reply freshness (`0088_reply_freshness_rpcs.sql`).** Both `claim_leads_for_drafting` and `claim_watchlist_leads_for_drafting` gained a **trailing `p_max_age_hours integer default null`** 3rd argument (DROP + CREATE — the return type is unchanged, but the arity is not). The default makes this backward-compatible: the existing **2-arg callers (Orion/reddit + Lyra/linkedin interns) resolve to the new function with `p_max_age_hours = null`** and keep byte-identical behavior, including the keyword lane's `created_at asc` ordering. Only Vega/x-intern passes the 3rd arg (`X_REPLY_MAX_AGE_HOURS`, default **25**): a set ceiling (a) drops candidate leads whose target tweet's own `payload->>'posted_at'` is older than the ceiling (fail-open on undateable posts) and (b) flips the keyword lane to **freshest-posted-first** — a reply account must serve live conversations before stale backlog; starvation of skipped-over leads is handled by the drafter's `expireStaleClassifiedLeads` sweep, not by oldest-first ordering. **Deploy order: apply 0088 BEFORE the x-intern code that passes the 3rd arg merges** (migrations are hand-applied first anyway — see § 6). The **drafter** (which always ticks, incl. paused instances) runs the same-ceiling `expireStaleApprovals` sweep (`lib/send-db.ts`) that flips aged-out pending/limbo reply approvals to the terminal `status='expired'`. The live reply path is the **browser actuator**, not the API send worker, so `apps/api-vm` `GET /api/actionable-x` reads the SAME `X_REPLY_MAX_AGE_HOURS` (default 25) and withholds any reply whose target tweet aged out — the definitive freshness gate at the actuation point.
+
+---
+
+## 4. App-layer tenancy (replaces RLS)
+
+`packages/runtime/src/tenancy.ts` exports `assertOrgMember(client, { orgId, userId })`. Every server-side caller invokes it before touching `noelle.*`. The function:
+
+1. Runs `select 1 from noelle.org_members where org_id = $orgId and user_id = $userId`.
+2. Throws `OrgMembershipError` if the row is missing.
+
+Callers:
+
+- **`apps/app` server actions and RSC fetchers** — verify JWT in middleware → extract `sub` → `assertOrgMember` → query.
+- **`apps/api-vm` Hono routes** — verify JWT (Supabase JWKS) → extract `sub` → `assertOrgMember` → query.
+- **Worker pool on `noelle-vm-0`** — workers act on behalf of an agent instance, not a user. They use the (org_id, agent_instance_id) ownership invariant directly: a worker only ever queries rows with the (org_id, agent_instance_id) it was assigned at boot. There is no per-user tenancy check because workers aren't user-driven.
+
+There is no fallback path. If `assertOrgMember` is skipped, the query still works at the DB level — that's the whole risk. CI tests in `apps/app` and `apps/api-vm` lint for the presence of `assertOrgMember` before any `noelle.*` query (see [testing.md](testing.md)).
+
+---
+
+## Migrations and initialization
+
+Use the managed CLI's `migrate` command. It reads migrations in filename order and records applied filenames in `noelle.schema_migrations`. Keep historical filenames stable: a restored installation may already have them in its ledger.
+
+Personal historical seed files remain as no-op ledger entries. A fresh `init` creates the configured operator and workspace, then four paused platform profiles with publication disabled. It does not seed personal contacts or management roles. Migration `0127` archives legacy management profiles without deleting their data.
+
+Existing saved installations keep their configuration. Apply updates through the documented managed commands; do not run ad hoc seed SQL against a live installation.
+
+## Runtime access
+
+Use the installation's configured `NOELLE_DATABASE_URL`. Keep database credentials in its private runtime configuration, outside git. Remote PostgreSQL requires the hosting provider's network and TLS settings; no repository IP or project identifier provisions that access.
+
+Back up the database and private installation configuration before restoration or destructive cleanup. A source checkout is not a database backup. See [the runbook](runbook.md) and [secrets](secrets.md).
+
+## Related contracts
+
+- [Architecture](architecture.md)
+- [Social profile model](agent-model.md)
+- [Vaults and retrieval](vault.md)
+- [Disposable database testing](testing.md)
