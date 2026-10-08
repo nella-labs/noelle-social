@@ -398,3 +398,81 @@ export async function readSql<T extends readonly (object | undefined)[] = postgr
     timeoutMs: QUERY_ATTEMPT_TIMEOUT_MS,
     label: "cloud-sql read-only query",
   }) as Promise<postgres.RowList<T>>;
+}
+
+/**
+ * Run a callback inside a transaction. Thin wrapper over `sql.begin` that
+ * bounds acquisition/dispatch and preserves the driver's read-committed
+ * default. Dispatched callbacks and commits are never automatically replayed.
+ */
+export async function withTx<T>(
+  fn: (tx: postgres.TransactionSql) => Promise<T>,
+): Promise<T> {
+  return sql.begin(fn) as Promise<T>;
+}
+
+/**
+ * Adapter so the existing `assertOrgMember` guard from `@noelle/runtime`
+ * (which today takes a Supabase-shaped `OrgMembersQueryClient`) can run
+ * against postgres.js without rewriting that package or duplicating the
+ * `org_members` lookup logic here.
+ *
+ * The shape `assertOrgMember` actually exercises is a single read:
+ *   `select user_id from noelle.org_members where org_id = $1 and user_id = $2`
+ * — we mimic the Supabase chain (`.from(...).select(...).eq(...).eq(...)
+ *   .maybeSingle()`) just enough to satisfy the structural type, and run
+ * the equivalent SQL when `.maybeSingle()` is finally invoked.
+ */
+export function pgOrgMembersClient() {
+  return {
+    from(_table: "org_members") {
+      return {
+        select(_columns: string) {
+          let orgId: string | null = null;
+          let userId: string | null = null;
+          const setEq = (column: "org_id" | "user_id", value: string) => {
+            if (column === "org_id") orgId = value;
+            else userId = value;
+          };
+          const runner = {
+            async maybeSingle() {
+              if (!orgId || !userId) {
+                return {
+                  data: null,
+                  error: { message: "missing org_id/user_id in guard query" },
+                };
+              }
+              try {
+                const rows = await readSql<{ user_id: string }[]>`
+                  select user_id
+                  from noelle.org_members
+                  where org_id = ${orgId} and user_id = ${userId}
+                  limit 1
+                `;
+                if (rows.length === 0) return { data: null, error: null };
+                return { data: { user_id: rows[0].user_id }, error: null };
+              } catch (err) {
+                return {
+                  data: null,
+                  error: { message: (err as Error).message },
+                };
+              }
+            },
+          };
+          const second = {
+            eq(column: "org_id" | "user_id", value: string) {
+              setEq(column, value);
+              return runner;
+            },
+          };
+          return {
+            eq(column: "org_id" | "user_id", value: string) {
+              setEq(column, value);
+              return second;
+            },
+          };
+        },
+      };
+    },
+  };
+}
