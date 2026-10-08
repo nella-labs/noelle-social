@@ -798,3 +798,203 @@ actuator.post("/api/actuator/claim-comment/:id", async (c) => {
       return c.json({ claimed: false, reason: "not-eligible" });
     }
     const comment = buildActionable([row], undefined, { requireVerify: true, voiceFloor }).comments[0];
+    const activityUrn = comment?.target.activity_urn;
+    if (!activityUrn) return c.json({ claimed: false, reason: "not-eligible" });
+
+    const rawWriteCap = (process.env.NOELLE_LINKEDIN_DAILY_WRITE_CAP ?? "").trim();
+    const writeCap = Number(rawWriteCap);
+    const outcome = await reserveLinkedInBrowserReply(sql, {
+      orgId, instanceId: row.cap_instance_id, approvalId, draftId: row.draft_id, leadId: row.lead_id,
+      activityUrn, body: comment.body, draftPayload: row.draft_payload, leadPayload: row.lead_payload,
+      voiceFloor, combinedWriteCap: rawWriteCap !== "" && Number.isFinite(writeCap) ? writeCap : null,
+    });
+    return c.json(outcome === "claimed" ? { claimed: true } : { claimed: false, reason: outcome });
+  } catch (err) {
+    console.error("[actuator] comment claim failed; withholding send", err);
+    return c.json({ claimed: false, reason: "claim-unavailable" }, 503);
+  }
+});
+
+actuator.use("/api/drafts/:id/approve-dm", requireActuatorToken);
+
+actuator.post("/api/drafts/:id/approve-dm", async (c) => {
+  const { orgId } = c.get("actuator");
+  const draftId = c.req.param("id");
+  const sql = noelleDb();
+  const rows = await sql<Array<{ id: string }>>`
+    update noelle.drafts d
+    set payload = coalesce(d.payload, '{}'::jsonb) || '{"dm_send_approved": true}'::jsonb
+    from noelle.approvals a, noelle.agent_instances ai
+    where d.id = ${draftId}
+      and a.draft_id = d.id
+      and ai.id = a.agent_instance_id
+      and ai.org_id = ${orgId}
+      and coalesce(d.payload->>'kind', 'reply') = 'dm'
+    returning d.id
+  `;
+  if (rows.length === 0) return c.json({ error: "not_found_or_not_dm" }, 404);
+  return c.json({ draft_id: draftId, dm_send_approved: true });
+});
+
+actuator.use("/api/linkedin-activity", requireActuatorToken);
+
+actuator.post("/api/linkedin-activity", async (c) => {
+  const { orgId } = c.get("actuator");
+  const body = LinkedInActivityInSchema.parse(await c.req.json());
+  const sql = noelleDb();
+  const values = body.events.map((e) => ({
+    org_id: orgId,
+    session_id: body.session_id,
+    type: e.type,
+    approval_id: e.approval_id ?? null,
+    activity_urn: e.activity_urn ?? null,
+    author_name: e.author_name ?? null,
+    reason: e.reason ?? null,
+    // e.reaction (the specific LinkedIn reaction on a like) is accepted by the
+    // schema and surfaced in the extension panel, but intentionally NOT persisted
+    // here — no column for it yet. Add one + map it if reaction analytics are wanted.
+  }));
+  await sql`insert into noelle.linkedin_activity ${sql(values)}`;
+  return c.json({ inserted: values.length });
+});
+
+// POST /api/actuator/mark-sent/:id — actuator-token-guarded. The browser
+// extension calls this (NOT the JWT /api/drafts/:id/mark-sent) after it
+// successfully posts a comment or DM to LinkedIn. The :id param is an
+// approval_id (not draft_id). Tenancy is verified before acting: we confirm
+// the approval belongs to the actuator-configured org before calling the
+// shared markApprovalSent core, which is identical to the JWT path's
+// transaction. decidedBy is set to the orgId (uuid, type-compatible with
+// decided_by text/uuid column).
+
+actuator.use("/api/actuator/mark-sent/:id", requireActuatorToken);
+
+actuator.post("/api/actuator/mark-sent/:id", async (c) => {
+  const { orgId } = c.get("actuator");
+  const approvalId = c.req.param("id");
+  const sql = noelleDb();
+
+  // Verify the approval belongs to the actuator org before acting (tenancy).
+  const owns = await sql<Array<{ id: string }>>`
+    select a.id
+    from noelle.approvals a
+    join noelle.agent_instances ai on ai.id = a.agent_instance_id
+    where a.id = ${approvalId}
+      and ai.org_id = ${orgId}
+    limit 1
+  `;
+  if (owns.length === 0) return c.json({ error: "not_found" }, 404);
+
+  const res = await markApprovalSent(sql, { approvalId, orgId, decidedBy: orgId, sentVia: "extension" });
+  if (!res.ok) {
+    return c.json({ error: res.error, detail: res.detail }, res.status);
+  }
+  // The approval is already sent. Keep the claim as a permanent post-level
+  // record; the status only records that the browser acknowledged the send.
+  // A failed status update cannot safely undo the sent approval or release it.
+  try {
+    await sql`
+      update noelle.linkedin_reply_claims
+      set status = 'sent', sent_at = coalesce(sent_at, now())
+      where org_id = ${orgId} and approval_id = ${approvalId} and status = 'claimed'
+    `;
+  } catch (err) {
+    console.error("[actuator] claim sent-state update failed; claim remains reserved", err);
+  }
+  return c.json(res.result);
+});
+
+// POST /api/actuator/mark-skipped/:id — actuator-token-guarded. The extension
+// calls this when a comment/DM target is PERMANENTLY gone ("This post cannot be
+// displayed" / deleted profile). Nothing was posted, so it must NOT markSent —
+// but the approval must leave the queue, else `buildActionable` (status='pending')
+// re-serves the dead permalink on every future run and the actuator re-navigates
+// to it and drops it again, forever. Sets status='skipped' (a normal terminal
+// state) ONLY while still pending, so it can never clobber a 'sent'/'errored' row.
+// :id is an approval_id. Tenancy verified before acting, exactly like mark-sent.
+actuator.use("/api/actuator/mark-skipped/:id", requireActuatorToken);
+
+actuator.post("/api/actuator/mark-skipped/:id", async (c) => {
+  const { orgId } = c.get("actuator");
+  const approvalId = c.req.param("id");
+  const body = await c.req.json().catch(() => ({}));
+  const reason = typeof body?.reason === "string" && body.reason.length > 0
+    ? body.reason.slice(0, 80)
+    : "post-unavailable";
+  const sql = noelleDb();
+
+  // Tenancy: the approval must belong to the actuator's configured org.
+  const owns = await sql<Array<{ id: string }>>`
+    select a.id
+    from noelle.approvals a
+    join noelle.agent_instances ai on ai.id = a.agent_instance_id
+    where a.id = ${approvalId}
+      and ai.org_id = ${orgId}
+    limit 1
+  `;
+  if (owns.length === 0) return c.json({ error: "not_found" }, 404);
+
+  try {
+    const result = await skipApproval(sql, { orgId, approvalId, operatorId: orgId }, reason, { selectedPendingOnly: true });
+    return c.json({ ok: true, approvalId, skipped: result.count > 0, reason });
+  } catch (error) {
+    if (error instanceof ApprovalMutationError) return c.json({ error: error.category }, 409);
+    throw error;
+  }
+});
+
+// GET /api/actuator/approval-state/:id — actuator-token-guarded, READ-ONLY.
+// The extension's pool items can sit queued for minutes-to-hours between the
+// queue fetch and the slot that posts them; in that window the approval can be
+// decided elsewhere (a human skips it, or — on X — the API-autosend pipeline
+// stamps auto_send_target_at and claimAutoSendDue claims + posts it). The
+// extension calls this immediately before each post and FAILS CLOSED (any
+// error ⇒ don't post now, retry later): a non-'pending' status or a stamped
+// auto_send_target_at means the browser must NOT post — doing so would
+// duplicate a reply that another sender owns or already published.
+// :id is an approval_id. Tenancy verified exactly like mark-sent/mark-skipped.
+actuator.use("/api/actuator/approval-state/:id", requireActuatorToken);
+
+actuator.get("/api/actuator/approval-state/:id", async (c) => {
+  const { orgId } = c.get("actuator");
+  const approvalId = c.req.param("id");
+  const sql = noelleDb();
+
+  const rows = await sql<Array<{ status: string; auto_send_target_at: string | null; draft_payload: DraftPayload | null }>>`
+    select a.status, a.auto_send_target_at, d.payload as draft_payload
+    from noelle.approvals a
+    join noelle.agent_instances ai on ai.id = a.agent_instance_id
+    join noelle.drafts d on d.id = a.draft_id
+    where a.id = ${approvalId}
+      and ai.org_id = ${orgId}
+    limit 1
+  `;
+  if (rows.length === 0) return c.json({ error: "not_found" }, 404);
+  return c.json({
+    status: rows[0]!.status === "pending" && awaitingHumanReview(rows[0]!.draft_payload) ? "deferred" : rows[0]!.status,
+    autosend_pending: rows[0]!.auto_send_target_at !== null,
+  });
+});
+
+// POST /api/actuator/enable-send: flip the master reply switch
+// (agent_instances.reply_send_enabled, migration 0081) for one instance. The
+// extension calls this with enabled=true when the operator explicitly starts a
+// Run/Drain — their consent to post — so approved replies flow to the queue
+// without a dashboard toggle, and enabled=false when the run ends so the system
+// stays fail-closed at rest. Token-authed; org-scoped exactly like the queue and
+// mark-sent routes. This does NOT create any autonomous send path — the only
+// thing that posts to LinkedIn is the human-operated extension pulling the queue.
+actuator.use("/api/actuator/enable-send", requireActuatorToken);
+
+actuator.post("/api/actuator/enable-send", async (c) => {
+  const { orgId } = c.get("actuator");
+  const parsed = ActuatorEnableSendInSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
+  const { instanceId, enabled } = parsed.data;
+  const sql = noelleDb();
+
+  // Tenancy: the instance must belong to the actuator's configured org. The
+  // select also captures the PRIOR reply_send_enabled value, returned below so
+  // the extension can arm transition-aware: it only ever disarms at run end a
+  // switch whose enable it flipped OFF→ON itself (prior=false), never the
+  // operator's standing dashboard toggle (prior=true — the flag was already ON).
