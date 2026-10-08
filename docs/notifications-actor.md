@@ -398,3 +398,143 @@ it. The extension therefore clamps at the source rather than relying on luck:
 - LinkedIn requires a derivable activity urn instead of falling back to the raw
   href — a real notification link carries `commentUrn`/`dashCommentUrn` tracking
   params and runs past 270 chars, over the 200-char `external_id` limit, and its
+  params vary between renders so it is not a stable key either.
+
+A 400 is not silent: it lands in the panel log as `ingest-failed`, and nothing
+is marked seen, so the next sweep retries the whole batch.
+
+### Turn cap
+
+Two bots can ping-pong forever. The endpoint refuses to enqueue once a
+conversation already has `NOELLE_NOTIFICATION_MAX_TURNS` (default **2**)
+notification leads. The conversation key is the thread root when the sweep could
+read it, else the person — so a thread whose root didn't render still can't
+loop. Setting the env var to `0` disables the ingest entirely; leaving it blank
+does **not** (an empty value reads as unset, not as zero).
+
+## Drafting
+
+`renderPrompt` takes an optional `conversationBlock`
+(`renderConversationBlock` in `apps/x-intern/src/lib/prompts.ts`), built only
+when `payload.source === 'notification'`. It leads the prompt — the model has to
+know it is mid-thread before it reads the message, or it drafts an opener. When
+the field is absent the prompt is **byte-identical** to today, so no other lane
+is affected (there is a regression test asserting exactly this).
+
+A notification lead also produces a DM draft, because that is the drafter's
+output contract. X DMs are never auto-sent (`dms: []` in the actuator queue), so
+this is harmless noise in the dashboard, not a send risk.
+
+**The block is fenced.** The thread root is untrusted — on a reply to somebody
+else's post it is a stranger's verbatim text — and it sits *ahead* of the fence
+that guards the post itself. So when `NOELLE_DRAFTER_FENCE` is on, the block
+wraps the thread in `<thread_context>` delimiters with a data-not-instructions
+guard. Our own reply is fenced too: it can quote them, so it is not a trusted
+channel either. (The fence defaults OFF repo-wide, so today the whole prompt is
+unfenced; this just means the new block is not the one hole when it is turned
+on.)
+
+## The LinkedIn dedup exemption
+
+`dedupeAlreadyCommented` exists to stop two different leads producing two
+comments on one post — real spam. But a conversation reply *is* a second comment
+on a post we already commented on: we commented, they replied, we answer.
+Without an exemption every LinkedIn conversation reply is silently dropped and
+the feature does nothing.
+
+So the dedup takes an `exemptLeadIds` set, built by querying which of the leads
+about to be served carry `payload.source = 'notification'`. Scoped to **lead
+ids**, never urns, so exempting one conversation can never let an unrelated
+stale lead through on the same post.
+
+X needs no equivalent: the target there is *their reply's* tweet id, a different
+tweet from the one we originally replied to, so `dedupeAlreadyRepliedX` is
+already correct.
+
+## Safety rails (all inherited, none new)
+
+Overnight posting curfew · per-hour write ceiling · daily caps · per-tweet dedup
+(in-run + server-side) · pre-send approval revalidation (fail-closed) · reply
+freshness ceiling · STOP · challenge halt · remote intent switch · the org-wide
+panic stop (the queue serves empty when consent is off, so the whole loop
+starves).
+
+## Verified against real captured markup
+
+The notification-cell selectors were the risky part. They are now checked
+against markup captured from the operator's own logged-in pages on 2026-07-26
+(`apps/x-actuator/tests/fixtures/notifications-mentions.html`,
+`apps/linkedin-actuator/tests/fixtures/notification-card.html` — anonymized,
+SVG noise trimmed, every walked path byte-faithful).
+
+**X passed as written.** Both real cells harvest correctly, including a
+multi-handle context ("Replying to @operator and @cleo").
+
+**LinkedIn failed on seven counts**, all now fixed and locked by tests against
+both a single card and a full 25-card page capture.
+
+From the full page — the three that mattered most:
+
+| Assumption | Reality |
+|---|---|
+| a card links to `/feed/update/…` | a **reply** card links to `/feed/?highlightedUpdateUrn=…`. The card filter required the former, so it matched only impressions cards and found **zero replies** — the sweep harvested nothing |
+| the comment urn identifies their message | a reply link carries **both** `commentUrn` (OUR comment) and `replyUrn` (THEIRS). Taking the first returned ours, so every different person replying to one comment of ours **collided on a single `external_id`** — only the first would ever be answered |
+| `highlightedUpdateUrn` is the post | it is the **notification's own activity**, different for every notification on one thread, which would have defeated the turn cap. The real root is the entity inside the comment-urn tuple |
+
+The page also exposed `highlightedUpdateType` — LinkedIn's own machine-readable
+notification type (`REPLIED_TO_YOUR_COMMENT`, `REACTED_TO_YOUR_COMMENT`,
+`COMMENT_VIEWS`, `MENTIONED_YOU_IN_THIS`, `REACTED_TO_COMMENT_MENTIONING_YOU`,
+`TOPIC_TRENDING_CONVERSATION_IN_YOUR_NETWORK`). That is now the primary signal,
+with the headline prose as fallback — far more robust than matching English.
+It also settled the last open question: reply cards **do** carry a profile link,
+in the left rail as `a[data-view-name='notification-card-image']`,
+percent-encoded.
+
+From the single card, four more:
+
+| Assumption | Reality |
+|---|---|
+| `data-view-name="notification-card"` | it is `notification-card-**container**` |
+| headline class `nt-card__text--headline` | it is `nt-card__headline`, and the anchor holds a `.visually-hidden` "Unread notification." that must be stripped — while a `[class*=headline]` fallback also matches the settings dropdown's items |
+| post link is an `activity` urn | it is a **percent-encoded `ugcPost`** — `/feed/update/urn%3Ali%3AugcPost%3A…` — so an `/activity[-:](\d+)/` regex matched **nothing** and every real card was skipped |
+| the snippet is the longest text | the longest text is the **original post** (1000+ chars); the comment is the body text *outside* `.nt-card-content__body--secondary`. Taking the longest made the drafter answer our own post instead of the person |
+
+It also revealed a bonus: the href's `commentUrn` param carries a **real comment
+id**, so a comment *is* addressable. `external_id` now uses it, which
+distinguishes two comments by the same person on the same post — the old
+(post, person) key collapsed them and the second would never have been answered.
+And the card quotes the original post, so `conversation.root_post_text` comes
+free with no extra navigation.
+
+Also verified: `harvestThread` against `status-page.html` and `thread-page.html`;
+the LinkedIn harvester yields **nothing** on every real non-notifications
+fixture; and the ingest's SQL was dry-run against the live `noelle` schema in a
+rolled-back transaction.
+
+**Still unverified:** only `readSelfHandle` (X's account-switcher / profile-nav
+testids). Everything else in the notification path is now checked against real
+captured markup. If the self-handle read fails the sweep falls back to the
+Options `selfHandle`, and with neither it reports `self-handle-unknown` in the
+panel rather than guessing.
+
+First live run: open the panel log. `notifications: nothing new` on every sweep
+while you can see unanswered replies in the tab means a selector drifted.
+
+## Scope
+
+In: replies to us. Out: likes on their comments (the reply-coupled like already
+exists behind `cfg.replyAlsoLikes`), standalone mentions, quote posts,
+follow-backs, comment-level threading on LinkedIn. Reddit is not included —
+Orion auto-sends and has no Full-auto panel.
+
+## Where the code is
+
+| Piece | File |
+|---|---|
+| Panel buttons | `apps/{x,linkedin}-actuator/src/content/panel.ts` |
+| DOM scraping (pure, unit-tested) | `apps/{x,linkedin}-actuator/src/content/notifications.ts` |
+| Sweep + cadence | `apps/{x,linkedin}-actuator/src/background/notifications.ts` |
+| Run flag + idle hook | `apps/{x,linkedin}-actuator/src/background/{state,index}.ts` |
+| Ingest endpoint | `apps/api-vm/src/routes/actuator.ts` (`/api/actuator/inbound-reply`) |
+| Contract | `packages/contracts/src/inbound-reply.ts` |
+| Prompt block | `apps/x-intern/src/lib/prompts.ts` (`renderConversationBlock`) |
