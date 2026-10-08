@@ -198,3 +198,203 @@ export default async function ContactDetailPage({ params }: PageProps) {
           source accounts, surface that link + the Gemini interpretation. */}
       {styleSource ? (
         <section className="card" style={{ marginBottom: 24 }}>
+          <div className="card-h">
+            <h3>Style source</h3>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              <span className="tag" style={{ color: styleSource.enabled ? "var(--accent)" : undefined }}>
+                {styleSource.enabled ? "On" : "Off"}
+              </span>
+              {styleFeederHref ? (
+                <Link href={styleFeederHref} className="btn btn-xs">
+                  Open in Styles →
+                </Link>
+              ) : null}
+            </div>
+          </div>
+          <p style={{ fontSize: 13, color: "var(--ink-2)", margin: "2px 0 10px" }}>
+            {styleAgent?.display_name?.trim() || "Lyra"} learns writing style from this account.
+            Pulled <strong>{styleSource.postCount}</strong> posts and{" "}
+            <strong>{styleSource.commentCount}</strong> comments
+            {styleSource.lastPulledAt ? ` · last pulled ${timeAgo(styleSource.lastPulledAt)}` : " · not pulled yet"}.
+          </p>
+          {styleSource.profile ? (
+            <>
+              <div className="eyebrow" style={{ marginBottom: 8 }}>
+                How the feeder interpreted this account
+              </div>
+              <UltraProfileView profile={styleSource.profile} />
+            </>
+          ) : (
+            <div style={{ fontSize: 13, color: "var(--ink-muted)" }}>
+              Posts were pulled, but no style profile has been distilled yet. Run the feeder
+              from the Styles page to generate one.
+            </div>
+          )}
+        </section>
+      ) : null}
+
+      {/* Watched by — the watchlist face of this contact (objectives + add/remove) */}
+      <div style={{ marginBottom: 24 }}>
+        <ContactWatchlistCard
+          orgSlug={orgSlug}
+          handle={person.xHandle}
+          watchers={watcherViews}
+          addableAgents={addableAgents}
+        />
+      </div>
+
+      {/* Profile + stats (whichever platform the contact is reached on) */}
+      {handle ? (
+        <div className={styles.detailGrid}>
+          <section className="card">
+            <div className="card-h">
+              <h3>What {profilerName} knows</h3>
+              <ReloadForm
+                action={async () => {
+                  "use server";
+                  await requestContactProfileRefresh({ orgSlug, personId });
+                }}
+              >
+                <SubmitButton className="btn btn-xs" title="Re-profile on the next profiler tick">
+                  Refresh
+                </SubmitButton>
+              </ReloadForm>
+            </div>
+            {profile ? (
+              <>
+                <p className="serif" style={{ fontSize: 16, lineHeight: 1.45, margin: "6px 0 10px" }}>
+                  {profile.summary}
+                </p>
+                {profile.tone ? (
+                  <div style={{ fontSize: 12.5, color: "var(--ink-muted)", marginBottom: 8 }}>
+                    <strong>Tone:</strong> {profile.tone}
+                  </div>
+                ) : null}
+                {profile.topics.length ? (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+                    {profile.topics.map((t) => (
+                      <span key={t} className="tag">
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+                {profile.engagementNotes ? (
+                  <div style={{ fontSize: 12.5, color: "var(--ink-2)", marginBottom: 10 }}>
+                    <strong>How to engage:</strong> {profile.engagementNotes}
+                  </div>
+                ) : null}
+                <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--ink-soft)" }}>
+                  {profile.postsAnalyzed} posts analyzed
+                  {profile.generatedAt ? ` · generated ${timeAgo(profile.generatedAt)}` : ""}
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 13, color: "var(--ink-muted)" }}>
+                No profile yet — {profilerName} builds one from their recent posts once
+                they&apos;re an active target. Hit Refresh to nudge it.
+              </div>
+            )}
+          </section>
+
+          <section className="card">
+            <div className="card-h">
+              <h3>Stats &amp; tendencies</h3>
+            </div>
+            <dl style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "8px 16px", margin: 0, fontSize: 13 }}>
+              <Stat label="Posts seen" value={String(stats?.postsSeen ?? 0)} />
+              <Stat label="Replies sent" value={String(stats?.repliesSent ?? 0)} />
+              <Stat label="Pending replies" value={String(stats?.pendingReplies ?? 0)} />
+              <Stat
+                label="Last interaction"
+                value={stats?.lastInteractionAt ? timeAgo(stats.lastInteractionAt) : "—"}
+              />
+            </dl>
+            {stats?.topTopics.length ? (
+              <div style={{ marginTop: 12 }}>
+                <div className="eyebrow" style={{ marginBottom: 6 }}>
+                  Tends to post
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {stats.topTopics.map((t) => (
+                    <span key={t} className="tag">
+                      {t}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </section>
+        </div>
+      ) : null}
+
+      {/* Interaction history */}
+      <section className="card">
+        <div className="card-h">
+          <h3>Interaction history</h3>
+          <span className="tag">{interactions.length}</span>
+        </div>
+        {interactions.length === 0 ? (
+          <div style={{ fontSize: 13, color: "var(--ink-muted)" }}>
+            No replies or DMs drafted for this person yet.
+          </div>
+        ) : (
+          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+            {interactions.map((it) => {
+              const parkedDm = it.status === "deferred" && it.kind === "dm";
+              return (
+              <li
+                key={it.approvalId}
+                style={{
+                  padding: "10px 0",
+                  borderTop: "1px dashed var(--rule-soft)",
+                  ...(parkedDm
+                    ? {
+                        background:
+                          "color-mix(in oklch, var(--accent) 6%, transparent)",
+                        borderRadius: 8,
+                        padding: "12px",
+                      }
+                    : {}),
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 4 }}>
+                  <span className="tag">{it.kind}</span>
+                  <span
+                    className="tag"
+                    style={parkedDm ? { color: "var(--accent)" } : undefined}
+                  >
+                    {parkedDm ? "waiting for reply" : it.status}
+                  </span>
+                  <span style={{ fontSize: 11, color: "var(--ink-soft)", fontFamily: "var(--mono)" }}>
+                    {it.decidedAt ? timeAgo(it.decidedAt) : "pending"}
+                  </span>
+                  <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+                    {it.sourcePostUrl ? (
+                      <a href={it.sourcePostUrl} target="_blank" rel="noreferrer" className="btn btn-xs">
+                        View post →
+                      </a>
+                    ) : null}
+                    {it.postUrl ? (
+                      <a href={it.postUrl} target="_blank" rel="noreferrer" className="btn btn-xs">
+                        View reply →
+                      </a>
+                    ) : null}
+                  </span>
+                </div>
+                {/* Parked DMs show the full text + Send actions so you can fire
+                    it once you see the person reply on X. */}
+                <div
+                  style={{
+                    fontSize: 13,
+                    color: "var(--ink-2)",
+                    whiteSpace: parkedDm ? "pre-wrap" : "normal",
+                  }}
+                >
+                  {(parkedDm ? it.body : it.bodyPreview) ?? "—"}
+                </div>
+                {parkedDm && it.body ? (
+                  <DeferredDmActions
+                    orgSlug={orgSlug}
+                    approvalId={it.approvalId}
+                    body={it.body}
