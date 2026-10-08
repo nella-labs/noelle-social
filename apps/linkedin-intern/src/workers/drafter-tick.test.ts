@@ -2198,3 +2198,203 @@ describe("runDrafterTick — verifier (grounded-drafting)", () => {
       log,
       instance: { id: "i", org_id: "o", objective: "Grow Noelle through approval clicks", brand_config: productBrand } as never,
       claimedLeads: [lead({ classifier_label: "light", tier: null, payload: { ...leadPayload, source: "extension_observed", text: "We launched our code editor today!" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      knowledgeDirs: ["product"],
+      knowledgeTopK: 1,
+      voiceDirs: ["noelle-voice", "content/voice-anchors", "02-brand"],
+    });
+
+    const call = runner.draft.mock.calls[0]![0] as { system: string; prompt: string };
+    expect(call.system).toContain("Ari");
+    expect(call.system).toContain("Avoid stale filler closers from my style notes");
+    expect(call.system).toContain("Never bolt Noelle onto unrelated posts");
+    expect(call.system + call.prompt).not.toContain("Click approve; nothing auto-posts.");
+    expect(call.system + call.prompt).not.toContain("Grow Noelle through approval clicks");
+    expect(call.prompt).not.toContain("Noelle approval workflow voice anchor.");
+    expect(call.prompt).toContain("We launched our code editor today!");
+    expect(call.prompt).toContain("A concrete peer observation.");
+    expect(kb.search).toHaveBeenCalledExactlyOnceWith(
+      "We launched our code editor today!", 8,
+      { filterDirs: ["noelle-voice", "content/voice-anchors"] },
+    );
+  });
+
+  const pinnedBrowserStyle = (body: string) => ({
+    enabled: true,
+    faithful: true,
+    faithfulVoices: ["kaia"],
+    loadPool: vi.fn().mockResolvedValue([
+      { external_id: "kaia-1", body, like_count: 500, comment_count: 40, account_handle: "kaia", posted_at: null },
+    ]),
+    loadUltraProfiles: vi.fn().mockResolvedValue([]),
+    config: { maxStyleExemplars: 2, varietyTemperature: 0 },
+    rng: () => 0.5,
+  });
+
+  it.each(["substantial", "light"] as const)(
+    "reviews browser %s replies against actual sent replies while writing with the pinned voice",
+    async (kind) => {
+      vi.stubEnv("TYPESAFE_API_KEY", "");
+      vi.stubEnv("AI_GATEWAY_API_KEY", "");
+      const { postOutbound, runner, kb, markStatus } = deps();
+      const pinnedPost = "small steps, weird little wins. ship it and see what happens??";
+      const generatedSummary = "GENERATED KB SUMMARY: the Noelle approval workflow is amazing.";
+      kb.search.mockResolvedValue([{ ...anchorHit(8), snippet: generatedSummary }]);
+      runner.draft.mockResolvedValue({
+        text: JSON.stringify(kind === "light" ? oneLight : browserDraft),
+        engine: "bedrock", model: "m",
+      });
+      const judge = vi.fn().mockResolvedValue(verdict(true));
+
+      const drafted = await runDrafterTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [lead({
+          classifier_label: kind,
+          tier: kind === "light" ? null : "T1",
+          payload: { ...leadPayload, source: "extension_observed" },
+        })] as never,
+        runner: runner as never,
+        kb: kb as never,
+        postOutbound,
+        markStatus,
+        voiceDirs: ["noelle-voice"],
+        style: pinnedBrowserStyle(pinnedPost) as never,
+        voiceExemplars: [{ post: "A real user post", reply: "The operator's sent reply" }],
+        verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+      });
+
+      expect(drafted).toBe(1);
+      const writer = runner.draft.mock.calls[0]![0] as { system: string; prompt: string };
+      const judgePrompt = judge.mock.calls[0]![1] as string;
+      expect(writer.system).toContain(pinnedPost);
+      expect(writer.system).toContain("FORM");
+      expect(writer.system + writer.prompt).not.toContain(generatedSummary);
+      expect(judgePrompt).toContain("The operator's sent reply");
+      expect(judgePrompt).toContain("already-sent LinkedIn reply");
+      expect(judgePrompt).not.toContain(pinnedPost);
+      expect(judgePrompt).not.toContain(generatedSummary);
+      if (kind === "substantial") expect(writer.system).toContain("The operator's sent reply");
+    },
+  );
+
+  it("falls back to the selected pinned style when there are no sent reply examples", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const pinnedPost = "small steps, weird little wins. ship it and see what happens??";
+    runner.draft.mockResolvedValue({ text: JSON.stringify(browserDraft), engine: "bedrock", model: "m" });
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ payload: { ...leadPayload, source: "extension_observed" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      style: pinnedBrowserStyle(pinnedPost) as never,
+      voiceExemplars: [],
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+
+    expect(judge.mock.calls[0]![1]).toContain(pinnedPost);
+  });
+
+  it("falls back to curated KB voice anchors when no pinned style post was selected", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const curatedVoice = "An actual operator voice anchor in the curated folder.";
+    kb.search.mockResolvedValue([{ ...anchorHit(8), snippet: curatedVoice }]);
+    runner.draft.mockResolvedValue({ text: JSON.stringify(browserDraft), engine: "bedrock", model: "m" });
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ payload: { ...leadPayload, source: "extension_observed" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      voiceDirs: ["noelle-voice"],
+      style: pinnedBrowserStyle(" ") as never,
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+
+    expect((runner.draft.mock.calls[0]![0] as { prompt: string }).prompt).toContain(curatedVoice);
+    expect(judge.mock.calls[0]![1]).toContain(curatedVoice);
+  });
+
+  it("browser-observed T1 asks for one reply and reviews only the exact reply it queues", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    runner.draft.mockResolvedValue({ text: JSON.stringify(browserDraft), engine: "bedrock", model: "m" });
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o", dm_autodraft_enabled: true } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { ...leadPayload, source: "extension_observed" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+
+    expect(n).toBe(1);
+    expect(runner.draft.mock.calls[0]![0].prompt).toContain("Draft exactly one comment");
+    expect(runner.draft.mock.calls[0]![0].prompt).toContain("Do NOT include a `dm`");
+    expect(judge).toHaveBeenCalledTimes(1);
+    const judgePrompt = judge.mock.calls[0]![1] as string;
+    expect(judgePrompt).toContain(`[reply/empathetic] ${browserDraft.drafts[0]!.body}`);
+    expect(judgePrompt).not.toContain(browserDraft.drafts[1]!.body);
+    expect(judgePrompt).not.toContain(browserDraft.drafts[2]!.body);
+    expect(judgePrompt).not.toContain(browserDraft.dm.body);
+    const outbound = postOutbound.mock.calls[0]![0];
+    expect(outbound.drafts).toEqual([
+      expect.objectContaining({ kind: "reply", angle: "empathetic", body: browserDraft.drafts[0]!.body }),
+    ]);
+    expect(outbound.verifierMeta).toEqual(expect.objectContaining({ pass: true, judgeOk: true, judgeProvider: "legacy" }));
+  });
+
+  it("reviews the emoji-cleaned browser reply body that is queued", async () => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const originalBody = "The customer feedback loop gives this launch a useful direction 🎉";
+    const cleanedBody = "The customer feedback loop gives this launch a useful direction";
+    runner.draft.mockResolvedValue({
+      text: JSON.stringify({ ...browserDraft, drafts: [{ ...browserDraft.drafts[0], body: originalBody }] }),
+      engine: "bedrock", model: "m",
+    });
+    const judge = vi.fn().mockResolvedValue(verdict(true));
+
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { ...leadPayload, source: "extension_observed", text: "post text" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+
+    const judgePrompt = judge.mock.calls[0]![1] as string;
+    expect(judgePrompt).toContain(`[reply/empathetic] ${cleanedBody}`);
+    expect(judgePrompt).not.toContain(originalBody);
+    expect(postOutbound.mock.calls[0]![0].drafts[0].body).toBe(cleanedBody);
+  });
+
+  it.each(["rejected", "unavailable"] as const)("browser-observed T1 has no genuine passing review when judge is %s", async (failure) => {
+    vi.stubEnv("TYPESAFE_API_KEY", "");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    const { postOutbound, runner, kb, markStatus } = deps();
