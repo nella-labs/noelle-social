@@ -198,3 +198,203 @@ Orion posts **no like slots** (voting only ever happens via the idle-upvote path
 | Archetype | Weight | Band |
 |---|---|---|
 | quick | 20% | ~4–7.6 min — an occasional quick reply-after-reply |
+| normal | 38% | ~7.6–13.3 min — the mode |
+| cooldown | 42% | ~13.3–19 min — a long "stepped away" pause (reply → cooldown → reply) |
+
+The weights are **upper-tail-heavy** (cooldown > quick) on purpose: that breaks the uniform-band fingerprint while keeping the **mean gap equal-or-slower** than the old flat uniform (~11.9 min vs 11.5 min), so reply velocity never rises. That direction is mandatory because drain mode bypasses **both** the runtime `replySpacingOk` floor and `maxWritesPerHour` — the planned gap is the SOLE spacing backstop, so a quick-heavy mixture (mass shifted toward the floor) would be a real velocity regression even with every single gap ≥ 240 s. Every band stays strictly inside `[240s, 1140s]`, so the **240 s floor** and the 19-min ceiling are untouched; this only reshapes the middle. Still reply-only: `.filter(kind === "comment")` at both plan sites, zero vote slots, ever.
+
+### Lights-out auto-drain (ports the Lyra queue-drain fixes, #446)
+
+With **Options → auto-drain** ticked (requires *Autonomous* on; **default OFF**),
+the 5-minute autonomy alarm also starts a **drain** whenever the server serves
+approved replies and nothing is running, so an approval made mid-afternoon goes
+out mid-afternoon instead of waiting for tomorrow's run or a manual "Drain all
+approvals" click. Semantics (identical to the LinkedIn actuator):
+
+- **Consent is server-side and standing.** The unattended path never arms
+  `reply_send_enabled` (the panic-stop invariant). Instead the
+  `GET /api/actionable-reddit` gate honors `agent_instances.auto_send_enabled` as
+  durable lights-out consent (`reply_send_enabled OR auto_send_enabled`); set it
+  once from the dashboard/DB for Orion's instance. **Pause-all clears both
+  flags** (the `reddit_intern` role is in its scope), so a panic still starves
+  auto-drain org-wide. Ships **inert**: it needs BOTH the Options checkbox and
+  the dashboard flag.
+- Same **safety gate** as the daily auto-start (server `/api/actuator/reddit-health`
+  ok + post-challenge cooldown), same operating window (start/end hours), and
+  every server-side withhold gate (challenge circuit-breaker, daily write cap,
+  external-link guard) applies unchanged: an empty served queue simply means no
+  drain starts. Drains stay reply-only with the 4–19 min gaps.
+- **Not once-per-day**, but re-arm-limited: at most one auto-drain start per
+  30 min (`AUTO_DRAIN_REARM_MIN`), so a drain that keeps dying with items still
+  queued (no reddit tab, reply-fail give-ups) can't be relaunched forever.
+- A manual **STOP silences auto-drain for the rest of the day**
+  (`actuator.lastManualStopDay`), exactly like it already silences the daily
+  auto-start.
+- **Strongly recommended before enabling:** turn on
+  `NOELLE_REDDIT_ACTUATOR_HALT_ON_CHALLENGE=1` (default OFF) — nobody is watching
+  when an unattended drain hits a "you're doing that too much" throttle, and the
+  circuit-breaker is what stops the queue from feeding it.
+
+### Stalled-run recovery (ports the LinkedIn actuator)
+
+`maybeAutoDrain` can't recover a run that is `"running"` but wedged (its
+`runActive` gate skips). So the autonomy alarm also runs
+`maybeRecoverStalledRun`: a provably stalled run — drafts loaded, reply slots
+overdue, no post for `STALL_RECOVER_MIN` (20 min) past warm-up — is superseded by
+a fresh drain, behind the same safety gates and **sharing the 30-min re-arm
+stamp**. It never arms sending, so the server queue gate (`reply_send_enabled` +
+the pending-arm inheritance) still governs supply — a wrong trigger just
+supersedes and starves — and per-thread dedup (`actionedKeys`) blocks any
+double-reply. Progress is stamped in `recordReplySuccess` (`lastProgressMs`). See
+`docs/linkedin-actuator.md` § *Stalled-run recovery* for the full invariant list.
+
+### Drain auto-continue (ports the Lyra queue-drain fixes, #439)
+
+A **Drain** plans a fixed batch (the queue size at start), so it used to stop
+after that batch even when the inbox still held approvals (capped at start,
+arrived mid-run, or re-queued after a transient failure). Now, when every planned
+slot is done, the drain re-fetches the queue and — if pending replies remain —
+**appends a fresh reply-only batch** and extends the window, so one Drain clears
+the whole inbox. **Persistent (never re-click):** an empty served queue no longer
+ends the drain — the run stays alive and re-checks the queue every ~75 s
+(`DRAIN_WATCH_POLL_MS`, `drainShouldKeepWaiting`), rolling its window forward, so
+a reply approved later goes out with no re-click. Only **STOP**, a **challenge
+halt**, or the runaway ceiling `MAX_DRAIN_ROUNDS` (raised 50 → **1000**, counting
+actual send-batches only) end it; forever-failing drafts still hit the per-draft
+retry cap below. Extension rounds are fed `likesPerGap*=0` and filtered to comment
+slots, so they can never introduce a vote slot.
+
+### Failure hygiene (ports the Lyra queue-drain fixes, #437)
+
+- **Per-draft retry cap.** A failed reply is re-queued at the **back** of the pool
+  (healthy drafts go first) and dropped for the session after `MAX_ACTION_TRIES`
+  (3) failures — one thread the composer/submit can't handle (or a live throttle)
+  can no longer be retried on every slot and starve every other pending draft. The
+  retry count survives replenish merges. "Removed" targets are exempt: they are
+  terminal on the first sighting, never retried.
+- **Durable dead-post skip.** A removed/deleted/unavailable target is dropped
+  locally **and** marked `skipped` server-side via the generic
+  `POST /api/actuator/mark-skipped/:id` (reason `post-removed`, best-effort), so
+  the queue stops re-serving the dead permalink on every future run. The route
+  only ever flips a still-`pending` approval, so it can never clobber a sent row.
+- **Per-stage skip diagnostics.** Failed replies log `reply-failed:<stage>` (or
+  `reply-failed:gave-up-after-N:<stage>`) plus the thread's `post_id`, with stages
+  `challenge` / `reply-button-not-found` / `comment-mismatch` /
+  `composer-entry-not-found` / `box-not-found` / `submit-not-found` /
+  `not-cleared` / `post-submit-challenge`. Signature reading: a wall of
+  `not-cleared` = a live "you're doing that too much" throttle;
+  `box-not-found` = composer/flavor drift; `submit-not-found` = submit locator
+  drift.
+
+**Idle-upvotes land on a feed, never the just-replied thread (ports LinkedIn #410):**
+before an idle-upvote fires, the background checks the tab URL — a `/comments/`
+permalink (where a scheduled-mode reply parks the tab) is navigated back to the feed
+(old.reddit.com when `preferOldReddit`) first, so an upvote can never pair with the
+reply the account just posted (a vote-manipulation fingerprint). Best-effort: a failed
+nav degrades to ambient browsing. When nothing is upvotable, the skip reason is
+self-diagnosing — `no-upvotable-post(posts=,withBtn=,btns=,path=,flavor=)` — so a
+`reddit_activity` skip row separates "not on a feed" (`path=/…/comments/…`) from "all
+already upvoted" (`withBtn>0`) from container DOM drift (`btns>0, posts=0`) without a
+live DevTools session.
+
+## Send reliability (ported from the LinkedIn actuator: #406, #407, #442, #444)
+
+- **Challenge detection is structural first.** `detectChallenge` halts on evidence that
+  cannot occur organically — an hCaptcha / Google reCAPTCHA **vendor iframe** (exact
+  hostnames only, never a bare `src*='captcha'`) or a **verification/block interstitial
+  route** (path-anchored, so a post slug containing "blocked" can't trip it) — checked
+  before the alert-scoped text probes, so a wall whose prose the regexes miss still
+  halts. A vendor iframe inside the transient `reputation-recaptcha` gate stays a soft
+  js-challenge (waited out, never a halt).
+- **The reply-submit locator is anchored + word-gated.** The old document-wide
+  `button[slot='submit-button']` fallback (first match wins, whatever composer it
+  belongs to) is gone. Search order: (1) the target comment's own composer subtree
+  (scoped by `thingid`); (2) a composer-anchored climb from the located reply box —
+  candidates must **follow the box in document order** and match an exact submit word
+  (`comment|reply|post|save`; slot/type=submit is a tiebreaker, never a qualifier);
+  (3) a global two-pass with the same word gate + decoy exclusions. Thread-level
+  "Reply" openers (inside `shreddit-comment-action-row`, or count-only visible text)
+  are rejected everywhere; a **disabled** real submit is returned as-is so the locator
+  reports `reply-submit-disabled` and the background waits — it never widens to a decoy.
+- **Chat-drawer exclusion.** The www.reddit.com chat drawer (`rs-*` elements, plus an
+  aria `message|chat` backstop) is excluded from both the reply-box search and every
+  submit pass — typing/submitting there would send a private chat message from the
+  operator's real account, and the cleared-composer check would read it as success.
+- **Zero-rect guard.** A resolved submit with no layout box is skipped
+  (`submit-zero-rect`) instead of synthesizing a trusted click at the viewport corner.
+- **Typing commits via `Input.insertText`.** Each mappable character is sent as a
+  text-less `rawKeyDown` (keystroke telemetry with real key/code/keyCode, Shift-hold
+  preserved) → `Input.insertText` (the `beforeinput`/`input` edit the framework
+  composer's model actually syncs from, so the submit **enables**) → `keyUp`. A
+  keyDown-with-text native edit could land in the DOM while the editor model stayed
+  empty — the submit then never enables (the LinkedIn live symptom).
+- **The submit locate is a poll, not a single shot.** After typing, the background polls
+  `locateReplySubmit` for ~6–12 s (jittered ~500 ms steps), riding out enable/layout lag;
+  only a persistent miss fails the attempt. The post-click cleared-confirm poll is ~3.2 s
+  plus one late-post re-check, so a reply that lands late is never re-typed (duplicate).
+- **Diagnosable failures.** A failed reply logs `reply-failed:<detail>` in
+  `reddit_activity` — `not-cleared(via=<pass>,btn=<label>,type=<hook>)` names the exact
+  button that was clicked; `submit-not-found(b=<build>,box=…,empty=…,last=<skipReason>,
+  wf=…,en=…,vis=…,slots=…,scoped=…,top=…,path=…)` buckets why no clickable submit
+  appeared (`diagnoseReplySubmit` re-walks the locator predicates on the failure path
+  only: `wf=0` = no eligible worded submit, `en=0` = never enabled, `en>0,vis=0` =
+  enabled but zero-rect). The `b=` build stamp (`BUILD` in `src/background/detail.ts`,
+  bump on every submit/typing change) self-identifies which unpacked build produced a
+  row — DevTools is blocked mid-run, so this row is the only debugging window.
+  Page-derived values are sanitized to `[A-Za-z0-9 _-]` and length-capped; server health
+  queries match `challenge`/`throttle` exactly and are unaffected.
+
+## Dead-target skips (removed / locked / archived)
+
+A reply target can be permanently un-replyable in two ways, both detected read-only
+before the composer is ever opened:
+
+- **Post gone** — removed by filters/mods, deleted, 404, private/banned community
+  (`checkPostRemoved` / `isPostUnavailable`).
+- **Comments unavailable** — the thread is **locked** or the post is **archived**
+  ("New comments cannot be posted"): the post renders fine but no composer will ever
+  appear (`checkCommentsLocked` / `isCommentsUnavailable`). Structural signals win
+  (the `shreddit-post` `locked`/`archived` attributes, old Reddit's
+  `.thing.link.locked`/`.archived` classes); the phrase fallback reads only
+  alert/banner/infobar chrome — never a post body or the comment tree — so a post
+  merely quoting "comments are locked" can't false-trip. Probed right after the
+  removed-post gate and re-probed when the reply box never appears (the banner can
+  render late).
+
+Both are **terminal skips**, not retries: the draft is dropped for the session, the
+skip is logged with a cause-specific reason (`post-removed` | `post-unavailable` |
+`comments-locked` | `post-archived`), and the tab returns to the feed. The
+**server-side** half (generic `POST /api/actuator/mark-skipped/:id`, best-effort,
+irreversibly flips the pending approval to `skipped` so the queue stops re-serving
+the dead permalink) is **gated on positive evidence**: a removed/deleted indicator
+attribute, old Reddit's `.thing.link.deleted`, a matched removal phrase, or a
+locked/archived signal (`classifyRemovedProbe` in `background/marksent.ts`). A
+merely-absent post shell (`post-absent` → skip reason `post-unavailable`) also
+occurs on transient 5xx / "something went wrong" interstitials, CDN error pages,
+and old-Reddit age gates where the content script runs fine — that stays a
+**session-local** drop that self-heals on the next run, never a server-side skip.
+Previously a locked or archived thread died in the `reply-box-not-found` retry loop
+and, with no server-side skip, was re-served every session forever. This only ever
+*withholds* a write — a false positive drops one approved reply with a logged
+reason; it can never post.
+
+## Server side
+
+`apps/api-vm/src/routes/actuator.ts` (mirrors the X handlers):
+- `GET /api/actionable-reddit?instanceId=…` — approved `platform='reddit'`, `kind='reply'`
+  drafts as `{ replies: [{ approval_id, draft_id, lead_id, kind, body, target }] }`, where
+  `target` is a post `{type:'post', url, post_id, subreddit, author}` or a comment
+  `{type:'comment', url, post_id, comment_id, subreddit, author}`. Gated by
+  `reply_send_enabled` **or** `auto_send_enabled` (the standing lights-out consent,
+  see auto-drain above), the daily write cap, the challenge breaker, and the
+  external-link guard.
+- **Persistent dedup-by-thread (always on, ports LinkedIn #420):** the queue never
+  serves a reply for a thread already replied to — any session, any lead, any prior
+  markSent outcome. Keyed on the bare t3 post id (a comment-target keys on its parent
+  post, so the grain is the thread), unioned from `'sent'` reply approvals via
+  `leads.external_id` (authoritative history) and `reddit_activity` reply rows the
+  extension stamps with `post_id` at post time (survives a failed markSent). Fails
+  CLOSED — a dedup query error serves an empty queue (still 200). Index: migration
+  `0086_reddit_reply_dedup.sql`.
+- `POST /api/reddit-activity` — append-only `noelle.reddit_activity` log.
+- `GET /api/actuator/reddit-health` — today's volume + challenge signal.
