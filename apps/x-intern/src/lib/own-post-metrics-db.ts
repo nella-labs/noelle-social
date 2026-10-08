@@ -198,3 +198,49 @@ export async function getOwnPostPerformance(
       likes: string;
       reposts: string;
       replies: string;
+      views: string | null;
+      quotes: string | null;
+      bookmarks: string | null;
+    }>
+  >`
+    with population as (
+      select external_id, max(captured_at) as latest_at
+      from noelle.own_post_metrics
+      where agent_instance_id = ${args.instanceId} and platform = 'x'
+        and captured_at >= now() - ${`${args.windowDays} days`}::interval
+      group by external_id
+      order by latest_at desc, external_id
+      limit ${Math.min(500, Math.max(0, Math.trunc(args.maxPosts ?? 500) || 0))}
+    )
+    select
+           m.external_id,
+           i.hook   as hook,
+           i.pillar as pillar,
+           i.angle  as angle,
+           m.likes, m.reposts, m.replies, m.views,
+           to_jsonb(m)->>'quotes' as quotes, to_jsonb(m)->>'bookmarks' as bookmarks
+      from population p
+      cross join lateral (
+        select snapshot.* from noelle.own_post_metrics snapshot
+        where snapshot.agent_instance_id = ${args.instanceId} and snapshot.platform = 'x'
+          and snapshot.external_id = p.external_id
+          and snapshot.captured_at >= now() - ${`${args.windowDays} days`}::interval
+        order by (coalesce(snapshot.views, 0) > 0) desc, snapshot.captured_at desc, snapshot.id desc
+        limit 1
+      ) m
+      left join noelle.post_ideas i on i.id = m.idea_id
+  `;
+  const input: OwnPerfInputRow[] = rows.map((r) => ({
+    externalId: r.external_id,
+    hook: r.hook,
+    pillar: r.pillar,
+    angle: r.angle,
+    likes: Number(r.likes) || 0,
+    reposts: Number(r.reposts) || 0,
+    replies: Number(r.replies) || 0,
+    views: r.views == null ? null : Number(r.views),
+    quotes: r.quotes == null ? null : Number(r.quotes),
+    bookmarks: r.bookmarks == null ? null : Number(r.bookmarks),
+  }));
+  return summarizeOwnPerformance(input, { topPosts: args.topPosts });
+}

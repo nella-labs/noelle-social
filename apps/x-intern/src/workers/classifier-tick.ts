@@ -198,3 +198,157 @@ export async function classifyOneLead(deps: {
   // drafted output was never graded and could not be filtered on quality at all.
   // Now every lead is classified and the hand-picked ones are merely PROTECTED:
   // a 'skip' verdict on their post is softened to 'light' (a short warm reply)
+  // rather than dropping it, because the PERSON is the gate, not the post.
+  //
+  // Two guards keep that from drafting off-topic noise:
+  //   1. On X, priority=true means the author is in the watchlist people list
+  //      and posted on/after the day they were added (discovery-tick.ts:315) —
+  //      i.e. genuinely hand-picked. X has no algorithmic author lane, so unlike
+  //      LinkedIn there is no payload.source discriminator to apply.
+  //   2. An OFF-TOPIC post from a hand-picked person is still skipped: the
+  //      rescue only fires at or above CLAMP_MIN_Q. A null q (a fail-open
+  //      scoring outage) clears the floor, so a watched person is never dropped
+  //      because the classifier was down.
+  // A null q means the classifier could not score (fail-open path). Treat that as
+  // clearing the floor so a watched person is never dropped because scoring was
+  // down. NOTE: the engine's fail-open also forces reply_kind='substantial', so
+  // this disjunct is belt-and-braces rather than the live outage path — the
+  // outage protection that actually matters is the slop/follower exemption above.
+  const aboveOffTopicFloor = cls.q == null || cls.q >= CLAMP_MIN_Q;
+  const clamped = protectedLead && cls.reply_kind === "skip" && aboveOffTopicFloor && !slopDrop;
+  const replyKind = clamped ? "light" : cls.reply_kind;
+
+  // Base grade: LLM verdict with the (rescued-aware) slop verdict folded in.
+  // A clamped lead is on-brand by definition (we chose to answer it).
+  const baseOnBrand = (cls.on_brand && replyKind !== "skip" && !slopDrop) || clamped;
+  // Score on REPLY-WORTHINESS (q), not the velocity proxy. Velocity predicts
+  // whether a post will blow up; q asks whether we should answer it, which is
+  // the question the drafter's quality gate is actually asking. Velocity is
+  // still recorded in classifierMeta for observability.
+  const baseScore = cls.q == null ? null : cls.q / 100;
+
+  // Follower floor: drop tiny accounts, grade small ones strictly, full credit
+  // for 1000+. Unknown follower count is neutral (never a drop).
+  const fp = applyFollowerPolicy({
+    // The follower floor grades STRANGERS. A watchlist person was hand-picked by
+    // the operator, so their follower count is not a second opinion on whether
+    // to engage — null is the policy's documented neutral bucket (never a drop).
+    // The old bypass short-circuited this entirely; without the exemption,
+    // removing it would silently skip small watched authors. The true count is
+    // still recorded in classifierMeta.follower_policy below.
+    followers: protectedLead ? null : followers,
+    onBrand: baseOnBrand,
+    // Only a SUBSTANTIAL lead carries a tier; light/clamped leads are tier-null
+    // so the drafter's Opus escalation does not fire on a short congrats.
+    tier: replyKind === "substantial" ? cls.tier : null,
+    score: baseScore,
+    isSlop: slopDrop,
+  });
+
+  const finalOnBrand = fp.onBrand;
+  // Recency weighting: fold the post's freshness into the score so the inbox's
+  // "score desc" order floats today's posts above last week's at equal base
+  // quality. Bounded to [0,1]; null (unscored) stays null. Browser observations
+  // retain their reviewed score without the legacy age weighting.
+  const recencyScore = observed ? fp.score : applyRecency(fp.score, postedAt, new Date());
+  const reasonBits = [
+    cls.on_brand_reason,
+    isSlop
+      ? `ai_slop(${[slop.isSlop ? "detector" : null, cls.ai_slop ? "llm" : null].filter(Boolean).join("+")})${slopRescued ? ` — rescued by ${followers} followers` : ""}`
+      : null,
+    fp.bucket !== "unknown" && fp.bucket !== "full" ? fp.reason : null,
+  ].filter(Boolean);
+
+  // VIP intro DM: the scout (gemini) decided WHO + WHETHER; draft the actual DM
+  // with Opus (claude -p → Bedrock) so it reads human, not like a flash one-shot.
+  // Fail-open — any miss leaves suggested_dm null and the banner still flags the VIP.
+  let vip = cls.vip;
+  if (vip?.dm_soon && deps.runner) {
+    const dm = await draftVipIntroDm({
+      runner: deps.runner,
+      orgId: inst.org_id,
+      instanceId: inst.id,
+      authorHandle: lead.author_handle,
+      postText,
+      why: vip.reason,
+      followers,
+    });
+    vip = { ...vip, suggested_dm: dm };
+  }
+
+  await markLeadClassified(sql, {
+    leadId: lead.id,
+    // Surface the drop reason in the label so it's legible in the dashboard.
+    // 'light' is a first-class label so the drafter can route a short warm
+    // reply, and so a clamped watchlist rescue is legible in the dashboard.
+    label: slopDrop ? "ai_slop" : replyKind === "light" ? "light" : cls.kind,
+    score: recencyScore,
+    tier: fp.tier,
+    onBrand: finalOnBrand,
+    // Engagement-bait: persisted so the drafter can discount an inflated reply
+    // count when deciding whether this lead deserves the smarter model.
+    commentBait: cls.comment_bait,
+    // Relationship-scout verdict (null when the scout is off or the call
+    // fail-opened) → persisted to leads.vip_signal for the approvals banner.
+    // suggested_dm is now drafted above with Opus, not by the gemini scout.
+    vipSignal: vip,
+    classifierMeta: {
+      ...(cls.raw as Record<string, unknown>),
+      recency: { posted_at: age.postedAtIso, age_days: age.ageDays, base_score: fp.score },
+      ai_slop: {
+        flagged: isSlop,
+        dropped: slopDrop,
+        rescued_by_followers: slopRescued,
+        detector_score: slop.score,
+        detector_reasons: slop.reasons,
+        llm: cls.ai_slop,
+        llm_reason: cls.ai_slop_reason,
+      },
+      follower_policy: {
+        followers,
+        bucket: fp.bucket,
+        reason: fp.reason,
+        ...(protectedLead
+          ? { exempt: lead.priority ? "watchlist_priority" : "notification_conversation" }
+          : {}),
+      },
+      // Reply-worthiness routing (the signal the gate now grades on), with the
+      // velocity proxy kept alongside so the two stay comparable in the data.
+      reply_worthiness: {
+        q: cls.q,
+        reply_kind: replyKind,
+        raw_reply_kind: cls.reply_kind,
+        velocity_score: cls.velocity_score,
+        comment_bait: cls.comment_bait,
+        ...(clamped ? { priority_clamped: true, clamp_min_q: CLAMP_MIN_Q } : {}),
+      },
+    },
+  });
+  if (observed && finalOnBrand && replyKind !== "skip") {
+    await sql`select pg_notify(${'noelle_x_priority'}, ${inst.id})`.catch((err) =>
+      log.warn({ leadId: lead.id, err: (err as Error).message }, "X priority drafter wake failed"),
+    );
+  }
+  await emitClassified(
+    slopDrop ? "ai_slop" : replyKind === "light" ? "light" : cls.kind,
+    fp.tier,
+    finalOnBrand,
+  );
+  // notify_low_confidence: ping when the lead was judged off-brand (by the LLM,
+  // the slop filter, or the follower floor). Best-effort; notifier.notify()
+  // returns status='no_channel' rather than throwing when no Pushover keys exist.
+  if (inst.notify_low_confidence && !finalOnBrand) {
+    await notifier
+      .notify({
+        orgId: inst.org_id,
+        title: `Off-brand lead · @${lead.author_handle}`,
+        message: `Classifier dropped lead (${isSlop ? "ai_slop" : cls.kind}, tier ${fp.tier ?? "—"}).\n${reasonBits.join(" · ")}`,
+      })
+      .catch((err) => {
+        log.warn(
+          { leadId: lead.id, err: (err as Error).message },
+          "notify low-confidence failed",
+        );
+      });
+  }
+}
