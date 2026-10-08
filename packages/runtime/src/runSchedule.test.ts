@@ -198,3 +198,4 @@ describe("planScheduledRun", () => {
     const plan = planScheduledRun({ runSchedule: interval(6), goalActive: false }, now);
     expect(plan.action).toBe("fire");
   });
+});
