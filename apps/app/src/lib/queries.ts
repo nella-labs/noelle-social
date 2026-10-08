@@ -3598,3 +3598,203 @@ export async function getLinkedInPipelineSnapshot(
       lifetime: counts[kind].lifetime,
       today: counts[kind].today,
       sinceStart: counts[kind].sinceStart,
+      lastFinishedAt: s?.lastFinishedAt ?? null,
+      runningSince: s?.runningSince ?? null,
+      lastError: s?.lastError ?? null,
+    };
+  });
+  // Lyra's always-on Watchlist lane (mirrors Vega). It has no worker_runs of its
+  // own — discovery / classifier / drafter produce its replies — so it mirrors the
+  // drafter's freshness and reports the watched-connection reply count.
+  // runsWhilePaused so it stays bright (and keeps working) while the funnel is
+  // paused. Pushed separately, after the four funnel stages, so it always renders
+  // last regardless of LINKEDIN_WORKERS.
+  {
+    const ws = enabledByKind.watchlist;
+    const ds = stateByKind.get("drafter");
+    workers.push({
+      kind: "watchlist",
+      enabled: ws,
+      toggleable: true,
+      runsWhilePaused: true,
+      state: ws ? ds?.state ?? "idle" : "disabled",
+      lifetime: counts.watchlist.lifetime,
+      today: counts.watchlist.today,
+      sinceStart: counts.watchlist.sinceStart,
+      lastFinishedAt: ds?.lastFinishedAt ?? null,
+      runningSince: ds?.runningSince ?? null,
+      // Synthetic lane (no worker_runs of its own); the real workers surface their
+      // own failures on their rows, so this convenience row never shows an error.
+      lastError: null,
+    });
+  }
+
+  return {
+    status: inst.status as string,
+    pipelineStartedAt: inst.pipeline_started_at,
+    leadsReady: appr?.leads_ready ?? 0,
+    leadsReadyLastRun: inst.goal_started_at ? appr?.leads_ready_run ?? 0 : null,
+    lastRunStartedAt: inst.goal_started_at,
+    goal: {
+      target: inst.goal_target,
+      startedAt: inst.goal_started_at,
+      produced: inst.goal_started_at ? appr?.produced ?? 0 : 0,
+      ready: appr?.leads_ready ?? 0,
+    },
+    // Lyra's per-connection Apify sweep carries each post's posted-at + reaction
+    // /comment counts, so the tailored run DOES apply (time window + engagement
+    // floors + posts-per-connection). Same saved-default column as Vega; the
+    // panel renders the LinkedIn-applicable subset of fields (no X search ops).
+    discoveryConfig: parseDiscoveryConfig(inst.discovery_config),
+    schedule: pipelineSchedule(inst),
+    workers,
+  };
+}
+
+/**
+ * Whether at least one ACTIVE x_intern instance has the given worker enabled.
+ * Used by the staleness banner so a deliberately-disabled worker doesn't read
+ * as a silent sync failure. Global (no org scope), matching getLastSyncRun and
+ * the dashboard-wide banner it feeds.
+ */
+export async function anyActiveXInternWorkerEnabled(
+  worker: "discovery" | "classifier" | "drafter" | "send",
+): Promise<boolean> {
+  const col = {
+    discovery: "discovery_enabled",
+    classifier: "classifier_enabled",
+    drafter: "drafter_enabled",
+    send: "send_enabled",
+  }[worker];
+  const rows = await readSql<{ n: number }[]>`
+    select count(*)::int as n
+    from noelle.agent_instances
+    where role = 'x_intern' and status = 'active' and ${sql(col)} = true
+  `;
+  return (rows[0]?.n ?? 0) > 0;
+}
+
+/**
+ * Most recent worker_runs rows across all workers, for the activity feed
+ * folding (so zero-result discovery cycles are visible — those produce a
+ * worker_runs row but no llm_calls row, which is exactly the case where
+ * the founder sees nothing happening today).
+ *
+ * No `assertOrgMember`: `worker_runs` is a global ops table.
+ */
+export async function listRecentWorkerRuns(limit = 20): Promise<NoelleSyncRun[]> {
+  const rows = await readSql<NoelleSyncRun[]>`
+    select *
+    from noelle.worker_runs
+    order by coalesce(finished_at, started_at) desc
+    limit ${limit}
+  `;
+  return rows;
+}
+
+// ── LinkedIn intern (Lyra) — draft-only approvals ───────────────────────────
+//
+// The LinkedIn intern writes the SAME noelle.approvals / noelle.drafts /
+// noelle.leads tables as the X intern, distinguished only by:
+//   - agent_instances.role = 'linkedin_intern'
+//   - leads.platform = 'linkedin'
+//   - drafts.payload.kind ∈ {'reply','dm'} (no per-angle bundle quirks)
+//
+// Lyra NEVER posts to LinkedIn (no send worker, no X client). The approvals UI
+// these readers feed is draft-only: copy + "Mark sent". The author name/headline
+// live in noelle.linkedin_watchlist_people (the drafter's outbound overwrite
+// drops them from leads.payload), so we join that in by author_id = fsd_profile_id.
+
+/** The org's LinkedIn intern instance, if one is provisioned. Tenancy via assertMember. */
+export const getLinkedInInternInstance = cache(async (
+  orgId: string,
+): Promise<NoelleAgentInstance | null> => {
+  const userId = await getRequiredUserId();
+  await assertMember(orgId, userId);
+  const rows = await readSql<NoelleAgentInstance[]>`
+    select * from noelle.agent_instances
+    where org_id = ${orgId} and role = 'linkedin_intern'
+    limit 1
+  `;
+  return rows[0] ?? null;
+});
+
+/**
+ * Pattern Breaker alerts still actionable for an instance (open | refining |
+ * refined), newest first, joined to the live rule text. Drives the approvals-
+ * page popup. Org-scoped via the instance's org + assertMember (Cloud SQL has
+ * no RLS). Explicit pages preserve continuation; unavailable owners reject.
+ */
+export type PatternAlertRow = StoredPatternAlertRow;
+export type PatternRuleRow = PatternRulesPage["rules"][number];
+async function authorizedPatternScope(instanceId: string): Promise<PatternScope | null> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return null;
+  const userId = await getRequiredUserId();
+  await assertMember(inst.org_id, userId);
+  const scope = {
+    orgId: inst.org_id,
+    agentInstanceId: inst.id,
+    role: inst.role as PatternScope["role"],
+    userId,
+  };
+  return validPatternScope(scope) ? scope : null;
+}
+export async function listVisiblePatternAlerts(
+  instanceId: string,
+  input: PatternAlertsPageInput = {},
+): Promise<StoredPatternAlertsPage> {
+  const scope = await authorizedPatternScope(instanceId);
+  if (!scope) throw new Error("Current pattern owner is unavailable");
+  return loadVisibleAlerts({ query: readSql, fragments: sql }, scope, input);
+}
+/** Explicit bounded pages preserve continuation for active and disabled rule history. */
+export async function listPatternRules(
+  instanceId: string,
+  input: PatternRulesPageInput = {},
+): Promise<PatternRulesPage> {
+  const scope = await authorizedPatternScope(instanceId);
+  if (!scope) throw new Error("Current pattern owner is unavailable");
+  return readPatternRules({ query: readSql, fragments: sql }, scope, input);
+}
+export async function countPatternRules(
+  instanceId: string,
+): Promise<{ active: number; total: number }> {
+  const scope = await authorizedPatternScope(instanceId);
+  return scope
+    ? readPatternCounts({ query: readSql, fragments: sql }, scope)
+    : { active: 0, total: 0 };
+}
+
+/** Count of people on the LinkedIn intern's watchlist (its whole targeting model). */
+export async function countLinkedInWatchlistPeople(
+  instanceId: string,
+): Promise<number> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return 0;
+  const rows = await readSql<Array<{ n: number }>>`
+    select count(*)::int as n
+    from noelle.linkedin_watchlist_people
+    where agent_instance_id = ${inst.id} and org_id = ${inst.org_id}
+  `;
+  return rows[0]?.n ?? 0;
+}
+
+/**
+ * A person on the LinkedIn intern's watchlist, for the dashboard editor. The
+ * LinkedIn analogue of WatchlistPersonRow: keyed by fsd_profile_id (no @handle),
+ * displayed by name/headline, linked out to linkedin.com/in/<public_id>. The
+ * `profiled` flag reflects whether the profiler has built a profile yet (drives
+ * the "profiled" badge, the analogue of Vega's person-detail page link target).
+ * `objective` is a single free-text engagement steer (the LinkedIn drafter reads
+ * the raw string), not X's preset-kind + note pair.
+ */
+export interface LinkedInWatchlistPersonRow {
+  id: string;
+  fsd_profile_id: string;
+  public_id: string | null;
+  name: string | null;
+  headline: string | null;
+  objective: string | null;
+  added_at: string;
+  profiled: boolean;
