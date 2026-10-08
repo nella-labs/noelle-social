@@ -198,3 +198,51 @@ describe("locatePostLike (reply-also-likes)", () => {
     stubRect(30, 40);
     // The focal tweet has no self-permalink → the id lookup misses → the
     // permalink-less article is picked (never the reply below, which has one).
+    const res = locatePostLike(document.body, "1801000000000000001");
+    expect(res.ok).toBe(true);
+    expect(res.rect).toEqual({ x: 30, y: 40, width: 40, height: 20 });
+    expect(res.observed?.tweet_id).toBeNull(); // the focal article carries no permalink
+  });
+
+  it("prefers the article whose permalink matches the target id when one does", () => {
+    document.body.innerHTML = fx("status-page.html");
+    stubRect(30, 40);
+    const res = locatePostLike(document.body, "1802000000000000002");
+    expect(res.ok).toBe(true);
+    expect(res.observed?.tweet_id).toBe("1802000000000000002");
+  });
+
+  it("skips when the tweet is already liked (testid swapped to unlike)", () => {
+    document.body.innerHTML = fx("status-page-liked.html");
+    const res = locatePostLike(document.body, "1801000000000000001");
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("already-liked");
+  });
+
+  it("skips when the tweet exposes no like button", () => {
+    document.body.innerHTML =
+      "<article data-testid='tweet'><div data-testid='tweetText'>no action bar</div></article>";
+    const res = locatePostLike(document.body);
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("no-like-button");
+  });
+
+  it("skips when there is no tweet at all", () => {
+    document.body.innerHTML = "<div>nothing here</div>";
+    const res = locatePostLike(document.body);
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("no-tweet");
+  });
+});
+
+describe("detectChallenge (locator wrapper)", () => {
+  it("true on a real captcha vendor iframe", () => {
+    document.body.innerHTML = "<iframe src='https://client-api.arkoselabs.com/v2/enforcement'></iframe>";
+    expect(detectChallenge(document.body)).toBe(true);
+  });
+
+  it("false on ordinary content mentioning a 'security check'", () => {
+    document.body.innerHTML = "<div>please verify your identity for this security check</div>";
+    expect(detectChallenge(document.body)).toBe(false);
+  });
+});
