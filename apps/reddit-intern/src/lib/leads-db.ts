@@ -398,3 +398,25 @@ export async function reapStaleClaims(
     /** The pre-claim status a fresh strand is returned to. */
     requeueStatus: "new" | "classified";
   },
+): Promise<{ requeued: number; expired: number }> {
+  const requeued = await sql<{ id: string }[]>`
+    update noelle.leads
+    set status = ${args.requeueStatus}, updated_at = now()
+    where agent_instance_id = ${args.agentInstanceId}
+      and status = ${args.claimedStatus}
+      and updated_at < now() - make_interval(mins => ${STALE_CLAIM_MINUTES})
+      and updated_at >= now() - make_interval(hours => ${STALE_CLAIM_EXPIRE_HOURS})
+    returning id
+  `;
+  const expired = await sql<{ id: string }[]>`
+    update noelle.leads
+    set status = 'skipped',
+        payload = payload || '{"stale_claim":"expired"}'::jsonb,
+        updated_at = now()
+    where agent_instance_id = ${args.agentInstanceId}
+      and status = ${args.claimedStatus}
+      and updated_at < now() - make_interval(hours => ${STALE_CLAIM_EXPIRE_HOURS})
+    returning id
+  `;
+  return { requeued: requeued.length, expired: expired.length };
+}
