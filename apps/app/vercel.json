@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "buildCommand": "pnpm exec turbo run build --filter=@noelle/app",
+  "installCommand": "pnpm install --frozen-lockfile",
+  "outputDirectory": ".next",
+  "regions": ["iad1"],
+  "crons": [
+    {
+      "path": "/api/cron/sync-spend",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
