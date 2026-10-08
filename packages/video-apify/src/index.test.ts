@@ -398,3 +398,125 @@ describe("nicheCreatorReels (profile-based niche)", () => {
   });
 
   it("falls back to the hashtag lane when profile discovery finds no creators", async () => {
+    const h = harness((url, body) => {
+      // user-search finds nothing
+      if (url.includes(INSTAGRAM_SEARCH_ACTOR_ID) && body.searchType === "user") return { items: [] };
+      // hashtag fallback: the popular search feed returns a reel
+      if (url.includes(INSTAGRAM_SEARCH_ACTOR_ID) && body.searchType === "popular") return { items: [IG_SAMPLE] };
+      return { items: [] };
+    });
+    const clips = await h.client.nicheCreatorReels({ platform: "instagram", query: "obscure niche" });
+    expect(clips).toHaveLength(1);
+    expect(clips[0]!.id).toBe("3001");
+  });
+
+  it("falls back to hashtagReels for tiktok by default (no user-search, keyword flag off)", async () => {
+    const h = harness(() => ({ items: [] }));
+    await h.client.nicheCreatorReels({ platform: "tiktok", query: "#growth" });
+    expect(h.startUrl()).toContain(`/v2/acts/${TIKTOK_ACTOR_ID}/`);
+    expect(h.body().hashtags).toEqual(["growth"]); // hashtag lane, not keyword search
+    expect(h.body().searchQueries).toBeUndefined();
+  });
+
+  it("routes tiktok niche through clockworks searchQueries when the opt-in flag is on (UNVERIFIED shape)", async () => {
+    const h = harness(() => ({ items: [TT_SAMPLE] }), { tiktokKeywordSearch: true });
+    const clips = await h.client.nicheCreatorReels({ platform: "tiktok", query: "#growth", maxItems: 8 });
+    expect(h.startUrl()).toContain(`/v2/acts/${TIKTOK_ACTOR_ID}/`);
+    expect(h.body().searchQueries).toEqual(["growth"]); // keyword input, # stripped
+    expect(h.body().resultsPerPage).toBe(8);
+    expect(h.body().hashtags).toBeUndefined(); // not the hashtag lane when flag on
+    expect(clips[0]!.platform).toBe("tiktok");
+  });
+});
+
+describe("accountSnapshot", () => {
+  it("reads follower count + recent clips for instagram", async () => {
+    const head = { ...IG_SAMPLE, followersCount: 240_000, fullName: "Chris V", biography: "viral reels" };
+    const h = harness(() => ({ items: [head] }));
+    const snap = await h.client.accountSnapshot({ platform: "instagram", handle: "ChrisDoesViral" });
+    expect(h.body().resultsType).toBe("details");
+    expect(snap.handle).toBe("chrisdoesviral");
+    expect(snap.followerCount).toBe(240_000);
+    expect(snap.fullName).toBe("Chris V");
+    expect(snap.recent).toHaveLength(1);
+  });
+
+  it("reads fans as follower count for tiktok", async () => {
+    const h = harness(() => ({ items: [TT_SAMPLE] }));
+    const snap = await h.client.accountSnapshot({ platform: "tiktok", handle: "growthnerd" });
+    expect(snap.followerCount).toBe(510_000);
+    expect(snap.recent[0]!.id).toBe("722334455");
+  });
+});
+
+describe("runActorSync real cost capture (drainLastRunUsd)", () => {
+  it("captures the run's real usageTotalUsd and drains it (reset to null on re-read)", async () => {
+    const h = harness(() => ({ items: [TT_SAMPLE], usageTotalUsd: 0.37 }));
+    await h.client.creatorReels({ platform: "tiktok", handle: "growthnerd" });
+    expect(h.client.drainLastRunUsd?.()).toBe(0.37);
+    // Drained: a second read (no new run) is null → caller falls back to estimate.
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("is null when the run object reports no usage", async () => {
+    const h = harness(() => ({ items: [TT_SAMPLE] })); // no usageTotalUsd
+    await h.client.creatorReels({ platform: "tiktok", handle: "growthnerd" });
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("polls a still-running run to completion, then returns its items + cost", async () => {
+    const h = harness(() => ({ items: [TT_SAMPLE], usageTotalUsd: 0.02, runStatus: "RUNNING" }));
+    const clips = await h.client.creatorReels({ platform: "tiktok", handle: "growthnerd" });
+    expect(clips).toHaveLength(1);
+    expect(h.client.drainLastRunUsd?.()).toBe(0.02);
+  });
+
+  it("throws (and records no cost) when the run finishes not-SUCCEEDED", async () => {
+    const h = harness(() => ({ items: [TT_SAMPLE], runStatus: "FAILED" }));
+    await expect(
+      h.client.creatorReels({ platform: "tiktok", handle: "growthnerd" }),
+    ).rejects.toBeInstanceOf(ApifyError);
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("surfaces a token-fatal status on the run start so the rotator can retire it", async () => {
+    const h = harness(() => ({ status: 403, text: "Monthly usage hard limit exceeded" }));
+    await expect(
+      h.client.creatorReels({ platform: "tiktok", handle: "growthnerd" }),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+
+  it("SUMS usageTotalUsd across the several runs one operation makes (niche discovery)", async () => {
+    // nicheCreatorReels makes a user-search run + one creator-harvest run; their
+    // real per-run costs accumulate into a single drained figure ($0.10 + $0.25).
+    const h = harness((url, body) => {
+      if (url.includes(INSTAGRAM_SEARCH_ACTOR_ID) && body.searchType === "user") {
+        return { items: [{ username: "aifounderone" }], usageTotalUsd: 0.1 };
+      }
+      if (url.includes(INSTAGRAM_ACTOR_ID)) {
+        return { items: [{ ...IG_SAMPLE, id: "r-1", shortCode: "r-1" }], usageTotalUsd: 0.25 };
+      }
+      return { items: [] };
+    });
+    const clips = await h.client.nicheCreatorReels({ platform: "instagram", query: "AI founder", maxCreators: 1 });
+    expect(clips.map((c) => c.id)).toEqual(["r-1"]);
+    expect(h.client.drainLastRunUsd?.()).toBeCloseTo(0.35, 10);
+    expect(h.client.drainLastRunUsd?.()).toBeNull(); // reset after drain
+  });
+
+  it("drains null when ANY run in a multi-run operation reported no usage", async () => {
+    // The discovery run has a real cost but the creator-harvest run reports none →
+    // the whole operation falls back to the estimate rather than under-reporting.
+    const h = harness((url, body) => {
+      if (url.includes(INSTAGRAM_SEARCH_ACTOR_ID) && body.searchType === "user") {
+        return { items: [{ username: "aifounderone" }], usageTotalUsd: 0.1 };
+      }
+      if (url.includes(INSTAGRAM_ACTOR_ID)) {
+        return { items: [{ ...IG_SAMPLE, id: "r-1", shortCode: "r-1" }] }; // no usage
+      }
+      return { items: [] };
+    });
+    await h.client.nicheCreatorReels({ platform: "instagram", query: "AI founder", maxCreators: 1 });
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+});
