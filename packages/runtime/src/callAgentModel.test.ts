@@ -598,3 +598,203 @@ describe("per-bucket call deadlines", () => {
   });
 });
 
+describe("a failed call is not a free call", () => {
+  it("records estimated input and cents for a thrown call, not zero", async () => {
+    // Recording zero made 54 pattern-breaker timeouts invisible to the cap.
+    const rows: Array<{ inputTokens: number; cents: number; status: string }> = [];
+    const recorder = {
+      record: async (r: { inputTokens: number; cents: number; status: string }) => {
+        rows.push(r);
+      },
+    };
+    const boom: EngineBackend = {
+      call: vi.fn(async () => {
+        throw new Error("claude cli timed out after 180000ms");
+      }),
+    };
+    await callAgentModel(
+      {
+        ...baseArgs,
+        system: "s".repeat(40_000),
+        prompt: "p".repeat(8_000),
+        routing: { primary: { engine: "bedrock", model: "claude-opus-4-6" } },
+      },
+      { engines: { bedrock: boom }, budget: unlimitedBudget, recorder },
+    ).catch(() => {});
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.status).toBe("timeout");
+    expect(rows[0]!.inputTokens).toBe(12_000); // 48,000 chars / 4
+    expect(rows[0]!.cents).toBeGreaterThan(0);
+  });
+});
+
+describe("codex failover when the Claude budget is spent", () => {
+  // An over-cap budget: any paid/subscription engine is refused at pre-flight.
+  const overCap: CallAgentModelDeps["budget"] = {
+    estimateCents: () => 100,
+    adapters: {
+      fetchSpend: vi.fn(async () => ({ bucket: 9999, org: 9999, instance: 9999 })),
+      fetchCaps: vi.fn(async () => ({ bucket: 10000, org: 10000, instance: 10000 })),
+    },
+  };
+
+  it("continues on codex-cli instead of going dark", async () => {
+    // The whole point: a weekly cap should stop the CLAUDE pot, not the work,
+    // when a second subscription is sitting idle.
+    const codex = stubBackend("codex-text");
+    const res = await callAgentModel(
+      { ...baseArgs, routing: { primary: { engine: "claude-cli", model: "claude-opus-4-6" } } },
+      {
+        engines: { "claude-cli": stubBackend("never"), "codex-cli": codex },
+        budget: overCap,
+        recorder: noopSpendRecorder,
+      },
+    );
+    expect(res.text).toBe("codex-text");
+    expect(res.engineUsed).toEqual({ engine: "codex-cli", model: "gpt-5" });
+    expect(res.outcome).toBe("fallback");
+  });
+
+  it("still throws when no codex backend is wired", async () => {
+    // An org without a ChatGPT subscription keeps today's behaviour exactly:
+    // the cap stops the work.
+    const err = await callAgentModel(
+      { ...baseArgs, routing: { primary: { engine: "claude-cli", model: "claude-opus-4-6" } } },
+      {
+        engines: { "claude-cli": stubBackend("never") },
+        budget: overCap,
+        recorder: noopSpendRecorder,
+      },
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(BudgetExceededError);
+  });
+
+  it("NOELLE_CODEX_FAILOVER=0 restores 'the cap stops the work'", async () => {
+    const prev = process.env.NOELLE_CODEX_FAILOVER;
+    process.env.NOELLE_CODEX_FAILOVER = "0";
+    try {
+      const err = await callAgentModel(
+        { ...baseArgs, routing: { primary: { engine: "claude-cli", model: "claude-opus-4-6" } } },
+        {
+          engines: { "claude-cli": stubBackend("never"), "codex-cli": stubBackend("codex") },
+          budget: overCap,
+          recorder: noopSpendRecorder,
+        },
+      ).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(BudgetExceededError);
+    } finally {
+      if (prev === undefined) delete process.env.NOELLE_CODEX_FAILOVER;
+      else process.env.NOELLE_CODEX_FAILOVER = prev;
+    }
+  });
+});
+
+describe("codex failover when Claude authentication expires", () => {
+  it("continues on codex-cli instead of retrying the same broken Claude session", async () => {
+    const cli = failingBackend(
+      new ClaudeCliAuthError(
+        "claude cli auth failure: OAuth session expired and could not be refreshed",
+      ),
+    );
+    const codex = stubBackend("codex-text");
+
+    const res = await callAgentModel(
+      {
+        ...baseArgs,
+        routing: {
+          primary: { engine: "bedrock", model: "claude-sonnet-4-6" },
+          fallback: { engine: "bedrock", model: "claude-opus-4-6" },
+        },
+      },
+      {
+        ...deps({ "claude-cli": cli, "codex-cli": codex }),
+        getLlmBackend: async () => "claude",
+      },
+    );
+
+    expect(res.text).toBe("codex-text");
+    expect(res.engineUsed).toEqual({ engine: "codex-cli", model: "gpt-5" });
+    expect(res.outcome).toBe("fallback");
+    expect(cli.call).toHaveBeenCalledOnce();
+    expect(codex.call).toHaveBeenCalledOnce();
+  });
+
+  it("preserves a healthy configured fallback when Codex is unavailable", async () => {
+    const cli = failingBackend(
+      new ClaudeCliAuthError(
+        "claude cli auth failure: OAuth session expired and could not be refreshed",
+      ),
+    );
+    const vertex = stubBackend("vertex-text");
+
+    const res = await callAgentModel(
+      {
+        ...baseArgs,
+        routing: {
+          primary: { engine: "bedrock", model: "claude-sonnet-4-6" },
+          fallback: { engine: "vertex", model: "gemini-2-5-pro" },
+        },
+      },
+      {
+        ...deps({ "claude-cli": cli, vertex }),
+        getLlmBackend: async () => "claude",
+      },
+    );
+
+    expect(res.text).toBe("vertex-text");
+    expect(res.engineUsed).toEqual({ engine: "vertex", model: "gemini-2-5-pro" });
+    expect(res.outcome).toBe("fallback");
+    expect(cli.call).toHaveBeenCalledOnce();
+    expect(vertex.call).toHaveBeenCalledOnce();
+  });
+
+  it("preserves a healthy configured fallback when the Codex attempt fails", async () => {
+    const cli = failingBackend(
+      new ClaudeCliAuthError(
+        "claude cli auth failure: OAuth session expired and could not be refreshed",
+      ),
+    );
+    const codex = failingBackend(new Error("codex unavailable"));
+    const vertex = stubBackend("vertex-text");
+
+    const res = await callAgentModel(
+      {
+        ...baseArgs,
+        routing: {
+          primary: { engine: "bedrock", model: "claude-sonnet-4-6" },
+          fallback: { engine: "vertex", model: "gemini-2-5-pro" },
+        },
+      },
+      {
+        ...deps({ "claude-cli": cli, "codex-cli": codex, vertex }),
+        getLlmBackend: async () => "claude",
+      },
+    );
+
+    expect(res.text).toBe("vertex-text");
+    expect(res.engineUsed).toEqual({ engine: "vertex", model: "gemini-2-5-pro" });
+    expect(res.outcome).toBe("fallback");
+    expect(cli.call).toHaveBeenCalledOnce();
+    expect(codex.call).toHaveBeenCalledOnce();
+    expect(vertex.call).toHaveBeenCalledOnce();
+  });
+
+  it("uses Codex when a rewritten configured fallback cannot authenticate", async () => {
+    const vertex = failingBackend(new Error("vertex unavailable"));
+    const cli = failingBackend(
+      new ClaudeCliAuthError(
+        "claude cli auth failure: OAuth session expired and could not be refreshed",
+      ),
+    );
+    const codex = stubBackend("codex-text");
+
+    const res = await callAgentModel(
+      {
+        ...baseArgs,
+        routing: {
+          primary: { engine: "vertex", model: "gemini-2-5-pro" },
+          fallback: { engine: "bedrock", model: "claude-sonnet-4-6" },
+        },
+      },
+      {
+        ...deps({ vertex, "claude-cli": cli, "codex-cli": codex }),
