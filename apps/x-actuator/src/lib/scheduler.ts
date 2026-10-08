@@ -198,3 +198,203 @@ export function planDrainTimeline(o: DrainOpts): PlannedAction[] {
     if (i === breakIdx) {
       t += longBreakMs;
       continue;
+    }
+    const pattern: GapPattern = patterned
+      ? GAP_PATTERNS[o.rng.pickWeighted(weights)]!
+      : "full";
+    // A cooldown gap is a deliberate quiet pause: draw from the NORMAL band so it
+    // is a real 1-2 min break (never the 20-60s short band), still inside the
+    // [1s, normalBandMax] envelope. Every other pattern keeps the two-band draw.
+    const gap = pattern === "cooldown"
+      ? o.rng.int(60_000, normalBandMax)
+      : drainGapMs(o.rng, shortProb, normalBandMax);
+    // Likes scale to the gap: a very short gap (<15s) has no room for a like
+    // sweep, a roomy 1-2 min gap carries the pattern's share. Offsets stay inside
+    // the gap so a like never lands after the next reply.
+    let nLikes: number;
+    switch (pattern) {
+      case "cooldown": nLikes = 0; break;
+      case "light": nLikes = 1; break;
+      case "frontload":
+      case "backload": nLikes = o.rng.int(1, 2); break;
+      default: nLikes = o.rng.int(lMin, lMax);
+    }
+    if (gap >= 15_000 && nLikes > 0) {
+      const lo = Math.min(8_000, Math.floor(gap * 0.15));
+      const hi = Math.max(lo + 1_000, gap - 3_000);
+      let plo = lo;
+      let phi = hi;
+      if (pattern === "frontload") phi = Math.max(lo + 1_000, Math.min(hi, Math.floor(gap * 0.4)));
+      if (pattern === "backload") plo = Math.min(Math.max(lo, Math.floor(gap * 0.6)), hi - 1_000);
+      for (let k = 0; k < nLikes; k++) {
+        actions.push({ kind: "like", atMs: t + o.rng.int(plo, phi) });
+      }
+    }
+    t += gap;
+  }
+  return actions;
+}
+
+// Whether `nowMs` sits inside a drain gap the plan deliberately left QUIET —
+// between two comment slots with no like slot scheduled between them (the
+// cooldown pattern). Idle-liking consults this so the waiting-likes engine can't
+// refill a pause the plan chose to leave empty. Slot times are PLAN times, so
+// the answer is stable across the whole gap. Ported from the LinkedIn actuator.
+export function inQuietDrainGap(
+  actions: readonly { kind: ActionKind; atMs: number }[],
+  nowMs: number,
+): boolean {
+  let prevComment = -Infinity;
+  let nextComment = Infinity;
+  for (const a of actions) {
+    if (a.kind !== "comment") continue;
+    if (a.atMs <= nowMs && a.atMs > prevComment) prevComment = a.atMs;
+    if (a.atMs > nowMs && a.atMs < nextComment) nextComment = a.atMs;
+  }
+  for (const a of actions) {
+    if (a.kind === "like" && a.atMs > prevComment && a.atMs < nextComment) return false;
+  }
+  return true;
+}
+
+// Curfew check lives in ./curfew.ts (isWriteCurfew) — the single switch every
+// enforcement point shares. It is DISABLED BY DEFAULT (manual runs write at any
+// hour) and enabled per-run for the unattended paths, which pass curfewEnabled.
+
+// Density weight for an absolute time.
+// Reduces action probability for deep-night hours.
+// Strengthened: 01:00–06:00 band is now 0.05 (was 0.25).
+function densityWeight(atMs: number, taper: boolean): number {
+  if (!taper) return 1;
+  const h = new Date(atMs).getHours();
+  return h >= 1 && h < 6 ? 0.05 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Hard-shift a curfew-landing action to the nearest allowed hour boundary.
+// Returns null if the entire window is in curfew (caller drops it).
+// ---------------------------------------------------------------------------
+function shiftOutOfCurfew(
+  atMs: number,
+  startMs: number,
+  endMs: number,
+  curfewEnabled: boolean,
+): number | null {
+  // The flag is REQUIRED, not defaulted. It used to call isWriteCurfew(atMs)
+  // with no second argument, which falls back to the global
+  // WRITE_CURFEW_ENABLED = false — so plan-time curfew avoidance never ran on
+  // any run, including the unattended ones that explicitly asked for it.
+  if (!isWriteCurfew(atMs, curfewEnabled)) return atMs;
+
+  // The shift targets are DERIVED from the curfew constants, never hardcoded.
+  //
+  // They used to be literal 06:00 and 22:59, left from the retired 23:00->06:00
+  // band. Against the live 01:00-09:00 band that is catastrophic rather than
+  // merely stale: 06:00 is INSIDE the band, so a shifted action is still
+  // curfewed, and because planTimeline sets `cursor = atMs` after each shift,
+  // the next action starts from 06:00 + gap, is curfewed again, and shifts back
+  // to 06:00. Every remaining in-band action collapses onto the same
+  // millisecond. Measured on a 00:30 start over a 12h window: 12 of 21 actions
+  // landed at exactly 06:00:00.000, all still inside the curfew.
+  //
+  // Forward target is the END of the band (the first allowed instant), which is
+  // outside it by construction, so `+ gap` cannot re-enter and the collapse is
+  // impossible. Backward target is one minute before the START.
+  const d = new Date(atMs);
+  const h = d.getHours();
+  const wraps = CURFEW_START_HOUR > CURFEW_END_HOUR;
+
+  // Forward: the next CURFEW_END_HOUR at or after `atMs`. For a wrapping band
+  // (e.g. 23->6) an hour before the end is on the FOLLOWING local day.
+  const fwd = new Date(d);
+  fwd.setHours(CURFEW_END_HOUR, 0, 0, 0);
+  if (fwd.getTime() <= atMs) fwd.setDate(fwd.getDate() + 1);
+  const candidate = fwd.getTime();
+  if (candidate >= startMs && candidate <= endMs) return candidate;
+
+  // Backward: one minute before CURFEW_START_HOUR. For a wrapping band an hour
+  // after the start belongs to the same day; otherwise step back a day.
+  const back = new Date(atMs);
+  back.setHours(CURFEW_START_HOUR, 0, 0, 0);
+  back.setTime(back.getTime() - 60_000);
+  if (back.getTime() >= atMs || (!wraps && back.getTime() > atMs)) {
+    back.setDate(back.getDate() - 1);
+  }
+  const backMs = back.getTime();
+  if (backMs >= startMs && backMs <= endMs) return backMs;
+
+  return null; // whole window is in curfew — drop
+}
+
+export function planTimeline(opts: PlanOpts): { actions: PlannedAction[]; clamps: ClampNote[] } {
+  const { params, approvedDms, caps, startMs, deepNightTaper, rng } = opts;
+  const maxWritesPerHour = opts.maxWritesPerHour ?? 0;
+  const windowMs = params.windowHours * HOUR;
+  const endMs = startMs + windowMs;
+
+  const clamps: ClampNote[] = [];
+  const clamp = (kind: ActionKind, requested: number, cap: number): number => {
+    if (requested > cap) { clamps.push({ kind, requested, allowed: cap }); return cap; }
+    return requested;
+  };
+
+  // ── 1. ±20% per-plan volume factor ────────────────────────────────────────
+  // Draw once per plan; scale requested counts before clamping to caps. Floor
+  // widened DOWN to 0.72 (fewer on average = safer) with the 1.2 cap unchanged.
+  const volumeFactor = rng.float(0.72, 1.2);
+
+  const rawComments = Math.round(params.targetComments * volumeFactor);
+  const rawLikes    = Math.round(params.targetLikes    * volumeFactor);
+  const rawDms      = Math.round(approvedDms           * volumeFactor);
+
+  const nComments = clamp("comment", rawComments, caps.comments);
+  const nLikes    = clamp("like",    rawLikes,    caps.likes);
+  const nDms      = clamp("dm",      rawDms,      caps.dms);
+
+  // ── 2. Build kind-list ─────────────────────────────────────────────────────
+  const kinds: ActionKind[] = [];
+  for (let i = 0; i < nComments; i++) kinds.push("comment");
+  for (let i = 0; i < nLikes; i++) kinds.push("like");
+  // Fisher–Yates shuffle with seeded RNG so likes/comments interleave.
+  for (let i = kinds.length - 1; i > 0; i--) {
+    const j = rng.int(0, i);
+    [kinds[i], kinds[j]] = [kinds[j]!, kinds[i]!];
+  }
+  // DMs spaced widest: insert at evenly-distributed indices.
+  for (let d = 0; d < nDms; d++) {
+    const idx = Math.floor(((d + 1) / (nDms + 1)) * kinds.length);
+    kinds.splice(idx, 0, "dm");
+  }
+
+  const total = kinds.length;
+  if (total === 0) return { actions: [], clamps };
+
+  // ── 3. Per-burst Gamma intensity ───────────────────────────────────────────
+  // Burst count: ~1 burst per 45–90 min.
+  const burstCount = Math.max(1, Math.round(params.windowHours / rng.float(0.6, 2.2)));
+
+  // Draw a Gamma weight per burst so intensity varies across bursts. The lower
+  // shape (k=1.5, was 2) widens the between-burst intensity spread.
+  const burstWeights: number[] = [];
+  for (let b = 0; b < burstCount; b++) {
+    burstWeights.push(rng.gamma(1.5, 1));
+  }
+  const totalWeight = burstWeights.reduce((s, w) => s + w, 0);
+
+  // Distribute total action count across bursts proportionally to gamma weights.
+  const burstSizes: number[] = burstWeights.map((w) =>
+    Math.round((w / totalWeight) * total),
+  );
+  // Correct rounding drift — assign remainder to heaviest burst.
+  const sizeSum = burstSizes.reduce((s, v) => s + v, 0);
+  const drift = total - sizeSum;
+  if (drift !== 0 && burstSizes.length > 0) {
+    const heaviest = burstWeights.indexOf(Math.max(...burstWeights));
+    burstSizes[heaviest] = (burstSizes[heaviest] ?? 0) + drift;
+  }
+
+  // Burst start times: evenly distributed across window with random jitter.
+  // A LONE burst (short windows, burstCount===1) anchors at the window OPEN, not
+  // its midpoint — otherwise the first half of a short window is dead and the
+  // first real action lands ~50% of the way in (the "nothing happens for 15 min"
+  // bug). Multi-burst windows keep the centered spacing unchanged.
