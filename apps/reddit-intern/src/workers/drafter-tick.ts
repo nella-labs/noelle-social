@@ -798,3 +798,203 @@ async function runVerifyLoop<T>(args: {
     const fix = bestVerdict.fix ?? "make the comments more specific, grounded, and on-voice";
     const fixPrompt = `${basePrompt}\n\nREVIEW FEEDBACK — an editor rejected the previous attempt: ${fix}\nRewrite all comments to fix this. Keep the exact strict JSON output shape.`;
     let candidate: T | null = null;
+    try {
+      candidate = await regenerate(fixPrompt);
+    } catch (e) {
+      log.warn({ leadId, err: (e as Error).message }, "verifier regenerate failed; keeping best so far");
+      break;
+    }
+    if (!candidate) break;
+    const verdict = await verifyTiered(toDrafts(candidate), ctx, calls);
+    if ((verdict.pass && !bestVerdict.pass) || total(verdict) > total(bestVerdict)) {
+      best = candidate;
+      bestVerdict = verdict;
+    }
+    if (verdict.pass) break;
+  }
+  log.info({ leadId, pass: bestVerdict.pass, attempts, scores: bestVerdict.scores }, "draft verified");
+  return {
+    best,
+    meta: toOutboundVerifierMeta(bestVerdict, attempts, { requireJudge: false }),
+  };
+}
+
+/**
+ * SUBSTANTIAL draft: tiered angle count (T1→3 empathetic/technical/contrarian,
+ * T2→2, T3→1). No DM — Orion only drafts public comments. Returns true when a
+ * draft was posted, false otherwise.
+ */
+async function draftSubstantial(args: DraftCommonArgs & { tier: "T1" | "T2" | "T3" }): Promise<boolean> {
+  const { lead, tier, postText, payload, anchors, knowledgeAnchors, imageCaption, brand, instance, routing, runner, postOutbound, markStatus, log, verify, registerBlock, shapeBlock, genzBlock, openingMoveBlock, energyHint, siblingBlock, allowCelebration, priorReplies, recentPhrasings, fenceUntrusted, commentTarget, patternRules } = args;
+  const allowedAngles = TIER_ANGLES[tier];
+
+  const prompt = renderSubstantialPrompt({
+    postText,
+    postTitle: (payload.title ?? "").trim() || null,
+    authorName: lead.author_handle,
+    subreddit: payload.subreddit ?? null,
+    anchors: anchors.map((a) => a.snippet),
+    knowledgeAnchors,
+    imageCaption,
+    topComments: payload.topComments,
+    commentTarget,
+    fenceUntrusted,
+    allowedAngles,
+    registerBlock,
+    shapeBlock,
+    genzBlock,
+    openingMoveBlock,
+    ...(energyHint ? { energyHint } : {}),
+    ...(siblingBlock ? { siblingBlock } : {}),
+    priorReplies,
+    recentPhrasings,
+  });
+  const draftArgs = {
+    bucket: "drafter-codex",
+    routing,
+    orgId: instance.org_id,
+    instanceId: instance.id,
+    worker: "drafter" as const,
+    agentRole: "reddit_intern" as const,
+    system: buildDrafterSystem(instance.objective, brand, patternRules, args.voiceExemplars),
+  };
+  const res = await runner.draft({ ...draftArgs, prompt });
+  const parsed = SubstantialOutput.safeParse(safeJsonParse(res.text));
+  if (!parsed.success) {
+    log.error({ leadId: lead.id, raw: res.text.slice(0, 200) }, "drafter output schema fail");
+    await markStatus({ leadId: lead.id, status: "errored", meta: { error: "schema" } });
+    return false;
+  }
+  if ("skip" in parsed.data) {
+    log.info({ leadId: lead.id, skip_reason: parsed.data.skip }, "drafter skipped substantial lead");
+    await markStatus({
+      leadId: lead.id,
+      status: "skipped",
+      meta: { skip_reason: parsed.data.skip, engine: res.engine, model: res.model },
+    });
+    return false;
+  }
+
+  const prepare = (data: typeof parsed.data) => ({
+    ...data,
+    drafts: applyReplyEmojiPolicy(allowedAngles.flatMap((angle) => {
+      const draft = data.drafts.find((row) => row.angle === angle);
+      return draft ? [{ ...draft, body: stripEmDashes(draft.body) }] : [];
+    }), postText),
+  });
+  let draftsData = { ...prepare(parsed.data), writer: { engine: res.engine, model: res.model } };
+  if (!draftsData.drafts.length) {
+    const noAllowedAngle = !parsed.data.drafts.some((row) => allowedAngles.includes(row.angle));
+    await markStatus({ leadId: lead.id, status: noAllowedAngle ? "errored" : "skipped",
+      meta: noAllowedAngle ? { error: "no_in_tier_angle" } : { reason: "empty-after-emoji-policy" } });
+    return false;
+  }
+  let verifierMeta: OutboundIn["verifierMeta"] = null;
+  let finalReview: { ctx: VerifyContext; calls: VerifierCall[] } | null = null;
+  let reviewContext: OutboundIn["drafts"][number]["reviewContext"];
+  if (verify?.enabled) {
+    const ctx: VerifyContext = {
+      platform: "reddit",
+      ...replyReviewSource(args),
+      voiceAnchors: anchors.map((a) => a.snippet),
+      knowledgeAnchors,
+      personProfile: null,
+      // A celebration comment may be warm/hyped — don't let the judge ding it.
+      ...(allowCelebration ? { allowCelebration: true } : {}),
+      ...(priorReplies?.length ? { priorRepliesToPerson: priorReplies } : {}),
+      ...(recentPhrasings?.length ? { recentReplies: recentPhrasings } : {}),
+      // Learned anti-pattern rules: auto phrase → soft penalty, refined/manual
+      // phrase → hard-zero, structure → folded into the voice judge.
+      ...(patternRules.length ? { dynamicBannedPatterns: patternRules } : {}),
+    };
+    reviewContext = OutboundFactualContextSchema.parse({ version: 1, ...ctx });
+    const calls = verify.makeCalls(lead.priority ?? false);
+    finalReview = { ctx, calls };
+    const toDrafts = (d: typeof draftsData): DraftToVerify[] =>
+      d.drafts.map((x) => ({ kind: "reply" as const, angle: x.angle, body: x.body }));
+    const { best, meta } = await runVerifyLoop({
+      initial: draftsData,
+      toDrafts,
+      regenerate: async (fixPrompt) => {
+        const r = await runner.draft({ ...draftArgs, prompt: fixPrompt });
+        const p = SubstantialOutput.safeParse(safeJsonParse(r.text));
+        if (!p.success || "skip" in p.data) return null;
+        const candidate = prepare(p.data);
+        return candidate.drafts.length ? { ...candidate, writer: { engine: r.engine, model: r.model } } : null;
+      },
+      basePrompt: prompt,
+      ctx,
+      calls,
+      retries: verify.retries,
+      leadId: lead.id,
+      log,
+    });
+    draftsData = best;
+    verifierMeta = meta;
+  }
+
+  const replyRows = draftsData.drafts.map((draft) => ({
+    id: randomUUID(), kind: "reply" as const, angle: draft.angle,
+    body: draft.body, charCount: [...draft.body].length,
+  }));
+
+  // Every retained variant passes the shared commitment guard before entering
+  // review or any configured automatic send path.
+  const safeReplyRows = replyRows.filter((r) => !makesCommitment(r.body));
+  for (const r of replyRows) {
+    if (makesCommitment(r.body)) {
+      log.warn(
+        { leadId: lead.id, reason: commitmentReason(detectCommitments(r.body)) },
+        "commitment guard dropped a reply variant",
+      );
+    }
+  }
+  if (safeReplyRows.length === 0) {
+    log.warn({ leadId: lead.id }, "commitment guard dropped every reply variant");
+    await markStatus({
+      leadId: lead.id,
+      status: "skipped",
+      meta: { skip_reason: commitmentReason(detectCommitments(replyRows[0]!.body)) || "commitment-guard" },
+    });
+    return false;
+  }
+
+  const outbound = buildOutbound({ lead, postText, payload, anchors, drafts: safeReplyRows, verifierMeta, commentTarget });
+  if (!outbound) {
+    // Every draft cleaned to empty. Skip with an ACCURATE reason rather than
+    // handing an empty set to a schema that requires min(1).
+    log.warn({ leadId: lead.id }, "every draft cleaned to empty; skipping the lead");
+    await markStatus({ leadId: lead.id, status: "skipped", meta: { reason: "empty-after-emoji-policy" } });
+    return false;
+  }
+  if (finalReview) {
+    for (const draft of outbound.drafts) {
+      if (reviewContext) draft.reviewContext = reviewContext;
+      if (verifierMeta && draftsData.drafts.length === 1 &&
+          draft.angle === draftsData.drafts[0]!.angle && draft.body === draftsData.drafts[0]!.body) {
+        draft.verifierMeta = verifierMeta;
+        continue;
+      }
+      const verdict = await verifyTiered(
+        [{ kind: "reply", angle: draft.angle, body: draft.body }],
+        finalReview.ctx, finalReview.calls,
+      );
+      draft.verifierMeta = toOutboundVerifierMeta(verdict, verifierMeta?.attempts ?? 0, { requireJudge: false });
+    }
+    const floor = verify?.voiceFloor;
+    const weak = floor ? outbound.drafts.filter((draft) =>
+      draft.verifierMeta?.judgeOk === true && draft.verifierMeta.scores.voice < floor) : [];
+    if (weak.length) {
+      const weakIds = new Set(weak.map((draft) => draft.id));
+      outbound.drafts = outbound.drafts.filter((draft) => !weakIds.has(draft.id));
+      log.info({ leadId: lead.id, angles: weak.map((draft) => draft.angle) }, "removed reply angles below voice floor");
+      if (!outbound.drafts.length) {
+        await markStatus({ leadId: lead.id, status: "skipped", meta: {
+          skip_reason: "low-voice", voice: Math.min(...weak.map((draft) => draft.verifierMeta!.scores.voice)),
+          model: draftsData.writer.model,
+        } });
+        return false;
+      }
+    }
+  }
+  await postOutbound(outbound);
