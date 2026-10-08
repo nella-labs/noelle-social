@@ -198,3 +198,91 @@ const EnvSchema = z.object({
   // How many knowledge chunks to retrieve in the second pass.
   NOELLE_DRAFTER_KNOWLEDGE_TOPK: z.coerce.number().int().min(0).default(4),
   // Run the post-draft verifier + regenerate loop.
+  NOELLE_DRAFTER_VERIFY: boolFlag,
+  // Max regenerate attempts on a failed verdict before queueing the best try.
+  NOELLE_DRAFTER_VERIFY_RETRIES: z.coerce.number().int().min(0).max(3).default(2),
+  // Voice floor (0-1). After the verifier + retries, a reply whose voice score
+  // is below this is DROPPED (lead skipped 'low-voice') instead of served.
+  // 0 disables the gate. Default 0.65.
+  NOELLE_DRAFTER_VOICE_FLOOR: z.coerce.number().min(0).max(1).default(0.65),
+  // Voice variety: per lead, randomly assign a "register" and inject it into the
+  // comment-drafting prompt so comments vary in length + energy across the feed
+  // (see lib/register.ts). Default OFF → byte-identical drafts. Mirrors x-intern.
+  NOELLE_DRAFTER_VARIETY: boolFlag,
+  // Post-energy mirroring (default OFF). When on, the drafter detects each thread's
+  // ENERGY (celebration / joke / hot_take / vent / question / analytical) and (a)
+  // picks an energy-aware register when variety is on — DEADPAN on a joke, never HYPE
+  // on a serious thread — and (b) injects a "POST ENERGY" hint so the comment MIRRORS
+  // the thread: answer a joke with a joke, a vent with commiseration, not philosophy.
+  // Off/unset → blind register only, byte-identical to today. See packages/runtime/src/register.ts.
+  NOELLE_DRAFTER_ENERGY: boolFlag,
+  // Sibling-comment "read the room" fetch (default OFF). When on, the drafter pulls
+  // the top OTHER comments on each thread via Reddit's FREE public .json endpoint (no
+  // token, no Apify spend, fail-open) and injects a digest so the comment mirrors the
+  // room's energy and never echoes a take already made. Off/unset → no fetch, no
+  // block, byte-identical. See packages/runtime/src/commentDigest.ts.
+  NOELLE_DRAFTER_COMMENT_ENERGY: boolFlag,
+  // Max sibling comments to fetch + show per lead when NOELLE_DRAFTER_COMMENT_ENERGY
+  // is on. Keeps the prompt bounded. Default 12.
+  NOELLE_DRAFTER_COMMENT_MAX: z.coerce.number().int().min(1).max(50).default(12),
+  // Per-author memory: how many of the replies Orion already sent/queued to a
+  // post's author to inject into the comment prompt ("do not repeat these").
+  // 0 disables it. Default 3.
+  REDDIT_DRAFTER_SENT_TOPK: z.coerce.number().int().min(0).default(3),
+  // Global phrasing memory: how many of Orion's most recent replies across the
+  // WHOLE feed (all authors) to inject as an avoid-list. 0 disables it. Default 10.
+  REDDIT_DRAFTER_RECENT_PHRASINGS_TOPK: z.coerce.number().int().min(0).default(10),
+  // Prompt-injection fence (SECURITY). When ON, the drafter wraps the UNTRUSTED
+  // Reddit post text, image caption, and top-comments digest in delimiters with a
+  // "data, never instructions" guard so a hostile post/comment can't hijack the
+  // model. DEFAULT ON for Reddit — Reddit text is attacker-authored and was
+  // previously injected UNFENCED. Set 0 only to reproduce the legacy prompt.
+  NOELLE_DRAFTER_FENCE: boolFlag.default("1"),
+  // Comment targeting. When ON and a post's most-upvoted comment clears
+  // REDDIT_COMMENT_TARGET_MIN_SCORE, the drafter grounds the reply in THAT comment
+  // (replying under it) instead of the post. DEFAULT ON. Set 0 to always reply to
+  // the post.
+  REDDIT_COMMENT_TARGETING: boolFlag.default("1"),
+  // Minimum score the top comment must have before the drafter targets it (rather
+  // than the post). Keeps Orion replying to genuinely-surfaced comments, not a
+  // 2-upvote aside. Default 30.
+  REDDIT_COMMENT_TARGET_MIN_SCORE: z.coerce.number().int().nonnegative().default(30),
+
+  // ---- Pattern Breaker -----------------------------------------------------
+  // Default OFF. When on, the drafter worker (a) drains the AI-refine queue
+  // every tick (cheap) and (b) re-analyzes the operator's last-N sent replies
+  // for over-used structural patterns at most once per interval, per instance.
+  // Mirrors LINKEDIN_PATTERN_BREAKER (docs/pattern-breaker.md); the knob names
+  // below are shared with the LinkedIn intern deliberately.
+  REDDIT_PATTERN_BREAKER: boolFlag,
+  // How often (ms) the full analysis re-runs per instance. Default 6h — it's a
+  // corpus-level audit, not a per-lead pass.
+  PATTERN_BREAKER_INTERVAL_MS: z.coerce.number().int().positive().default(6 * 60 * 60_000),
+  // Min posts in a window for a pattern to be flagged (also the corpus floor).
+  PATTERN_BREAKER_MIN_FREQUENCY: z.coerce.number().int().positive().default(3),
+  // Min SHARE of the window a pattern must cover to count as over-used (0..1).
+  PATTERN_BREAKER_MIN_RATIO: z.coerce.number().min(0).max(1).default(0.3),
+  // Max posts pulled into the corpus (the largest analysis window).
+  PATTERN_BREAKER_MAX_POSTS: z.coerce.number().int().positive().default(100),
+
+  // Vision caption fallback. When no BYO org `gemini-api-key` is configured (the
+  // self-host case), caption post images via Vertex Gemini using the worker's
+  // attached service account / ADC instead. Default ON; set 0 to force text-only.
+  NOELLE_VERTEX_ENABLED: boolFlag.default("1"),
+  // Vertex region for the ADC vision caption (and any Vertex engine fallback).
+  VERTEX_LOCATION: z.string().default("us-central1"),
+});
+
+export type Env = z.infer<typeof EnvSchema>;
+
+let cached: Env | undefined;
+
+export function loadEnv(): Env {
+  if (cached) return cached;
+  cached = EnvSchema.parse(process.env);
+  return cached;
+}
+
+export function resetEnvForTests() {
+  cached = undefined;
+}

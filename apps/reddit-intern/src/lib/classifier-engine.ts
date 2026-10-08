@@ -198,3 +198,72 @@ export function createClassifier(opts: {
           q: parsed.data.q,
           reply_kind: replyKind,
           tier,
+          reason: parsed.data.reason,
+          comment_bait: parsed.data.comment_bait,
+          usage: callUsage,
+          raw: { ...parsed.data, judge: "legacy" },
+        };
+      } catch (err) {
+        if (isBudgetAdmissionError(err)) throw err;
+        return failOpen((err as Error).message);
+      }
+    },
+  };
+}
+
+/**
+ * Parse the model's text into a JSON object. Vertex Gemini, called without a
+ * forced JSON mime-type, sometimes wraps the object in a ```json fence or
+ * surrounds it with prose, so we strip fences and fall back to the first
+ * `{...}` span before giving up. Returns null when nothing parses.
+ */
+function extractJson(text: string): unknown {
+  const trimmed = text.trim();
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  for (const candidate of [unfenced, sliceBraces(unfenced)]) {
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+function sliceBraces(s: string): string | null {
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  return s.slice(start, end + 1);
+}
+
+/**
+ * Fail-open verdict: when the backend errors or returns garbage, let the lead
+ * through as a LIGHT reply (never the Opus-eligible substantial/T3 lane) with a
+ * NULL score so it's distinguishable from a real zero downstream.
+ *
+ * Light, not substantial: a SYSTEMIC backend outage fails EVERY lead this way,
+ * and routing them all to substantial/T3 flooded the approval queue with
+ * expensive, unscored Opus-tier drafts (and spent the scarce substantial daily
+ * cap on unclassified content). Light degrades gracefully — nothing is lost
+ * (still human-gated), a short cheap reply is drafted instead, and the blast
+ * radius is bounded by REDDIT_DAILY_LIGHT_CAP.
+ */
+function failOpen(
+  reason: string,
+  usage: { inputTokens: number; outputTokens: number } = { inputTokens: 0, outputTokens: 0 },
+): ClassifyOutput {
+  return {
+    q: null,
+    reply_kind: "light",
+    tier: null,
+    reason: `fail-open: ${reason}`,
+    comment_bait: false,
+    usage,
+    raw: { fail_open: reason },
+  };
+}
