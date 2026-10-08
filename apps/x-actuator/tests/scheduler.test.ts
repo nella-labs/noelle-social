@@ -398,3 +398,80 @@ describe("planDrainTimeline — session archetype opts (X)", () => {
     // The break decision derives from (startMs, approvedComments) via a separate
     // rng (in production startMs is a fresh wall-clock ms), so vary startMs here.
     for (let seed = 1; seed <= 20; seed++) {
+      const startMs = seed * 100_000;
+      const withBreak = planDrainTimeline({ approvedComments: 8, startMs, rng: makeRng(seed), longBreakMs: 600_000 });
+      const comments = withBreak.filter((a) => a.kind === "comment").map((a) => a.atMs).sort((x, y) => x - y);
+      const gaps = comments.slice(1).map((v, i) => v - comments[i]!);
+      // Non-break gaps stay in the [1s,120s] envelope, so only the break gap can reach 600s.
+      const longGaps = gaps.filter((g) => g >= 600_000);
+      if (longGaps.length > 0) {
+        seedsWithBreak.push(seed);
+        expect(longGaps).toHaveLength(1); // exactly one break per batch
+        const idx = gaps.findIndex((g) => g >= 600_000);
+        const lo = comments[idx]!;
+        const hi = comments[idx + 1]!;
+        // The break gap is QUIET: no like slots inside it → idle-likes stay out.
+        const likesInBreak = withBreak.filter((a) => a.kind === "like" && a.atMs > lo && a.atMs < hi).length;
+        expect(likesInBreak).toBe(0);
+        expect(inQuietDrainGap(withBreak, lo + Math.floor((hi - lo) / 2))).toBe(true);
+      }
+    }
+    expect(seedsWithBreak.length).toBeGreaterThan(0); // breaks actually fire across sessions
+  });
+
+  it("handles tiny queues and the long-break eligibility boundary (n<3 never breaks)", () => {
+    expect(planDrainTimeline({ approvedComments: 0, startMs: 0, rng: makeRng(1), longBreakMs: 600_000 })).toEqual([]);
+    const one = planDrainTimeline({ approvedComments: 1, startMs: 0, rng: makeRng(1), longBreakMs: 600_000 });
+    expect(one.filter((a) => a.kind === "comment")).toHaveLength(1);
+    // n=2 is below the break-eligibility floor (approvedComments >= 3): no 600s
+    // break can appear at any startMs (non-break gaps stay ≤120s on X).
+    for (let seed = 1; seed <= 40; seed++) {
+      const two = planDrainTimeline({ approvedComments: 2, startMs: seed * 100_000, rng: makeRng(seed), longBreakMs: 600_000 });
+      const c = two.filter((a) => a.kind === "comment").map((a) => a.atMs).sort((x, y) => x - y);
+      expect(c[1]! - c[0]!).toBeLessThan(600_000);
+    }
+    // n=3 is the minimum eligible; a break (index ∈ {0,1}) can fire.
+    let sawBreakAt3 = false;
+    for (let seed = 1; seed <= 60 && !sawBreakAt3; seed++) {
+      const three = planDrainTimeline({ approvedComments: 3, startMs: seed * 100_000, rng: makeRng(seed), longBreakMs: 600_000 });
+      const c = three.filter((a) => a.kind === "comment").map((a) => a.atMs).sort((x, y) => x - y);
+      if (c.some((_, i) => i > 0 && c[i]! - c[i - 1]! >= 600_000)) sawBreakAt3 = true;
+    }
+    expect(sawBreakAt3).toBe(true);
+  });
+
+  it("explicit like knobs disable the pattern-weight draw (weights ignored, every ample gap full-fills)", () => {
+    // patternWeights alongside like knobs: patterns are OFF (patterned=false), so
+    // the weights are ignored. An all-cooldown vector WOULD zero every gap's likes
+    // if it applied — asserting every ample gap carries exactly the knob count proves
+    // it does not. shortBandProb=0 keeps every gap in the ample 60-120s band.
+    const plan = planDrainTimeline({
+      approvedComments: 20, startMs: 0, rng: makeRng(4),
+      shortBandProb: 0,
+      patternWeights: [0, 1, 0, 0, 0], // all-cooldown, i.e. zero likes — IF it applied
+      likesPerGapMin: 5, likesPerGapMax: 5,
+    });
+    const gaps = commentGaps(plan);
+    likesPerGap(plan).forEach((n, i) => {
+      if ((gaps[i] ?? 0) >= 15_000) expect(n).toBe(5); // knobs win; weights ignored
+    });
+  });
+
+  it("the default path is byte-identical when archetype opts are absent (old persisted states)", () => {
+    // Old RunStates carry no drainStyle; passing the documented defaults explicitly
+    // must not shift a single slot vs omitting them entirely (byte-compatible fallback).
+    const withoutOpts = planDrainTimeline({ approvedComments: 12, startMs: 500_000, rng: makeRng(21) });
+    const withDefaults = planDrainTimeline({
+      approvedComments: 12, startMs: 500_000, rng: makeRng(21),
+      normalBandMaxMs: 120_000, longBreakMs: 0,
+    });
+    expect(withDefaults).toEqual(withoutOpts);
+  });
+
+  it("is deterministic for a fixed seed + opts", () => {
+    const opts = { approvedComments: 8, startMs: 0, patternWeights: [0.3, 0.3, 0.15, 0.15, 0.1], shortBandProb: 0.3, normalBandMaxMs: 160_000, longBreakMs: 500_000 };
+    const a = planDrainTimeline({ ...opts, rng: makeRng(7) });
+    const b = planDrainTimeline({ ...opts, rng: makeRng(7) });
+    expect(a).toEqual(b);
+  });
+});
