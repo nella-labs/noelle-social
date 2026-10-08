@@ -598,3 +598,203 @@ export interface SentStatsByAgentRow {
   /** Of `total`, how many were DMs (drafts.payload.kind = 'dm'). */
   dms: number;
   /** Of `total`, how many were replies (everything that isn't a DM). */
+  replies: number;
+}
+
+function platformForRole(role: string): SentStatsByAgentRow["platform"] {
+  if (role === "x_intern") return "x";
+  if (role === "linkedin_intern") return "linkedin";
+  return "other";
+}
+
+/**
+ * Per-agent sent-message stats for the Stats page — today / last 7 days /
+ * lifetime, plus a reply-vs-DM split. Driven from `agent_instances` (left join
+ * approvals) so a real agent with zero sends still shows a row of zeros rather
+ * than vanishing. 'sent' is status = 'sent' only (skips are not sends), and
+ * synthetic seed leads are excluded via a NOT EXISTS in the join so they never
+ * inflate a count. `decided_at` is the send time; windows are UTC, matching the
+ * rest of the dashboard. Tenancy guard before the query.
+ */
+export async function getSentStatsByAgent(
+  orgId: string,
+): Promise<SentStatsByAgentRow[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<
+    Array<{
+      instance_id: string;
+      role: string;
+      display_name: string;
+      today: number;
+      last7: number;
+      total: number;
+      dms: number;
+      replies: number;
+    }>
+  >`
+    select
+      ai.id           as instance_id,
+      ai.role         as role,
+      ai.display_name as display_name,
+      count(a.id)::int                                                          as total,
+      count(a.id) filter (where a.decided_at >= date_trunc('day', now()))::int  as today,
+      count(a.id) filter (
+        where a.decided_at >= date_trunc('day', now()) - interval '6 days'
+      )::int                                                                    as last7,
+      count(a.id) filter (
+        where coalesce(d.payload->>'kind', 'reply') = 'dm'
+      )::int                                                                    as dms,
+      count(a.id) filter (
+        where coalesce(d.payload->>'kind', 'reply') <> 'dm'
+      )::int                                                                    as replies
+    from noelle.agent_instances ai
+    left join noelle.approvals a
+      on a.agent_instance_id = ai.id
+     and a.org_id = ai.org_id
+     and a.status = 'sent'
+     and not exists (
+       select 1 from noelle.leads syn
+       where syn.id = a.lead_id and syn.external_id like 'synthetic-%'
+     )
+    left join noelle.drafts d on d.id = a.draft_id
+    where ai.org_id = ${orgId}
+      and ai.role in ('x_intern', 'linkedin_intern')
+    group by ai.id, ai.role, ai.display_name
+    order by total desc, ai.role asc
+  `;
+  return rows.map((r) => ({
+    instanceId: r.instance_id,
+    role: r.role,
+    displayName: r.display_name,
+    platform: platformForRole(r.role),
+    today: r.today,
+    last7: r.last7,
+    total: r.total,
+    dms: r.dms,
+    replies: r.replies,
+  }));
+}
+
+/** One day's sent total, split by platform, for the trailing-14-day chart. */
+export interface SentDailyPoint {
+  /** ISO date (YYYY-MM-DD), UTC. */
+  day: string;
+  /** Sent by the X intern (Vega) that day. */
+  x: number;
+  /** Sent by the LinkedIn intern (Lyra) that day. */
+  linkedin: number;
+  /** x + linkedin (+ any other role). */
+  total: number;
+}
+
+/**
+ * Trailing-14-day daily sent counts, split X vs LinkedIn, for the Stats page
+ * chart. Generates a dense date series (so empty days render as zero-height
+ * bars rather than gaps), left-joins sent approvals on `decided_at::date`, and
+ * excludes synthetic seed leads. Mirrors `getOrgSpendDaily14`'s shape. Tenancy
+ * guard before the query.
+ */
+export async function getSentDaily14ByAgent(
+  orgId: string,
+): Promise<SentDailyPoint[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<
+    Array<{ day: string; x: number; linkedin: number; total: number }>
+  >`
+    with days as (
+      select generate_series(
+        (current_date - interval '13 days')::date,
+        current_date,
+        interval '1 day'
+      )::date as day
+    )
+    select
+      d.day::text as day,
+      count(a.id) filter (where ai.role = 'x_intern')::int        as x,
+      count(a.id) filter (where ai.role = 'linkedin_intern')::int as linkedin,
+      count(a.id)::int                                            as total
+    from days d
+    left join noelle.approvals a
+      on a.org_id = ${orgId}
+     and a.status = 'sent'
+     and a.decided_at::date = d.day
+     and not exists (
+       select 1 from noelle.leads syn
+       where syn.id = a.lead_id and syn.external_id like 'synthetic-%'
+     )
+    left join noelle.agent_instances ai on ai.id = a.agent_instance_id
+    group by d.day
+    order by d.day asc
+  `;
+  return rows.map((r) => ({
+    day: r.day,
+    x: r.x,
+    linkedin: r.linkedin,
+    total: r.total,
+  }));
+}
+
+/**
+ * Lifetime count of approvals that have been actioned (sent OR skipped) for an
+ * org, excluding synthetic seed leads. Used to derive "drafts produced"
+ * (pending + actioned) so a produced count includes drafts you skipped.
+ */
+export async function countActionedApprovalsForOrg(orgId: string): Promise<number> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<Array<{ n: number }>>`
+    select count(*)::int as n
+    from noelle.approvals a
+    left join noelle.leads l on l.id = a.lead_id
+    where a.org_id = ${orgId}
+      and a.status in ('sent', 'skipped')
+      and (l.external_id is null or l.external_id not like 'synthetic-%')
+  `;
+  return rows[0]?.n ?? 0;
+}
+
+/**
+ * Backpressure status for the org's X Growth Intern (Vega).
+ *
+ * Returns the configured caps and the current counts so the dashboard
+ * can surface "Resting at 100/100 drafts — review some to wake Vega up"
+ * or "Backlog full (243/200) — discovery paused" without the card
+ * having to know how the workers gate themselves.
+ *
+ * Returns `null` when the org has no `x_intern` instance (alpha
+ * cohorts that haven't been provisioned yet) — let the caller skip
+ * the override entirely instead of falling back to fake numbers.
+ *
+ * One round trip, index-covered by:
+ *   - approvals_instance_idx (counts pending approvals)
+ *   - leads(org_id, status, ...)
+ */
+export async function getCapStatusForXIntern(
+  orgId: string,
+): Promise<{
+  pendingDraftsCap: number | null;
+  pendingDrafts: number;
+  leadBacklogCap: number | null;
+  leadBacklog: number;
+} | null> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+
+  // Single round trip: pulls the instance's two caps and the live
+  // counts from approvals + leads. LEFT JOIN LATERAL keeps the row
+  // even when there's nothing in either subtable (counts default 0).
+  const rows = await readSql<
+    Array<{
+      pending_drafts_cap: number | null;
+      pending_drafts: string;
+      lead_backlog_cap: number | null;
+      lead_backlog: string;
+    }>
+  >`
+    select
