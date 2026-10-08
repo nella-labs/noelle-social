@@ -598,3 +598,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
     ? await getWatchlistProfiles(sql, instance.id)
     : new Map();
 
+  // Active Pattern Breaker rules — over-used structures the breaker discovered
+  // from the operator's last-N sent replies + published posts. Loaded ONCE per
+  // tick (instance-scoped) and threaded into every reply draft's SYSTEM prompt +
+  // verifier. A failed or incomplete rule read holds drafting for this tick.
+  // Empty until X_PATTERN_BREAKER has produced rules (or the operator added manual ones) — byte-identical to today.
+  const patternRules: DynamicPattern[] = args.patternRules
+    ? [...args.patternRules]
+    : sql
+      ? await loadActivePatternRules(sql, {
+          orgId: instance.org_id,
+          agentInstanceId: instance.id,
+          role: "x_intern",
+        })
+      : [];
+
+  // The operator's OWN account (handle + follower/following/post counts), read
+  // ONCE per tick off the shared memory bus. This is what stops Vega inventing a
+  // first-person stat: with the real number in the prompt it has no gap to fill,
+  // and with NO number the block says so explicitly. Passing the wrapper even
+  // when the snapshot is null is deliberate — `null` still renders the "you do
+  // not know these" half. Fail-open: readOwnAccountSnapshot never throws.
+  const ownAccount: OwnAccountFacts = {
+    snapshot: bus ? await readOwnAccountSnapshot(bus) : null,
+    now: new Date(),
+  };
+
+  // Account Feeder — the "voice of our posts" STYLE layer. Load this instance's
+  // style corpus + ultra profiles ONCE per tick, gated on NOELLE_DRAFTER_STYLE.
+  // The per-lead selector below picks a few exemplars matched to each post and
+  // injects their FORM (rhythm/hooks), never their content. If the operator PINNED
+  // a handle (e.g. eliana_jordan) we restrict the pool to that one account and
+  // floor the exemplar count so the named voice actually lands. Fail-open: any
+  // error → empty pool → no STYLE block (drafts exactly as before).
+  // Read the style gate + pool size straight off process.env (like the selector
+  // does) — fail-open, and never triggers strict env-schema validation in tests.
+  const styleGateOn = /^(1|true|yes|on)$/i.test((process.env["NOELLE_DRAFTER_STYLE"] ?? "").trim());
+  const feederConfig = instance.account_feeder_config ?? null;
+  // Faithful-voice pin: an explicit faithfulVoices list, or the legacy single
+  // pinnedStyleHandle folded into a 1-element list (readFaithfulVoices), so an
+  // existing single-pin instance behaves byte-identically. With MORE than one
+  // voice, each lead deterministically gets ONE of them (pickFaithfulVoice,
+  // seeded on the post text, optionally biased by faithfulVoiceWeights) so a
+  // reply always sounds like a single real writer, rotating across the feed.
+  const faithfulVoices = readFaithfulVoices(feederConfig);
+  const faithfulVoiceWeights = readFaithfulVoiceWeights(feederConfig);
+  const styleFaithful = faithfulVoices.length > 0;
+  const styleCorpusPlan = xReplyStyleCorpusPlan(feederConfig, styleFaithful);
+  const styleKinds = styleCorpusPlan.primary;
+  let stylePool: StyleExemplarRow[] = [];
+  let styleProfiles: UltraProfileRow[] = [];
+  let styleSelectConfig: unknown = feederConfig;
+  // Canonical corpus handles parallel to faithfulVoices (so the weights list
+  // stays aligned after resolution). Non-empty only in faithful mode.
+  let resolvedVoices: string[] = [];
+  if (sql && (styleGateOn || styleFaithful)) {
+    try {
+      const poolLimit = Math.min(500, Math.max(1, Number(process.env["NOELLE_DRAFTER_STYLE_POOL"]) || 60));
+      if (faithfulVoices.length > 0) {
+        const sources = await listFeederSources(sql, {
+          agentInstanceId: instance.id,
+          platform: "x",
+        });
+        const sourceRefs = sources.map((s) => ({ handle: s.handle, displayName: s.displayName }));
+        resolvedVoices = faithfulVoices.map(
+          (voice) => resolveStyleSourceHandle(voice, sourceRefs) ?? voice,
+        );
+        // Honor an explicit corpus choice. Otherwise a faithful X reply learns
+        // from the pinned writer's actual comments, falling back to posts only
+        // when that source has no comment corpus.
+        const loadPinnedPool = (handle: string, kinds: ("post" | "comment")[]) => Promise.all(
+          kinds.map((kind) =>
+            listStyleExemplarsForHandle(sql, {
+              agentInstanceId: instance.id,
+              platform: "x",
+              kind,
+              handle,
+              limit: poolLimit,
+            }),
+          ),
+        );
+        const pools = await Promise.all(resolvedVoices.map(async (handle) => {
+          const primary = (await loadPinnedPool(handle, styleKinds)).flat();
+          if (primary.length > 0 || styleCorpusPlan.fallback.length === 0) return primary;
+          return (await loadPinnedPool(handle, styleCorpusPlan.fallback)).flat();
+        }));
+        stylePool = pools.flat();
+        const profs = await Promise.all(
+          resolvedVoices.map((handle) =>
+            getUltraProfileForHandle(sql, {
+              agentInstanceId: instance.id,
+              platform: "x",
+              handle,
+            }),
+          ),
+        );
+        styleProfiles = profs.filter((p): p is NonNullable<(typeof profs)[number]> => p != null);
+        styleSelectConfig = pinnedSelectConfig(feederConfig);
+      } else {
+        const pools = await Promise.all(styleKinds.map((kind) =>
+          listStyleExemplars(sql, { agentInstanceId: instance.id, platform: "x", kind, limit: poolLimit }),
+        ));
+        stylePool = pools.flat();
+        styleProfiles = await listUltraProfiles(sql, {
+          agentInstanceId: instance.id,
+          platform: "x",
+        });
+      }
+    } catch {
+      // fail-open: a corpus-load failure just means no STYLE this tick (as before).
+      stylePool = [];
+      styleProfiles = [];
+    }
+  }
+
+  for (const lead of claimedLeads) {
+    const payload = lead.payload as {
+      text?: string;
+      url?: string;
+      followers?: number;
+      posted_at?: string;
+      images?: string[];
+    };
+    const replyRequest = readReplyRequest(payload);
+    // Match the outbound DM gate before asking the model to write one. Most
+    // browser-observed leads are priority replies, so DM text here is wasted
+    // generation and competes with the single public reply we actually need.
+    const dmEligible = !replyRequest && !lead.priority && (instance.dm_autodraft_enabled ?? false);
+    const postText = payload.text ?? "";
+    // The lead's REAL tweet time (set at discovery from the tweet's own
+    // created_at). Forward it so the outbound upsert doesn't overwrite
+    // noelle.leads.posted_at with a draft-time "now" — that clobber corrupted
+    // the post age and erased the evidence behind stale leads in the inbox.
+    const postedAt = readSourceTimestamp(payload.posted_at);
+    if (!postText) {
+      await markStatus({ leadId: lead.id, status: "skipped", meta: { skip_reason: "empty post text" } });
+      continue;
+    }
+
+    // NOTIFICATION TRIAGE. A lead the actuator harvested because someone
+    // replied to us does NOT automatically deserve a reply: most inbound is a
+    // thanks or an emoji (answering it is noise and burns write budget), and a
+    // few are real opportunities where an AI answer is actively the wrong move.
+    // Runs BEFORE retrieval so an ignored lead costs zero LLM spend.
+    if (!replyRequest && (payload as { source?: string }).source === "notification") {
+      const decision = triageNotification({
+        text: postText,
+        author: lead.author_handle,
+        priorTurns: Number((payload as { prior_turns?: number }).prior_turns ?? 0),
+      });
+      if (decision.verdict !== "reply") {
+        let pinned = false;
+        if (decision.verdict === "pin" && args.pinNotification) {
+          // Escalate instead of answering — and deliberately draft NOTHING, so
+          // there is no half-written reply sitting in the inbox tempting a
+          // one-click send on something that needs a human.
+          const pin = renderPin({
+            platform: "x",
+            author: lead.author_handle,
+            text: postText,
+            reason: decision.reason,
+          });
+          pinned = await args
+            .pinNotification({ ...pin, url: (payload as { url?: string }).url ?? undefined })
+            .catch((err) => {
+              log.warn({ err: (err as Error).message }, "notification pin failed");
+              return false;
+            });
+        }
+        // An UNDELIVERED pin must never be filed as 'skipped'. That would be the
+        // worst outcome this feature can produce: a real opportunity (an
+        // investor, a job, an intro) with no reply drafted AND no push — silently
+        // gone. 'errored' is the repo's never-silently-lost status, so it
+        // surfaces loudly instead of vanishing into the skip pile.
+        const undeliveredPin = decision.verdict === "pin" && !pinned;
+        if (undeliveredPin) {
+          log.error(
+            { leadId: lead.id, reason: decision.reason },
+            "notification pin NOT delivered — leaving the lead visible",
+          );
+        }
+        log.info({ leadId: lead.id, verdict: decision.verdict, reason: decision.reason, pinned }, "notification triage");
+        await markStatus({
+          leadId: lead.id,
+          status: undeliveredPin ? "errored" : "skipped",
+          meta: {
+            skip_reason: `triage:${decision.verdict}:${decision.reason}`,
+            ...(decision.verdict === "pin" ? { pin_delivered: pinned } : {}),
+          },
+        });
+        continue;
+      }
+    }
+
+    // Classifier quality gate. A non-priority lead must clear the quality bar to
+    // be worth a reply. Watchlist (priority) leads bypass — every post from a
+    // watchlisted person gets a reply regardless of score. Disabled when
+    // qualityThreshold is 0.
+    //
+    // A NULL score means the classifier could not score the lead, NOT that the
+    // lead is junk. The old condition dropped null alongside sub-threshold, on
