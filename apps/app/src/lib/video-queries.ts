@@ -198,3 +198,137 @@ export async function listVideoClips(
 ): Promise<VideoClipRow[]> {
   const inst = await getAgentInstance(instanceId);
   if (!inst) return [];
+  const limit = Math.min(opts.limit ?? 60, 200);
+  const sourceKind = opts.sourceKind ?? null;
+  // Bound-value optional filter — postgres.js throws on `${cond ? sql : sql}`
+  // conditional fragments mid-statement, so gate with a nullable bound value.
+  const rows = await sql<
+    Array<
+      Omit<VideoClipRow, "views" | "likes" | "comments" | "author_follower_count"> & {
+        views: string | null;
+        likes: string | null;
+        comments: string | null;
+        author_follower_count: string | null;
+      }
+    >
+  >`
+    select id, platform, external_id, source_kind, author_handle, caption, url, thumb_url,
+           views::text as views, likes::text as likes, comments::text as comments,
+           author_follower_count::text as author_follower_count,
+           deep_tier, posted_at::text as posted_at
+    from noelle.video_clips
+    where agent_instance_id = ${inst.id} and org_id = ${inst.org_id}
+      and (${sourceKind}::text is null or source_kind = ${sourceKind})
+    order by case when video_clips.views between 0 and ${Number.MAX_SAFE_INTEGER} then video_clips.views end desc nulls last
+    limit ${limit}
+  `;
+  return rows.map((r) => ({
+    ...r,
+    views: readSourceCount(r.views),
+    likes: readSourceCount(r.likes),
+    comments: readSourceCount(r.comments),
+    posted_at: readSourceTimestamp(r.posted_at),
+    author_follower_count: readSourceCount(r.author_follower_count),
+  }));
+}
+
+export interface VideoClipDetail extends VideoClipRow {
+  /** Direct media URL (may have expired) — embed iframe is the reliable player. */
+  video_url: string | null;
+  shares: number | null;
+  saves: number | null;
+  duration_sec: number | null;
+  music_name: string | null;
+  /** The structured teardown (VideoTeardown jsonb), null until Nova analyses it. */
+  teardown: unknown | null;
+  /** Full timestamped transcript, when a deep-tier pass produced one. */
+  transcript: string | null;
+}
+
+/**
+ * One clip + its teardown, for the Discover detail popup. LEFT JOINs the latest
+ * teardown (deep-tier clips have one; others don't yet). Fetched lazily on modal
+ * open so the grid payload stays small (transcripts can be long). IDOR-guarded
+ * via getAgentInstance + the org scope, same as every Nova read.
+ */
+export async function getVideoClipDetail(
+  instanceId: string,
+  clipId: string,
+): Promise<VideoClipDetail | null> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return null;
+  const rows = await sql<
+    Array<
+      Omit<VideoClipDetail, "views" | "likes" | "comments" | "author_follower_count" | "shares" | "saves"> & {
+        views: string | null;
+        likes: string | null;
+        comments: string | null;
+        shares: string | null;
+        saves: string | null;
+        author_follower_count: string | null;
+      }
+    >
+  >`
+    select c.id, c.platform, c.external_id, c.source_kind, c.author_handle, c.caption,
+           c.url, c.thumb_url, c.video_url,
+           c.views::text as views, c.likes::text as likes, c.comments::text as comments,
+           c.shares::text as shares, c.saves::text as saves,
+           c.author_follower_count::text as author_follower_count,
+           c.duration_s as duration_sec, c.music_name, c.deep_tier, c.posted_at::text as posted_at,
+           t.teardown as teardown, t.transcript as transcript
+    from noelle.video_clips c
+    left join noelle.video_teardowns t
+      on t.clip_id = c.id and t.org_id = c.org_id
+    where c.id = ${clipId} and c.agent_instance_id = ${inst.id} and c.org_id = ${inst.org_id}
+    limit 1
+  `;
+  const r = rows[0];
+  if (!r) return null;
+  // duration_s is numeric -> postgres.js hands it back as a string; coerce.
+  const dur = (r as { duration_sec: unknown }).duration_sec;
+  return {
+    ...r,
+    views: readSourceCount(r.views),
+    likes: readSourceCount(r.likes),
+    comments: readSourceCount(r.comments),
+    posted_at: readSourceTimestamp(r.posted_at),
+    shares: readSourceCount(r.shares),
+    saves: readSourceCount(r.saves),
+    author_follower_count: readSourceCount(r.author_follower_count),
+    duration_sec: readSourceNonnegativeNumber(dur),
+  };
+}
+
+export interface VideoUltraProfileRow {
+  id: string;
+  platform: string;
+  scope: string;
+  subject: string;
+  /** The VideoUltraProfile distillation (jsonb). */
+  profile: unknown;
+  avg_views: number | null;
+  avg_likes: number | null;
+  clips_analyzed: number;
+  refreshed_at: string | null;
+}
+
+/** The distilled Video Brand Guide rows (per creator / niche / account). */
+export async function listVideoUltraProfiles(instanceId: string): Promise<VideoUltraProfileRow[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+  const rows = await sql<
+    Array<Omit<VideoUltraProfileRow, "avg_views" | "avg_likes"> & { avg_views: string | null; avg_likes: string | null }>
+  >`
+    select id, platform, scope, subject, profile,
+           avg_views::text as avg_views, avg_likes::text as avg_likes,
+           clips_analyzed, refreshed_at::text as refreshed_at
+    from noelle.video_ultra_profiles
+    where agent_instance_id = ${inst.id} and org_id = ${inst.org_id}
+    order by case when video_ultra_profiles.avg_views between 0 and ${Number.MAX_SAFE_INTEGER} then video_ultra_profiles.avg_views end desc nulls last
+  `;
+  return rows.map((r) => ({
+    ...r,
+    avg_views: readSourceNonnegativeNumber(r.avg_views),
+    avg_likes: readSourceNonnegativeNumber(r.avg_likes),
+  }));
+}
