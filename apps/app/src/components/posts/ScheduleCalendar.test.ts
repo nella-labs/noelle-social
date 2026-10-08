@@ -198,3 +198,45 @@ test("pending navigation coalesces to the latest window while the old real read 
 });
 test("refreshing server props refetches an uncovered far window and removes a deleted row", async () => {
   const far = readySlot({ slotAt: "2026-11-03T12:00:00Z", preview: "Far scheduled body" });
+  let deleted = false;
+  actions.load.mockImplementation(async (_org, _platform, from, to) => !deleted && from <= far.slotAt && far.slotAt < to ? [far] : []);
+  await render(); await nextFourWeeks(); expect(chip("Far scheduled body")).not.toBeNull();
+  deleted = true;
+  const previous = actions.load.mock.calls.length;
+  await render({ slots: [] });
+  expect(actions.load).toHaveBeenCalledTimes(previous + 1);
+  expect(chip("Far scheduled body")).toBeNull();
+});
+test("a late mutation receipt cannot replace a refreshed published date", async () => {
+  const pending = deferred({ id: slotId, slot_at: "2026-10-07T12:00:00Z", status: "ready", auto_publish: false });
+  actions.move.mockReturnValueOnce(pending.promise);
+  await render({ slots: [readySlot()] }); await dragTo(2);
+  await render({ slots: [readySlot({ status: "published", slotAt: "2026-10-09T12:00:00Z" })] });
+  expect(weekCell(4)?.contains(chip())).toBe(true);
+  await act(async () => pending.resolve({ id: slotId, slot_at: "2026-10-07T12:00:00Z", status: "ready", auto_publish: false }));
+  expect(weekCell(4)?.contains(chip())).toBe(true);
+  expect(chip()?.draggable).toBe(false);
+});
+test("a real pending move rejects a second drag and removal before dispatch", async () => {
+  const pending = deferred({ id: slotId, slot_at: "2026-10-07T12:00:00Z", status: "ready", auto_publish: false });
+  actions.move.mockReturnValueOnce(pending.promise);
+  await render({ slots: [readySlot()] }); await dragTo(2);
+  expect(chip()?.draggable).toBe(false);
+  expect(host.querySelector('[aria-label="Remove from schedule"]')).toBeNull();
+  await dragTo(3);
+  expect(actions.move).toHaveBeenCalledTimes(1);
+  expect(actions.skip).not.toHaveBeenCalled();
+});
+test("a confirmed removal removes the current row", async () => {
+  await render({ slots: [readySlot()] }); await click("Remove from schedule");
+  expect(actions.skip).toHaveBeenCalledExactlyOnceWith("first-org", slotId);
+  expect(chip()).toBeNull();
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+});
+test("leaving the one extra window replaces it rather than retaining every visited range", async () => {
+  await render(); for (let i = 0; i < 4; i++) await click("Next");
+  expect(actions.load).toHaveBeenCalledTimes(2);
+  await click("Previous");
+  expect(actions.load).toHaveBeenCalledTimes(3);
+  expect(actions.load.mock.calls[0]).toEqual(actions.load.mock.calls[2]);
+});
