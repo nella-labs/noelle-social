@@ -798,3 +798,203 @@ function AgentChatSession({
 }
 
 function ChatRow({
+  m,
+  agentRole,
+  agentName,
+  userInitial,
+  userName,
+  onPick,
+  canApply,
+  applying,
+  applyDisabled,
+  onApply,
+  onCancel,
+  applyingVault,
+  vaultApplyDisabled,
+  onApplyVaultEdit,
+  onRefreshVaultEdit,
+  onCancelVaultEdit,
+  canApplyScriptEdit,
+  onApplyScriptEdit,
+  onCancelScriptEdit,
+}: {
+  m: ChatMessage;
+  agentRole: string;
+  agentName: string;
+  userInitial: string;
+  userName: string;
+  onPick?: (text: string) => void;
+  canApply?: boolean;
+  applying?: boolean;
+  applyDisabled?: boolean;
+  onApply?: () => void;
+  onCancel?: () => void;
+  applyingVault?: boolean;
+  vaultApplyDisabled?: boolean;
+  onApplyVaultEdit?: () => void;
+  onRefreshVaultEdit?: () => void;
+  onCancelVaultEdit?: () => void;
+  canApplyScriptEdit?: boolean;
+  onApplyScriptEdit?: () => void;
+  onCancelScriptEdit?: () => void;
+}) {
+  const isAgent = m.who === "agent";
+  return (
+    <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+      {isAgent ? (
+        <Avatar role={agentRole as AvatarRole} size={28} />
+      ) : (
+        <div
+          style={{
+            width: 28,
+            height: 28,
+            borderRadius: "50%",
+            background: "var(--ink)",
+            color: "var(--paper)",
+            display: "grid",
+            placeItems: "center",
+            fontFamily: "var(--display)",
+            fontSize: 14,
+            flexShrink: 0,
+          }}
+        >
+          {userInitial}
+        </div>
+      )}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 3 }}>
+          <span style={{ fontWeight: 500, fontSize: 12.5 }}>
+            {isAgent ? agentName : userName}
+          </span>
+          {isAgent ? (
+            <span
+              style={{
+                fontFamily: "var(--mono)",
+                fontSize: 9.5,
+                letterSpacing: "0.08em",
+                textTransform: "uppercase",
+                color: "var(--ink-soft)",
+              }}
+            >
+              agent
+            </span>
+          ) : null}
+          <span
+            style={{
+              fontSize: 11,
+              color: "var(--ink-soft)",
+              fontFamily: "var(--mono)",
+              marginLeft: "auto",
+            }}
+          >
+            {m.at}
+          </span>
+        </div>
+        <div
+          style={{
+            padding: "10px 14px",
+            borderRadius: 10,
+            background: isAgent
+              ? "var(--paper-2)"
+              : "color-mix(in oklch, var(--accent) 8%, var(--paper))",
+            boxShadow: isAgent
+              ? "0 0 0 0.5px var(--rule)"
+              : "0 0 0 0.5px color-mix(in oklch, var(--accent) 30%, var(--rule))",
+            fontSize: 13.5,
+            lineHeight: 1.55,
+            color: "var(--ink-2)",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}
+        >
+          {renderMessageBody(m.body)}
+        </div>
+
+        {isAgent && m.proposal ? (
+          <ProposalCard
+            proposal={m.proposal}
+            agentRole={agentRole}
+            state={m.proposalState ?? "pending"}
+            canApply={!!canApply}
+            applying={!!applying}
+            applyDisabled={!!applyDisabled}
+            onApply={onApply}
+            onCancel={onCancel}
+          />
+        ) : null}
+
+        {isAgent && m.vaultEdit ? (
+          <VaultEditCard
+            edit={m.vaultEdit}
+            receipt={m.vaultEditReceipt ?? null}
+            state={m.vaultEditState ?? "pending"}
+            canApply={!!canApply}
+            applying={!!applyingVault}
+            applyDisabled={!!vaultApplyDisabled}
+            onApply={onApplyVaultEdit}
+            onRefresh={onRefreshVaultEdit}
+            onCancel={onCancelVaultEdit}
+          />
+        ) : null}
+
+        {isAgent && m.scriptEdit ? (
+          <ScriptEditCard
+            edit={m.scriptEdit}
+            state={m.scriptEditState ?? "pending"}
+            canApply={!!canApplyScriptEdit}
+            onApply={onApplyScriptEdit}
+            onCancel={onCancelScriptEdit}
+          />
+        ) : null}
+
+        {m.suggestions && m.suggestions.length > 0 && onPick ? (
+          <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {m.suggestions.map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => onPick(s)}
+                style={{
+                  padding: "6px 10px",
+                  border: 0,
+                  borderRadius: 999,
+                  background: "color-mix(in oklch, var(--accent) 10%, var(--paper))",
+                  color: "var(--accent)",
+                  boxShadow:
+                    "0 0 0 0.5px color-mix(in oklch, var(--accent) 30%, transparent)",
+                  fontSize: 11.5,
+                  cursor: "pointer",
+                }}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+async function safeJson(
+  res: Response,
+): Promise<{ message?: string; error?: string } | null> {
+  try {
+    return (await res.json()) as { message?: string; error?: string };
+  } catch {
+    return null;
+  }
+}
+
+type AppliedSummary = NonNullable<ApplyTargetingResult["applied"]>;
+
+function summarizeApplied(applied?: AppliedSummary): string {
+  if (!applied) return "couldn't confirm a targeting change";
+  const parts: string[] = [];
+  // X targets (handles + keywords) and LinkedIn people are mutually exclusive
+  // per proposal, so summing across both is safe — one side is always zero.
+  const added = applied.addedHandles + applied.addedKeywords + applied.addedPeople + applied.addedSubreddits;
+  const removed =
+    applied.removedHandles + applied.removedKeywords + applied.removedPeople + applied.removedSubreddits;
+  if (added > 0) parts.push(`added ${added} target${added === 1 ? "" : "s"}`);
+  if (removed > 0) parts.push(`removed ${removed} target${removed === 1 ? "" : "s"}`);
