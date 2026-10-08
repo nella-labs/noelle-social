@@ -198,3 +198,86 @@ export default async function VaultPage({ params, searchParams }: PageProps) {
                 <div
                   className="mono"
                   style={{
+                    fontSize: 11,
+                    color: "var(--ink-muted)",
+                    marginTop: 4,
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  {usage.agentLabel} · {timeAgoShort(usage.whenISO)}
+                </div>
+                <div
+                  style={{
+                    marginTop: 10,
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: 6,
+                  }}
+                >
+                  {usage.anchorPaths.map((path) => (
+                    <span
+                      key={path}
+                      className="mono"
+                      style={{
+                        fontSize: 11,
+                        padding: "3px 8px",
+                        borderRadius: 6,
+                        background: "var(--paper-2)",
+                        color: "var(--ink-2)",
+                        boxShadow: "0 0 0 0.5px var(--rule)",
+                        overflowWrap: "anywhere",
+                        maxWidth: "100%",
+                      }}
+                    >
+                      {path}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <span
+                className="mono"
+                style={{
+                  fontSize: 11,
+                  color: "var(--ink-soft)",
+                  whiteSpace: "nowrap",
+                  letterSpacing: "0.04em",
+                }}
+              >
+                {usage.anchorPaths.length} anchors
+              </span>
+            </div>
+          ))}
+        </div>
+      </section>
+    </>
+  );
+}
+
+interface StatCardProps {
+  label: string;
+  value: string;
+  sub: string;
+}
+
+function StatCard({ label, value, sub }: StatCardProps) {
+  return (
+    <div className="card" style={{ padding: 16 }}>
+      <div className="eyebrow">{label}</div>
+      <div
+        className="serif"
+        style={{ fontSize: 28, lineHeight: 1, marginTop: 6 }}
+      >
+        {value}
+      </div>
+      <div
+        style={{
+          marginTop: 6,
+          fontSize: 11.5,
+          color: "var(--ink-muted)",
+        }}
+      >
+        {sub}
+      </div>
+    </div>
+  );
+}
