@@ -2998,3 +2998,203 @@ export async function listBusEvents(
     topic: r.topic,
     severity: r.severity,
     summary: r.summary,
+    payload: r.payload ?? {},
+    correlationId: r.correlation_id,
+    createdAt: toIso(r.created_at),
+  }));
+}
+
+/** Current-value bus_state for an org (unexpired), optionally one bucket. */
+export async function getBusState(
+  orgId: string,
+  bucket?: string,
+): Promise<DashboardBusStateEntry[]> {
+  const userId = await getRequiredUserId();
+  await assertMember(orgId, userId);
+  const rows = await readSql<
+    Array<{
+      bucket: string;
+      key: string;
+      value: unknown;
+      version: string | number;
+      updated_by_worker: string | null;
+      updated_at: unknown;
+    }>
+  >`
+    select bucket, key, value, version, updated_by_worker, updated_at
+    from noelle.bus_state
+    where org_id = ${orgId}
+      and (expires_at is null or expires_at > now())
+      ${bucket ? sql`and bucket = ${bucket}` : sql``}
+    order by bucket, key
+  `;
+  return rows.map((r) => ({
+    bucket: r.bucket,
+    key: r.key,
+    value: r.value ?? null,
+    version: Number(r.version), // bigint → string from postgres.js
+    updatedByWorker: r.updated_by_worker,
+    updatedAt: toIso(r.updated_at),
+  }));
+}
+
+/**
+ * Derived per-worker status for the Vega observability panel.
+ *
+ * `state` collapses the raw `worker_runs` history into the one word the
+ * founder cares about:
+ *   - "running"  — a row with `finished_at IS NULL` and `started_at` in
+ *                  the last 15 minutes (matches `listActiveWorkers` so the
+ *                  pulsing dot and this panel never disagree)
+ *   - "stalled"  — `finished_at IS NULL` but `started_at` older than 15min
+ *                  (the worker died mid-tick and never wrote its closer)
+ *   - "errored"  — most-recent finished row has `error IS NOT NULL`
+ *   - "idle"     — everything else
+ *
+ * `idleFor` is the seconds since the most recent `finished_at` (regardless
+ * of error). It powers "Idle 14h — last error: codex oauth expired" lines.
+ */
+export type VegaWorkerKind = "discovery" | "classifier" | "drafter" | "send" | "profiler" | "watchlist";
+export type VegaWorkerState = "running" | "idle" | "stalled" | "errored" | "disabled";
+
+/** Per-worker enable flags (agent_instances.*_enabled). Absent = treat as on. */
+export type WorkerEnabledMap = Partial<Record<VegaWorkerKind, boolean>>;
+
+export interface VegaWorkerStatus {
+  kind: VegaWorkerKind;
+  state: VegaWorkerState;
+  lastStartedAt: string | null;
+  lastFinishedAt: string | null;
+  lastRowsProcessed: number | null;
+  lastError: string | null;
+  runningSince: string | null;
+  idleForSeconds: number | null;
+}
+
+const VEGA_WORKERS: VegaWorkerKind[] = [
+  "discovery",
+  "classifier",
+  "drafter",
+  "send",
+  "profiler",
+];
+
+const FIFTEEN_MIN_MS = 15 * 60 * 1000;
+
+export interface VegaWorkerRow {
+  worker: VegaWorkerKind;
+  last_started_at: string | null;
+  last_finished_at: string | null;
+  last_rows_processed: number | null;
+  last_error: string | null;
+  running_started_at: string | null;
+}
+
+/**
+ * Pure derivation: takes the per-worker "latest finished" + "current
+ * running" join rows and folds them into the four `VegaWorkerStatus`
+ * entries the UI consumes. Extracted from `listVegaWorkerStatus` so unit
+ * tests can pin the state-transition table without mocking postgres.
+ */
+export function deriveVegaWorkerStatus(
+  rows: VegaWorkerRow[],
+  nowMs: number = Date.now(),
+  enabledByKind?: WorkerEnabledMap,
+): VegaWorkerStatus[] {
+  const byWorker = new Map(rows.map((r) => [r.worker, r] as const));
+  return VEGA_WORKERS.map((kind) => {
+    const r = byWorker.get(kind);
+    const lastFinishedAt = r?.last_finished_at ?? null;
+    const runningStartedAt = r?.running_started_at ?? null;
+
+    let state: VegaWorkerState = "idle";
+    if (runningStartedAt) {
+      const ageMs = nowMs - new Date(runningStartedAt).getTime();
+      state = ageMs < FIFTEEN_MIN_MS ? "running" : "stalled";
+    } else if (r?.last_error) {
+      state = "errored";
+    }
+    // A worker the operator deliberately turned off (per-worker flag = false)
+    // reads as 'disabled', not idle/stalled/errored — so an intentional
+    // off-switch isn't mistaken for a silent failure or ever-climbing idle. A
+    // live in-flight run still wins (the worker is demonstrably doing work).
+    if (enabledByKind && enabledByKind[kind] === false && state !== "running") {
+      state = "disabled";
+    }
+
+    const idleForSeconds = lastFinishedAt
+      ? Math.max(0, Math.floor((nowMs - new Date(lastFinishedAt).getTime()) / 1000))
+      : null;
+
+    return {
+      kind,
+      state,
+      lastStartedAt: r?.last_started_at ?? null,
+      lastFinishedAt,
+      lastRowsProcessed: r?.last_rows_processed ?? null,
+      lastError: r?.last_error ?? null,
+      runningSince: state === "running" ? runningStartedAt : null,
+      idleForSeconds,
+    };
+  });
+}
+
+/**
+ * Per-worker status for Vega's status panel. Single query that picks the
+ * most recent row per worker plus the most recent in-flight row, so we can
+ * tell the founder "discovery is running right now" vs "drafter last
+ * errored 14h ago" without firing four separate queries.
+ *
+ * No `assertOrgMember`: `worker_runs` is a global ops table.
+ */
+export async function listVegaWorkerStatus(
+  enabledByKind?: WorkerEnabledMap,
+): Promise<VegaWorkerStatus[]> {
+  const rows = await readSql<VegaWorkerRow[]>`
+    with latest as (
+      select distinct on (worker)
+        worker,
+        started_at  as last_started_at,
+        finished_at as last_finished_at,
+        rows_processed as last_rows_processed,
+        error       as last_error
+      from noelle.worker_runs
+      where finished_at is not null
+      order by worker, finished_at desc
+    ),
+    running as (
+      select distinct on (worker)
+        worker,
+        started_at as running_started_at
+      from noelle.worker_runs
+      where finished_at is null
+      order by worker, started_at desc
+    )
+    select
+      w.worker,
+      l.last_started_at,
+      l.last_finished_at,
+      l.last_rows_processed,
+      l.last_error,
+      r.running_started_at
+    from (values ('discovery'),('classifier'),('drafter'),('send'),('profiler')) w(worker)
+    left join latest  l using (worker)
+    left join running r using (worker)
+  `;
+
+  return deriveVegaWorkerStatus(rows, Date.now(), enabledByKind);
+}
+
+// ── Unified pipeline snapshot (live work + goal-run) ─────────────────────────
+
+export interface PipelineWorkerSnapshot {
+  kind: VegaWorkerKind;
+  enabled: boolean;
+  toggleable: boolean;
+  // The profiler (0024) is decoupled from Start/Pause — it runs for paused
+  // instances too — so the UI must not dim/disable it when the pipeline is
+  // paused. The four pipeline workers are false (pause stops them).
+  runsWhilePaused: boolean;
+  state: VegaWorkerState;
+  lifetime: number;
+  today: number;
