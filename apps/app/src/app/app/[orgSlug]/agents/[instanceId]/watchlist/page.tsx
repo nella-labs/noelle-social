@@ -598,3 +598,203 @@ async function VideoWatchlist({
       <div style={{ marginBottom: 24 }}>
         <HarvestCard orgSlug={orgSlug} instanceId={instanceId} status={harvest} sourceCount={sources.length} />
       </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+          gap: 16,
+          marginBottom: 24,
+        }}
+      >
+        <CreatorColumn orgSlug={orgSlug} instanceId={instanceId} rows={sources} />
+        <NicheColumn orgSlug={orgSlug} instanceId={instanceId} rows={niches} hasObjective={Boolean(objective?.trim())} />
+      </div>
+
+      {feederConfig ? (
+        <div style={{ marginBottom: 24 }}>
+          <HarvestFilters orgSlug={orgSlug} instanceId={instanceId} cfg={feederConfig} />
+        </div>
+      ) : null}
+
+      <DiscoverList clips={clips} />
+    </>
+  );
+}
+
+function HarvestCard({
+  orgSlug,
+  instanceId,
+  status,
+  sourceCount,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  status: HarvestRunStatus | null;
+  sourceCount: number;
+}) {
+  const state = status?.state ?? "idle";
+  const label: Record<string, string> = {
+    running: "Harvesting…",
+    requested: "Queued — Nova will harvest shortly",
+    stalled: "Stalled — check the worker",
+    errored: "Last run errored",
+    idle: "Idle",
+  };
+  const busy = state === "running" || state === "requested";
+  const parked = maintenanceNote("video_intern");
+  return (
+    <section className="card">
+      <div className="card-h">
+        <h3>Harvest now</h3>
+        <span className="tag">{parked ? "Maintenance" : (label[state] ?? state)}</span>
+      </div>
+      {parked ? (
+        <p className="muted" style={{ fontSize: 12, margin: "0 0 12px" }}>{parked}</p>
+      ) : (
+        <p className="muted" style={{ fontSize: 12, margin: "0 0 12px" }}>
+          Pulls the top-performing reels from your {sourceCount} watched creator{sourceCount === 1 ? "" : "s"} + niche lanes via
+          Apify, applies your filters, and stores them for analysis. Costs a few cents per creator.{" "}
+          {status?.lastRunAt ? `Last run ${status.lastRunAt.slice(0, 16).replace("T", " ")} UTC.` : "Not run yet."}
+          {state === "errored" && status?.lastError ? ` Error: ${status.lastError}` : ""}
+        </p>
+      )}
+      {!parked && (      <form
+        action={async () => {
+          "use server";
+          await requestVideoHarvest({ orgSlug, instanceId });
+        }}
+      >
+        <button
+          className="btn btn-sm btn-accent"
+          type="submit"
+          disabled={busy || sourceCount === 0}
+        >
+          {busy ? "Harvest queued…" : "Harvest now"}
+        </button>
+      </form>)}
+    </section>
+  );
+}
+
+/**
+ * The "tailored harvest" controls: how many videos Nova pulls per creator and
+ * WHICH ones — top-N by views/engagement, measured view/follower ratios
+ * (extra clips not already picked), niche recency — plus
+ * the analysis + grounding tiers. A plain server-action form that rebuilds the
+ * exact VideoFeederConfig the Scout harvester parses out of video_feeder_config.
+ */
+function HarvestFilters({
+  orgSlug,
+  instanceId,
+  cfg,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  cfg: VideoFeederConfig;
+}) {
+  return (
+    <section className="card">
+      <div className="card-h">
+        <h3>Harvest filters</h3>
+        <span className="tag">tailored</span>
+      </div>
+      <p className="muted" style={{ fontSize: 12, margin: "0 0 16px" }}>
+        How many videos Nova pulls per creator, and <em>which</em> ones. Each run keeps the top
+        performers by your rules, tears them down, and feeds the Brand Guide. Saved here, applied
+        on the next <strong>Harvest now</strong>.
+      </p>
+      <form
+        action={async (fd: FormData) => {
+          "use server";
+          const n = (k: string, d: number) => {
+            const v = Number(fd.get(k));
+            return Number.isFinite(v) ? v : d;
+          };
+          await saveVideoFeederConfig({
+            orgSlug,
+            instanceId,
+            config: {
+              topByViews: n("topByViews", cfg.topByViews),
+              topByEngagement: n("topByEngagement", cfg.topByEngagement),
+              outperformers: {
+                ratio: n("outperformers.ratio", cfg.outperformers.ratio),
+                n: n("outperformers.n", cfg.outperformers.n),
+              },
+              maxPerSource: n("maxPerSource", cfg.maxPerSource),
+              recencyWindowDays: n("recencyWindowDays", cfg.recencyWindowDays),
+              nicheTrending: {
+                recencyWindowHours: n("nicheTrending.recencyWindowHours", cfg.nicheTrending.recencyWindowHours),
+                minViews: n("nicheTrending.minViews", cfg.nicheTrending.minViews),
+                n: n("nicheTrending.n", cfg.nicheTrending.n),
+              },
+              deepTierPercentile: n("deepTierPercentile", cfg.deepTierPercentile),
+              maxVideoExemplars: n("maxVideoExemplars", cfg.maxVideoExemplars),
+              varietyTemperature: n("varietyTemperature", cfg.varietyTemperature),
+              minPerformancePercentile: n("minPerformancePercentile", cfg.minPerformancePercentile),
+            },
+          });
+        }}
+      >
+        <FilterGroup label="Per creator — how many, which ones">
+          <NumField name="topByViews" label="Top by views" hint="Best N clips by views. 0 = off." value={cfg.topByViews} min={0} max={100} />
+          <NumField name="topByEngagement" label="Top by engagement" hint="Best N by engagement rate. 0 = off." value={cfg.topByEngagement} min={0} max={100} />
+          <NumField name="maxPerSource" label="Max per creator" hint="Hard cap pulled per run (cost guard)." value={cfg.maxPerSource} min={1} max={200} />
+          <NumField name="recencyWindowDays" label="Only last N days" hint="Ignore clips older than this." value={cfg.recencyWindowDays} min={1} max={365} />
+        </FilterGroup>
+
+        <FilterGroup label="Extra clips — measured views/followers ratio">
+          <NumField name="outperformers.ratio" label="Views ÷ followers ≥" hint="Recorded views divided by captured followers." value={cfg.outperformers.ratio} min={1} max={50} step={0.5} />
+          <NumField name="outperformers.n" label="How many" hint="Extra clips, excluding ones already picked above." value={cfg.outperformers.n} min={0} max={100} />
+        </FilterGroup>
+
+        <FilterGroup label="Niche lanes — newest top performers in a niche">
+          <NumField name="nicheTrending.n" label="How many" hint="Top clips per niche keyword/hashtag lane." value={cfg.nicheTrending.n} min={0} max={100} />
+          <NumField name="nicheTrending.recencyWindowHours" label="Within N hours" hint="“Newest” window — 168 = 7 days." value={cfg.nicheTrending.recencyWindowHours} min={1} max={720} />
+          <NumField name="nicheTrending.minViews" label="Min views" hint="Floor so junk doesn’t qualify. 0 = none." value={cfg.nicheTrending.minViews} min={0} max={100000000} step={1000} />
+        </FilterGroup>
+
+        <FilterGroup label="Analysis & grounding">
+          <NumField name="deepTierPercentile" label="Deep-pass percentile" hint="Top X% get the expensive teardown. 100 = never." value={cfg.deepTierPercentile} min={0} max={100} />
+          <NumField name="maxVideoExemplars" label="Exemplars / script" hint="Proven clips each script is grounded on." value={cfg.maxVideoExemplars} min={0} max={20} />
+          <NumField name="varietyTemperature" label="Variety" hint="0 = always best-fit · 1 = max variety." value={cfg.varietyTemperature} min={0} max={1} step={0.1} />
+          <NumField name="minPerformancePercentile" label="Min performance %ile" hint="Exemplar eligibility floor. 0 = none." value={cfg.minPerformancePercentile} min={0} max={100} />
+        </FilterGroup>
+
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 4 }}>
+          <button className="btn btn-sm btn-primary" type="submit">Save filters</button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function FilterGroup({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <fieldset style={{ border: "none", padding: 0, margin: "0 0 18px" }}>
+      <legend className="studio-sub" style={{ padding: 0, marginBottom: 10 }}>
+        {label}
+      </legend>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(158px, 1fr))",
+          gap: 12,
+        }}
+      >
+        {children}
+      </div>
+    </fieldset>
+  );
+}
+
+function NumField({
+  name,
+  label,
+  hint,
+  value,
+  min,
+  max,
+  step,
+}: {
+  name: string;
