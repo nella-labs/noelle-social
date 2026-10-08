@@ -198,3 +198,203 @@ describe("classifyOneLead", () => {
     const { sql } = makeSql();
     const classify = vi.fn().mockResolvedValue(clsOut());
     await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false, icp_config: icp },
+      lead: { ...baseLead, priority: true, payload: { ...baseLead.payload, author_bio: "crypto degen, NFTs" } },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).toHaveBeenCalled();
+  });
+
+  it("stays OFF when icp_config has no keywords (byte-identical)", async () => {
+    const { sql } = makeSql();
+    const classify = vi.fn().mockResolvedValue(clsOut());
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false, icp_config: { headlineKeywords: [] } },
+      lead: { ...baseLead, priority: false, payload: { ...baseLead.payload, author_bio: "crypto degen" } },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).toHaveBeenCalled();
+  });
+
+  // A notification lead is someone who REPLIED TO US. The classifier's rules are
+  // written for cold discovery and actively disqualify a conversation — SYSTEM_X
+  // lists "replies to threads" as off-brand, and these are by definition replies.
+  // Live data: 8 of 8 were classified 'reply'/'other' and skipped, so the
+  // notifications actor produced nothing.
+  const convoLead = {
+    ...baseLead,
+    priority: false,
+    payload: { ...baseLead.payload, source: "notification" },
+  };
+
+  it("CLAMPS a skip verdict on a conversation lead (they spoke to us first)", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(clsOut({ reply_kind: "skip", q: 60, tier: null }));
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: convoLead,
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("light");
+    expect(values).toContain("classified");
+  });
+
+  it("does not drop a conversation lead on the AI-slop or follower floors", async () => {
+    for (const over of [{ ai_slop: true }, { q: 70, tier: "T3" }]) {
+      const { sql, values } = makeSql();
+      const classify = vi.fn().mockResolvedValue(clsOut(over));
+      await classifyOneLead({
+        sql,
+        classifier: { classify },
+        notifier: { notify: vi.fn() },
+        inst: { id: "i", org_id: "o", notify_low_confidence: false },
+        lead: {
+          ...convoLead,
+          payload: { ...convoLead.payload, author_followers: 30 },
+        },
+        log: { warn: vi.fn() },
+      });
+      expect(values).toContain("classified");
+    }
+  });
+
+  it("still honours the off-topic floor for a conversation lead", async () => {
+    // Protection is not a blank cheque: a genuinely off-topic reply is still a
+    // skip, exactly as for a hand-picked watchlist person.
+    const { sql, values } = makeSql();
+    const classify = vi
+      .fn()
+      .mockResolvedValue(clsOut({ reply_kind: "skip", q: 5, on_brand: false, tier: null }));
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: convoLead,
+      log: { warn: vi.fn() },
+    });
+    expect(values).not.toContain("light");
+  });
+
+  it("CLASSIFIES a priority lead instead of bypassing it", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(clsOut());
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: true },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).toHaveBeenCalled();
+    expect(values).toContain("classified");
+    // Graded on its real reply-worthiness (q=70 → 0.7), not a forged 1.
+    expect(values).not.toContain(1);
+  });
+
+  it("CLAMPS a skip verdict on a priority lead to light (the person is the gate)", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(clsOut({ reply_kind: "skip", q: 60, tier: null }));
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: true },
+      log: { warn: vi.fn() },
+    });
+    // Rescued: labelled 'light' and status 'classified' (markLeadClassified only
+    // writes that when onBrand is true), so it reaches the drafter.
+    expect(values).toContain("light");
+    expect(values).toContain("classified");
+  });
+
+  it("honours the skip when a priority lead is genuinely OFF-TOPIC (below the floor)", async () => {
+    const { sql, values } = makeSql();
+    // q=5 is far below CLAMP_MIN_Q (25): a hand-picked person posting something
+    // unrelated is still a skip. "The person is the gate" must not become
+    // "reply to anything they post".
+    const classify = vi.fn().mockResolvedValue(clsOut({ reply_kind: "skip", q: 5, on_brand: false, tier: null }));
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, priority: true },
+      log: { warn: vi.fn() },
+    });
+    expect(values).not.toContain("light");
+  });
+
+  // The engine's REAL fail-open shape: q null AND reply_kind forced to
+  // 'substantial' (a q:null + reply_kind:'skip' pair is unreachable, so mocking
+  // it proved nothing). Paired with a mid-size follower count, this is the
+  // outage case that actually used to drop a watched person.
+  it("never drops a priority lead when scoring FAILED (real fail-open shape)", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi
+      .fn()
+      .mockResolvedValue(clsOut({ reply_kind: "substantial", q: null, tier: null }));
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: {
+        ...baseLead,
+        priority: true,
+        payload: { ...baseLead.payload, author_followers: 300 },
+      },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("classified");
+  });
+
+  it("does NOT drop a small watched author on the follower floor", async () => {
+    // The floor grades strangers. Before the exemption, removing the bypass made
+    // a 300-follower hand-picked author terminal-skip unless they scored T1.
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(clsOut({ q: 70, tier: "T3" }));
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: {
+        ...baseLead,
+        priority: true,
+        payload: { ...baseLead.payload, author_followers: 300 },
+      },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("classified");
+  });
+
+  it("STILL applies the follower floor to a stranger", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(clsOut({ q: 70, tier: "T3" }));
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: {
+        ...baseLead,
+        priority: false,
+        payload: { ...baseLead.payload, author_followers: 12 },
+      },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("skipped");
+  });
+
