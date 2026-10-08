@@ -1,0 +1,40 @@
+.toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 18px 22px;
+  margin-bottom: 18px;
+  border: 1px solid var(--rule);
+  border-radius: 20px;
+  background: var(--paper);
+}
+.toolbarTitle { display: flex; align-items: center; gap: 8px; color: var(--ink-muted); font-size: 12px; font-weight: 500; }
+.fields { display: flex; flex: 1; gap: 12px; flex-wrap: wrap; min-width: 0; }
+.field { display: flex; flex: 1 1 110px; min-width: 0; flex-direction: column; gap: 7px; }
+.label { color: var(--ink-muted); font-size: 11px; font-weight: 500; }
+.select {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 7px 10px;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  background: var(--paper-2);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.select:hover { border-color: var(--ink-muted); }
+.select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.field[data-active] .label { color: var(--accent); }
+.field[data-active] .select { border-color: var(--accent); background: var(--accent-soft); }
+.notes:empty { display: none; }
+.notes { display: flex; flex-basis: 100%; gap: 12px; flex-wrap: wrap; color: var(--ink-muted); font-size: 12px; line-height: 1.5; }
+@media (max-width: 768px) {
+  .toolbar { padding: 16px; gap: 12px; }
+  .toolbarTitle { flex-basis: 100%; }
+  .field { flex-basis: calc(50% - 12px); }
+  .select { min-height: 44px; font-size: 16px; }
+}
