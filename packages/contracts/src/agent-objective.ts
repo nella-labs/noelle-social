@@ -198,3 +198,24 @@ export function proposalTouchesWatchlist(p: TargetingProposal): boolean {
   return (
     p.addHandles.length > 0 ||
     p.removeHandles.length > 0 ||
+    p.addKeywords.length > 0 ||
+    p.removeKeywords.length > 0 ||
+    p.addPeople.length > 0 ||
+    p.removePeople.length > 0 ||
+    p.addSubreddits.length > 0 ||
+    p.removeSubreddits.length > 0
+  );
+}
+
+/** Role authority shared by the write action and proposal review UI. */
+export function targetingProposalMatchesRole(proposal: TargetingProposal, role: string): boolean {
+  const x = proposal.addHandles.length + proposal.removeHandles.length + proposal.addKeywords.length + proposal.removeKeywords.length;
+  const linkedin = proposal.addPeople.length + proposal.removePeople.length;
+  const reddit = proposal.addSubreddits.length + proposal.removeSubreddits.length;
+  switch (role.replace(/-/g, "_")) {
+    case "x_intern": return linkedin === 0 && reddit === 0;
+    case "linkedin_intern": return x === 0 && reddit === 0;
+    case "reddit_intern": return x === 0 && linkedin === 0;
+    default: return false;
+  }
+}

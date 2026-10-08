@@ -598,3 +598,42 @@ export const HarvestLaneResultSchema = z
   .strict();
 export type HarvestLaneResult = z.infer<typeof HarvestLaneResultSchema>;
 
+export const HarvestPhaseSchema = z.enum([
+  "starting",
+  "creators",
+  "niches",
+  "done",
+  "cancelled",
+  "error",
+]);
+export type HarvestPhase = z.infer<typeof HarvestPhaseSchema>;
+
+/** The active filter values, echoed so the UI can show "kept:0 · min-views 300k". */
+export const HarvestConfigEchoSchema = z
+  .object({
+    nicheMinViews: z.number().int().min(0),
+    nicheRecencyHours: z.number().int().min(1),
+    creatorRecencyDays: z.number().int().min(1),
+  })
+  .strict();
+
+export const HarvestRunSummarySchema = z
+  .object({
+    phase: HarvestPhaseSchema.default("starting"),
+    lanes: z.array(HarvestLaneResultSchema).default([]),
+    totals: z
+      .object({
+        pulled: z.number().int().min(0).default(0),
+        kept: z.number().int().min(0).default(0),
+      })
+      .strict()
+      .default({ pulled: 0, kept: 0 }),
+    config: HarvestConfigEchoSchema.optional(),
+    /** ISO timestamps for elapsed display; startedAt set on the first patch. */
+    startedAt: z.string().optional(),
+    updatedAt: z.string().optional(),
+    /** Run-level error message (no token / fatal), distinct from a per-lane error. */
+    error: z.string().max(500).optional(),
+  })
+  .strict();
+export type HarvestRunSummary = z.infer<typeof HarvestRunSummarySchema>;
