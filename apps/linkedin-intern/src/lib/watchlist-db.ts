@@ -198,3 +198,203 @@ export async function listRepliedPeopleNeedingProfile(
             lower(p2.fsd_profile_id) = lower(r.handle)
             or lower(coalesce(p2.public_id, '')) = lower(r.handle)
           )
+        order by p2.refreshed_at desc nulls last
+        limit 1
+      ) pr on true
+    ),
+    stale as (
+      select * from matched
+      where refreshed_at is null
+         or refreshed_at < now() - make_interval(days => ${args.staleDays})
+    ),
+    newest as (
+      select distinct on (l.author_handle)
+        l.author_handle                         as handle,
+        nullif(l.payload->>'authorPublicId','') as author_public_id,
+        nullif(l.payload->>'authorName','')     as name,
+        nullif(l.payload->>'authorHeadline','') as headline
+      from noelle.leads l
+      join stale s on s.handle = l.author_handle
+      where l.agent_instance_id = ${args.agentInstanceId} and l.platform = 'linkedin'
+      order by l.author_handle, l.created_at desc
+    ),
+    -- Newest permalink of the shape linkedin.com/posts/<slug>_… — the only place
+    -- a urn-keyed person's real vanity slug survives.
+    permalink as (
+      select distinct on (l.author_handle)
+        l.author_handle as handle, l.payload->>'url' as post_url
+      from noelle.leads l
+      join stale s on s.handle = l.author_handle
+      where l.agent_instance_id = ${args.agentInstanceId} and l.platform = 'linkedin'
+        and l.payload->>'url' like '%linkedin.com/posts/%'
+      order by l.author_handle, l.created_at desc
+    )
+    select
+      coalesce(s.profile_key, s.handle) as fsd_profile_id,
+      n.author_public_id,
+      n.name,
+      n.headline,
+      pl.post_url,
+      s.replies
+    from stale s
+    join newest n on n.handle = s.handle
+    left join permalink pl on pl.handle = s.handle
+    order by s.refreshed_at asc nulls first, s.replies desc
+    limit ${args.batch}
+  `;
+  return rows.map((r) => ({
+    fsdProfileId: r.fsd_profile_id,
+    publicId: r.author_public_id,
+    name: r.name,
+    headline: r.headline,
+    postUrl: r.post_url,
+    replies: r.replies,
+  }));
+}
+
+/** A high-reply author queued for profiling; `postUrl` is a slug-recovery hint. */
+export interface RepliedProfileCandidate extends ProfilePerson {
+  /** Newest post permalink for this author — mines the vanity slug when needed. */
+  postUrl: string | null;
+  /** SENT replies to this author, for logging. */
+  replies: number;
+}
+
+/**
+ * Record a (re)profile ATTEMPT that produced no usable profile — no fetchable
+ * posts, unparseable LLM output, or an error. Stamps refreshed_at=now() so the
+ * person backs off for the normal refresh window instead of re-queuing every
+ * tick. Never writes a summary.
+ */
+export async function markProfileAttempted(
+  sql: Sql,
+  args: { orgId: string; agentInstanceId: string; fsdProfileId: string; publicId: string | null },
+): Promise<void> {
+  await sql`
+    insert into noelle.linkedin_watchlist_profiles
+      (org_id, agent_instance_id, fsd_profile_id, public_id, refreshed_at)
+    values (${args.orgId}, ${args.agentInstanceId}, ${args.fsdProfileId}, ${args.publicId}, now())
+    on conflict (agent_instance_id, fsd_profile_id) do update set
+      refreshed_at = now(), updated_at = now()
+  `;
+}
+
+export interface WatchlistProfileUpsert {
+  orgId: string;
+  agentInstanceId: string;
+  fsdProfileId: string;
+  publicId: string | null;
+  summary: string;
+  topics: string[];
+  tone: string;
+  engagementNotes: string;
+  postsAnalyzed: number;
+  model: string;
+}
+
+/**
+ * Insert or refresh a person's profile. Stamps generated_at + refreshed_at to
+ * now() so the row drops out of the needs-profile queue until it goes stale.
+ */
+export async function upsertWatchlistProfile(
+  sql: Sql,
+  p: WatchlistProfileUpsert,
+): Promise<void> {
+  await sql`
+    insert into noelle.linkedin_watchlist_profiles
+      (org_id, agent_instance_id, fsd_profile_id, public_id, summary, topics, tone,
+       engagement_notes, posts_analyzed, model, generated_at, refreshed_at)
+    values
+      (${p.orgId}, ${p.agentInstanceId}, ${p.fsdProfileId}, ${p.publicId}, ${p.summary},
+       ${sql.json(p.topics as unknown as JSONValue)}, ${p.tone},
+       ${p.engagementNotes}, ${p.postsAnalyzed}, ${p.model}, now(), now())
+    on conflict (agent_instance_id, fsd_profile_id) do update set
+      public_id = excluded.public_id,
+      summary = excluded.summary,
+      topics = excluded.topics,
+      tone = excluded.tone,
+      engagement_notes = excluded.engagement_notes,
+      posts_analyzed = excluded.posts_analyzed,
+      model = excluded.model,
+      generated_at = excluded.generated_at,
+      refreshed_at = excluded.refreshed_at,
+      updated_at = now()
+  `;
+}
+
+export interface WatchlistProfileRow {
+  fsdProfileId: string;
+  publicId: string | null;
+  summary: string | null;
+  topics: string[];
+  tone: string | null;
+  engagementNotes: string | null;
+}
+
+/**
+ * Per-person profiles for the instance, keyed by fsd_profile_id AND by the
+ * lowercased vanity slug. The drafter looks a lead's author up here to tailor
+ * the reply using the person's summary/topics/tone/engagement notes. Only rows
+ * with a generated summary are returned (attempt tombstones — summary null —
+ * are skipped).
+ *
+ * Why two keys: the drafter's primary key is `lead.author_id` (the fsd id), but
+ * the keyword lane inserts leads with `author_id = null` (discovery-tick.ts) and
+ * the ICP lane's fsd id is often absent in the actor's short mode. Those leads
+ * could never match an fsd-keyed map, so a profile written for such a person was
+ * paid for and then silently ignored at draft time. The slug alias gives the
+ * drafter a second way in. Never overwrites an existing key — an fsd hit always
+ * wins over a slug alias.
+ */
+export async function getWatchlistProfiles(
+  sql: Sql,
+  instanceId: string,
+): Promise<Map<string, WatchlistProfileRow>> {
+  const rows = await sql<
+    {
+      fsd_profile_id: string;
+      public_id: string | null;
+      summary: string | null;
+      topics: unknown;
+      tone: string | null;
+      engagement_notes: string | null;
+    }[]
+  >`
+    select fsd_profile_id, public_id, summary, topics, tone, engagement_notes
+    from noelle.linkedin_watchlist_profiles
+    where agent_instance_id = ${instanceId} and summary is not null
+  `;
+  const map = new Map<string, WatchlistProfileRow>();
+  for (const r of rows) {
+    map.set(r.fsd_profile_id, {
+      fsdProfileId: r.fsd_profile_id,
+      publicId: r.public_id,
+      summary: r.summary,
+      topics: Array.isArray(r.topics) ? (r.topics as string[]) : [],
+      tone: r.tone,
+      engagementNotes: r.engagement_notes,
+    });
+  }
+  // Second pass so a real fsd key can never be shadowed by another person's slug.
+  for (const r of rows) {
+    const alias = r.public_id?.trim().toLowerCase();
+    if (!alias || map.has(alias)) continue;
+    map.set(alias, map.get(r.fsd_profile_id)!);
+  }
+  return map;
+}
+
+export interface IntroDmPerson {
+  /** noelle.linkedin_watchlist_people.id (the row claimed). */
+  id: string;
+  /** urn:li:fsd_profile:<id>, prefix stripped — the stable person key. */
+  fsdProfileId: string;
+  /** Vanity slug (linkedin.com/in/<publicId>). */
+  publicId: string | null;
+  name: string | null;
+  headline: string | null;
+  /** Optional per-person engagement steer for the drafter. */
+  objective: string | null;
+  // ---- joined from the person's generated profile (summary IS NOT NULL) ----
+  summary: string;
+  topics: string[];
