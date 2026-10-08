@@ -198,3 +198,38 @@ export function readEnvFile(envFilePath: string): Record<string, string> {
 function assertEnvKey(key: string): void {
   if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) throw new Error("Invalid environment key");
 }
+
+/** Atomically write the env file with 0600 perms. */
+export function writeEnvFile(envFilePath: string, env: Record<string, string>): void {
+  writeEnvBody(envFilePath, serializeEnv(env));
+}
+
+/**
+ * Surgically upsert ONE key in an existing .env, preserving every other line
+ * (comments, operator-tuned knobs, ordering). Used by the operator-JWT
+ * re-mint, where a full `writeEnvFile` recompose would clobber hand edits.
+ */
+export function upsertEnvKey(envFilePath: string, key: string, value: string): void {
+  assertEnvKey(key);
+  const line = `${key}=${quote(value)}`;
+  if (!existsSync(envFilePath)) {
+    writeEnvBody(envFilePath, line + "\n");
+    return;
+  }
+  let replaced = false;
+  let next = readFileSync(envFilePath, "utf8").replace(envAssignments(), (assignment, name: string) => {
+    if (name !== key) return assignment;
+    const replacement = replaced ? "" : line;
+    replaced = true;
+    return replacement;
+  });
+  if (!replaced) {
+    if (next && !next.endsWith("\n")) next += "\n";
+    next += line + "\n";
+  }
+  writeEnvBody(envFilePath, next);
+}
+
+function writeEnvBody(envFilePath: string, body: string): void {
+  writePrivateFile(envFilePath, body);
+}

@@ -1,0 +1,29 @@
+{
+  "name": "@noelle/cli",
+  "version": "0.0.1-alpha.0",
+  "private": true,
+  "type": "module",
+  "description": "noelle — set up and operate a fully self-hosted Noelle on a personal VM (macOS or Linux). Provisions local Postgres, applies the schema, mints a single-operator identity, and orchestrates the dashboard + API + (optional) workers.",
+  "main": "./src/index.ts",
+  "bin": { "noelle": "./dist/index.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@noelle/contracts": "workspace:*",
+    "@noelle/runtime": "workspace:*",
+    "@noelle/secrets": "workspace:*",
+    "jose": "^6.1.0",
+    "pm2": "^6.0.5",
+    "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  }
+}
