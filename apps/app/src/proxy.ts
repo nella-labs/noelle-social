@@ -198,3 +198,55 @@ export async function proxy(request: NextRequest) {
     pathname === "/robots.txt" ||
     pathname === "/sitemap.xml" ||
     pathname.startsWith("/auth/") ||
+    pathname.startsWith("/api/auth/")
+  ) {
+    return NextResponse.next();
+  }
+
+  if (!hasSessionCookie(request)) {
+    // Not signed in at all — let the destination's own server-side checks
+    // handle the redirect to /. We don't gate unauthenticated traffic here
+    // because some routes (eg. /api/*) may legitimately serve 401s.
+    // Still rate-limit unauth /api/* by IP to absorb scrape bursts.
+    const rl = await enforceApiRateLimit(request);
+    if (rl) return rl;
+    return NextResponse.next();
+  }
+
+  const verified = request.cookies.get(VERIFIED_COOKIE)?.value;
+  if (await verifyVerifiedCookie(verified)) {
+    // Auth gate passed — apply the per-user rate limit before the
+    // request reaches a route handler.
+    const rl = await enforceApiRateLimit(request);
+    if (rl) return rl;
+    return NextResponse.next();
+  }
+
+  // Session cookie present but verified marker missing / forged / expired
+  // → the gate must re-run. BUT: only a top-level DOCUMENT navigation can
+  // usefully follow a redirect to /auth/gate (the browser navigates there,
+  // re-gates, gets a fresh cookie). An RSC navigation fetch or a server-action
+  // POST CANNOT — a redirect on those silently aborts the request, so the
+  // user's click does nothing with no console error, and only a full reload
+  // fixes it. (This is why every button/link goes dead once the 24h verified
+  // cookie expires mid-session.) For those fetch requests we fall through:
+  // the data-layer guard (assertOrgMember on every server path) still enforces
+  // access, and the user is re-gated on their next full document load.
+  const dest = request.headers.get("sec-fetch-dest");
+  const isFetch =
+    dest === "empty" ||
+    request.headers.get("rsc") === "1" ||
+    request.headers.has("next-action");
+  if (isFetch) {
+    const rl = await enforceApiRateLimit(request);
+    if (rl) return rl;
+    return NextResponse.next();
+  }
+  return NextResponse.redirect(`${origin}/auth/gate`);
+}
+
+export const config = {
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
+  ],
+};
