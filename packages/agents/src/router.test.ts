@@ -198,3 +198,21 @@ describe("routeByIntent (LLM disambiguation tier)", () => {
   it("returns {kind:none} on empty text without calling the model", async () => {
     const call = vi.fn<RouterModelCall>(async () => ({ text: "{}" }));
     const decision = await routeByIntent({ surface: "agent_chat", text: "  " }, manifests, {
+      call,
+    });
+    expect(call).not.toHaveBeenCalled();
+    expect(decision.kind).toBe("none");
+  });
+
+  it("returns {kind:none} when no capability is routable on the surface", async () => {
+    const call = vi.fn<RouterModelCall>(async () => ({ text: "{}" }));
+    // Nothing declares the `bus` surface in the fixture.
+    const decision = await routeByIntent(
+      { surface: "bus", text: "draft a reply to this tweet" },
+      manifests,
+      { call },
+    );
+    expect(call).not.toHaveBeenCalled();
+    expect(decision.kind).toBe("none");
+  });
+});
