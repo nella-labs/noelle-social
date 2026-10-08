@@ -998,3 +998,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
       // whole design — "don't overdo it, it looks more ai that way" — so this
       // is gated separately from NOELLE_DRAFTER_VARIETY's on/off and defaults
       // to 22%. A rate of 0 emits no block and leaves the prompt unchanged.
+      const genzMarkerRate = variety?.genzMarkerRate ?? genzMarkerRateFromEnv();
+      const genzMarker =
+        variety?.enabled && genzMarkerRate > 0 && (variety.rng ?? Math.random)() < genzMarkerRate
+          ? (variety.genzMarkerRotation ?? xGenZMarkerRotation).next(variety.rng, postEnergy)
+          : null;
+      const genzBlock = genzMarker ? renderGenZMarkerBlock(genzMarker) : undefined;
+
+      const registerBlock =
+        variety?.enabled && !formVariant
+          ? renderRegisterBlock(
+              postEnergy
+                ? pickRegisterForEnergy(postEnergy, variety.rng)
+                : pickRegister(variety.rng),
+              "all three reply angles",
+            )
+          : undefined;
+
+      // "Read the room": fetch the top OTHER replies on this post and inject a digest
+      // so the reply mirrors the room's energy and avoids echoing an existing take.
+      // Fail-open — any fetch error just means no room context for this lead.
+      let siblingBlock: string | undefined;
+      if (args.fetchSiblingComments) {
+        const siblings = await args.fetchSiblingComments(lead).catch((err) => {
+          log.warn(
+            { leadId: lead.id, err: (err as Error).message },
+            "sibling-comment fetch failed; drafting without room context",
+          );
+          return [] as SiblingComment[];
+        });
+        const digest = renderCommentDigest(siblings, { sampleMax: 8 });
+        if (digest) siblingBlock = digest;
+      }
+
+      // Energy hint: a one-line nudge to MIRROR the post's energy. Only for
+      // non-default energies (joke/hot_take/vent/celebration/question); an analytical
+      // post gets no hint, so it stays byte-identical.
+      const energyHint = postEnergy ? renderEnergyHint(postEnergy) : undefined;
+
+      // Per-person memory: what Vega already said to THIS author. Fail-open.
+      const priorReplies = getPriorReplies
+        ? await getPriorReplies({
+            authorHandle: lead.author_handle,
+            authorId: lead.author_id,
+            excludeLeadId: lead.id,
+            limit: priorRepliesTopK,
+          }).catch(() => [])
+        : [];
+
+      // Notifications actor: a lead the actuator harvested because this person
+      // replied to US carries the thread on its payload. Hand the drafter that
+      // context so it continues the exchange instead of opening a new one.
+      // Absent on every other lane ⇒ the prompt is unchanged.
+      const conversation = (payload as { source?: string }).source === "notification"
+        ? (payload as { conversation?: ConversationBrief }).conversation
+        : undefined;
+      const conversationBlock = conversation
+        ? (renderConversationBlock(conversation, lead.author_handle, { fence: fenceUntrusted }) ?? undefined)
+        : undefined;
+
+      const prompt = renderPrompt({
+        postText,
+        handle: lead.author_handle,
+        anchors: anchors.map((a) => a.snippet),
+        includeDm: dmEligible,
+        knowledgeAnchors: knowledge.map((k) => k.snippet),
+        imageCaption,
+        examples,
+        registerBlock,
+        ...(shapeBlock ? { shapeBlock } : {}),
+        ...(openingMoveBlock ? { openingMoveBlock } : {}),
+        ...(genzBlock ? { genzBlock } : {}),
+        ...(isLight ? { lightLane: true } : {}),
+        ...(priorReplies.length ? { priorReplies } : {}),
+        ...(recentPhrasings.length ? { recentPhrasings } : {}),
+        ...(siblingBlock ? { siblingBlock } : {}),
+        ...(energyHint ? { energyHint } : {}),
+        ...(conversationBlock ? { conversationBlock } : {}),
+        ...(replyRequest?.instructions ? { operatorInstructions: replyRequest.instructions } : {}),
+        fenceUntrusted,
+      });
+      // Steer drafting for a watchlist person by their per-person objective
+      // (empty string when the author has none → no prompt change).
+      // Normalize the same way discovery + the add action do (lowercase,
+      // @-stripped, trimmed) so the lookup matches the stored handle.
+      const handleKey = lead.author_handle
+        ? lead.author_handle.trim().toLowerCase().replace(/^@/, "")
+        : "";
+      const personObj = handleKey ? objectivesByHandle.get(handleKey) : undefined;
+      const personDirective = composeObjectiveDirective(
+        personObj?.kind ?? null,
+        personObj?.note,
+      );
+      // Ground the reply in the watchlist person's profile (null when the author
+      // isn't a profiled watchlist person → no prompt change, byte-identical).
+      const personProfile = renderPersonProfile(
+        handleKey ? profilesByHandle.get(handleKey) : undefined,
+      );
+      // Per-lead STYLE selection: pick a few exemplars from the pool matched to
+      // THIS post, register-conditioned (postRegister computed above). null when
+      // style is off / the pool is empty / anything errors (selectStyleExemplars is
+      // itself fail-open). With multiple faithful voices, the pool is first
+      // restricted to the ONE voice picked for this lead (rotating across the
+      // feed, weight-biased when configured; fail-open to the full pool when the
+      // chosen voice has no corpus).
+      const stylePoolForLead = poolForFaithfulLead(
+        stylePool,
+        resolvedVoices,
+        postText,
+        faithfulVoiceWeights,
+      );
+      const styleForLead: StyleForPrompt | null = stylePoolForLead.length
+        ? await selectStyleExemplars(postText, stylePoolForLead, styleProfiles, {
+            enabled: true,
+            config: styleSelectConfig,
+            postRegister: styleFaithful ? undefined : postRegister,
+          })
+        : null;
+      if (styleForLead && styleFaithful) {
+        // Keep X's tiny/varied shapes and tone-first register. The faithful
+        // renderer's legacy hook-then-line fallback would otherwise override them.
+        styleForLead.formVariant = formVariant ?? {
+          id: "REGISTER",
+          directive: registerBlock ?? "Follow the reply length and energy assigned in the user message. A brief reaction can stand alone; do not force a hook and second line.",
+        };
+      }
+      // Engagement-tiered escalation: a post with genuine traction earns the
+      // smarter model; an engagement-bait post's inflated reply count does not.
+      // Thresholds of 0 disable it entirely (today's behaviour).
+      const enginePayload = payload as { likes?: number | null; replies?: number | null };
+      const opusDecision =
+        opusLikesThreshold > 0 || opusRepliesThreshold > 0
+          ? decideOpus({
+              likes: enginePayload.likes,
+              replies: enginePayload.replies,
+              // Read from the payload, NOT lead.comment_bait: neither claim RPC
+              // returns that column, so the field is always undefined on a
+              // claimed row and the bait suppression would be dead code. The
+              // classifier writes the same verdict into
+              // payload.classifier.reply_worthiness, which the RPCs DO return —
+              // so this needs no migration and no deploy-ordering hazard
+              // (migrations are not applied automatically on deploy).
+              commentBait:
+                (payload as { classifier?: { reply_worthiness?: { comment_bait?: boolean } } })
+                  .classifier?.reply_worthiness?.comment_bait ?? false,
+              likesThreshold: opusLikesThreshold,
+              repliesThreshold: opusRepliesThreshold,
+            })
+          : null;
+      const baseRouting = xInternRouting(instance);
+      const browserObserved = (payload as { source?: string }).source === "extension_observed";
+      const draftArgs = {
+        bucket: "drafter-codex",
+        routing: opusDecision?.useOpus ? opusOverrideRouting(baseRouting) : baseRouting,
+        orgId: instance.org_id,
+        instanceId: instance.id,
+        worker: "drafter" as const,
+        agentRole: "x_intern" as const,
+        ...(browserObserved ? { codexSubscriptionOnly: true } : {}),
+        system: buildDrafterSystem(
+          instance.objective,
+          personDirective,
+          brand,
+          personProfile,
+          styleForLead,
+          postRegister,
+          patternRules,
+          ownAccount,
+          undefined,
+          args.voiceExemplars,
+          styleFaithful,
+          !dmEligible,
+        ),
+      };
+      const doDraft = () => runner.draft({ ...draftArgs, prompt });
+      let res = await doDraft();
+      let parsed = DrafterOutput.safeParse(safeJsonParse(res.text));
+      if (!parsed.success) {
+        // Malformed / truncated model output is usually transient (e.g. the model
+        // ran out of tokens mid-JSON). Retry once before giving up — a single
+        // re-draft recovers most of these instead of erroring the lead, which for
+        // a watchlist (priority) lead silently drops a reply we promised to write.
+        log.warn(
+          { leadId: lead.id, raw: res.text.slice(0, 200) },
+          "drafter output schema fail; retrying once",
+        );
+        res = await doDraft();
+        parsed = DrafterOutput.safeParse(safeJsonParse(res.text));
+      }
+      if (!parsed.success) {
+        log.error(
+          { leadId: lead.id, raw: res.text.slice(0, 200) },
+          "drafter output schema fail after retry",
+        );
+        await markStatus({ leadId: lead.id, status: "errored", meta: { error: "schema" } });
+        continue;
+      }
+
+      if ("skip" in parsed.data) {
+        if (lead.priority || replyRequest) {
+          // A watchlist (priority) lead must never be silently dropped. The
