@@ -398,3 +398,203 @@ async function loadBestLeads(inst: NoelleAgentInstance): Promise<ChatLeadSummary
       coalesce(l.payload->>'post_text', l.payload->>'text') as l_post_text,
       l.payload as l_payload,
       exists(select 1 from noelle.drafts d where d.lead_id = l.id and d.org_id=l.org_id) as has_draft
+    from noelle.leads l
+    where l.agent_instance_id = ${inst.id}
+      and l.org_id = ${inst.org_id}
+      and exists(select 1 from noelle.agent_instances owner where owner.id=l.agent_instance_id
+        and owner.org_id=l.org_id and owner.role=${inst.role} and owner.role=l.platform||'_intern')
+      and l.status in ('classified', 'drafting', 'drafted')
+      and l.created_at >= now() - interval '1 day'
+      and not exists (
+        select 1 from noelle.approvals a
+        join noelle.drafts d on d.id = a.draft_id
+        where a.lead_id = l.id and a.status = 'pending' and ${replyApprovalContextSql(sql)}
+      )
+    order by
+      case l.tier when 'T1' then 1 when 'T2' then 2 when 'T3' then 3 else 4 end,
+      l.classifier_score desc nulls last,
+      l.created_at desc
+    limit ${TOP_LEADS}
+  `;
+  return rows.map((r) => {
+    const source = replySource(inst, r.l_payload);
+    return toChatLeadSummary({
+      authorHandle: r.l_author_handle,
+      tier: r.l_tier,
+      classifierScore: r.l_classifier_score,
+      postId: r.l_post_id,
+      postText: source.postText ?? r.l_post_text,
+      hasDraft: r.has_draft,
+      platform: inst.role === "x_intern" ? "x" : inst.role === "linkedin_intern" ? "linkedin" : "reddit",
+      postUrl: source.postUrl,
+    });
+  });
+}
+
+/**
+ * Pure row → ChatLeadSummary mapper (exported for unit tests). Builds the
+ * original-post and reply-composer links from the handle + post id.
+ */
+export function toChatLeadSummary(row: {
+  authorHandle: string | null;
+  tier: string | null;
+  classifierScore: string | null;
+  postId: string | null;
+  postText: string | null;
+  hasDraft: boolean;
+  platform?: "x" | "linkedin" | "reddit";
+  postUrl?: string | null;
+}): ChatLeadSummary {
+  const handle = normaliseHandle(row.authorHandle);
+  const postId = row.postId ?? null;
+  const url = row.platform && row.platform !== "x" ? row.postUrl ?? null : buildXPostUrl({ handle, tweetId: postId });
+  return {
+    handle,
+    tier: normaliseTier(row.tier),
+    score: parseScore(row.classifierScore, undefined),
+    postText: row.postText ?? "",
+    postId,
+    originalPostUrl: url,
+    replyUrl: row.platform && row.platform !== "x" ? url : url ? buildXReplyUrl(postId) : null,
+    hasDraft: row.hasDraft,
+  };
+}
+
+/**
+ * What the X intern is currently hunting for — its x_watchlist. Lets the chat
+ * tell the founder the current targeting and propose precise diffs against it.
+ */
+async function loadTargeting(inst: NoelleAgentInstance): Promise<ChatTargeting> {
+  const rows = await sql<{ kind: "handle" | "keyword"; value: string }[]>`
+    select kind, value
+    from noelle.x_watchlist
+    where agent_instance_id = ${inst.id} and org_id = ${inst.org_id}
+    order by created_at asc
+  `;
+  return {
+    handles: rows.filter((r) => r.kind === "handle").map((r) => r.value),
+    keywords: rows.filter((r) => r.kind === "keyword").map((r) => r.value),
+  };
+}
+
+async function loadTopPendingApprovals(
+  inst: NoelleAgentInstance,
+): Promise<ChatApprovalSummary[]> {
+  type JoinedRow = {
+    a_id: string;
+    a_created_at: string;
+    d_payload: unknown;
+    l_tier: string | null;
+    l_classifier_score: string | null;
+    l_author_handle: string | null;
+    l_payload: unknown;
+    l_external_id: string | null;
+    l_post_text: string | null;
+  };
+
+  const rows = await sql<JoinedRow[]>`
+    select
+      a.id              as a_id,
+      a.created_at      as a_created_at,
+      d.payload         as d_payload,
+      l.tier            as l_tier,
+      l.classifier_score as l_classifier_score,
+      l.author_handle   as l_author_handle,
+      l.payload         as l_payload,
+      l.external_id     as l_external_id,
+      coalesce(l.payload->>'post_text', l.payload->>'text') as l_post_text
+    from noelle.approvals a
+    join noelle.drafts d on d.id = a.draft_id
+    join noelle.leads l on l.id = a.lead_id
+    cross join lateral(select ${visibleDraftBodySql(sql, true)} as text) visible_body
+    where a.agent_instance_id = ${inst.id}
+      and a.org_id = ${inst.org_id} and ${replyApprovalContextSql(sql)}
+      and l.platform = ${inst.role.replace(/_intern$/, "")}
+      and a.status = 'pending'
+      and ${trimMemorySql(sql, sql`visible_body.text`)} <> ''
+      and not (${trimMemorySql(sql, sql`visible_body.text`)} ~* '^SKIP:')
+      and not exists(select 1 from unnest(${SKIP_MARKERS}::text[]) marker where strpos(lower(visible_body.text),marker)>0)
+    order by l.classifier_score desc nulls last, a.created_at desc
+    limit ${TOP_APPROVALS}
+  `;
+
+  const out: ChatApprovalSummary[] = [];
+  for (const r of rows) {
+    const draft = readDraftPayload(r.d_payload);
+    const lead = readLeadPayload(r.l_payload);
+    const source = replySource(inst, r.l_payload);
+    const selectedAngle = selectedDraftAngle(draft);
+    const draftBody = bodyForSelectedAngle(draft);
+    if (draftBody === undefined) continue;
+
+    // post_id lives in the external_id column for discovery-produced leads;
+    // fall back to it so the reply link is a real threaded reply, not a new
+    // tweet. Mirrors apps/app/src/lib/to-speedrun-draft.ts.
+    const postId = lead.post_id ?? r.l_external_id ?? null;
+    out.push({
+      approvalId: r.a_id,
+      authorHandle: normaliseHandle(draft.replyTarget?.kind === "comment" ? draft.replyTarget.author ?? null : r.l_author_handle ?? source.authorHandle ?? null),
+      postText: source.postText ?? lead.post_text ?? r.l_post_text ?? "",
+      selectedAngle,
+      draftBody,
+      tier: normaliseTier(r.l_tier),
+      velocityScore: parseScore(r.l_classifier_score, lead.velocity_score),
+      createdAt: r.a_created_at,
+      postId,
+      // Reply link prefilled with the drafted reply — "click to send".
+      replyUrl: draft.kind === "dm" ? null : inst.role === "x_intern" ? buildXPostUrl({ handle: r.l_author_handle, tweetId: postId }) ? buildXReplyUrl(postId, draftBody) : null
+        : draft.replyTarget?.kind === "comment" ? draft.replyTarget.permalink ?? null : source.postUrl,
+    });
+  }
+  return out;
+}
+
+async function loadApprovalTotals(
+  inst: NoelleAgentInstance,
+): Promise<{ pending?: number; sentLifetime?: number }> {
+  const rows = await sql<Array<{ pending: number; sent_lifetime: number }>>`
+    select count(*) filter(where a.status='pending' and ${replyApprovalContextSql(sql)})::int as pending,
+      count(*) filter(where a.status in ('sent','skipped'))::int as sent_lifetime
+    from noelle.approvals a ${approvalMemoryJoins(sql)}
+    where a.org_id=${inst.org_id} and a.agent_instance_id=${inst.id} and ai.role=${inst.role}
+  `;
+  const r = rows[0];
+  if (!r) return {};
+  return { pending: r.pending, sentLifetime: r.sent_lifetime };
+}
+
+async function loadWorkerFreshness(
+  workers: ReadonlyArray<ChatWorkerFreshness["worker"]>,
+): Promise<ChatWorkerFreshness[]> {
+  const rows = await sql<Array<{ worker: string; last_success_at: string | null }>>`
+    select
+      worker,
+      max(finished_at) filter (where error is null) as last_success_at
+    from noelle.worker_runs
+    where worker = any(${workers as unknown as string[]})
+    group by worker
+  `;
+  const byWorker = new Map(rows.map((r) => [r.worker, r.last_success_at] as const));
+  return workers.map((worker) => ({
+    worker,
+    lastSuccessAt: byWorker.get(worker) ?? null,
+  }));
+}
+
+/**
+ * `draftPayload` / `leadPayload` expect a full row but only read `.payload`.
+ * The join above projects the payload column directly, so we shim the
+ * minimal shape — the unused row fields are never inspected by the readers.
+ */
+function readDraftPayload(payload: unknown): DraftPayloadView {
+  if (!payload) return draftPayload(null);
+  return draftPayload({ payload } as unknown as Parameters<typeof draftPayload>[0]);
+}
+
+function readLeadPayload(payload: unknown): LeadPayloadView {
+  if (!payload) return leadPayload(null);
+  return leadPayload({ payload } as unknown as Parameters<typeof leadPayload>[0]);
+}
+
+function replySource(inst: NoelleAgentInstance, payload: unknown): { postText: string | null; postUrl: string | null; authorHandle: string | null } {
+  if (inst.role === "reddit_intern") return redditLeadFields(payload);
