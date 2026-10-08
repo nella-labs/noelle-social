@@ -198,3 +198,203 @@ export async function runDiscoveryTick(args: RunDiscoveryTickArgs): Promise<numb
         "watchlist person has no public_id; cannot query Apify — skipping",
       );
       continue;
+    }
+
+    // Re-poll cooldown: skip a person attempted within the window. Stamp BEFORE
+    // the fetch so a throwing profile also cools down instead of being
+    // re-hammered every tick.
+    if (repollGate) {
+      if (!repollGate.due(person.publicId)) {
+        cooledDown++;
+        continue;
+      }
+      repollGate.stamp(person.publicId);
+    }
+
+    let posts: LinkedInPost[] = [];
+    try {
+      posts = await metered("linkedin-profile-posts", operation => operation.profilePosts({
+        publicId: person.publicId!,
+        maxPosts: discoveryLimit,
+        // Only ingest posts from the day the person was added forward; their
+        // older history belongs to the profiler, not the comment pipeline. When a
+        // tailored-run time window is set, narrow further to the later of the two
+        // bounds so Apify doesn't return posts the window would just drop.
+        sinceISO: laterISO(person.addedAt, windowSince),
+      }));
+    } catch (err) {
+      // Every token spent → the rest of the watchlist will 403 identically.
+      // Propagate so the worker records the error + pings the operator instead
+      // of silently completing with inserted:0 (which reads as "idle").
+      if (err instanceof AllApifyTokensExhaustedError) throw err;
+      log.error(
+        { publicId: person.publicId, err: (err as Error).message },
+        "apify profilePosts failed for watchlist person",
+      );
+      continue;
+    }
+    scanned += posts.length;
+
+    for (const post of posts) {
+      const postedAt = readSourceTimestamp(post.postedAt);
+      if (extractedToday >= dailyExtractCap) {
+        log.info(
+          { extractedToday, dailyExtractCap },
+          "daily extract cap reached mid-person; stopping",
+        );
+        break;
+      }
+      // Tailored-run filters: drop posts that don't clear the engagement floors
+      // or fall outside the time window BEFORE they become leads. Missing
+      // engagement counts as 0, so a floor > 0 also drops posts Apify returned
+      // without counts. The window is a client-side backstop to the narrowed
+      // sinceISO above.
+      if (
+        (minReactions != null && minReactions > 0 && (post.reactions ?? 0) < minReactions) ||
+        (minComments != null && minComments > 0 && (post.comments ?? 0) < minComments) ||
+        (windowSince != null && postedAt != null && postedAt < windowSince)
+      ) {
+        filtered++;
+        continue;
+      }
+      seen.add(post.id);
+      try {
+        const res = await upsertLead({
+          orgId: instance.org_id,
+          agentInstanceId: instance.id,
+          platform: "linkedin",
+          externalId: post.id,
+          authorHandle: person.publicId,
+          authorId: person.fsdProfileId,
+          payload: {
+            text: post.text,
+            url: post.url,
+            postedAt,
+            authorName: person.name ?? post.author.name,
+            authorHeadline: person.headline ?? post.author.headline,
+            authorPublicId: person.publicId,
+            reactions: post.reactions,
+            comments: post.comments,
+            // Post media image URLs for a downstream vision-caption step. Only
+            // present on posts that actually have media (omitted otherwise).
+            ...(post.images && post.images.length > 0 ? { images: post.images } : {}),
+          },
+          postedAt,
+          // WATCH lane = hand-picked connections. Mark them priority so the
+          // classifier never HARD-skips one of the operator's own people: a
+          // 'skip' verdict is clamped to 'light' (a short supportive reply). The
+          // person is the gate, not the post — the operator chose to watch them,
+          // so every post they make earns at least a peer note (wins/launches
+          // especially). The keyword/search lane keeps the full skip filter.
+          priority: true,
+        });
+        // Only a genuinely NEW lead counts toward the daily extract cap; a
+        // re-seen post (inserted=false) is a no-op and shouldn't burn budget.
+        if (res.inserted) {
+          inserted++;
+          extractedToday++;
+          await bus?.emit({
+            topic: "lead.discovered",
+            worker: "discovery",
+            summary: `discovered ${person.publicId}`,
+            payload: {
+              lead_id: res.id,
+              external_id: post.id,
+              handle: person.publicId,
+              reactions: post.reactions ?? null,
+            },
+            correlationId: res.id,
+          });
+        }
+      } catch (err) {
+        log.error({ activityId: post.id, err: (err as Error).message }, "lead upsert failed");
+      }
+    }
+  }
+
+  if (cooledDown > 0) {
+    log.info(
+      { cooledDown, watchlistPeople: watchlistPeople.length },
+      "watch lane: people skipped by re-poll cooldown (fetched again once their window elapses)",
+    );
+  }
+
+  // ── Keyword (SEARCH) lane ──────────────────────────────────────────────────
+  // Search LinkedIn-wide for high-engagement posts matching the operator's
+  // keywords, from people OUTSIDE the watchlist. Unlike X's native search, the
+  // Apify post-search actor can't sort by engagement, filter language, or exclude
+  // authors — so we over-fetch by recency and filter client-side: skip company
+  // pages, drop posts below the reaction floor, drop posts outside the window.
+  // Skipped entirely when the caller passes no keywords/keywordConfig (paused or
+  // watchlist-only). Search posts carry their OWN author (a stranger), so the
+  // lead's author_handle is the post author's public id and author_id is null.
+  const searchPosts = postsSource.searchPosts;
+  if (keywordConfig && keywords.length > 0 && searchPosts) {
+    const keywordMin = keywordConfig.minReactions;
+    for (const keyword of keywords) {
+      if (extractedToday >= dailyExtractCap) {
+        log.info({ extractedToday, dailyExtractCap }, "daily extract cap reached; stopping keyword lane");
+        break;
+      }
+      let posts: LinkedInPost[] = [];
+      try {
+        posts = await metered("linkedin-post-search", operation => operation.searchPosts!({
+          queries: [keyword],
+          maxPosts: keywordConfig.searchLimit,
+          postedLimit: keywordConfig.postedLimit,
+          sinceISO: windowSince ?? undefined,
+        }));
+      } catch (err) {
+        if (err instanceof AllApifyTokensExhaustedError) throw err;
+        log.error({ keyword, err: (err as Error).message }, "apify searchPosts failed for keyword");
+        continue;
+      }
+      scanned += posts.length;
+
+      for (const post of posts) {
+        const postedAt = readSourceTimestamp(post.postedAt);
+        if (extractedToday >= dailyExtractCap) break;
+        if (seen.has(post.id)) continue;
+        seen.add(post.id);
+        // Company pages post promo, not the peer-builder content the objective
+        // targets ("SKIP: corporate boilerplate ... pure promo"). Skip by default.
+        if (!keywordConfig.includeCompanies && post.author.type === "company") {
+          filtered++;
+          continue;
+        }
+        // High-engagement floor + time window — the whole point of the search lane.
+        // Missing counts read as 0, so any floor > 0 also drops countless posts.
+        if (
+          (keywordMin > 0 && (post.reactions ?? 0) < keywordMin) ||
+          (windowSince != null && postedAt != null && postedAt < windowSince)
+        ) {
+          filtered++;
+          continue;
+        }
+        // A reply needs a target author; the search actor occasionally returns a
+        // post with no resolvable public id (no publicIdentifier / universalName).
+        const handle = post.author.publicId;
+        if (!handle) {
+          log.warn({ activityId: post.id }, "search post has no author public id; skipping");
+          continue;
+        }
+        // Profile-first AUTHOR gate: when an ICP is set, only keep the post if
+        // its author is the right kind of person (headline match). This is the
+        // "correct people, not the post" filter — a keyword can surface anyone,
+        // so we vet the author before drafting. Qualified authors' leads are
+        // priority=true (the classifier won't hard-skip them).
+        if (icp) {
+          const q = qualifyByHeadline(post.author.headline, icp);
+          if (!q.qualified) {
+            filtered++;
+            continue;
+          }
+          // Retain the qualified person (best-effort) so the profile is stored,
+          // not just used to mint this lead.
+          if (recordDiscoveredPerson) {
+            await recordDiscoveredPerson({
+              publicId: handle,
+              fsdProfileId: null,
+              name: post.author.name,
+              headline: post.author.headline,
+              source: "post_search",
