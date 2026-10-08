@@ -398,3 +398,203 @@ function RelationshipDmsRow({
   return (
     <div
       style={{
+        padding: 12,
+        borderRadius: 10,
+        background: "var(--paper-2)",
+        boxShadow: "0 0 0 0.5px var(--rule-soft)",
+        marginBottom: 14,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 13.5, fontWeight: 600 }}>Friendly DMs</span>
+            <span className="tag">{cap}/day</span>
+          </div>
+          <div style={{ fontSize: 11.5, color: "var(--ink-muted)", marginTop: 3, lineHeight: 1.35 }}>
+            Independent from reply controls. Drafts from saved person context. Review required before anything is sent.
+          </div>
+        </div>
+        <label
+          style={{ display: "flex", alignItems: "center", gap: 8, cursor: saving ? "wait" : "pointer" }}
+          title={checked ? "On — click to pause Friendly DMs" : "Off — click to enable Friendly DMs"}
+        >
+          <input
+            type="checkbox"
+            aria-label="Friendly DMs"
+            checked={checked}
+            disabled={saving}
+            onChange={(e) => save(e.target.checked)}
+          />
+          <span className={`btn btn-sm ${checked ? "btn-primary" : ""}`}>
+            {saving ? "Saving…" : checked ? "On" : "Off"}
+          </span>
+        </label>
+      </div>
+      <ReviewFriendlyDmsLink href={approvalsHref} />
+      {error ? (
+        <div role="alert" aria-live="polite" style={{ marginTop: 8, fontSize: 11.5, color: "var(--warn)" }}>
+          {error}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// "Schedule" — a recurring scheduled run (0085). Arms a standing order that
+// auto-fires Start all on a cadence (every N hours, or daily at HH:MM in a tz),
+// so the pipeline runs without clicking the button. Saving with the toggle ON
+// stamps the next fire time; OFF stores the settings but fires nothing. A firing
+// does exactly what Start all does — this only sets the timer.
+function ScheduleBlock({
+  orgSlug,
+  instanceId,
+  saved,
+  goalNoun,
+  now,
+  busy,
+  pending,
+  run,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  saved: PipelineScheduleSnapshot | null;
+  goalNoun: string;
+  now: number | null;
+  busy: string | null;
+  pending: boolean;
+  run: (key: string, fn: () => Promise<{ ok: boolean; error?: { message: string } }>) => void;
+}) {
+  const on = Boolean(saved?.enabled);
+  const [open, setOpen] = useState(on);
+  const [mode, setMode] = useState<"interval" | "daily">(saved?.mode ?? "daily");
+  const [intervalHours, setIntervalHours] = useState(saved?.intervalHours ?? 6);
+  const [dailyTime, setDailyTime] = useState(saved?.dailyTime ?? "09:00");
+  const [goal, setGoal] = useState(saved?.goal ?? 20);
+  // tz initialises to the saved value or "UTC" for a stable first render (no
+  // hydration mismatch), then adopts the browser tz post-mount for a NEW schedule.
+  const [tz, setTz] = useState(saved?.timezone ?? "UTC");
+  useEffect(() => {
+    if (!saved) {
+      try {
+        setTz(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+      } catch {
+        /* keep UTC */
+      }
+    }
+  }, [saved]);
+
+  function save(enabled: boolean) {
+    const schedule = {
+      enabled,
+      mode,
+      intervalHours:
+        mode === "interval" ? Math.max(1, Math.min(168, Math.round(intervalHours || 6))) : null,
+      dailyTime: mode === "daily" ? dailyTime : null,
+      timezone: tz || "UTC",
+      goal: Math.max(1, Math.min(500, Math.round(goal || 20))),
+    };
+    run("schedule", () => setRunSchedule({ orgSlug, instanceId, schedule }));
+  }
+
+  // "Next run" — local time, only after mount (now != null) so SSR and the first
+  // client render match (toLocaleString is locale/tz-dependent → hydration unsafe).
+  const nextLabel =
+    on && saved?.nextAt && now != null
+      ? new Date(saved.nextAt).toLocaleString(undefined, {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      : null;
+
+  const cadenceSummary =
+    saved?.mode === "interval"
+      ? `every ${saved.intervalHours ?? "?"}h`
+      : saved?.mode === "daily"
+        ? `daily at ${saved.dailyTime ?? "?"}`
+        : null;
+
+  return (
+    <div
+      style={{
+        padding: 12,
+        borderRadius: 10,
+        background: "var(--paper-2)",
+        boxShadow: "0 0 0 0.5px var(--rule-soft)",
+        marginBottom: 14,
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="btn btn-xs btn-ghost"
+        aria-expanded={open}
+        style={{ fontFamily: "var(--mono)", fontSize: 11, display: "flex", alignItems: "center", gap: 8 }}
+      >
+        <span>{open ? "▾" : "▸"} Schedule</span>
+        <span className="tag" style={{ color: on ? "var(--ok)" : "var(--ink-soft)" }}>
+          <span className={on ? "dot dot-ok" : "dot dot-mute"} /> {on ? "on" : "off"}
+        </span>
+        {on && cadenceSummary ? (
+          <span style={{ color: "var(--ink-soft)" }}>· {cadenceSummary}</span>
+        ) : null}
+      </button>
+
+      {on && nextLabel ? (
+        <div style={{ fontSize: 11.5, color: "var(--ink-muted)", marginTop: 6 }}>
+          Next run: <span style={{ fontWeight: 500 }}>{nextLabel}</span> · then auto-pauses at {goal}.
+        </div>
+      ) : null}
+
+      {open ? (
+        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10 }}>
+          {/* Mode selector */}
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              type="button"
+              className={`btn btn-xs ${mode === "interval" ? "btn-primary" : ""}`}
+              onClick={() => setMode("interval")}
+            >
+              Every N hours
+            </button>
+            <button
+              type="button"
+              className={`btn btn-xs ${mode === "daily" ? "btn-primary" : ""}`}
+              onClick={() => setMode("daily")}
+            >
+              Daily at time
+            </button>
+          </div>
+
+          {/* Cadence input */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 13 }}>
+            {mode === "interval" ? (
+              <>
+                <span>Every</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={168}
+                  value={intervalHours}
+                  onChange={(e) => setIntervalHours(Math.max(1, Math.min(168, Number(e.target.value) || 1)))}
+                  className="input"
+                  style={{ width: 64, textAlign: "center" }}
+                />
+                <span>hours</span>
+              </>
+            ) : (
+              <>
+                <span>Daily at</span>
+                <input
+                  type="time"
+                  value={dailyTime}
+                  onChange={(e) => setDailyTime(e.target.value)}
+                  className="input"
+                  style={{ width: 110 }}
+                />
+                <input
+                  type="text"
+                  value={tz}
