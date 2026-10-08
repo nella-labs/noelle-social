@@ -198,3 +198,203 @@ export function renderBrandBlock(brand: BrandConfig): string {
     if (p.surfaces?.length) lines.push(`Public surfaces you may reference: ${p.surfaces.join(", ")}`);
     if (p.fits_when?.length) {
       lines.push(`The product genuinely FITS only when the post is about: ${p.fits_when.join("; ")}. If the post isn't about one of these, do NOT pitch it.`);
+    }
+  }
+
+  const policyLine =
+    brand.pitch_policy === "never"
+      ? "PITCH POLICY: never pitch the product. Always stay a genuine peer, even in the DM."
+      : brand.pitch_policy === "always"
+        ? "PITCH POLICY: you may pitch in the DM on every lead, but only where it's honest — never fabricate fit."
+        : "PITCH POLICY: pitch ONLY when the product genuinely fits the post (see fits_when). When it doesn't, write a peer comment with no pitch.";
+  lines.push("", policyLine);
+
+  if (brand.qa?.length) {
+    lines.push("", "BRAND Q&A (ground your comments + DM in these answers; use them, do not quote them verbatim)");
+    for (const item of brand.qa) lines.push(`Q: ${item.q}\nA: ${item.a}`);
+  }
+
+  if (brand.reply_style?.voice_notes || brand.reply_style?.never_do?.length) {
+    lines.push("", "REPLY STYLE");
+    if (brand.reply_style.voice_notes) lines.push(brand.reply_style.voice_notes);
+    if (brand.reply_style.never_do?.length) {
+      lines.push(`Additional NEVER-DO: ${brand.reply_style.never_do.join("; ")}.`);
+    }
+  }
+
+  const dm = brand.dm_style;
+  if (dm && (dm.greeting || dm.closing || dm.notes || dm.fragments_min || dm.len_min)) {
+    lines.push("", "DM STYLE (overrides the default DM shape)");
+    if (dm.greeting) lines.push(`Open with: "${dm.greeting}" (plus a first name when given).`);
+    if (dm.closing) lines.push(`Close with: "${dm.closing}"`);
+    if (dm.fragments_min || dm.fragments_max) {
+      lines.push(`Fragments: ${dm.fragments_min ?? 4} to ${dm.fragments_max ?? 6} short chunks separated by blank lines.`);
+    }
+    if (dm.len_min || dm.len_max) lines.push(`Length: aim ${dm.len_min ?? 400} to ${dm.len_max ?? 700} characters.`);
+    if (dm.notes) lines.push(dm.notes);
+  }
+
+  return lines.join("\n");
+}
+
+
+// ---- Pattern Breaker rules -------------------------------------------------
+// The Pattern Breaker (packages/runtime/src/patternBreaker) discovers structural
+// habits the operator over-uses across their last N posts and stores them as
+// noelle.pattern_rules. The drafter injects the active rules' instructions here
+// so the writer actively BREAKS them — the proactive complement to the verifier
+// catching them after the fact.
+
+/** A learned anti-pattern rule as the drafter consumes it. */
+export interface PatternRuleForPrompt {
+  instruction: string;
+  source?: "auto" | "refined" | "manual";
+  /** The positive "do this instead" mirror; appended to the ban when present. */
+  suggestion?: string | null;
+}
+
+/** One rule as its NEVER-DO line plus, when present, its positive mirror
+ * ("- <ban> → instead: <suggestion>") — steer the drafter, don't just fence it. */
+function renderPatternRule(r: PatternRuleForPrompt): string {
+  const instruction = r.instruction.trim();
+  const suggestion = r.suggestion?.trim();
+  return suggestion ? `- ${instruction} → instead: ${suggestion}` : `- ${instruction}`;
+}
+
+export function renderPatternRulesBlock(rules: PatternRuleForPrompt[]): string {
+  // The public reply rule bans full stops. Do not let an automatically learned
+  // terminal-punctuation habit contradict it in the writer's final instructions.
+  const active = rules.filter((r) => r.instruction.trim() &&
+    !(r.source === "auto" && /\bwithout terminal punctuation\b/i.test(r.instruction)));
+  if (active.length === 0) return "";
+  return [
+    "BREAK THESE REPEATED PATTERNS (learned from your own recent posts — you lean on these too hard, so deliberately do something different here)",
+    ...active.map(renderPatternRule),
+    "These are habits, not hard bans on a topic: vary the opener, the rhythm, and the closer so this post does not read like a template of the last ten. Keep every voice and NEVER-DO rule above intact.",
+  ].join("\n");
+}
+
+// ---- F6b: Batched light-lead prompt ----------------------------------------
+// The batched path groups N light leads into ONE model call, each carrying its
+// own post text + its own per-lead STYLE block (selectStyleExemplars is called
+// per lead — not one shared context). The model returns a strict JSON array
+// [{id, reply}], one entry per input id, same order. On any parse failure the
+// caller falls back to per-lead single calls (fail-open, spec §9).
+
+/**
+ * One lead's data for a batched-light call. The id is a unique, tick-local
+ * handle (UUID or index) used to correlate the model's array entries back to
+ * the original lead — the model is instructed to echo it verbatim.
+ */
+export interface BatchedLightLeadInput {
+  id: string;
+  postText: string;
+  authorName: string | null;
+  publicId: string | null;
+  /** Per-lead STYLE block (from selectStyleExemplars), or "" when style is off. */
+  styleBlock: string;
+  /** Voice anchors from the operator's KB for this lead's post. */
+  anchors: string[];
+  /** Product-knowledge snippets, or [] when off. */
+  knowledgeAnchors: string[];
+  /** Image caption line, or "" when none. */
+  imageCaption: string;
+  /** Existing comment digest, or "" when none. */
+  commentDigest: string;
+  /** Register block (variety), or "" when off. */
+  registerBlock?: string;
+  /**
+   * The standalone "THIS REPLY'S ASSIGNED SHAPE" block for this lead, when the
+   * shape could not be rendered inside its style block (no pinned voice).
+   * Mutually exclusive with registerBlock — both claim reply length.
+   */
+  shapeBlock?: string;
+  /** Opening-move block (variety), or "" when off. */
+  openingMoveBlock?: string;
+  /**
+   * The gen-z "SPOKEN REGISTER" marker block, or undefined when this lead was
+   * offered no marker. NOT mutually exclusive with the register or the shape:
+   * it governs word choice, not length, so it is pushed on its own.
+   */
+  genzBlock?: string;
+  /** Prior replies to this author (do-not-repeat memory). */
+  priorReplies?: string[];
+  /** Recent phrasings across the feed (global avoid-list). */
+  recentPhrasings?: string[];
+}
+
+/**
+ * Render the batched system prompt used when grouping N light leads into one
+ * model call. The system instruction replaces the single-lead LIGHT system
+ * prompt with a batch-aware variant: "you are drafting one reply PER post
+ * below; return a strict JSON array [{id, reply}] with one entry per input id,
+ * same order." All existing light-lead voice/format/NEVER-DO rules still apply
+ * — the only difference is the output shape (array, not single object) and the
+ * multi-lead user content.
+ *
+ * This is a SYSTEM prompt for `runner.draft`; the user content is built by
+ * `renderBatchedLightUserPrompt`. Kept separate so tests can assert on each.
+ */
+export const BATCHED_LIGHT_SYSTEM_SUFFIX = `
+
+BATCHED MODE
+You are drafting ONE short reply for EACH post enumerated below. For each post you will be given:
+  - id: a unique handle (echo it back verbatim in the output)
+  - post: the LinkedIn post text
+  - style: (when present) STYLE TO EMULATE notes for that specific post — treat them as per-post FORM guidance
+  - anchors: (when present) voice anchors from the operator's knowledge base for that specific post
+  - knowledge: (when present) product-knowledge snippets for that specific post
+  - image: (when present) image caption for that specific post
+  - comments: (when present) COMMENT SECTION for that specific post
+  - register: (when present) ASSIGNED REGISTER for that specific reply
+  - shape: (when present) THIS REPLY'S ASSIGNED SHAPE for that specific reply — it REPLACES the default comment length below
+  - spoken register: (when present) a SPOKEN REGISTER block offering ONE marker for that specific reply, and ONLY that one
+  - opening_move: (when present) OPENING MOVE for that specific reply
+  - prior_replies: (when present) prior replies to this author (do not repeat)
+  - recent_phrasings: (when present) recent phrasings across the feed (avoid-list)
+
+Apply ALL length, format, NEVER-DO, and VOICE rules from above to EVERY reply. The STYLE block, anchors, ASSIGNED REGISTER, ASSIGNED SHAPE and SPOKEN REGISTER are PER-POST — apply each only to the reply for that post. A SPOKEN REGISTER block under ONE post never licenses that marker, or any marker, in the replies to the OTHER posts; most posts in a batch carry none at all, and those replies use no marker. One short comment per post: 1-2 sentences, ~90-180 chars, hard cap ~220 — UNLESS that post carries an ASSIGNED SHAPE (as its own block or inside its style block); then that shape's length and sentence count REPLACE this default entirely, and it may legitimately be three words or a 320-char run-on. Do not drag a shaped reply back toward the default band.
+
+OUTPUT FORMAT — STRICT JSON ARRAY, NO PREAMBLE, NO MARKDOWN FENCES:
+The very first character of your response MUST be \`[\` and the last \`]\`. Output exactly one entry per input post, in the SAME ORDER as the input, each entry:
+  {"id":"<echo the id verbatim>","reply":"<the short comment body>"}
+No angle field, no char_count field, no extra keys. No skip entries — write the best honest peer comment even when you have little to say.`;
+
+/**
+ * Render the user content for a batched-light call: enumerate each lead as a
+ * numbered block with its id, post text, optional context blocks (STYLE,
+ * anchors, knowledge, image, comments, register, opening_move, prior_replies,
+ * recent_phrasings). The model is expected to return a JSON array with one
+ * {id, reply} per entry.
+ */
+export function renderBatchedLightUserPrompt(leads: BatchedLightLeadInput[]): string {
+  const blocks = leads.map((l, idx) => {
+    const who = l.authorName ?? (l.publicId ? `@${l.publicId}` : "a watchlist person");
+    const parts: string[] = [`[${idx + 1}] id: ${l.id}`, `post by ${who}:`, l.postText];
+    if (l.imageCaption) parts.push(`image: ${l.imageCaption}`);
+    if (l.commentDigest) parts.push(l.commentDigest);
+    if (l.anchors.length > 0) {
+      parts.push(
+        "anchors (voice-ground your reply — do not force-reference):",
+        l.anchors.map((a, i) => `[${i + 1}] ${a}`).join("\n"),
+      );
+    }
+    if (l.knowledgeAnchors.length > 0) {
+      parts.push(
+        "knowledge (ONLY facts you may assert about the product):",
+        l.knowledgeAnchors.map((a, i) => `[${i + 1}] ${a}`).join("\n"),
+      );
+    }
+    if (l.priorReplies && l.priorReplies.length > 0) {
+      const pr = l.priorReplies
+        .slice(0, 5)
+        .map((b, i) => `[${i + 1}] ${b.length > 240 ? `${b.slice(0, 237)}…` : b}`);
+      parts.push(
+        "prior_replies (do NOT repeat these takes or phrasings to this person):",
+        pr.join("\n"),
+      );
+    }
+    if (l.recentPhrasings && l.recentPhrasings.length > 0) {
+      const rp = l.recentPhrasings
+        .slice(0, 12)
+        .map((b, i) => `[${i + 1}] ${b.length > 160 ? `${b.slice(0, 157)}…` : b}`);
