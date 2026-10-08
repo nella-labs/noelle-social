@@ -398,3 +398,203 @@ function ActionButton({
 function toneFor(severity: Severity): string {
   switch (severity) {
     case "danger":
+      return "var(--danger)";
+    case "warn":
+      return "var(--warn)";
+    case "info":
+      return "var(--info)";
+    case "accent":
+      return "var(--accent)";
+    default:
+      return "var(--ink)";
+  }
+}
+
+// ─── Visual hero illustrations ──────────────────────────────────────────
+
+type ArtKind =
+  | "missing-star"
+  | "loose-wire"
+  | "sealed"
+  | "dropped-signal"
+  | "moon"
+  | "dimmed-agent";
+
+function ErrorArt({
+  kind,
+  tone,
+  code,
+}: {
+  kind: ArtKind;
+  tone: string;
+  code: string;
+}) {
+  return (
+    <div
+      style={{
+        position: "relative",
+        overflow: "hidden",
+        background: "color-mix(in oklch, var(--paper-2) 70%, var(--paper))",
+        padding: "40px 32px",
+        display: "grid",
+        placeItems: "center",
+        minHeight: 460,
+      }}
+    >
+      <div
+        aria-hidden
+        style={{
+          position: "absolute",
+          inset: 0,
+          pointerEvents: "none",
+          backgroundImage: `
+            radial-gradient(circle at 18% 22%, var(--ink) 0 1px, transparent 1.5px),
+            radial-gradient(circle at 72% 14%, var(--ink) 0 1px, transparent 1.5px),
+            radial-gradient(circle at 88% 58%, var(--ink) 0 1.2px, transparent 1.7px),
+            radial-gradient(circle at 12% 78%, var(--ink) 0 1px, transparent 1.5px),
+            radial-gradient(circle at 60% 86%, var(--ink) 0 1px, transparent 1.5px),
+            radial-gradient(circle at 38% 44%, var(--ink) 0 0.8px, transparent 1.2px)
+          `,
+          opacity: 0.18,
+        }}
+      />
+
+      <div
+        style={{
+          position: "relative",
+          width: "min(360px, 80%)",
+          aspectRatio: "1 / 1",
+        }}
+      >
+        {kind === "missing-star" && <ArtMissingStar tone={tone} />}
+        {kind === "loose-wire" && <ArtLooseWire tone={tone} />}
+        {kind === "sealed" && <ArtSealed tone={tone} />}
+        {kind === "dropped-signal" && <ArtDroppedSignal tone={tone} />}
+        {kind === "moon" && <ArtMoon tone={tone} />}
+        {kind === "dimmed-agent" && <ArtDimmedAgent tone={tone} />}
+      </div>
+
+      <div
+        style={{
+          position: "absolute",
+          left: 24,
+          bottom: 18,
+          fontFamily: "var(--mono, 'JetBrains Mono', ui-monospace, monospace)",
+          fontSize: 11,
+          letterSpacing: "0.18em",
+          textTransform: "uppercase",
+          color: "var(--ink-soft)",
+        }}
+      >
+        Error <span style={{ color: "var(--ink-2)" }}>{code}</span>
+      </div>
+      <div
+        style={{
+          position: "absolute",
+          right: 24,
+          bottom: 18,
+          fontFamily: "var(--mono, 'JetBrains Mono', ui-monospace, monospace)",
+          fontSize: 11,
+          letterSpacing: "0.18em",
+          textTransform: "uppercase",
+          color: "var(--ink-soft)",
+        }}
+      >
+        Noelle · workspace
+      </div>
+    </div>
+  );
+}
+
+function ArtMissingStar({ tone }: { tone: string }) {
+  const points: [number, number][] = [
+    [80, 120],
+    [150, 90],
+    [220, 140],
+    [270, 100],
+    [250, 200],
+    [180, 230],
+    [110, 210],
+  ];
+  return (
+    <svg viewBox="0 0 360 360" width="100%" height="100%">
+      <g stroke="var(--rule)" strokeWidth="1" fill="none">
+        <polyline points="80,120 150,90 220,140 270,100 250,200 180,230 110,210 80,120" />
+      </g>
+      {points.map(([x, y], i) => (
+        <g key={i}>
+          <circle cx={x} cy={y} r="6" fill="var(--paper)" stroke="var(--ink)" strokeWidth="1.2" />
+          <circle cx={x} cy={y} r="1.6" fill="var(--ink)" />
+        </g>
+      ))}
+      <circle cx="200" cy="170" r="14" fill="none" stroke={tone} strokeWidth="1.5" strokeDasharray="3 3" />
+      <text x="200" y="174" textAnchor="middle" fontFamily="var(--mono)" fontSize="11" letterSpacing="0.06em" fill={tone}>
+        404
+      </text>
+      <path d="M 200 170 Q 280 240 320 310" stroke={tone} strokeWidth="1" strokeDasharray="2 4" fill="none" opacity="0.7" />
+      <g transform="translate(320 310)">
+        <circle r="7" fill={tone} />
+        <circle r="14" fill="none" stroke={tone} strokeWidth="1" opacity="0.4" />
+      </g>
+    </svg>
+  );
+}
+
+function ArtLooseWire({ tone }: { tone: string }) {
+  return (
+    <svg viewBox="0 0 360 360" width="100%" height="100%">
+      <g>
+        <circle cx="80" cy="180" r="22" fill="var(--paper)" stroke="var(--ink)" strokeWidth="1.5" />
+        <circle cx="80" cy="180" r="6" fill="var(--ink)" />
+        <text x="80" y="232" textAnchor="middle" fontFamily="var(--mono)" fontSize="10" letterSpacing="0.1em" fill="var(--ink-muted)">
+          CLIENT
+        </text>
+        <circle cx="280" cy="180" r="22" fill="var(--paper)" stroke="var(--ink)" strokeWidth="1.5" />
+        <circle cx="280" cy="180" r="6" fill="var(--ink)" />
+        <text x="280" y="232" textAnchor="middle" fontFamily="var(--mono)" fontSize="10" letterSpacing="0.1em" fill="var(--ink-muted)">
+          SERVER
+        </text>
+      </g>
+      <path d="M 100 180 C 140 150, 160 160, 178 178" stroke={tone} strokeWidth="2.5" fill="none" />
+      <g stroke={tone} strokeWidth="1.6" fill="none" opacity="0.85">
+        <path d="M 178 178 L 188 168" />
+        <path d="M 178 178 L 192 182" />
+        <path d="M 178 178 L 184 192" />
+      </g>
+      <path d="M 200 184 C 220 200, 240 200, 258 180" stroke={tone} strokeWidth="1.2" strokeDasharray="3 4" fill="none" opacity="0.45" />
+      <circle cx="178" cy="178" r="14" fill={tone} opacity="0.18" />
+      <circle cx="178" cy="178" r="4" fill={tone} />
+    </svg>
+  );
+}
+
+function ArtSealed({ tone }: { tone: string }) {
+  return (
+    <svg viewBox="0 0 360 360" width="100%" height="100%">
+      <rect x="80" y="100" width="200" height="140" rx="6" fill="var(--paper)" stroke="var(--ink)" strokeWidth="1.5" />
+      <path d="M 80 110 L 180 180 L 280 110" stroke="var(--ink)" strokeWidth="1.2" fill="none" />
+      <circle cx="180" cy="200" r="32" fill={tone} opacity="0.18" />
+      <circle cx="180" cy="200" r="22" fill={tone} />
+      <circle cx="180" cy="195" r="4" fill="var(--paper)" />
+      <rect x="178" y="195" width="4" height="9" fill="var(--paper)" />
+      <g transform="rotate(-6 180 90)">
+        <rect x="100" y="80" width="160" height="20" fill="var(--ink)" />
+        <text x="180" y="94" textAnchor="middle" fontFamily="var(--mono)" fontSize="11" letterSpacing="0.4em" fill="var(--paper)">
+          PRIVATE
+        </text>
+      </g>
+    </svg>
+  );
+}
+
+function ArtDroppedSignal({ tone }: { tone: string }) {
+  return (
+    <svg viewBox="0 0 360 360" width="100%" height="100%">
+      <g transform="translate(90 220)">
+        <path d="M 0 0 L -22 -110 L 22 -110 Z" fill="var(--paper)" stroke="var(--ink)" strokeWidth="1.2" />
+        <line x1="-14" y1="-30" x2="14" y2="-30" stroke="var(--ink)" strokeWidth="1" />
+        <line x1="-18" y1="-60" x2="18" y2="-60" stroke="var(--ink)" strokeWidth="1" />
+        <line x1="-22" y1="-90" x2="22" y2="-90" stroke="var(--ink)" strokeWidth="1" />
+        <circle cx="0" cy="-110" r="5" fill={tone} />
+      </g>
+      <path d="M 130 200 Q 145 160, 160 200 T 190 200 T 220 200" stroke={tone} strokeWidth="2.5" fill="none" />
