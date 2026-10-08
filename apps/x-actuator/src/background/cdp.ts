@@ -198,3 +198,172 @@ export class Cdp {
       // force:0.5 matches a real mouse button-down (PointerEvent.pressure); CDP's
       // default of 0 is a per-event tell if a page reads pressure on pointerdown.
       await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: jp.x, y: jp.y, button: "left", clickCount: 1, buttons: 1, force: 0.5 });
+      const hold = clampMs(rng.logNormal(Math.log(95), 0.42), 50, 260);
+      await sleep(hold);
+      tElapsed += hold;
+      const jr = tremor(target, tElapsed, rng);
+      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: jr.x, y: jr.y, button: "left", clickCount: 1, buttons: 0 });
+    }
+
+    this.lastPos = target;
+  }
+
+  /**
+   * Approach `rect` and DWELL there (no click) long enough for a hover-triggered
+   * affordance to appear — e.g. a profile hover-card, or a menu that opens on
+   * hover. Keeps dispatching tremored mouseMoved events on the target so the
+   * page's :hover / mouseover state is sustained (a frozen cursor would neither
+   * open the affordance nor read as human). Leaves the cursor parked ON the
+   * target, so a follow-up moveAndClick travels a short in-affordance path.
+   * DOM-agnostic; ported from the LinkedIn actuator's reaction-flyout primitive.
+   */
+  async hover(tabId: number, rect: Rect, rng: Rng, sleep: Sleep, holdMs?: number): Promise<void> {
+    const { target, tElapsed: t0 } = await this.approach(tabId, rect, rng, sleep);
+    let tElapsed = t0;
+    const total = holdMs ?? rng.float(650, 1150);
+    const slices = rng.int(5, 8);
+    for (let h = 0; h < slices; h++) {
+      const hd = total / slices;
+      await sleep(hd);
+      tElapsed += hd;
+      const j = tremor(target, tElapsed, rng);
+      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: j.x, y: j.y, buttons: 0 });
+    }
+    this.lastPos = target;
+  }
+
+  /**
+   * Select everything in the focused editor and delete it — used to empty a
+   * composer that a failed send left dirty, so the next navigation cannot raise
+   * a `beforeunload` ("Leave site?") dialog. Escape is deliberately NOT used:
+   * on X it opens the in-page "Discard post?" confirm instead of clearing.
+   */
+  async clearFocusedEditor(tabId: number, sleep: Sleep): Promise<void> {
+    await clearFocusedEditor((t, method, params) => this.send(t, method, params ?? {}), tabId, sleep);
+  }
+
+  /**
+   * Press Escape — dismisses X's transient menus/popovers (e.g. the repost
+   * confirm menu) WITHOUT a click. Used when a menu is (or may be) open and its
+   * backdrop would swallow a synthetic click: closing via keyboard is both what
+   * a human does and the only path that can't accidentally click through onto
+   * whatever sits under the backdrop.
+   */
+  async pressEscape(tabId: number): Promise<void> {
+    await this.send(tabId, "Input.dispatchKeyEvent", {
+      type: "rawKeyDown", key: "Escape", code: "Escape",
+      windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
+    });
+    await this.send(tabId, "Input.dispatchKeyEvent", {
+      type: "keyUp", key: "Escape", code: "Escape",
+      windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
+    });
+  }
+
+  /**
+   * Scroll `totalPx` driven by §3(a) momentum gestures (flick/slow-drag/
+   * micro-nudge/back-scroll mixture). Each gesture dispatches a decelerating
+   * `mouseWheel` delta series with non-uniform inter-delta sleeps + a post-dwell,
+   * with tremor on the wheel anchor x,y. Same `(tabId, at, totalPx, rng, sleep)`
+   * signature so existing callers keep working.
+   */
+  async wheel(
+    tabId: number,
+    at: Point,
+    totalPx: number,
+    rng: Rng,
+    sleep: Sleep,
+    contentHints?: { wordCount?: number; hasMedia?: boolean }[],
+  ): Promise<void> {
+    const gestures = planScrollGestures(rng, totalPx, contentHints);
+    let tElapsed = 0;
+    for (const g of gestures) {
+      for (let i = 0; i < g.deltas.length; i++) {
+        const j = tremor(at, tElapsed, rng);
+        await this.send(tabId, "Input.dispatchMouseEvent", {
+          type: "mouseWheel", x: j.x, y: j.y, deltaX: 0, deltaY: g.deltas[i]!,
+        });
+        const dt = g.interDeltaMs[i] ?? 0;
+        if (dt > 0) await sleep(dt);
+        tElapsed += dt;
+      }
+      if (g.postDwellMs != null && g.postDwellMs > 0) {
+        await sleep(g.postDwellMs);
+        tElapsed += g.postDwellMs;
+      }
+    }
+  }
+
+  /**
+   * Submit chord: a modifier+Enter keydown/keyup with real key metadata. X
+   * natively posts the focused composer on Cmd+Enter (macOS) / Ctrl+Enter.
+   * `modifiers` is the CDP bitmask: 4 = Meta/⌘, 2 = Ctrl. Sends a rawKeyDown
+   * (no `text` field), so a bare Enter can never leak a newline into the
+   * composer — the chord either submits or does nothing.
+   */
+  async pressSubmitChord(tabId: number, modifiers: number): Promise<void> {
+    await this.send(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers });
+    await this.send(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers });
+  }
+
+  /**
+   * Type `text` one character at a time with full US-keyboard metadata so each
+   * keydown/keyup carries a real key/code/keyCode (not keyCode=0 / code="" /
+   * key="Unidentified", which no hardware produces and both LinkedIn and X can
+   * read from keystroke telemetry). Shift is held across consecutive shifted
+   * characters like a real typist.
+   *
+   * The character itself is committed with `Input.insertText`, NOT via the
+   * keyDown's `text` field. X's reply composer is a React-controlled
+   * contenteditable (DraftJS-style): it intercepts `beforeinput` and applies
+   * its own transaction. A keyDown-with-text produces a native edit the editor
+   * model doesn't always sync from, so the character lands in the DOM but the
+   * model stays empty — which keeps the reply button DISABLED forever (text
+   * typed, box populated, submit never enables → submit-not-found).
+   * `Input.insertText` fires the `inputType:"insertText"` beforeinput/input the
+   * editor handles natively, so the model updates and the submit enables. We
+   * therefore send a text-less rawKeyDown (telemetry only), then insertText
+   * (the real, framework-observable edit), then keyUp. (Ports #444.)
+   */
+  async typeText(tabId: number, text: string, rng: Rng, sleep: Sleep): Promise<void> {
+    const delays = typingDelays(rng, text.length);
+    const shift = { down: false };
+    const releaseShift = async () => {
+      if (!shift.down) return;
+      await this.send(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, location: 1 });
+      shift.down = false;
+    };
+    let i = 0;
+    for (const ch of text) {
+      const def = keyStrokeFor(ch);
+      if (!def) {
+        await releaseShift();
+        await this.send(tabId, "Input.insertText", { text: ch });
+        await sleep(delays[i++] ?? 60);
+        continue;
+      }
+      if (def.shift && !shift.down) {
+        await this.send(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16, modifiers: 8, location: 1 });
+        shift.down = true;
+      } else if (!def.shift && shift.down) {
+        await releaseShift();
+      }
+      const modifiers = shift.down ? 8 : 0;
+      // rawKeyDown (no `text`) → no native character insertion, just the
+      // keystroke telemetry with real US-keyboard metadata.
+      await this.send(tabId, "Input.dispatchKeyEvent", {
+        type: "rawKeyDown", key: def.key, code: def.code,
+        windowsVirtualKeyCode: def.keyCode, nativeVirtualKeyCode: def.keyCode,
+        unmodifiedText: def.unmodified, modifiers,
+      });
+      // The actual edit, via a path the React editor observes and syncs from.
+      await this.send(tabId, "Input.insertText", { text: ch });
+      await this.send(tabId, "Input.dispatchKeyEvent", {
+        type: "keyUp", key: def.key, code: def.code,
+        windowsVirtualKeyCode: def.keyCode, nativeVirtualKeyCode: def.keyCode, modifiers,
+      });
+      await sleep(delays[i++] ?? 60);
+    }
+    await releaseShift();
+  }
+}
