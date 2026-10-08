@@ -198,3 +198,62 @@ export function mountPanel(): void {
       log("STOPPED");
     })();
   });
+  q("#na-discover").addEventListener("click", () => {
+    void (async () => {
+      if (!(await saveSchedule())) return;
+      await start("startBrowserDiscovery", "DISCOVER + REPLY", [
+        "reading posts at the actor's normal pace and sending suitable replies after review",
+        "press STOP to end",
+      ], () => showDiscovery(true, true));
+    })();
+  });
+  // Manual Auto: drain everything the operator approved, right now, at the hour
+  // they chose — no overnight hold.
+  q("#na-drain").addEventListener("click", () => {
+    void start("startDrain", "MANUAL AUTO", [
+      "draining ALL approved replies, ~1-2 min apart, browsing + liking (4-8) between each",
+      "set-and-forget: survives reloads/restarts, resumes on its own — no re-click; press STOP to end",
+      "(no overnight pause — for that, use Auto instead)",
+    ]);
+  });
+  q("#na-fullauto").addEventListener("click", () => {
+    void start("startFullAuto", "AUTO", [
+      "draining approvals + watching for new ones (safe to leave running)",
+      "pauses comments/DMs overnight 1am–9am; likes + browsing stay on. Press STOP to end",
+    ]);
+  });
+  // Auto notifications: the conversation lane. It IS an unattended drain (so
+  // whatever Lyra drafts from the sweep gets posted by this same run), plus a
+  // periodic sweep of the notifications page that enqueues the people who
+  // replied to us. One click runs the whole loop.
+  if (NOTIFICATIONS_ACTOR_ENABLED) q("#na-notifs").addEventListener("click", () => {
+    void start("startNotifications", "AUTO NOTIFICATIONS", [
+      "checking notifications every ~10-20 min for people who replied to you",
+      "each one goes to Lyra to draft, then this same run posts it. Press STOP to end",
+      "pauses comments overnight 1am–9am; approvals already queued drain as usual",
+    ]);
+  });
+
+  setInterval(async () => {
+    // Drive the loop from here: the content script stays alive as long as the
+    // tab is open, unlike the MV3 service worker whose alarms/timers are
+    // unreliable. tick() is a no-op unless an action is actually due, so the
+    // human pacing (the schedule) is preserved.
+    await chrome.runtime.sendMessage({ cmd: "tick" }).catch(() => null);
+    const r = await chrome.runtime.sendMessage({ cmd: "getState" }).catch(() => null);
+    const s = r?.state;
+    if (r?.ok && typeof r.browserDiscoveryActive === "boolean") {
+      const observationError = r.browserDiscoveryStatus?.result === "failed"
+        ? `Observation failed: ${r.browserDiscoveryStatus.error ?? "unknown error"}` : "";
+      const identity = r.browserDiscoveryIdentityStatus;
+      const identityAt = Date.parse(identity?.at ?? "");
+      const identityAge = Date.now() - identityAt;
+      const observationAt = Date.parse(r.browserDiscoveryStatus?.at ?? "");
+      const identityError = r.browserDiscoveryActive && identity?.result === "unresolved" &&
+        identityAge >= 0 && identityAge < 10 * 60_000 &&
+        (!Number.isFinite(observationAt) || identityAt >= observationAt)
+        ? `Post link unavailable: ${identity.reason ?? "unknown reason"}` : "";
+      view.render(s ? { ...s, lastEvent: observationError || identityError || s.lastEvent } : null, r.browserDiscoveryActive);
+    }
+  }, 4_000);
+}
