@@ -2398,3 +2398,203 @@ async function draftLight(args: DraftCommonArgs): Promise<boolean> {
         const draft = prepare(p.data);
         return draft.drafts.length ? { draft, writer: { engine: r.engine, model: r.model } } : null;
       },
+      basePrompt: prompt,
+      ctx,
+      calls,
+      retries: verify.retries,
+      leadId: lead.id,
+      traceSource: payload.source,
+      traceRedactions: [postText, payload.authorName ?? "", payload.authorPublicId ?? lead.author_handle ?? ""],
+      log,
+    });
+    draftsData = best;
+    selectedWriter = bestWriter;
+    verifierMeta = meta;
+  }
+
+  // Voice gate (same as substantial): drop a still-generic light comment rather
+  // than serve it. A weak "love this, congrats" that fails the voice floor is
+  // exactly the slop the operator doesn't want.
+  if (replyRequest && verifierMeta && verify?.voiceFloor && verifierMeta.scores.voice < verify.voiceFloor) {
+    log.info(
+      { leadId: lead.id, voice: verifierMeta.scores.voice, floor: verify.voiceFloor },
+      "requested light reply below the voice floor — serving it for human review",
+    );
+  } else if (verifierMeta && verify?.voiceFloor && verifierMeta.scores.voice < verify.voiceFloor) {
+    log.info(
+      { leadId: lead.id, voice: verifierMeta.scores.voice, floor: verify.voiceFloor },
+      "light draft below voice floor; skipping instead of serving a generic comment",
+    );
+    await markStatus({
+      leadId: lead.id,
+      status: "skipped",
+      meta: { skip_reason: "low-voice", voice: verifierMeta.scores.voice, model: selectedWriter.model },
+    });
+    return false;
+  }
+
+  // Exactly one normalized comment was selected before review.
+  const first = draftsData.drafts[0]!;
+  if (makesCommitment(first.body)) {
+    const reason = commitmentReason(detectCommitments(first.body)) || "commitment-guard";
+    log.warn({ leadId: lead.id, reason }, "commitment guard dropped a light reply");
+    await markStatus({ leadId: lead.id, status: "skipped", meta: { skip_reason: reason } });
+    return false;
+  }
+  const angle = first.angle;
+  const replyRow = {
+    id: randomUUID(),
+    kind: "reply" as const,
+    angle: angle as "empathetic" | "technical" | "contrarian" | null,
+    body: first.body,
+    charCount: first.char_count ?? [...first.body].length,
+  };
+  const outbound = buildOutbound({ lead, postText, payload, anchors, drafts: [replyRow], verifierMeta, style });
+  if (!outbound) {
+    // Every draft cleaned to empty. Skip with an ACCURATE reason rather than
+    // handing an empty set to a schema that requires min(1).
+    log.warn({ leadId: lead.id }, "every draft cleaned to empty; skipping the lead");
+    await markStatus({ leadId: lead.id, status: "skipped", meta: { reason: "empty-after-emoji-policy" } });
+    return false;
+  }
+  if (reviewContext) {
+    for (const draft of outbound.drafts) draft.reviewContext = reviewContext;
+  }
+  await postOutbound(withReplyRequestOwner(outbound, replyRequest, instance));
+  await markStatus({
+    leadId: lead.id, status: "drafted",
+    meta: { engine: selectedWriter.engine, model: selectedWriter.model, reply_kind: "light", ...(replyRequest ? { reply_request_key: replyRequest.requestKey } : {}) },
+  });
+  return true;
+}
+
+/**
+ * Build the OutboundIn payload. CRITICAL INVARIANT: there is NO `autoSend` field
+ * — Lyra is draft-only and never auto-sends. The field is omitted entirely.
+ */
+function buildOutbound(args: {
+  lead: LeadRow;
+  postText: string;
+  payload: { url?: string };
+  anchors: Array<{ snippet: string; score: number }>;
+  drafts: Array<{ id: string; kind: "reply" | "dm"; angle: "empathetic" | "technical" | "contrarian" | null; body: string; charCount: number }>;
+  /** Post-draft verifier verdict (null when the verifier didn't run). */
+  verifierMeta?: OutboundIn["verifierMeta"];
+  /**
+   * The style exemplars the selector chose for this lead (Account Feeder). Used
+   * to derive the style-source blend shown on the approval card. Omitted/null on
+   * the DM path and when style injection is off ⇒ no badge (base voice only).
+   */
+  style?: StyleForPrompt | null;
+}): OutboundIn | null {
+  const { lead, postText, payload, anchors, drafts, verifierMeta, style } = args;
+  if (lead.payload.source === "extension_observed" &&
+      !hasCanonicalObservedIdentity(lead, lead.payload)) return null;
+  // Hard emoji backstop: strip any emoji outside the {💀 😭 😛} allowlist the
+  // prompt asks for, and recompute char_count off the cleaned body so the inbox
+  // count matches what ships. The model can't be trusted to self-restrict.
+  //
+  // The postText gate ("no emoji at all when the post used none") is a REPLY
+  // rule and is passed only for reply rows. This function is the shared path
+  // for replies AND DMs, so applying it to everything would have silently
+  // extended a reply-only rule to Lyra's DMs — which the prompts explicitly
+  // exempt, and which the X drafter deliberately keeps post-agnostic. A DM is
+  // not answering a post, so there is nothing for it to match.
+  const cleanedDrafts = applyReplyEmojiPolicy(
+    drafts,
+    postText,
+    (d) => d.kind === "reply",
+  ).map((d) => ({ ...d, charCount: [...d.body].length }));
+  // NULL, not an empty drafts array: OutboundInSchema requires min(1), so an
+  // empty set throws in postOutbound. Callers skip on null with their own
+  // accurate reason instead.
+  if (cleanedDrafts.length === 0) return null;
+  return {
+    leadId: lead.external_id,
+    batchNumber: null,
+    platform: "linkedin",
+    authorHandle: lead.author_handle,
+    authorId: lead.author_id ?? "0",
+    authorFollowers: null,
+    allowsDms: null,
+    originalPostId: lead.external_id,
+    originalPostText: postText,
+    originalPostUrl:
+      payload.url ?? `https://www.linkedin.com/feed/update/urn:li:activity:${lead.external_id}/`,
+    postedAt: readSourceTimestamp(lead.payload.posted_at),
+    matchedTrigger: null,
+    drafts: cleanedDrafts,
+    tier: lead.tier ?? null,
+    postKind: lead.classifier_label,
+    anchors: anchors.slice(0, 5).map((a) => ({ snippet: a.snippet, score: a.score })),
+    // Post-draft verifier verdict (null when off). The api-vm route persists it
+    // onto public reply payloads. DMs carry their own dmVoiceCheck instead.
+    verifierMeta: verifierMeta ?? null,
+    // Account-Feeder style-source blend (null when style injection is off / no
+    // exemplars). The api-vm route persists it onto each draft's payload as
+    // style_source so the approval card can show a "Style: …" badge.
+    styleSource: buildStyleSource(style),
+    // NO autoSend block — Lyra never auto-sends. The field is intentionally
+    // omitted from the payload entirely.
+  };
+}
+
+function withReplyRequestOwner(
+  outbound: OutboundIn,
+  replyRequest: ReplyRequestMeta | null | undefined,
+  instance: ActiveInstance,
+): OutboundIn {
+  if (!replyRequest) return outbound;
+  return {
+    ...outbound,
+    owner: { orgId: instance.org_id, agentInstanceId: instance.id },
+    replyRequestKey: replyRequest.requestKey,
+    humanReviewRequired: replyRequest.humanReviewRequired,
+  };
+}
+
+
+/**
+ * Re-set a deferred lead back to 'classified' (it was claimed as 'drafting' by
+ * the RPC) so a later tick re-claims and drafts it. Stamps the defer reason into
+ * payload.classifier so it's legible in the dashboard.
+ * No-op when sql is absent (tests).
+ */
+async function deferLeadToClassified(args: {
+  sql?: Sql;
+  leadId: string;
+  replyKind: "substantial" | "light";
+  /** Why it was deferred. 'daily_cap' (kind's quota spent) or 'budget' (org spend cap). */
+  reason?: "daily_cap" | "budget";
+}): Promise<void> {
+  if (!args.sql) return;
+  const stamp: JSONValue =
+    args.reason === "budget"
+      ? ({ budget_deferred: args.replyKind } as JSONValue)
+      : ({ daily_cap_deferred: args.replyKind } as JSONValue);
+  await args.sql`
+    update noelle.leads
+    set status = 'classified',
+        payload = payload || ${args.sql.json(stamp)}::jsonb,
+        updated_at = now()
+    where id = ${args.leadId}
+  `;
+}
+
+/**
+ * Browser observations and older Apify leads use different engagement field
+ * names. Resolve them before model tiering and comment-context gating.
+ */
+function leadEngagement(payload: {
+  reactionCount?: number | null; commentCount?: number | null;
+  reactions?: number | null; comments?: number | null;
+}): { likes: number | null | undefined; comments: number | null | undefined } {
+  return {
+    likes: payload.reactionCount ?? payload.reactions,
+    comments: payload.commentCount ?? payload.comments,
+  };
+}
+
+/**
+ * useOpus = likes > likesThreshold || (comments > commentsThreshold && !commentBait).
+ * The comments trigger is suppressed for engagement-bait posts. Missing or
