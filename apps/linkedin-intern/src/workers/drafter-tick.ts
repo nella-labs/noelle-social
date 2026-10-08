@@ -798,3 +798,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
         }
         log.info({ leadId: lead.id, verdict: decision.verdict, reason: decision.reason, pinned }, "notification triage");
         await markStatus({
+          leadId: lead.id,
+          status: undeliveredPin ? "errored" : "skipped",
+          meta: {
+            skip_reason: `triage:${decision.verdict}:${decision.reason}`,
+            ...(decision.verdict === "pin" ? { pin_delivered: pinned } : {}),
+          },
+        });
+        continue;
+      }
+    }
+
+    // For substantial leads, defer context-gathering to the singles loop below
+    // (they always go single-call). Reserve the budget slot now (budgetLeft)
+    // so subsequent leads in this pre-compute pass see the right cap.
+    // remaining.substantial is decremented by the singles loop only on actual
+    // successful drafts — no double-counting.
+    if (replyKind === "substantial") {
+      singleLeads.push({ lead, replyKind, replyRequest });
+      if (!replyRequest) budgetLeft.substantial--;
+      continue;
+    }
+
+    const engagement = leadEngagement(payload);
+    const decision = decideOpus({
+      likes: engagement.likes,
+      comments: engagement.comments,
+      commentBait: lead.comment_bait ?? false,
+      likesThreshold: opusLikesThreshold,
+      commentsThreshold: opusCommentsThreshold,
+    });
+    const useSmartest = decision.useOpus;
+    // Repair review needs a per-lead model call; browser and explicit requests
+    // also retain their single-call path.
+    const canBatch = payload.source !== "extension_observed" && !replyRequest && batchingEnabled && !useSmartest && !verify?.enabled;
+    const gatherLight = async (): Promise<LightLeadCtx> => {
+      const browserObserved = payload.source === "extension_observed";
+      const anchorDirs = browserObserved ? browserVoiceDirs : voiceDirs;
+      const anchors = browserObserved && browserVoiceDirs.length === 0
+        ? []
+        : await retrieveAnchors(kb, postText, {
+            topK: 8,
+            ...(anchorDirs && anchorDirs.length ? { filterDirs: anchorDirs } : {}),
+            rerank: rerankGrounding,
+          }).catch((err) => {
+            log.warn({ err: (err as Error).message }, "knowledge base search failed; drafting with no anchors");
+            return [];
+          });
+      const knowledge =
+        payload.source !== "extension_observed" && knowledgeDirs && knowledgeDirs.length && knowledgeTopK > 0
+          ? await retrieveAnchors(kb, postText, {
+              topK: knowledgeTopK,
+              filterDirs: knowledgeDirs,
+              rerank: rerankGrounding,
+            }).catch((err) => {
+                log.warn({ err: (err as Error).message }, "knowledge retrieval failed; drafting without product knowledge");
+                return [];
+              })
+          : [];
+      const knowledgeAnchors = knowledge.map((k) => k.snippet);
+      const imageCaption = await captionImages({
+        imageUrls: payload.images ?? [],
+        postText,
+        ...(captionFn ? { captionFn } : {}),
+      });
+      const fsd = lead.author_id ?? "";
+      const publicIdKey = (payload.authorPublicId ?? lead.author_handle ?? "").trim().toLowerCase();
+      // fsd first; fall back to the slug because keyword-lane leads carry no
+      // author_id at all, so an fsd-only lookup can never find their profile.
+      const profile =
+        (fsd ? profilesByFsd.get(fsd) : undefined) ??
+        (publicIdKey ? profilesByFsd.get(publicIdKey) : undefined);
+      const personObj = publicIdKey ? objectivesByPublicId.get(publicIdKey) : undefined;
+      const personDirective = buildPersonDirective(payload, profile, personObj);
+      const postRegister = detectPostRegister(postText, lead.classifier_label);
+      // Faithful multi-voice: when more than one voice is pinned, restrict THIS
+      // lead's exemplar pool to the ONE voice picked for it (rotating across the
+      // feed via pickFaithfulVoice) so the reply sounds like a single real writer,
+      // not a blend. A single pinned voice needs no filter; a chosen voice with no
+      // corpus fails open to the full pool.
+      const styleCandidatesForLead =
+        styleFaithful && faithfulVoices.length > 1
+          ? (() => {
+              const chosen = pickFaithfulVoice(faithfulVoices, postText, faithfulVoiceWeights);
+              const filtered = styleCandidates.filter((c) => c.account_handle === chosen);
+              return filtered.length ? filtered : styleCandidates; // fail-open if chosen voice has no corpus
+            })()
+          : styleCandidates;
+      const styleForLead: StyleForPrompt | null = style?.enabled
+        ? await selectStyleExemplars(postText, styleCandidatesForLead, styleProfiles, {
+            enabled: true,
+            config: style.config,
+            // Faithful mode: pass undefined so the selector uses the legacy fit×perf
+            // path (the pinned voice's characteristic/high-performing posts are
+            // selected instead of being cheer-penalized on a "neutral" post).
+            postRegister: styleFaithful ? undefined : postRegister,
+            ...(style.dense !== undefined ? { dense: style.dense } : {}),
+            ...(style.rng ? { rng: style.rng } : {}),
+          })
+        : null;
+      const routing: ModelRouting = useSmartest
+        ? opusOverrideRouting(baseRouting, opusModel)
+        : baseRouting;
+      log.info(
+        {
+          leadId: lead.id,
+          priority: lead.priority,
+          likes: decision.likes,
+          comments: decision.comments,
+          comment_bait: decision.commentBait,
+          useOpus: useSmartest,
+          opus_reason: decision.useOpus ? "high_engagement" : null,
+          model: routing.primary.model,
+        },
+        useSmartest ? "drafter using Opus for high-engagement light lead" : "drafter using default model for light lead",
+      );
+      const commentDigest = await fetchCommentDigest({
+        lead, payload: { url: payload.url, comments: engagement.comments }, fetchPostComments,
+        maxComments: commentFetchMax, minCount: commentFetchMinCount, log,
+      });
+      // Form-variant rotation: assign this reply ONE of the SHAPE variants (never
+      // the previous pick's) and let it own length/structure. Register +
+      // opening-move are suppressed for the lead so the prompt carries ONE shape
+      // instruction, not three contradicting ones. The light lane excludes
+      // shapes that can't carry a congrats (QUESTION_ONLY).
+      //
+      // The shape fires on EVERY lead, not only pinned-voice ones. It used to be
+      // gated on `styleFaithful && styleForLead` because the directive was
+      // rendered INSIDE the faithful style block, so a lead with no pinned voice
+      // silently got no shape and fell back to the fixed "~90-180 chars" line at
+      // the bottom of the user prompt. That is exactly why Lyra's feed came out
+      // one length: measured over 30 days her replies sat at 181 +/- 44 chars
+      // while Vega's, which has had a standalone block since #498, spread
+      // 131 +/- 58. Where there IS a pinned voice the shape still renders inline
+      // (so it replaces the faithful block's own hook-then-line recipe rather
+      // than fighting it); everywhere else it renders as its own block.
+      // TONE-FIRST lane (mirrors Vega's, apps/x-intern/.../drafter-tick.ts): on a
+      // CELEBRATION post, mirroring the ENERGY beats varying the form, so the
+      // register (HYPE, "LETS GOOO") wins that lead and no shape is assigned.
+      // Exception: when the operator PINNED a voice, the shape renders inside
+      // the faithful style block and replaces its fixed hook-then-line recipe —
+      // dropping it there would hand the recipe back, which is the thing the
+      // rotation exists to kill. Everything else (the neutral, analytical bulk
+      // of the feed, i.e. every substantial lead) gets a shape.
+      const toneFirst = postRegister === "celebration" && !(styleFaithful && styleForLead);
+      // Half of the tone-first leads now take a shape after all, drawn only
+      // from the shapes that can carry a celebration (see Vega's split and
+      // ENERGY_SHAPE_IDS). Leaving the whole lane shapeless meant every win in
+      // the feed came out in one length band. The register still wins the other
+      // half, because HYPE's CAPS is a thing no shape can express.
+      const toneFirstShape =
+        toneFirst && variety?.enabled
+          ? (variety.rng ?? Math.random)() < TONE_FIRST_SHAPE_SHARE
+          : false;
+      const formVariant =
+        variety?.enabled && (!toneFirst || toneFirstShape)
+          ? (variety.formVariantRotation ?? formVariantRotation).next(variety.rng, [
+              ...LIGHT_EXCLUDED_VARIANT_IDS,
+              ...(toneFirstShape ? shapesExcludedForEnergy("celebration") : []),
+              ...(browserObserved ? BROWSER_OBSERVED_EXCLUDED_VARIANT_IDS : []),
+            ])
+          : undefined;
+      const shapeInStyleBlock = Boolean(formVariant && styleFaithful && styleForLead);
+      if (formVariant && shapeInStyleBlock && styleForLead) {
+        styleForLead.formVariant = { id: formVariant.id, directive: formVariant.directive };
+      }
+      const shapeBlock =
+        formVariant && !shapeInStyleBlock ? renderAssignedShapeBlock(formVariant) : undefined;
+      const registerBlock =
+        variety?.enabled && !formVariant
+          ? renderRegisterBlock(pickRegisterForPost(postRegister, variety.rng))
+          : undefined;
+      const openingMoveBlock =
+        variety?.enabled && !formVariant ? renderOpeningMoveBlock(pickOpeningMove(variety.rng)) : undefined;
+      const genzBlock = pickGenzBlock(variety, postRegister);
+      const priorReplies = getPriorReplies
+        ? await getPriorReplies({
+            authorHandle: payload.authorPublicId ?? lead.author_handle,
+            authorId: lead.author_id,
+            excludeLeadId: lead.id,
+            limit: priorRepliesTopK,
+          }).catch(() => [])
+        : [];
+
+      return {
+        lead, postText, payload, anchors, knowledgeAnchors, imageCaption,
+        personDirective, commentDigest, routing, useSmartest, styleForLead,
+        registerBlock, shapeBlock, shapeAssigned: Boolean(formVariant),
+        openingMoveBlock, genzBlock, priorReplies, postRegister,
+        faithful: styleFaithful,
+        replyRequest,
+      };
+    };
+    try {
+      if (canBatch) {
+        batchableLights.push(await gatherLight());
+      } else {
+        singleLeads.push({ lead, replyKind, gatherLight });
+      }
+      // Reserve the light budget slot so the next lead in this pass sees the
+      // right cap (mirrors how the original sequential loop worked).
