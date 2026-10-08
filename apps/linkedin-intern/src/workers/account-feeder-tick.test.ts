@@ -198,3 +198,122 @@ describe("runAccountFeederTick", () => {
     deps.apify.drainLastRunUsd = () => 0.01;
     const record = deps.recorder!.record as ReturnType<typeof vi.fn>;
 
+    const reserveAttempt = vi.fn(async () => ({ attemptId: "feeder_attempt" }));
+    deps.extractor = createBudgetedBackend(deps.extractor, {
+      engine: "vertex", context: { orgId: deps.instance.org_id, instanceId: deps.instance.id,
+        agentRole: "linkedin_intern", worker: "feeder", bucket: "feeder" },
+      budget: { adapters: { ...unlimitedBudget.adapters, reserveAttempt }, estimateCents: () => 1 }, recorder: deps.recorder!,
+    });
+    await runAccountFeederTick(deps);
+
+    // 2 apify runs (posts + comments) + 1 vertex extractor = 3 spend rows.
+    expect(reserveAttempt).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledTimes(3);
+    const engines = record.mock.calls.map((c) => (c[0] as { engine: string }).engine);
+    expect(engines.filter((e) => e === "apify")).toHaveLength(2);
+    expect(engines.filter((e) => e === "vertex")).toHaveLength(1);
+    // Apify actor slugs are the bare names the price table keys on.
+    const models = record.mock.calls.map((c) => (c[0] as { model: string }).model);
+    expect(models).toContain("apify/linkedin-profile-posts");
+    expect(models).toContain("apify/linkedin-profile-comments");
+  });
+
+  it("writes ZERO leads — the tick has no leads sink and only ever touches the corpus + profile seams", async () => {
+    const { deps, captured } = makeDeps();
+    // The deps surface is the worker's ENTIRE write capability. There is no
+    // leads writer in it; assert the only writers invoked are the corpus +
+    // profile upserts (structurally impossible to insert a lead).
+    const writerKeys = Object.keys(deps).filter((k) => k.startsWith("upsert"));
+    expect(writerKeys.sort()).toEqual(["upsertStylePosts", "upsertUltraProfile"]);
+
+    await runAccountFeederTick(deps);
+
+    expect(captured.corpusStore.length).toBeGreaterThan(0); // corpus written
+    expect(captured.profiles.length).toBe(1); // profile written
+    // No lead-shaped writer exists on deps at all.
+    const depsRec = deps as unknown as Record<string, unknown>;
+    expect(depsRec.insertLead).toBeUndefined();
+    expect(depsRec.upsertLead).toBeUndefined();
+  });
+
+  it("SURFACES an Apify 402 (usage cap) as a quotaError instead of swallowing it", async () => {
+    const throwing = vi.fn().mockRejectedValue(new ApifyError("apify actor -> 402: usage cap", 402));
+    const { deps, captured } = makeDeps({
+      apify: { profilePosts: throwing, authoredComments: vi.fn() } as never,
+    });
+
+    const res = await runAccountFeederTick(deps);
+
+    expect(res.quotaError).toBeTruthy();
+    expect(res.quotaError).toContain("402");
+    // The source that hit the wall produced no profile (extraction skipped).
+    expect(captured.profiles).toHaveLength(0);
+    expect(res.profilesWritten).toBe(0);
+  });
+
+  it("SURFACES a 429 (concurrency) the same way", async () => {
+    const throwing = vi.fn().mockRejectedValue(new ApifyError("too many runs", 429));
+    const { deps } = makeDeps({
+      apify: { profilePosts: throwing, authoredComments: vi.fn() } as never,
+    });
+    const res = await runAccountFeederTick(deps);
+    expect(res.quotaError).toBeTruthy();
+  });
+
+  it("is fail-open per source: a NON-quota pull error skips that source, the rest still run", async () => {
+    const goodSource = { ...source, id: "src-2", handle: "another-builder", displayName: "Other" };
+    // First source throws a non-quota error; second source pulls fine.
+    const profilePosts = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("transient network blip"))
+      .mockResolvedValueOnce([post("p9", "great thread", 50, 3)]);
+    const authoredComments = vi.fn().mockResolvedValue([]);
+    const { deps, captured } = makeDeps({
+      sources: [source, goodSource],
+      apify: { profilePosts, authoredComments } as never,
+    });
+
+    const res = await runAccountFeederTick(deps);
+
+    // The run was not aborted: the second source's corpus landed + got a profile.
+    expect(res.quotaError).toBeUndefined();
+    expect(res.sourcesPulled).toBe(1);
+    expect(captured.corpusStore.map((r) => r.externalId)).toEqual(["p9"]);
+    expect(captured.profiles).toHaveLength(1);
+  });
+
+  it("does NOT lose the corpus when an extraction fails to parse (profile skipped, corpus kept)", async () => {
+    const junk = vi.fn().mockResolvedValue({ text: "not json at all", usage: { input_tokens: 10, output_tokens: 5 } });
+    const { deps, captured } = makeDeps({ extractor: { call: junk } as never });
+
+    const res = await runAccountFeederTick(deps);
+
+    expect(res.corpusRows).toBe(3); // corpus persisted
+    expect(captured.corpusStore).toHaveLength(3);
+    expect(res.profilesWritten).toBe(0); // but no profile
+    expect(captured.profiles).toHaveLength(0);
+  });
+
+  it("honors explicit post/comment limits", async () => {
+    const { deps, profilePosts, authoredComments } = makeDeps();
+    deps.postLimit = 25;
+    deps.commentLimit = 15;
+    await runAccountFeederTick(deps);
+    expect(profilePosts).toHaveBeenCalledWith({ publicId: "kaia-tham", maxPosts: 25 });
+    expect(authoredComments).toHaveBeenCalledWith({ publicId: "kaia-tham", maxComments: 15 });
+  });
+});
+
+describe("isApifyQuotaError", () => {
+  it("flags 402/429/403 ApifyError + AllApifyTokensExhaustedError, not other errors", () => {
+    expect(isApifyQuotaError(new ApifyError("cap", 402))).toBe(true);
+    expect(isApifyQuotaError(new ApifyError("conc", 429))).toBe(true);
+    expect(isApifyQuotaError(new ApifyError("limit", 403))).toBe(true);
+    expect(isApifyQuotaError(new ApifyError("bad request", 400))).toBe(false);
+    expect(isApifyQuotaError(new Error("network"))).toBe(false);
+    const exhausted = Object.assign(new Error("all 2 tokens exhausted"), {
+      name: "AllApifyTokensExhaustedError",
+    });
+    expect(isApifyQuotaError(exhausted)).toBe(true);
+  });
+});
