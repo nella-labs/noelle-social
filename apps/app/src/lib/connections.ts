@@ -398,3 +398,5 @@ export async function peekConnectionValue(
     )
       return null;
     throw err;
+  }
+}

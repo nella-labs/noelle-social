@@ -198,3 +198,201 @@ function InboxRow({
   const pushed = row.createdAt ? timeAgo(row.createdAt) : "—";
   const detailHref = `/app/${orgSlug}/approvals/${row.approvalId}${filterQuery}`;
 
+  const onSkip = () =>
+    startRow(async () => {
+      await skipDraft({ orgSlug, approvalId: row.approvalId });
+      router.refresh();
+    });
+  const onUnskip = () =>
+    startRow(async () => {
+      await unskipDraft({ orgSlug, approvalId: row.approvalId });
+      router.refresh();
+    });
+
+  const actionBtn = isSkipped ? (
+    <button
+      type="button"
+      onClick={onUnskip}
+      disabled={busy}
+      title="Un-skip — return this draft to the pending queue"
+      className="inbox-rowbtn"
+      style={{
+        justifySelf: "center",
+        border: "none",
+        background: "transparent",
+        cursor: busy ? "default" : "pointer",
+        color: "var(--ink-muted)",
+        fontSize: 14,
+        lineHeight: 1,
+        padding: 4,
+      }}
+    >
+      ↩
+    </button>
+  ) : isPending ? (
+    <button
+      type="button"
+      onClick={onSkip}
+      disabled={busy}
+      title="Skip — remove this draft from the queue (reversible under Status → Skipped)"
+      className="inbox-rowbtn"
+      style={{
+        justifySelf: "center",
+        border: "none",
+        background: "transparent",
+        cursor: busy ? "default" : "pointer",
+        color: "var(--ink-muted)",
+        fontSize: 15,
+        lineHeight: 1,
+        padding: 4,
+      }}
+    >
+      ✕
+    </button>
+  ) : null;
+
+  const dmTag =
+    row.kind === "dm" ? (
+      <span
+        className="tag tag-acc"
+        style={{ height: 18, fontSize: 10, letterSpacing: "0.06em" }}
+        title="Cold-outreach DM — copy and send on LinkedIn yourself"
+      >
+        DM
+      </span>
+    ) : null;
+  const readinessBadge = isPending && row.kind === "reply"
+    ? <ReplyReadinessBadge ready={isLinkedInReplyReady(row, voiceFloor)} unavailable={voiceFloor === null} />
+    : null;
+
+  // ─── Phone: one card per lead (checkbox + name head, clamped preview body,
+  // meta footer with the skip/unskip action). ───────────────────────────────
+  if (mobile) {
+    return (
+      <div className={`row-card ${styles.mobileRow}`} style={{ gap: 8 }}>
+        <div className="row-card-head" style={{ alignItems: "flex-start" }}>
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggle}
+            disabled={!canSelect}
+            title={canSelect ? "Select reply to skip" : row.kind === "dm" ? "Use the DM row's skip action" : "Only pending drafts are selectable"}
+            style={{
+              width: 18,
+              height: 18,
+              marginTop: 2,
+              flexShrink: 0,
+              cursor: canSelect ? "pointer" : "default",
+            }}
+          />
+          <Link
+            href={detailHref}
+            className="inbox-handle"
+            style={{
+              flex: 1,
+              minWidth: 0,
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              whiteSpace: "normal",
+              textDecoration: "none",
+              color: "inherit",
+            }}
+          >
+            {row.authorName}
+            {dmTag}
+          </Link>
+          {actionBtn}
+        </div>
+        <Link
+          href={detailHref}
+          className="inbox-preview"
+          style={{ textDecoration: "none", color: "var(--ink-muted)" }}
+        >
+          &ldquo;{preview}&rdquo;
+        </Link>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexWrap: "wrap",
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "var(--ink-soft)",
+          }}
+        >
+          <span>{pushed}</span>
+          {readinessBadge}
+          {row.authorHeadline ? <span>· {row.authorHeadline}</span> : null}
+          <StyleSourceBadge
+            styleSource={row.styleSource}
+            className="tag tag-info"
+            style={{ height: 18, fontSize: 10, letterSpacing: "0.04em" }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`${styles.row} ${styles.simple}`}
+      data-selected={selected || undefined}
+    >
+      <input
+        type="checkbox"
+        checked={selected}
+        onChange={onToggle}
+        disabled={!canSelect}
+        title={canSelect ? "Select reply to skip" : row.kind === "dm" ? "Use the DM row's skip action" : "Only pending drafts are selectable"}
+        style={{
+          width: 16,
+          height: 16,
+          cursor: canSelect ? "pointer" : "default",
+        }}
+      />
+      <Link
+        href={detailHref}
+        style={{ textDecoration: "none", color: "inherit", display: "block", minWidth: 0 }}
+      >
+        <div
+          className="inbox-handle"
+          style={{ display: "flex", alignItems: "center", gap: 6 }}
+        >
+          {row.authorName}
+          {dmTag}
+        </div>
+        <div
+          style={{
+            fontSize: 11,
+            color: "var(--ink-muted)",
+            marginTop: 2,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {row.authorHeadline ?? "—"}
+        </div>
+      </Link>
+      <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+        <Link
+          href={detailHref}
+          className="inbox-preview"
+          style={{ textDecoration: "none", color: "inherit" }}
+        >
+          &ldquo;{preview}&rdquo;
+        </Link>
+        <StyleSourceBadge
+          styleSource={row.styleSource}
+          className="tag tag-info"
+          style={{ height: 18, fontSize: 10, letterSpacing: "0.04em", alignSelf: "flex-start" }}
+        />
+        {readinessBadge}
+      </div>
+      <div className="inbox-time">{pushed}</div>
+      {actionBtn ?? <span />}
+    </div>
+  );
+}
