@@ -198,3 +198,203 @@ function prettyModel(model: string | null): string {
  * send button are disabled and we show a tiny offline-greeting fallback
  * keyed by `agentId` instead of mocking responses.
  */
+export function AgentChat(props: AgentChatProps) {
+  const identity = JSON.stringify([props.orgSlug, props.instanceId, props.draftId, props.agentId]);
+  return <AgentChatSession key={identity} {...props} />;
+}
+
+function AgentChatSession({
+  agentId,
+  agentRole,
+  agentName,
+  instanceId,
+  orgSlug,
+  userInitial = "Y",
+  userName = "You",
+  draftId,
+  fillHeight = false,
+  onApplyScriptEdit,
+}: AgentChatProps) {
+  const { beginRequest, beginAction, isCurrent, finish, invalidate } = useChatSession();
+  const conversationStarted = React.useRef(false);
+  const fallback = React.useMemo(
+    () => offlineGreeting(agentId, agentName),
+    [agentId, agentName],
+  );
+  const [chat, setChat] = React.useState<ChatMessage[]>([
+    { who: "agent", at: "just now", body: fallback.body, suggestions: fallback.suggestions },
+  ]);
+  const [draft, setDraft] = React.useState("");
+  const [thinking, setThinking] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  /**
+   * The last request and its explicit file refresh, kept so the inline "Retry"
+   * button can resend without making the user retype. Cleared on
+   * any successful response.
+   */
+  const [lastSent, setLastSent] = React.useState<{ message: string; vaultPath?: string } | null>(null);
+  /**
+   * The persisted conversation this chat is threaded onto. Null until the
+   * first turn of a fresh thread is sent (the server mints the id and returns
+   * it) or until a prior thread is resumed on mount. "New chat" resets it to
+   * null so the next message starts a new thread.
+   */
+  const [conversationId, setConversationId] = React.useState<string | null>(null);
+  /** The model actually answering (from the server) — shown in the footer. */
+  const [model, setModel] = React.useState<string | null>(null);
+  /** Index of the chat message whose proposal is currently being applied. */
+  const [applyingIdx, setApplyingIdx] = React.useState<number | null>(null);
+  /** Index of the chat message whose vault edit is currently being applied. */
+  const [applyingVaultIdx, setApplyingVaultIdx] = React.useState<number | null>(null);
+  const scrollRef = React.useRef<HTMLDivElement | null>(null);
+  const busy = thinking || applyingIdx !== null || applyingVaultIdx !== null;
+  const canSend = !!instanceId && !busy;
+
+  React.useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [chat, thinking]);
+
+  const loadGreeting = React.useCallback(async (resume: boolean) => {
+    if (!instanceId) return;
+    const operation = beginRequest();
+    try {
+      const res = await fetch(chatGetUrl(instanceId, draftId), { method: "GET", signal: operation.controller.signal });
+      if (!res.ok) return;
+      const payload = (await res.json()) as ChatGetPayload;
+      if (!isCurrent(operation) || conversationStarted.current) return;
+      if (payload.model) setModel(payload.model);
+
+      const history = payload.messages ?? [];
+      if (resume && history.length > 0) {
+        // Vault receipts remain reviewable; Apply checks current file bytes before replacement.
+        setConversationId(payload.conversationId ?? null);
+        setChat((c) => {
+          // Don't clobber a message the user already started this session.
+          if (c.length !== 1 || c[0]?.who !== "agent") return c;
+          return history.map((m) => ({ who: m.who, at: m.at, body: m.body, vaultEdit: m.vaultEdit, vaultEditReceipt: m.vaultEditReceipt }));
+        });
+        return;
+      }
+
+      if (!payload.greeting) return;
+      setChat((c) => {
+        // Only replace if the user hasn't typed yet — once a conversation
+        // starts we don't yank the seed message out from under them.
+        if (c.length !== 1 || c[0]?.who !== "agent") return c;
+        return [
+          {
+            who: "agent",
+            at: "just now",
+            body: payload.greeting!.body,
+            suggestions: payload.greeting!.suggestions,
+          },
+        ];
+      });
+    } catch (err) {
+      if (isCurrent(operation)) console.warn("[agent-chat] greeting fetch failed:", err);
+    } finally {
+      finish(operation);
+    }
+  }, [instanceId, draftId, beginRequest, isCurrent, finish]);
+
+  React.useEffect(() => { void loadGreeting(true); }, [loadGreeting]);
+
+  const send = async (text: string, opts: { isRetry?: boolean; vaultPath?: string } = {}) => {
+    const trimmed = text.trim();
+    if (!trimmed || !instanceId) return;
+    const operation = beginAction();
+    if (!operation) return;
+    conversationStarted.current = true;
+    // On a retry we already have the user-side message in the transcript
+    // (it was added on the original failed attempt); appending it a second
+    // time would visually duplicate the question.
+    if (!opts.isRetry) {
+      setChat((c) => [...c, { who: "user", at: "now", body: trimmed }]);
+      setDraft("");
+    }
+    setLastSent({ message: trimmed, vaultPath: opts.vaultPath });
+    setError(null);
+    setThinking(true);
+
+    try {
+      const res = await fetch(
+        `/api/agents/${encodeURIComponent(instanceId)}/chat`,
+        {
+          method: "POST",
+          signal: operation.controller.signal,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ message: trimmed, conversationId, draftId, vaultPath: opts.vaultPath }),
+        },
+      );
+      if (!res.ok) {
+        const payload = await safeJson(res);
+        if (!isCurrent(operation)) return;
+        const detail = payload?.message ?? `HTTP ${res.status}`;
+        console.error(
+          "[agent-chat] upstream error:",
+          res.status,
+          payload?.error,
+          detail,
+        );
+        const msg = chatErrorMessage({
+          status: res.status,
+          code: payload?.error,
+          agentName,
+        });
+        setError(msg);
+        setChat((c) => [
+          ...c,
+          { who: "agent", at: "just now", body: msg },
+        ]);
+        return;
+      }
+      const payload = (await res.json()) as {
+        text?: string;
+        proposal?: TargetingProposal | null;
+        vaultEdit?: VaultEditProposal | null;
+        vaultEditReceipt?: VaultEditClientReceipt | null;
+        scriptEdit?: ScriptEditProposal | null;
+        conversationId?: string;
+        model?: string;
+      };
+      if (!isCurrent(operation)) return;
+      const reply = payload.text?.trim() || "(no response)";
+      const parsedProposal = TargetingProposalSchema.safeParse(payload.proposal);
+      const proposal = parsedProposal.success ? parsedProposal.data : null;
+      const vaultEdit = payload.vaultEdit ?? null;
+      const scriptEdit = payload.scriptEdit ?? null;
+      if (payload.model) setModel(payload.model);
+      // Thread subsequent turns onto the conversation the server persisted this
+      // turn under (it minted the id if this was the first message).
+      if (payload.conversationId) setConversationId(payload.conversationId);
+      setChat((c) => [
+        ...c,
+        {
+          who: "agent",
+          at: "just now",
+          body: reply,
+          proposal,
+          proposalState: proposal ? ("pending" as const) : undefined,
+          vaultEdit,
+          vaultEditReceipt: payload.vaultEditReceipt ?? null,
+          vaultEditState: vaultEdit ? ("pending" as const) : undefined,
+          scriptEdit,
+          scriptEditState: scriptEdit ? ("pending" as const) : undefined,
+        },
+      ]);
+      setLastSent(null);
+    } catch (err) {
+      if (!isCurrent(operation)) return;
+      console.error("[agent-chat] network error:", err);
+      const msg = chatErrorMessage({ agentName });
+      setError(msg);
+      setChat((c) => [
+        ...c,
+        { who: "agent", at: "just now", body: msg },
+      ]);
+    } finally {
+      if (finish(operation)) setThinking(false);
+    }
+  };
+
+  /**
