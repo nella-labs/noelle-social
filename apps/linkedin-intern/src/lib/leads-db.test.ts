@@ -198,3 +198,45 @@ describe("extension-observed lead claims", () => {
 
   it("claims Jev-qualified browser leads first while enforcing one pending reply per author", async () => {
     const { sql, queries, params } = capture();
+    const rows = await claimObservedLeadsForDrafting(sql, { agentInstanceId: "i", cap: 5 });
+    expect(rows).toHaveLength(1);
+    expect(queries[0]).toContain("status = 'drafting'");
+    expect(queries[0]).toContain("payload->>'source' = 'extension_observed'");
+    expect(queries[0]).toContain("payload->'classifier'->>'provider' = 'jev'");
+    expect(queries[0]).toContain("cand.external_id ~ '^[0-9]+$'");
+    expect(queries[0]).toContain("cand.payload->>'url' like 'https://www.linkedin.com/%'");
+    expect(queries[0]).toContain("distinct on (cand.author_handle)");
+    expect(queries[0]).toContain("a.status = 'pending'");
+    expect(params[0]).toContain("i");
+    expect(params[0]).toContain(5);
+  });
+
+  it("keeps browser reply drafting within five in-progress or pending leads", async () => {
+    const { sql, queries, params } = capture();
+    await claimObservedLeadsForDrafting(sql, { agentInstanceId: "i", cap: 5 });
+
+    expect(queries[0]).toContain("count(distinct occupied.id)");
+    expect(queries[0]).toContain("occupied.status = 'drafting'");
+    expect(queries[0]).toContain("approval.status = 'pending'");
+    expect(queries[0]).toContain("coalesce(draft.payload->>'kind', 'reply') = 'reply'");
+    expect(queries[0]).toContain("draft.payload->'verifier_meta'->>'pass' = 'true'");
+    expect(queries[0]).toContain("draft.payload->'verifier_meta'->>'judgeOk' = 'true'");
+    expect(queries[0]).toContain("draft.payload->>'human_review_required' is distinct from 'true'");
+    expect(queries[0]).toContain("draft.payload->'verifier_meta'->'scores'->>'voice'");
+    expect(queries[0]).toContain("occupied.payload->>'source' = 'extension_observed'");
+    expect(queries[0]).toMatch(/limit greatest\(0, least\(/);
+    expect(params[0]).toContain("i");
+    expect(params[0]).toContain(5);
+  });
+
+  it("keeps browser-observed posts out of the generic priority claim", async () => {
+    const { sql, queries, params } = capture();
+    await claimWatchlistLeadsForDrafting(sql, { agentInstanceId: "i", cap: 5 });
+    expect(queries[0]).toContain("payload->>'source' is distinct from 'extension_observed'");
+    expect(queries[0]).toContain("distinct on (cand.author_handle)");
+    expect(queries[0]).toContain("a.status = 'pending'");
+    expect(queries[0]).toContain("reply_requested");
+    expect(params[0]).toContain("i");
+    expect(params[0]).toContain(5);
+  });
+});

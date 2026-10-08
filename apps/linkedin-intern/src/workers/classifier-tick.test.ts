@@ -398,3 +398,158 @@ describe("classifyOneLead (linkedin)", () => {
       lead: { ...baseLead, priority: true, payload: { ...baseLead.payload, text: frenchText } },
       log: { warn: vi.fn() },
     });
+    expect(classify).not.toHaveBeenCalled();
+    expect(values).toContain("skipped");
+  });
+
+  it("still classifies a clearly-English lead (not flagged non-English)", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue(substantial);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead, payload: { ...baseLead.payload, text: "we keep losing context across sessions, any tips?" } },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).toHaveBeenCalledTimes(1);
+    expect(values).toContain("classified");
+  });
+
+  it("passes the post text + author name/headline to the classifier engine", async () => {
+    const { sql } = makeSql();
+    const classify = vi.fn().mockResolvedValue(substantial);
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead },
+      log: { warn: vi.fn() },
+    });
+    expect(classify).toHaveBeenCalledWith({
+      postText: "we keep losing context",
+      authorName: "Jane",
+      authorHeadline: "Founder",
+    });
+  });
+
+  it("records one admitted receipt for the actual classifier backend", async () => {
+    const { sql } = makeSql();
+    const record = vi.fn().mockResolvedValue(undefined);
+    const reserveAttempt = vi.fn(async () => ({ attemptId: "classifier_attempt" }));
+    const backend = createBudgetedBackend({ call: async () => ({
+      text: JSON.stringify({ q: 92, reply_kind: "substantial", tier: "T1", reason: "specific question" }), usage: { input_tokens: 300, output_tokens: 20 },
+    }) }, { engine: "vertex", context: { orgId: "o", instanceId: "i", agentRole: "linkedin_intern", worker: "classifier", bucket: "classifier" },
+      budget: { adapters: { ...unlimitedBudget.adapters, reserveAttempt }, estimateCents: () => 1 }, recorder: { record } });
+    const classifier = createClassifier({ backend, evaluateChoice: async () => ({ kind: "unavailable", provider: "jev" }) });
+    await classifyOneLead({ sql, classifier, notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false }, lead: { ...baseLead },
+      log: { warn: vi.fn() } });
+    expect(reserveAttempt).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledOnce();
+    expect(record.mock.calls[0]?.[0]).toMatchObject({ attemptId: "classifier_attempt", engine: "vertex",
+      worker: "classifier", bucket: "classifier", agentRole: "linkedin_intern", inputTokens: 300 });
+  });
+
+
+  it("a fail-open lead is kept (status 'classified'), never silently lost", async () => {
+    const { sql, values } = makeSql();
+    const classify = vi.fn().mockResolvedValue({
+      q: null,
+      reply_kind: "substantial",
+      tier: "T3",
+      reason: "fail-open: vertex 500",
+      usage: { inputTokens: 0, outputTokens: 0 },
+      raw: { fail_open: "vertex 500" },
+    });
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify: vi.fn() },
+      inst: { id: "i", org_id: "o", notify_low_confidence: false },
+      lead: { ...baseLead },
+      log: { warn: vi.fn() },
+    });
+    expect(values).toContain("classified");
+    expect(values).not.toContain("skipped");
+  });
+
+  it("notifies on a skip when notify_low_confidence is set", async () => {
+    const { sql } = makeSql();
+    const classify = vi.fn().mockResolvedValue(skip);
+    const notify = vi.fn().mockResolvedValue({ status: "sent" });
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify },
+      inst: { id: "i", org_id: "o", notify_low_confidence: true },
+      lead: { ...baseLead },
+      log: { warn: vi.fn() },
+    });
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT notify on a kept (substantial) lead even with notify_low_confidence", async () => {
+    const { sql } = makeSql();
+    const classify = vi.fn().mockResolvedValue(substantial);
+    const notify = vi.fn();
+    await classifyOneLead({
+      sql,
+      classifier: { classify },
+      notifier: { notify },
+      inst: { id: "i", org_id: "o", notify_low_confidence: true },
+      lead: { ...baseLead },
+      log: { warn: vi.fn() },
+    });
+    expect(notify).not.toHaveBeenCalled();
+  });
+});
+
+describe("classifierBudgetBlock", () => {
+  const adapters = (
+    spend: { bucket: number; org: number; instance: number },
+    cap: { bucket: number; org: number; instance: number },
+  ): CapAdapters => ({
+    fetchSpend: async () => spend,
+    fetchCaps: async () => cap,
+  });
+
+  it("returns the BudgetExceededError when the classifier bucket is at cap", async () => {
+    const blocked = await classifierBudgetBlock(
+      adapters({ bucket: 100, org: 100, instance: 100 }, { bucket: 50, org: 9_999_999, instance: 9_999_999 }),
+      { orgId: "o", instanceId: "i" },
+    );
+    expect(blocked).not.toBeNull();
+    expect(blocked?.layer).toBe("bucket");
+  });
+
+  it("returns null when under every cap layer", async () => {
+    const blocked = await classifierBudgetBlock(
+      adapters({ bucket: 0, org: 0, instance: 0 }, { bucket: 1000, org: 1000, instance: 1000 }),
+      { orgId: "o", instanceId: "i" },
+    );
+    expect(blocked).toBeNull();
+  });
+
+  it("never blocks claude-cli, even with every layer over cap (flat-rate, cents=0)", async () => {
+    const blocked = await classifierBudgetBlock(
+      adapters({ bucket: 100, org: 100, instance: 100 }, { bucket: 50, org: 50, instance: 50 }),
+      { orgId: "o", instanceId: "i", engine: "claude-cli" },
+    );
+    expect(blocked).toBeNull();
+  });
+
+  it("propagates non-budget errors (does not silently skip the tick)", async () => {
+    const broken: CapAdapters = {
+      fetchSpend: async () => {
+        throw new Error("db down");
+      },
+      fetchCaps: async () => ({ bucket: 1, org: 1, instance: 1 }),
+    };
+    await expect(
+      classifierBudgetBlock(broken, { orgId: "o", instanceId: "i" }),
+    ).rejects.toThrow("db down");
+  });
+});
