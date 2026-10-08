@@ -198,3 +198,16 @@ export async function runAmbient(
         acceptedPosts += secondRead?.accepted ?? 0;
         readsSucceeded &&= secondRead !== undefined;
       }
+    }
+    if (readsSucceeded && acceptedPosts === 0 && onPageRead && canReadMore && await canReadMore()
+        && isXPageUrl(fallbackTarget) && new URL(fallbackTarget!).pathname === "/search") {
+      await navigate(tabId, fallbackTarget!);
+      await sleep(skew(rng, 4000, 5200, 22000));
+      if (await canReadMore()) await onPageRead(tabId);
+    }
+  } finally {
+    await navigate(tabId, FEED);
+    await sleep(skew(rng, 2000, 2200, 9000)); // settle back on the feed
+  }
+  return "navigate";
+}

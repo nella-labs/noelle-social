@@ -398,3 +398,12 @@ export async function runNotificationSweep(
     .catch((e: unknown) => ({ error: e instanceof Error ? e.message : String(e) }) as const);
   if ("error" in res) {
     return { fresh: fresh.length, accepted: 0, skipped: 0, detail: `ingest-failed: ${res.error}` };
+  }
+
+  // Only remember what the server actually took a decision on. An item that
+  // never reached api-vm stays unseen so the next sweep retries it.
+  await chrome.storage.local.set({
+    [SEEN_KEY]: mergeSeen(seen, items.map((i) => i.external_id), SEEN_CAP),
+  });
+  return { fresh: fresh.length, accepted: res.accepted, skipped: res.skipped };
+}
