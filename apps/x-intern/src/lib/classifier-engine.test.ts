@@ -398,3 +398,6 @@ describe("budget admission failures", () => {
     const call = vi.fn().mockRejectedValue(error);
     const classifier = createClassifier({ backend: { call }, evaluate: async () => ({ kind: "unavailable", provider: "jev" }) });
     await expect(classifier.classifyMany([{ postText: "question", authorHandle: "author", source: "x", velocityAtDiscovery: 0 }])).rejects.toBe(error);
+    expect(call).toHaveBeenCalledOnce();
+  });
+});
