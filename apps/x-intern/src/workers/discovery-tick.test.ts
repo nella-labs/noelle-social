@@ -198,3 +198,203 @@ describe("runDiscoveryTick", () => {
         watchlistPeople: [],
         xClient: xClient as never,
         upsertLead: upsert,
+        rateBucket: { tryTake: () => true },
+      }),
+    ).rejects.toBeInstanceOf(AllApifyTokensExhaustedError);
+    // The already-fetched lead was saved BEFORE the error surfaced.
+    expect(upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it("still swallows an ORDINARY per-source error and keeps polling the rest", async () => {
+    // Only a dead pool is systemic; one bad handle must not kill the tick.
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      userTweets: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("actor 500"))
+        .mockResolvedValue(
+          res([
+            { id: "2", text: "hi", created_at: "2026-05-18T00:00:00.000Z", author: { handle: "b", id: "bid", followers: 100 }, url: "https://x.com/b/status/2" },
+          ]),
+        ),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["a", "b"], keywords: [] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    expect(inserted).toBe(1); // handle "b" still polled after "a" failed
+  });
+
+  it("stops issuing Apify runs once the tick budget is spent, deferring the rest", async () => {
+    // Regression for the 10+ min "hung worker": a pool of slow/queued free-tier
+    // tokens made one tick spend N × the per-run timeout. The budget caps the tick.
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: false });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(res([])),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const warn = vi.fn();
+    const log = { info: vi.fn(), debug: vi.fn(), warn, error: vi.fn() } as never;
+    // clock: deadline calc=0 (⇒ deadline 100); handle "a" check=10 (under, runs);
+    // handle "b" check=200 (over ⇒ defer); keyword "k1" check=200 (over ⇒ defer).
+    const times = [0, 10, 200, 200, 200, 200];
+    let i = 0;
+    const clockNow = () => times[Math.min(i++, times.length - 1)]!;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["a", "b"], keywords: ["k1"] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      budgetMs: 100,
+      clockNow,
+    });
+    // Only the first handle ran before the budget was spent; B + the keyword deferred.
+    expect(xClient.userTweets).toHaveBeenCalledTimes(1);
+    expect(xClient.userTweets).toHaveBeenCalledWith(expect.objectContaining({ handle: "a" }));
+    expect(xClient.searchTimeline).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ deferredHandles: 1, deferredKeywords: 1 }),
+      expect.stringContaining("time budget"),
+    );
+  });
+
+  it("polls every source when no budget is set (legacy, unbounded)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: false });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(res([])),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const warn = vi.fn();
+    const log = { info: vi.fn(), debug: vi.fn(), warn, error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["a", "b"], keywords: ["k1", "k2"] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      // no budgetMs ⇒ deadline Infinity ⇒ nothing deferred
+    });
+    expect(xClient.userTweets).toHaveBeenCalledTimes(2);
+    expect(xClient.searchTimeline).toHaveBeenCalledTimes(2);
+    expect(warn).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining("time budget"),
+    );
+  });
+
+  it("records Apify spend per call when a recorder is provided", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(
+        res([
+          { id: "1", text: "hi", created_at: "2026-05-18T00:00:00.000Z", author: { handle: "u", id: "uid", followers: 100 }, url: "u" },
+        ]),
+      ),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const recorder = { record: vi.fn().mockResolvedValue(undefined) };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["u"], keywords: [] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      recorder: recorder as never,
+      credentialId: "cred-1",
+    });
+    expect(recorder.record).toHaveBeenCalledTimes(1);
+    expect(recorder.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        engine: "apify",
+        model: "apify/twitter-x-data-tweet-scraper",
+        worker: "discovery",
+        credentialId: "cred-1",
+      }),
+    );
+  });
+
+  it("does not record spend for an empty (free) run", async () => {
+    const upsert = vi.fn();
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(res([])),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const recorder = { record: vi.fn() };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["u"], keywords: [] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+      recorder: recorder as never,
+    });
+    expect(recorder.record).not.toHaveBeenCalled();
+  });
+
+  it("skips a handle when the rate bucket is empty", async () => {
+    const upsert = vi.fn();
+    const xClient = {
+      userTweets: vi.fn(),
+      searchTimeline: vi.fn(),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: ["u"], keywords: [] },
+      watchlistPeople: [],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => false },
+    });
+    expect(upsert).not.toHaveBeenCalled();
+    expect(xClient.userTweets).not.toHaveBeenCalled();
+  });
+
+  it("flags priority for a watchlist person's post on/after added_at", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(
+        res([
+          { id: "1", text: "new", created_at: "2026-05-29T12:00:00.000Z", author: { handle: "Patio11", id: "p", followers: 9 }, url: "u" },
+        ]),
+      ),
+      searchTimeline: vi.fn().mockResolvedValue(res([])),
+    };
+    const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: [] },
+      watchlistPeople: [{ handle: "patio11", addedAt: "2026-05-29T00:00:00.000Z" }],
+      xClient: xClient as never,
+      upsertLead: upsert,
+      rateBucket: { tryTake: () => true },
+    });
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ priority: true }));
+  });
+
+  it("does NOT ingest a watchlist person's post made before added_at (backfill is not drafted)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const xClient = {
+      userTweets: vi.fn().mockResolvedValue(
+        res([
+          // pre-added_at post → profiler owns history, discovery must not draft it
