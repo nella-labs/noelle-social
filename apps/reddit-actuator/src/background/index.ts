@@ -1598,3 +1598,203 @@ async function checkAutonomy(): Promise<void> {
   }).catch((e) => console.warn("[autonomy] auto-start failed:", e instanceof Error ? e.message : e));
 }
 // Lights-out inbox clearing. When the operator opted in (Options → auto-drain),
+// start a drain whenever the server is willing to serve approved replies and
+// nothing is running — an approval made mid-afternoon goes out mid-afternoon
+// instead of waiting for tomorrow's scheduled run or a manual Drain click.
+// Consent to post is the STANDING dashboard switch the queue route enforces
+// (reply_send_enabled, or auto_send_enabled as durable lights-out consent);
+// this path NEVER arms sending itself, so the panic-stop kill switch stays
+// authoritative: once Pause-all clears the flags the queue serves empty and
+// this loop starves. Supply == what /api/actionable-reddit returns, so every
+// server-side withhold gate (challenge circuit-breaker, daily write cap,
+// external-link guard) also starves it. Runs behind the same health +
+// challenge-cooldown safety gate as the daily auto-start, and a manual STOP
+// silences it for the rest of the day. Reply-only, same 4–19 min drain gaps.
+async function maybeAutoDrain(
+  cfg: ActuatorConfig,
+  s: RunState | null,
+  now: Date,
+  lastChallengeDay: string | null,
+): Promise<void> {
+  const store = await chrome.storage.local.get([AUTO_DRAIN_MS_KEY, STOP_DAY_KEY]);
+  const base = {
+    autonomous: true, // caller already required cfg.autonomous
+    autoDrain: cfg.autoDrain ?? false,
+    runActive: s?.status === "running",
+    localHour: now.getHours(),
+    startHour: cfg.autoStartHour ?? 9,
+    endHour: cfg.autoEndHour ?? 21,
+    lastAutoDrainMs: (store[AUTO_DRAIN_MS_KEY] as number | undefined) ?? null,
+    nowMs: now.getTime(),
+    minGapMinutes: AUTO_DRAIN_REARM_MIN,
+    todayKey: localDayKey(now),
+    stopDay: (store[STOP_DAY_KEY] as string | undefined) ?? null,
+  };
+  // Cheap gates first (pendingComments=1 stands in for "unknown supply") so the
+  // network calls below are only spent when a drain could actually start.
+  if (!shouldAutoDrain({ ...base, pendingComments: 1 })) return;
+
+  // Same safety gate as the daily auto-start: post-challenge cooldown + /health.
+  const api = new ActuatorApi(cfg);
+  const health = await api.health().catch(() => null); // fetch fail → null → fail-closed
+  const safe = passesAutoStartSafety({
+    healthGate: cfg.healthGate ?? true,
+    healthStatus: health?.status ?? null,
+    challengeCooldownDays: cfg.challengeCooldownDays ?? 3,
+    todayKey: localDayKey(now),
+    lastChallengeDay,
+  });
+  if (!safe) {
+    console.warn("[autonomy] auto-drain suppressed by safety gate", { health: health?.status ?? "unknown" });
+    return; // no stamp → re-evaluates next tick when health recovers
+  }
+
+  const queue = await api.fetchQueue().catch(() => null); // fetch fail → no drain
+  if (!queue) return;
+  if (!shouldAutoDrain({ ...base, pendingComments: queue.comments.length })) return;
+
+  // Stamp BEFORE starting so a mid-start crash can't machine-gun restarts.
+  await chrome.storage.local.set({ [AUTO_DRAIN_MS_KEY]: now.getTime() });
+  console.info("[autonomy] auto-drain starting", { pending: queue.comments.length });
+  await startDrain().catch((e) =>
+    console.warn("[autonomy] auto-drain failed:", e instanceof Error ? e.message : e),
+  );
+}
+
+async function clearStallProbe(): Promise<void> {
+  await chrome.storage.local.remove(STALL_PROBE_KEY).catch(() => {});
+}
+
+// Stalled-run recovery. shouldAutoDrain skips whenever a run is live, so a run
+// that is "running" but WEDGED — a frozen tick loop, a tab that wandered off, a
+// wall of comment-failed skips — pins the actor with approvals piling up and
+// never recovers. This supersedes such a run with a fresh drain, but ONLY when it
+// is provably stalled (drafts loaded + comment slots overdue + no post for
+// STALL_RECOVER_MIN, past warm-up) and only behind the same consent/health/
+// challenge/window/STOP gates as auto-drain. It shares the auto-drain re-arm
+// stamp, so a false positive can start at most one drain per re-arm window. Never
+// arms sending (startDrain unattended); supply is still the server queue gate, so
+// a wrongly-triggered recovery just supersedes the wedged run and starves.
+// Returns true when it acted (so the caller skips maybeAutoDrain this tick).
+async function maybeRecoverStalledRun(
+  cfg: ActuatorConfig,
+  s: RunState | null,
+  now: Date,
+  lastChallengeDay: string | null,
+): Promise<boolean> {
+  if (!s || s.status !== "running") { await clearStallProbe(); return false; } // only a live run can be wedged
+  const nowMs = now.getTime();
+  const store = await chrome.storage.local.get([AUTO_DRAIN_MS_KEY, STOP_DAY_KEY, STALL_PROBE_KEY]);
+  const dueCommentSlots = s.actions.filter(
+    (a) => !a.executed && a.kind === "comment" && a.atMs <= nowMs,
+  ).length;
+  const decide = shouldRecoverStalledRun({
+    autonomous: true, // caller already required cfg.autonomous
+    autoDrain: cfg.autoDrain ?? false,
+    runActive: true,
+    msSinceProgress: nowMs - (s.lastProgressMs ?? s.startMs),
+    msSinceStart: nowMs - s.startMs,
+    warmupSuppressMs: s.warmupSuppressMs,
+    stallThresholdMs: (cfg.stallRecoverMinutes ?? STALL_RECOVER_MIN) * 60_000,
+    loadedDrafts: s.commentPool.length,
+    dueCommentSlots,
+    localHour: now.getHours(),
+    startHour: cfg.autoStartHour ?? 9,
+    endHour: cfg.autoEndHour ?? 21,
+    lastAutoDrainMs: (store[AUTO_DRAIN_MS_KEY] as number | undefined) ?? null,
+    nowMs,
+    minGapMinutes: AUTO_DRAIN_REARM_MIN,
+    todayKey: localDayKey(now),
+    stopDay: (store[STOP_DAY_KEY] as string | undefined) ?? null,
+  });
+  // Two-tick confirmation: a healthy run momentarily past the no-progress
+  // threshold (a legit large scheduled-mode gap, or a post mid-flight) still
+  // posts within ~60s, so the next tick sees advanced progress and never
+  // confirms. A real wedge makes no progress across ticks and confirms.
+  const progressMs = s.lastProgressMs ?? s.startMs;
+  const probe = (store[STALL_PROBE_KEY] as StallProbe | undefined) ?? null;
+  const outcome = confirmStall({ stalledNow: decide, sessionId: s.sessionId, progressMs, probe });
+  if (outcome === "clear") { if (probe) await clearStallProbe(); return false; }
+  if (outcome === "observe") {
+    await chrome.storage.local.set({ [STALL_PROBE_KEY]: { sid: s.sessionId, progressMs } satisfies StallProbe });
+    return false;
+  }
+  // outcome === "recover": stalled across two consecutive ticks with no progress.
+
+  // Same safety gate as auto-start/auto-drain: post-challenge cooldown + /health.
+  const api = new ActuatorApi(cfg);
+  const health = await api.health().catch(() => null); // fetch fail → null → fail-closed
+  const safe = passesAutoStartSafety({
+    healthGate: cfg.healthGate ?? true,
+    healthStatus: health?.status ?? null,
+    challengeCooldownDays: cfg.challengeCooldownDays ?? 3,
+    todayKey: localDayKey(now),
+    lastChallengeDay,
+  });
+  if (!safe) {
+    console.warn("[autonomy] stall-recovery suppressed by safety gate", { health: health?.status ?? "unknown" });
+    return false; // no stamp → re-evaluates next tick when health recovers
+  }
+
+  // Stamp the SHARED auto-drain cooldown BEFORE (re)starting: one drain start —
+  // auto OR recovery — per re-arm window, so a false stall can't machine-gun.
+  await chrome.storage.local.set({ [AUTO_DRAIN_MS_KEY]: nowMs });
+  await clearStallProbe(); // consumed this observation; the superseding run gets a fresh session
+  const stalledMin = Math.round((nowMs - (s.lastProgressMs ?? s.startMs)) / 60_000);
+  console.info("[autonomy] recovering stalled run — superseding with a fresh drain", {
+    stalledMin, loaded: s.commentPool.length, dueSlots: dueCommentSlots,
+  });
+  sinkLog("warn", "stall-recovery: superseding wedged run with a drain", {
+    stalledMin, loaded: s.commentPool.length, dueSlots: dueCommentSlots,
+  });
+  // startDrain bumps the epoch → the wedged run's next tick sees a stale epoch and
+  // bails, so no explicit endRun is needed. Unattended → never arms sending.
+  await startDrain().catch((e) =>
+    console.warn("[autonomy] stall-recovery drain failed:", e instanceof Error ? e.message : e),
+  );
+  return true;
+}
+
+// Self-reload when a newer build lands on disk. Deploys are merge-driven
+// (`noelle sync` rebuilds the extension into .output/chrome-mv3), but an
+// unpacked extension keeps running stale code until something reloads it.
+// api-vm serves the on-disk build-stamp.json; when it differs from the stamp
+// compiled into this bundle, chrome.runtime.reload() re-reads the unpacked dir
+// — same as clicking Reload on chrome://extensions. Independent of the
+// `autonomous` flag (a fresh build should land even on manually-operated
+// setups). Never during a run; one attempt per served stamp so a stale disk
+// copy (e.g. the laptop's unsynced dir) can't reload-loop every 5 minutes.
+async function checkSelfReload(): Promise<void> {
+  const cfg = await getConfig();
+  if (!cfg) return;
+  const s = await loadState();
+  const api = new ActuatorApi(cfg);
+  const served = await api.fetchExtensionBuild().catch(() => null); // fetch fail → null → no reload
+  const store = await chrome.storage.local.get(RELOAD_STAMP_KEY);
+  // A persistent drain (auto-drain) never ends, so `runActive` alone would block
+  // self-updates forever. Allow the reload when the run is provably idle —
+  // nothing loaded to send, so no work is lost — AND autonomy is armed to start a
+  // fresh drain right after, which makes the reload invisible.
+  const quiet = !!s && s.commentPool.length === 0 && s.dmPool.length === 0;
+  const autonomyWillRestart = cfg.autonomous === true && cfg.autoDrain === true;
+  const decide = shouldSelfReload({
+    runActive: s?.status === "running",
+    runResumable: quiet && autonomyWillRestart,
+    embeddedStamp: typeof __BUILD_STAMP__ === "string" ? __BUILD_STAMP__ : null,
+    servedStamp: served?.stamp ?? null,
+    lastAttemptedStamp: (store[RELOAD_STAMP_KEY] as string | undefined) ?? null,
+  });
+  if (!decide) return;
+  await chrome.storage.local.set({ [RELOAD_STAMP_KEY]: served!.stamp });
+  console.info("[self-reload] newer build on disk; reloading extension", {
+    from: __BUILD_STAMP__,
+    to: served!.stamp,
+  });
+  chrome.runtime.reload();
+}
+
+// Fire-and-forget liveness pulse to the Chrome Bridge sink (observability only;
+// see docs/chrome-bridge.md). Reads current run state so the heartbeat reports
+// running vs idle without any per-transition wiring. `force` bypasses the 60s
+// throttle for the 5-min autonomy alarm. Never touches the send path.
+async function pulseBridge(force: boolean): Promise<void> {
