@@ -198,3 +198,33 @@ describe("outbound client — human typo pass", () => {
 
   it("strips full stops from replies, on every platform, at any rate", async () => {
     for (const platform of ["x", "linkedin"] as const) {
+      const drafts = await postAndCapture(
+        0,
+        [{ id: "d1", kind: "reply", angle: "empathetic", body: "that tracks. every time.", charCount: 24 }],
+        platform,
+      );
+      expect(drafts[0]!.body).toBe("that tracks every time");
+      expect(drafts[0]!.charCount).toBe("that tracks every time".length);
+    }
+  });
+
+  it("never strips a full stop from a DM", async () => {
+    const drafts = await postAndCapture(0, [
+      { id: "d1", kind: "dm", angle: null, body: "hey. saw you shipped it.", charCount: 24 },
+    ]);
+    expect(drafts[0]!.body).toBe("hey. saw you shipped it.");
+  });
+
+  it("applies to LinkedIn replies too (no platform cap there)", async () => {
+    let mutated = 0;
+    for (let i = 0; i < 40; i++) {
+      const drafts = await postAndCapture(
+        1,
+        [{ id: "d1", kind: "reply", angle: "empathetic", body: REPLY_BODY, charCount: REPLY_BODY.length }],
+        "linkedin",
+      );
+      if (drafts[0]!.body !== REPLY_BODY) mutated++;
+    }
+    expect(mutated).toBeGreaterThan(0);
+  });
+});
