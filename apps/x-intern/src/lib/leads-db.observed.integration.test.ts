@@ -198,3 +198,64 @@ describe.skipIf(!url)("X browser reply capacity (integration)", () => {
     const duplicate = await insertObserved(6);
     await sql`update noelle.leads set external_id = '1' where id = ${duplicate}`;
     const safe = await insertObserved(5);
+    const claimed = await claimObservedLeadsForDrafting(sql, { agentInstanceId: instanceId, cap: 12 });
+    expect(claimed.map((lead) => lead.id)).toEqual([safe]);
+  });
+
+  it("claims only one known conversation and favors a fresh author over recent repeated replies", async () => {
+    const sent = await insertObserved(1, { status: "drafted", author: "frequent" });
+    await makeEligible(1, sent);
+    await sql`update noelle.approvals set status = 'sent', decided_at = now() where lead_id = ${sent}`;
+    await insertObserved(2, { author: "frequent", score: 0.9 });
+    const fresh = await insertObserved(3, { author: "new-author", score: 0.9, payload: { conversation_id: "900" } });
+    await insertObserved(4, { score: 0.9, hoursAgo: 2, payload: { conversation_id: "900" } });
+    const claimed = await claimObservedLeadsForDrafting(sql, { agentInstanceId: instanceId, cap: 1 });
+    expect(claimed.map((lead) => lead.id)).toEqual([fresh]);
+  });
+
+  it("preserves explicit manual requests for their separate claim lane", async () => {
+    await insertObserved(1, { payload: { reply_requested: true, reply_request: { request_key: "manual-1" } } });
+    const safe = await insertObserved(2);
+    expect((await claimObservedLeadsForDrafting(sql, { agentInstanceId: instanceId, cap: 12 }))
+      .map((lead) => lead.id)).toEqual([safe]);
+  });
+
+  it("bounds reads per author so a prolific author cannot fill the candidate pool", async () => {
+    const newest = await insertObserved(1, { author: "prolific", score: 0.95 });
+    for (let n = 2; n <= 205; n++) await insertObserved(n, { author: "prolific", score: 0.95, hoursAgo: 3 });
+    const other = await insertObserved(206, { author: "other", score: 0.9 });
+    expect((await claimObservedLeadsForDrafting(sql, { agentInstanceId: instanceId, cap: 12 }))
+      .map((lead) => lead.id).sort()).toEqual([newest, other].sort());
+  });
+
+  it("counts newly committed capacity after waiting for the instance lock", async () => {
+    for (let n = 1; n <= 13; n++) await insertObserved(n, { score: 0.9 });
+    let unlock!: () => void;
+    let locked!: () => void;
+    const gate = new Promise<void>((resolve) => { unlock = resolve; });
+    const acquired = new Promise<void>((resolve) => { locked = resolve; });
+    const writer = sql.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended(${'x-observed:' + instanceId}, 0))`;
+      await tx`update noelle.leads set status = 'drafting' where external_id <> '13'`;
+      locked();
+      await gate;
+    });
+    await acquired;
+    const claim = claimObservedLeadsForDrafting(sql, { agentInstanceId: instanceId, cap: 12 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    unlock();
+    await writer;
+    expect(await claim).toEqual([]);
+  });
+
+  it("serializes concurrent claims so they cannot exceed twelve active slots", async () => {
+    for (let n = 1; n <= 20; n++) await insertObserved(n, { score: 0.9 });
+    const results = await Promise.all([
+      claimObservedLeadsForDrafting(sql, { agentInstanceId: instanceId, cap: 12 }),
+      claimObservedLeadsForDrafting(sql, { agentInstanceId: instanceId, cap: 12 }),
+    ]);
+    const ids = results.flatMap((rows) => rows.map((lead) => lead.id));
+    expect(ids).toHaveLength(12);
+    expect(new Set(ids).size).toBe(12);
+  });
+});
