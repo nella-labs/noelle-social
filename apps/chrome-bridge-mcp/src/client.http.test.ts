@@ -198,3 +198,155 @@ describe("BridgeClient canonical HTTP options and receipts", () => {
       expect(await new BridgeClient({ maxBytes: bytes.length }).op({ op: "meta.ping" }))
         .toEqual({ ok: true, value: "😀" });
       expect(await new BridgeClient({ maxBytes: bytes.length - 1 }).op({ op: "meta.ping" }))
+        .toMatchObject({ ok: false, code: "body_too_large", status: 200 });
+      expect(fixture.requests()).toBe(2);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  for (const status of [401, 503, 504]) {
+    it(`retains HTTP ${status} and its hint when the error body times out`, async () => {
+      const headersSeen = deferred<void>();
+      const admitted = deferred<void>();
+      const closed = deferred<void>();
+      let held: ServerResponse | undefined;
+      const fixture = await serve((_path, res) => {
+        held = res;
+        res.once("close", () => closed.resolve());
+        res.writeHead(status, { "content-type": "application/json" });
+        res.write('{"error":');
+        admitted.resolve();
+      });
+      vi.stubGlobal("fetch", (async (...args: Parameters<typeof fetch>) => {
+        const response = await nativeFetch(...args);
+        headersSeen.resolve();
+        return response;
+      }) as typeof fetch);
+      let pending: Promise<unknown> | undefined;
+      let settled = false;
+      try {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        pending = new BridgeClient({ timeoutMs: 80 }).health().then(result => {
+          settled = true;
+          return result;
+        });
+        await admitted.promise;
+        await headersSeen.promise;
+        await vi.advanceTimersByTimeAsync(79);
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(await pending).toMatchObject({
+          ok: false, code: "timeout", status,
+          hint: expect.stringContaining(String(status)),
+        });
+        await closed.promise;
+        expect(fixture.requests()).toBe(1);
+      } finally {
+        vi.useRealTimers();
+        held?.destroy();
+        await pending;
+        await fixture.close();
+      }
+    });
+  }
+
+  it("retains status and hint when an HTTP error body exceeds the byte bound", async () => {
+    const fixture = await serve((_path, res) => {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "x".repeat(100) }));
+    });
+    try {
+      expect(await new BridgeClient({ maxBytes: 20 }).health()).toMatchObject({
+        ok: false, code: "body_too_large", status: 503,
+        hint: expect.stringContaining("503"),
+      });
+      expect(fixture.requests()).toBe(1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("allows the existing 20-second op result without applying the shorter helper default", async () => {
+    const admitted = deferred<void>();
+    let response: ServerResponse | undefined;
+    let pending: Promise<unknown> | undefined;
+    const fixture = await serve((_path, res) => {
+      response = res;
+      admitted.resolve();
+    });
+    let settled = false;
+    try {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      pending = new BridgeClient().op({ op: "meta.ping" }).then(result => {
+        settled = true;
+        return result;
+      });
+      await admitted.promise;
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(settled).toBe(false);
+      response!.end(JSON.stringify({ ok: false, error: "op timeout", tookMs: 20_000 }));
+      expect(await pending).toEqual({ ok: false, error: "op timeout", tookMs: 20_000 });
+      expect(fixture.requests()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      response?.destroy();
+      await pending;
+      await fixture.close();
+    }
+  });
+});
+
+async function mcpCall(url: string): Promise<Record<string, unknown>> {
+  const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
+    cwd: packageDir, env: { ...process.env, NOELLE_BRIDGE_URL: url, NOELLE_BRIDGE_TOKEN: token },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const exited = once(child, "exit");
+  const lines = createInterface({ input: child.stdout });
+  const received = new Map<number, ReturnType<typeof deferred<Record<string, unknown>>>>();
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += String(chunk); });
+  lines.on("line", line => {
+    const message = JSON.parse(line) as { id?: number; result?: Record<string, unknown> };
+    if (message.id !== undefined) received.get(message.id)?.resolve(message.result ?? {});
+  });
+  const request = (id: number, method: string, params: unknown) => {
+    const wait = deferred<Record<string, unknown>>(); received.set(id, wait);
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n"); return wait.promise;
+  };
+  try {
+    const initialized = await request(1, "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "local-fixture", version: "1" } });
+    expect(initialized.serverInfo).toMatchObject({ name: "chrome-bridge" });
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+    return await request(2, "tools/call", { name: "chrome_heartbeats", arguments: {} });
+  } finally {
+    child.stdin.end(); child.kill("SIGTERM");
+    const [code, signal] = await exited;
+    lines.close();
+    expect(code === 0 || signal === "SIGTERM").toBe(true);
+    expect(stderr).toContain("ready —");
+  }
+}
+
+describe("actual MCP stdio health envelope", () => {
+  for (const [bridgeFails, heartbeatFails] of [[true, false], [false, true], [false, false], [true, true]] as const) {
+    it(`reports bridge=${bridgeFails ? "failed" : "healthy"}, heartbeats=${heartbeatFails ? "failed" : "healthy"}`, async () => {
+      const fixture = await serve((path, res) => {
+        const fail = path === "/health" ? bridgeFails : heartbeatFails;
+        res.writeHead(fail ? 500 : 200, { "content-type": "application/json" });
+        res.end(JSON.stringify(fail ? { ok: false, error: "local fixture failure" } : path === "/health" ? health : { sources: [] }));
+      });
+      try {
+        const result = await mcpCall(fixture.url);
+        const content = result.content as Array<{ type: string; text: string }>;
+        const payload = JSON.parse(content[0]!.text);
+        expect(payload.bridge).toMatchObject({ ok: !bridgeFails });
+        if (heartbeatFails) expect(payload.heartbeats).toMatchObject({ ok: false });
+        else expect(payload.heartbeats).toEqual({ sources: [] });
+        expect(result.isError ?? false).toBe(bridgeFails || heartbeatFails);
+        expect(fixture.requests()).toBe(2);
+      } finally { await fixture.close(); }
+    }, 15_000);
+  }
+});
