@@ -198,3 +198,94 @@ async function defaultBedrockClient(opts: {
   region: string;
   accessKeyId?: string;
   secretAccessKey?: string;
+  timeoutMs: number;
+}): Promise<BedrockVisionClient> {
+  if (!cachedBedrock) {
+    const mod = await import("@anthropic-ai/bedrock-sdk");
+    cachedBedrock = mod.AnthropicBedrock as unknown as {
+      new (opts: unknown): { messages: BedrockVisionClient };
+    };
+  }
+  const ctorOpts =
+    opts.accessKeyId && opts.secretAccessKey
+      ? { awsRegion: opts.region, awsAccessKey: opts.accessKeyId, awsSecretKey: opts.secretAccessKey }
+      : { awsRegion: opts.region };
+  return new cachedBedrock({ ...ctorOpts, timeout: opts.timeoutMs, maxRetries: 0,
+    fetch: createBoundedHttpFetch({ timeoutMs: opts.timeoutMs }) }).messages;
+}
+
+/** Bedrock caption generation with bounded SDK HTTP transport and supported request cancellation. */
+export function createBedrockCaptionFn(opts: {
+  region?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  /** Bedrock inference-profile model ID. Default: haiku (cheap, multimodal). */
+  model?: string;
+  maxTokens?: number;
+  clientImpl?: BedrockVisionClient;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+  metering?: CaptionMetering;
+}): CaptionFn {
+  const region =
+    opts.region ?? process.env["AWS_REGION"] ?? process.env["AWS_BEDROCK_REGION"] ?? "us-east-1";
+  const model = opts.model ?? "us.anthropic.claude-haiku-4-5-20251001-v1:0";
+  const maxTokens = opts.maxTokens ?? 512;
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const timeoutMs = opts.timeoutMs ?? 8000;
+  return async (imageUrls, ctx) => {
+    if (imageUrls.length === 0) return "";
+
+    const bytes = await fetchImageBytes(imageUrls, fetchImpl, timeoutMs, true);
+    if (bytes.length === 0) return "";
+    const imageParts = bytes.map((b) => ({
+      type: "image" as const,
+      source: { type: "base64" as const, media_type: b.mime, data: b.data },
+    }));
+
+    const promptText = ctx.postText
+      ? `${VISION_INSTRUCTION}\n\nThe post's text (for context): ${ctx.postText.slice(0, 500)}`
+      : VISION_INSTRUCTION;
+
+    let client: BedrockVisionClient;
+    try {
+      client =
+        opts.clientImpl ??
+        (await defaultBedrockClient({
+          region,
+          timeoutMs,
+          ...(opts.accessKeyId ? { accessKeyId: opts.accessKeyId } : {}),
+          ...(opts.secretAccessKey ? { secretAccessKey: opts.secretAccessKey } : {}),
+        }));
+    } catch {
+      return "";
+    }
+
+    return runCaptionModel({
+      engine: "bedrock", model: opts.model === undefined ? "claude-haiku-4-5" : model, failOpen: true,
+      prompt: promptText, images: bytes, timeoutMs, ...(opts.metering ? { metering: opts.metering } : {}),
+      call: async () => {
+        let res: { content: Array<{ type: string; text?: string }>; usage?: unknown };
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          res = await client.create({
+            model,
+            max_tokens: maxTokens,
+            messages: [{ role: "user", content: [{ type: "text", text: promptText }, ...imageParts] }],
+          }, { signal: controller.signal, timeout: timeoutMs, maxRetries: 0 });
+        } catch (error) {
+          if (controller.signal.aborted) throw new Error("vision request timed out");
+          throw error;
+        } finally {
+          clearTimeout(timer);
+        }
+        if (controller.signal.aborted) throw new Error("vision request timed out");
+        if (!Array.isArray(res.content)) throw new Error("vision response contains invalid generated text");
+        const textBlock = res.content.find((b) => b.type === "text");
+        if (typeof textBlock?.text !== "string" || !textBlock.text.trim()) throw new Error("vision response contains no generated text");
+        return { text: textBlock.text, usage: reportedAnthropicUsage(res.usage) };
+      },
+    });
+  };
+}
