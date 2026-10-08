@@ -198,3 +198,82 @@ export async function runHarvesterTick(deps: HarvesterTickDeps): Promise<number>
 
   // --- niche lane ---
   await flush("niches");
+  const nicheSince = new Date(Date.now() - cfg.nicheTrending.recencyWindowHours * 3_600_000).toISOString();
+  for (const nq of await listEnabledNiches(sql, instance.id)) {
+    if (await cancelled()) return total;
+    let pulledCount = 0;
+    let selectedCount = 0;
+    let writtenCount = 0;
+    let drops = { belowMinViews: 0, notSelected: 0 };
+    try {
+      // Niche discovery may run several paid actors; meter every receipt.
+      const clips = await withMeteredApifyCall({ client: handle.client, recorder, log,
+        orgId, instanceId: instance.id, agentRole: "video_intern", worker: "harvester",
+        actor: defaultVideoApifyActor(nq.platform), startedAt: new Date(), credentialId: handle.credentialId },
+        operation => operation.nicheCreatorReels({ platform: nq.platform, query: nq.query,
+          maxItems: Math.max(cfg.nicheTrending.n * 3, cfg.maxPerSource), sinceISO: nicheSince }));
+      const { selected, dropped } = selectNicheWithReasons(clips, cfg);
+      pulledCount = clips.length;
+      selectedCount = selected.length;
+      drops = dropped;
+      // Objective grading (Vega-style): drop clips that don't serve the objective,
+      // even if they trended. Fail-open — no grader / no objective / a flaky call
+      // keeps `selected` unchanged. Grades the small selected set, not the raw pull.
+      const graded = Boolean(gradeJson && objective);
+      const onObjective =
+        gradeJson && objective ? await gradeClipsForObjective(objective, selected, gradeJson) : selected;
+      const written = await upsertVideoClips(sql, {
+        orgId,
+        instanceId: instance.id,
+        sourceKind: "niche",
+        clips: onObjective,
+      });
+      total += written;
+      writtenCount = written;
+      await markNichePulled(sql, nq.id);
+      await pushLane({
+        kind: "niche",
+        label: nq.query,
+        pulled: clips.length,
+        selected: selected.length,
+        kept: written,
+        dropped: {
+          belowMinViews: dropped.belowMinViews,
+          notSelected: dropped.notSelected,
+          offObjective: selected.length - onObjective.length,
+        },
+        graded,
+      });
+      log.info(
+        {
+          instance: instance.id,
+          niche: nq.query,
+          pulled: clips.length,
+          selected: selected.length,
+          kept: written,
+          graded,
+        },
+        "niche harvested",
+      );
+    } catch (err) {
+      const message = (err as Error).message;
+      const blocked = isBudgetAdmissionError(err);
+      await pushLane({
+        kind: "niche",
+        label: nq.query,
+        pulled: blocked ? pulledCount : 0,
+        selected: blocked ? selectedCount : 0,
+        kept: blocked ? writtenCount : 0,
+        dropped: { ...(blocked ? drops : { belowMinViews: 0, notSelected: 0 }), offObjective: 0 },
+        graded: false,
+        error: message.slice(0, 500),
+      });
+      log.error({ instance: instance.id, niche: nq.query, err: message }, "niche lane failed");
+      if (blocked) await stopAdmission(err);
+    }
+  }
+
+  await flagDeepTier(sql, instance.id, cfg.deepTierPercentile).catch(() => {});
+  await flush("done");
+  return total;
+}
