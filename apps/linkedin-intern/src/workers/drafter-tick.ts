@@ -1598,3 +1598,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
           ? renderOpeningMoveBlock(pickOpeningMove(variety.rng))
           : undefined;
 
+      // Voice variety, part three: on a minority of leads, offer ONE gen-z
+      // marker the comment may use once, or drop. Word choice only, so unlike
+      // the shape and the register it does not compete for the length slot and
+      // is NOT suppressed when a shape is assigned.
+      const genzBlock = pickGenzBlock(variety, postRegister);
+
+      // Per-person memory: the replies Lyra already sent/queued to THIS author, so
+      // the comment doesn't repeat a take it already made. Fail-open to [].
+      const priorReplies = getPriorReplies
+        ? await getPriorReplies({
+            authorHandle: payload.authorPublicId ?? lead.author_handle,
+            authorId: lead.author_id,
+            excludeLeadId: lead.id,
+            limit: priorRepliesTopK,
+          }).catch(() => [])
+        : [];
+
+      // SUBSTANTIAL path.
+      const tier: "T1" | "T2" | "T3" = lead.tier ?? "T3";
+      const ok = await draftSubstantial({
+            voiceExemplars: args.voiceExemplars,
+        lead,
+        tier,
+        postText,
+        payload,
+        anchors,
+        knowledgeAnchors,
+        imageCaption,
+        personDirective,
+        commentDigest,
+        brand,
+        instance,
+        routing,
+        opusRepairRouting,
+        runner,
+        postOutbound,
+        markStatus,
+        log,
+        verify,
+        registerBlock,
+        shapeBlock,
+        shapeAssigned: Boolean(formVariant),
+        openingMoveBlock,
+        genzBlock,
+        priorReplies,
+        recentPhrasings,
+        replyRequest,
+        style: styleForLead,
+        postRegister,
+        faithful: styleFaithful,
+        patternRules,
+      });
+      if (ok) {
+        processed++;
+        remaining.substantial--;
+        await bus?.emit({
+          topic: "draft.created",
+          worker: "drafter",
+          summary: "drafted substantial reply",
+          payload: { lead_id: lead.id, reply_kind: "substantial", tier },
+          correlationId: lead.id,
+        });
+      }
+    } catch (err) {
+      if (err instanceof BudgetExceededError) {
+        log.warn(
+          { leadId: lead.id, layer: err.layer, spent_cents: err.spentCents, cap_cents: err.capCents },
+          "drafter blocked by budget cap; deferring lead, will retry",
+        );
+        budgetBlown = true;
+        await deferLeadToClassified({
+          // This loop carries BOTH kinds ("substantial + non-batchable lights"),
+          // so the stamp must follow the lead, not be hardcoded.
+          sql,
+          leadId: lead.id,
+          replyKind,
+          reason: "budget",
+        });
+        continue;
+      }
+      log.error({ leadId: lead.id, err: (err as Error).message }, "drafter tick failed for lead");
+      await markStatus({ leadId: lead.id, status: "errored", meta: { error: (err as Error).message } });
+    }
+  }
+  return processed;
+}
+
+/**
+ * Parse the batched-light model output. Tries to extract a JSON array from the
+ * raw text (fence-stripped), validates with Zod, and checks that:
+ *   - the array has exactly `expectedCount` entries
+ *   - every expected id appears exactly once (no cross-wiring, no drops)
+ * Returns null on ANY failure so the caller can fail-open to per-lead single calls.
+ */
+function parseBatchedLightOutput(
+  raw: string,
+  expectedCount: number,
+  expectedIds: string[],
+  log: { warn(obj: Record<string, unknown>, msg: string): void },
+): Array<{ id: string; reply: string }> | null {
+  // Try to extract a JSON array from the raw text.
+  let parsed: unknown = null;
+  // 1. Direct parse.
+  try { parsed = JSON.parse(raw); } catch { /* fall through */ }
+  // 2. Strip markdown fences.
+  if (parsed === null) {
+    try {
+      const stripped = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
+      parsed = JSON.parse(stripped);
+    } catch { /* fall through */ }
+  }
+  // 3. Extract first [...] block.
+  if (parsed === null) {
+    const firstBracket = raw.indexOf("[");
+    const lastBracket = raw.lastIndexOf("]");
+    if (firstBracket >= 0 && lastBracket > firstBracket) {
+      try { parsed = JSON.parse(raw.slice(firstBracket, lastBracket + 1)); } catch { /* fall through */ }
+    }
+  }
+  if (parsed === null) {
+    log.warn({ raw: raw.slice(0, 200) }, "parseBatchedLightOutput: no JSON array found");
+    return null;
+  }
+
+  // Validate with Zod.
+  const zodResult = BatchedLightOutput.safeParse(parsed);
+  if (!zodResult.success) {
+    log.warn({ error: zodResult.error.message.slice(0, 200) }, "parseBatchedLightOutput: Zod validation failed");
+    return null;
+  }
+  const entries = zodResult.data;
+
+  // Length check.
+  if (entries.length !== expectedCount) {
+    log.warn(
+      { expected: expectedCount, got: entries.length },
+      "parseBatchedLightOutput: array length mismatch",
+    );
+    return null;
+  }
+
+  // Id match check: every expected id must appear exactly once.
+  const returnedIds = new Set(entries.map((e) => e.id));
+  for (const id of expectedIds) {
+    if (!returnedIds.has(id)) {
+      log.warn({ missingId: id }, "parseBatchedLightOutput: expected id missing from batch output");
+      return null;
+    }
+  }
+  if (returnedIds.size !== expectedIds.length) {
+    log.warn(
+      { expected: expectedIds.length, got: returnedIds.size },
+      "parseBatchedLightOutput: duplicate ids in batch output",
+    );
+    return null;
+  }
+
+  return entries;
+}
+
+interface DraftCommonArgs {
+  /**
+   * The operator's approved replies paired with the posts they answered.
+   * Fetched once per tick — the set barely moves between leads.
+   */
+  voiceExemplars?: ReadonlyArray<{ post: string; reply: string }>;
+
+  lead: LeadRow;
+  postText: string;
+  payload: {
+    text?: string;
+    url?: string;
+    authorName?: string | null;
+    authorHeadline?: string | null;
+    authorPublicId?: string | null;
+    source?: string;
+  };
+  anchors: Array<{ snippet: string; score: number }>;
+  /** Product-knowledge snippets from the second (scoped) retrieval pass. [] when off. */
+  knowledgeAnchors: string[];
+  /** One-line description of the post's image(s), or "" when none / vision off. */
+  imageCaption: string;
+  personDirective: string | null;
+  /** The COMMENT SECTION block (existing comments on the post), or "" when none. */
+  commentDigest: string;
+  brand: ReturnType<typeof parseBrandConfig>;
+  /** The post's register (celebration | neutral) for register-aware STYLE + variety. */
+  postRegister: PostRegister;
+  /**
+   * Faithful-voice mode (operator pinned a style source). When true, the STYLE
+   * block adopts the pinned writer's voice instead of the faint FORM-only echo.
+   * Undefined/false ⇒ byte-identical to before. Carried alongside postRegister.
+   */
+  faithful?: boolean;
+  instance: ActiveInstance;
+  /** The model routing for THIS lead's draft call (Opus-overridden when high-engagement). */
+  routing: ModelRouting;
+  /** Opus with the ordinary instance writer preserved as its fallback. */
+  opusRepairRouting: ModelRouting;
+  runner: CodexRunner;
