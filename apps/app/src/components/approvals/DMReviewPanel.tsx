@@ -198,3 +198,78 @@ export function DMReviewPanel({
           disabled={pending || !!success}
         >
           Skip
+        </button>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={onPark}
+          disabled={pending || !!success}
+          title="Park this DM on the person's Contacts page — send it by hand once they reply on X"
+        >
+          Wait for reply
+        </button>
+        <div
+          className="action-bar-primary"
+          style={{
+            marginLeft: "auto",
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+          }}
+        >
+          {sendResult && !sendResult.ok ? (
+            <span
+              className="tag"
+              style={{ color: "var(--danger)", fontSize: 11.5 }}
+            >
+              {sendResult.error.message}
+            </span>
+          ) : null}
+          {skipResult && !skipResult.ok ? (
+            <span
+              className="tag"
+              style={{ color: "var(--danger)", fontSize: 11.5 }}
+            >
+              {skipResult.error.message}
+            </span>
+          ) : null}
+          {parkResult && !parkResult.ok ? (
+            <span className="tag" style={{ color: "var(--danger)", fontSize: 11.5 }}>
+              {parkResult.error.message}
+            </span>
+          ) : null}
+          {sendResult?.ok ? (
+            <span className="tag tag-ok">Marked sent ✓</span>
+          ) : skipResult?.ok ? (
+            <span className="tag">skipped</span>
+          ) : parkResult?.ok ? (
+            <span className="tag tag-ok">Parked — on their Contacts page ✓</span>
+          ) : null}
+          <CopyButton text={draft.trim() ? draft : body} label="Copy DM" />
+          {/* Fast path: open the X DM composer pre-filled in your logged-in
+              session (X has no DM-send API, so the agent can't auto-send DMs —
+              this is the one-click manual send). Uses the edited text. */}
+          <a
+            href={buildXDmUrl(recipientId, draft.trim() ? draft : body)}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn"
+            style={{ background: "var(--danger)", color: "#fff", borderColor: "var(--danger)", textDecoration: "none" }}
+            title="Open the X DM composer pre-filled — send it from X (one click)"
+          >
+            Send DM in X ↗
+          </a>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            onClick={onMarkSent}
+            disabled={pending || !!success}
+            title="Record this DM as sent (after you've sent it on X)"
+          >
+            {pending && !skipResult ? "Marking…" : "Mark as sent"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
