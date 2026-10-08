@@ -598,3 +598,79 @@ export function diagnoseReplySubmit(
     (el) => follows(el) && !replyToggleLike(el) && !inTweet(el) && el.closest(DM_SEL) === null,
   );
   const en = wf.filter((el) => !submitDisabled(el));
+  const vis = en.filter((el) => !isZeroRect(el));
+  const label = (el: HTMLElement) => ((el.getAttribute("aria-label") || el.textContent) ?? "").trim().slice(0, 12);
+  const why = (el: HTMLElement): string =>
+    !box ? "nobox"
+      : submitDisabled(el) ? "dis"
+      : !follows(el) ? "pre"
+      : replyToggleLike(el) ? "tog"
+      : inTweet(el) ? "itm"
+      : el.closest(DM_SEL) ? "msg"
+      : isZeroRect(el) ? "zr"
+      : "ok";
+  // Name the most telling candidate, in priority of what best explains the
+  // failure: an enabled-but-invisible one (locator saw it, skipped on zero rect
+  // → `zr`), then a disabled would-be submit (never enabled → `dis`), then a
+  // healthy enabled+visible one (`ok` — it SHOULD have been clicked, so a real
+  // locator logic bug), then any worded button whose `why` reveals what
+  // excluded it (the only "Reply" is the action-bar icon → `tog`/`pre`).
+  const pick = en.find(isZeroRect) ?? wf.find(submitDisabled) ?? vis[0] ?? worded[0];
+
+  // Region dump: every button within the box's 6-hop climb scope (where the
+  // real submit must live if the locator is to find it) plus any worded button
+  // elsewhere (the icons). Names each button's shape so an unworded or
+  // mis-ordered real submit is visible in the failure row.
+  let region: ParentNode = root;
+  if (box) {
+    let s: HTMLElement = box;
+    for (let i = 0; i < 6 && s.parentElement; i++) s = s.parentElement;
+    region = s;
+  }
+  const near = new Set<HTMLElement>(Array.from(region.querySelectorAll<HTMLElement>("button, [role='button']")));
+  for (const w of worded) near.add(w);
+  // Also every type=submit document-wide — if the real submit sits outside the
+  // 6-hop climb region or precedes the box, it must still surface in the dump.
+  for (const s of Array.from(root.querySelectorAll<HTMLElement>("button[type='submit'], [role='button'][type='submit']"))) near.add(s);
+  const typeChar = (el: HTMLElement) => {
+    const t = el.getAttribute("type");
+    return t === "submit" ? "s" : t === "button" ? "b" : "x";
+  };
+  const groupChar = (el: HTMLElement) =>
+    replyToggleLike(el) ? "t" : inTweet(el) ? "i" : el.closest(DM_SEL) ? "m" : "n";
+  const token = (el: HTMLElement) =>
+    `${label(el).slice(0, 10)}_${box ? (follows(el) ? "f" : "p") : "n"}${typeChar(el)}_` +
+    `${submitDisabled(el) ? 1 : 0}${isZeroRect(el) ? 1 : 0}${submitWordy(el) ? 1 : 0}_g${groupChar(el)}`;
+  const region_ = Array.from(near).slice(0, 8).map(token).join(" ");
+
+  // Composer/editor descriptor — the ground truth for a disabled submit while
+  // text is present. Uses only sanitizer-safe chars ([A-Za-z0-9 _-]); the
+  // booleans (pm/len/nce, ad/dis) carry the signal. Tokens are `key_value`,
+  // space-separated.
+  const safe = (s: string, n: number) => s.replace(/\s+/g, "-").replace(/[^A-Za-z0-9_-]/g, "").slice(0, n);
+  const clsF = (el: Element | null) => (el ? safe((el.className || "").toString(), 16) || "x" : "x");
+  // Describe the button the locator actually resolves to (or the first
+  // submit-worded following candidate when it resolves to none).
+  const sub =
+    findReplySubmitInfo(root)?.el ??
+    (box ? worded.find((el) => follows(el)) : undefined) ??
+    null;
+  const nce = root.querySelectorAll("[contenteditable='true']").length;
+  const editorRoot = box?.closest("[data-testid^='tweetTextarea'], .DraftEditor-root, .public-DraftEditor-content, [data-testid*='editor' i]") ?? null;
+  const dom = box
+    ? `bx_${box.tagName.toLowerCase()} cls_${clsF(box)} al_${safe(box.getAttribute("aria-label") ?? "", 16) || "none"} ` +
+      `pm_${editorRoot ? 1 : 0} len_${(box.textContent ?? "").trim().length} nce_${nce} ` +
+      (sub ? `sub_${clsF(sub)} ad_${safe(sub.getAttribute("aria-disabled") ?? "na", 6)} dis_${(sub as HTMLButtonElement).disabled}` : "sub_none")
+    : `bx_none nce_${nce}`;
+
+  return {
+    box: !!box,
+    wf: wf.length,
+    en: en.length,
+    vis: vis.length,
+    all: worded.length,
+    top: pick ? `${label(pick)}_${why(pick)}` : "none",
+    region: region_,
+    dom,
+  };
+}
