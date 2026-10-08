@@ -198,3 +198,18 @@ describe("xInternChatProfile.systemPrompt", () => {
             postText: longPost,
             selectedAngle: "technical",
             draftBody: longDraft,
+            tier: null,
+            velocityScore: null,
+            createdAt: "2026-05-26T11:00:00.000Z",
+          },
+        ],
+      },
+    });
+    // 180-char truncation + ellipsis = <= 181 chars on the rendered line
+    const postLine = prompt
+      .split("\n")
+      .find((line) => line.includes("post: "))!;
+    expect(postLine.length).toBeLessThan(220);
+    expect(postLine).toContain("…");
+  });
+});
