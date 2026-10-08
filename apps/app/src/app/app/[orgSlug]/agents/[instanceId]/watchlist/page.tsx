@@ -398,3 +398,203 @@ async function RedditWatchlist({
   instanceId,
   objective,
   displayName: displayNameRaw,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  objective: string | null;
+  displayName: string | null;
+}) {
+  const fixture = channelForRole("reddit_intern")!;
+  const displayName = displayNameRaw ?? fixture.label;
+  const resolvedObjective = resolveObjective(objective, fixture.description);
+  const objectiveIsCustom = hasCustomObjective(objective);
+  const rows = await getRedditWatchlistForInstance(instanceId).catch(
+    () => [] as RedditWatchlistRow[],
+  );
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Reddit Growth Intern · Watchlist"
+        title={<>Which subreddits <em>{displayName}</em> watches</>}
+        sub="The subreddits Orion sweeps for in-ICP threads. Every qualifying thread in one earns a drafted reply. Give a subreddit an objective to steer how Orion engages, and a min score to skip low-signal threads. Approved replies are auto-sent via the Reddit actuator — Skip any you don't want posted."
+        right={
+          <Link href={`/app/${orgSlug}/agents/${instanceId}`} className="btn btn-sm">
+            ← Back to agent
+          </Link>
+        }
+      />
+
+      <div style={{ marginBottom: 24 }}>
+        <ObjectiveCard
+          orgSlug={orgSlug}
+          instanceId={instanceId}
+          mission={resolvedObjective}
+          isCustom={objectiveIsCustom}
+          agentName={displayName}
+        />
+      </div>
+
+      <SubredditColumn orgSlug={orgSlug} instanceId={instanceId} rows={rows} />
+    </>
+  );
+}
+
+/**
+ * Subreddit editor (noelle.reddit_watchlist). One card listing watched
+ * subreddits, with an add form (subreddit + optional objective + optional min
+ * score). Writes through the reddit_intern-gated server actions.
+ */
+function SubredditColumn({
+  orgSlug,
+  instanceId,
+  rows,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  rows: RedditWatchlistRow[];
+}) {
+  return (
+    <section className="card">
+      <div className="card-h">
+        <h3>Subreddits</h3>
+        <span className="tag">{rows.length}</span>
+      </div>
+      <p className="muted" style={{ fontSize: 12, margin: "0 0 12px" }}>
+        Each subreddit Orion watches. Empty = no targeting (no leads). Set per-run
+        engagement floors under Configure agent → Discovery.
+      </p>
+
+      <form
+        action={async (fd: FormData) => {
+          "use server";
+          const subreddit = String(fd.get("subreddit") ?? "");
+          if (!subreddit) return;
+          const objective = String(fd.get("objective") ?? "");
+          const minScoreRaw = String(fd.get("minScore") ?? "").trim();
+          await addRedditWatchlistEntry({
+            orgSlug,
+            instanceId,
+            subreddit,
+            objective,
+            ...(minScoreRaw ? { minScore: Number(minScoreRaw) } : {}),
+          });
+        }}
+        style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}
+      >
+        <input
+          name="subreddit"
+          placeholder="SaaS"
+          className="input"
+          style={{ flex: "1 1 140px", minWidth: 0 }}
+          required
+          maxLength={200}
+        />
+        <input
+          name="objective"
+          placeholder="optional — how should Orion engage?"
+          className="input"
+          style={{ flex: "2 1 200px", minWidth: 0 }}
+          maxLength={240}
+        />
+        <input
+          name="minScore"
+          type="number"
+          min={0}
+          placeholder="min ↑"
+          className="input"
+          style={{ flex: "0 0 90px", width: 90 }}
+          inputMode="numeric"
+        />
+        <button className="btn btn-sm btn-accent" type="submit">Add</button>
+      </form>
+
+      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        {rows.map((r) => (
+          <li
+            key={r.id}
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              padding: "8px 0",
+              borderTop: "1px dashed var(--rule-soft)",
+            }}
+          >
+            <div style={{ minWidth: 0 }}>
+              <a
+                href={`https://www.reddit.com/r/${r.subreddit}`}
+                target="_blank"
+                rel="noreferrer"
+                style={{
+                  fontFamily: "var(--mono)",
+                  fontSize: 12.5,
+                  color: "inherit",
+                  textDecoration: "none",
+                }}
+              >
+                r/{r.subreddit}
+              </a>
+              <div style={{ fontSize: 11.5, color: "var(--ink-muted)", marginTop: 2 }}>
+                {r.objective ? r.objective : "no objective"}
+                {r.min_score != null ? ` · min ↑ ${r.min_score}` : ""}
+              </div>
+            </div>
+            <form
+              action={async () => {
+                "use server";
+                await removeRedditWatchlistEntry({ orgSlug, instanceId, rowId: r.id });
+              }}
+            >
+              <button className="btn btn-xs" type="submit">×</button>
+            </form>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/**
+ * Nova (video_intern) watchlist: two source lanes (creators + niche keywords),
+ * a cost-gated "Harvest now" trigger, and a Discover grid of the top harvested
+ * clips. Writes through the video_intern-gated server actions.
+ */
+async function VideoWatchlist({
+  orgSlug,
+  instanceId,
+  displayName: displayNameRaw,
+  objective,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  displayName: string | null;
+  objective: string | null;
+}) {
+  const fixture = channelForRole("video_intern")!;
+  const displayName = displayNameRaw ?? fixture.label;
+  const [sources, niches, clips, harvest, feederConfig] = await Promise.all([
+    listVideoWatchlistSources(instanceId).catch(() => [] as VideoSourceRow[]),
+    listVideoWatchlistNiches(instanceId).catch(() => [] as VideoNicheRow[]),
+    listVideoClips(instanceId, { limit: 24 }).catch(() => [] as VideoClipRow[]),
+    getVideoHarvestStatus(instanceId).catch(() => null),
+    getVideoFeederConfig(instanceId).catch(() => null),
+  ]);
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Video Growth Intern · Watchlist"
+        title={<>Which creators <em>{displayName}</em> studies</>}
+        sub="The IG/TikTok creators Nova learns from, plus niche keyword/hashtag lanes. Each harvest pulls their top-performing reels (by your filters), breaks down what makes them work, and distils a Video Brand Guide. Nova never posts — you record + post by hand."
+        right={
+          <Link href={`/app/${orgSlug}/agents/${instanceId}`} className="btn btn-sm">
+            ← Back to agent
+          </Link>
+        }
+      />
+
+      <div style={{ marginBottom: 24 }}>
+        <HarvestCard orgSlug={orgSlug} instanceId={instanceId} status={harvest} sourceCount={sources.length} />
+      </div>
