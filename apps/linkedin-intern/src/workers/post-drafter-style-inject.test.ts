@@ -198,3 +198,203 @@ describe("runPostDrafterTick — gate OFF → no style, behavior unchanged", () 
 
   it("drafts without a STYLE block when postStyleEnabled=false", async () => {
     const runner = makeRunner();
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d1" });
+
+    await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
+      sink,
+      release: vi.fn(),
+      postStyleEnabled: false,
+      stylePool: [styleRow({ external_id: "a" })],
+    });
+
+    const systemArg: string = runner.draft.mock.calls[0]![0].system;
+    expect(systemArg).not.toContain("STYLE TO EMULATE");
+  });
+
+  it("drafts without a STYLE block when postStyleEnabled=true but pool is empty", async () => {
+    const runner = makeRunner();
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d1" });
+
+    await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
+      sink,
+      release: vi.fn(),
+      postStyleEnabled: true,
+      stylePool: [], // empty pool → selectStyleExemplars returns null → no block
+    });
+
+    const systemArg: string = runner.draft.mock.calls[0]![0].system;
+    expect(systemArg).not.toContain("STYLE TO EMULATE");
+  });
+});
+
+// ── runPostDrafterTick — gate ON with a real pool injects STYLE block ─────────
+
+describe("runPostDrafterTick — gate ON + kind='post' corpus → STYLE block present", () => {
+  const pool: StyleExemplarRow[] = [
+    styleRow({ external_id: "p1", body: "Juniors beat seniors in 12 months.", like_count: 500, comment_count: 60 }),
+    styleRow({ external_id: "p2", body: "Hiring slow is hiring wrong.", like_count: 300, comment_count: 30 }),
+  ];
+
+  const profiles: UltraProfileRow[] = [
+    {
+      account_handle: "guru",
+      voice_summary: "punchy and concrete",
+      tone: "direct",
+      structure_notes: "one claim per paragraph",
+      hook_patterns: ["bold contrarian claim"],
+      signature_phrases: ["here's the thing"],
+      top_topics: ["hiring"],
+    },
+  ];
+
+  it("injects a STYLE TO EMULATE block when the gate is on and pool is non-empty", async () => {
+    const runner = makeRunner();
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d1" });
+
+    const n = await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
+      sink,
+      release: vi.fn(),
+      postStyleEnabled: true,
+      stylePool: pool,
+      styleUltraProfiles: profiles,
+    });
+
+    expect(n).toBe(1);
+    const systemArg: string = runner.draft.mock.calls[0]![0].system;
+    expect(systemArg).toContain("STYLE TO EMULATE");
+  });
+
+  it("style block includes exemplar bodies from the pool", async () => {
+    const runner = makeRunner();
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d1" });
+
+    await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
+      sink,
+      release: vi.fn(),
+      postStyleEnabled: true,
+      stylePool: pool,
+      styleUltraProfiles: profiles,
+    });
+
+    const systemArg: string = runner.draft.mock.calls[0]![0].system;
+    // At least one exemplar body must appear in the system prompt.
+    const hasBody =
+      systemArg.includes("Juniors beat seniors") ||
+      systemArg.includes("Hiring slow is hiring wrong");
+    expect(hasBody).toBe(true);
+  });
+
+  it("style block includes ultra-profile style notes", async () => {
+    const runner = makeRunner();
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d1" });
+
+    await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
+      sink,
+      release: vi.fn(),
+      postStyleEnabled: true,
+      stylePool: pool,
+      styleUltraProfiles: profiles,
+    });
+
+    const systemArg: string = runner.draft.mock.calls[0]![0].system;
+    expect(systemArg).toContain("punchy and concrete");
+  });
+
+  it("the no-fabrication rule is always present (reinforces existing ban)", async () => {
+    // Regardless of the style gate, the hard-ban must be in the system prompt.
+    const runnerOn = makeRunner();
+    const sinkOn = vi.fn().mockResolvedValue({ draft_id: "d1" });
+    await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner: runnerOn,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
+      sink: sinkOn,
+      release: vi.fn(),
+      postStyleEnabled: true,
+      stylePool: pool,
+      styleUltraProfiles: profiles,
+    });
+
+    const runnerOff = makeRunner();
+    const sinkOff = vi.fn().mockResolvedValue({ draft_id: "d2" });
+    await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner: runnerOff,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
+      sink: sinkOff,
+      release: vi.fn(),
+      postStyleEnabled: false,
+    });
+
+    const onSystem: string = runnerOn.draft.mock.calls[0]![0].system;
+    const offSystem: string = runnerOff.draft.mock.calls[0]![0].system;
+    // Both paths must include the no-fabrication hard ban.
+    expect(onSystem).toContain("FAKE THE OPERATOR");
+    expect(offSystem).toContain("FAKE THE OPERATOR");
+  });
+});
+
+// ── Fail-open: Voyage error / no key ─────────────────────────────────────────
+
+describe("runPostDrafterTick — fail-open on style error", () => {
+  it("drafts the post when a fake fetch always errors (fail-open, no STYLE block)", async () => {
+    const pool: StyleExemplarRow[] = [
+      styleRow({ external_id: "x1", body: "A post body.", like_count: 100, comment_count: 10 }),
+    ];
+    // A fetch that always throws — simulates a Voyage network error.
+    const badFetch = vi.fn().mockRejectedValue(new Error("network error")) as unknown as typeof fetch;
+
+    const runner = makeRunner();
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d1" });
+
+    const n = await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [idea],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
