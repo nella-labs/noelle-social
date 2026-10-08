@@ -198,3 +198,203 @@ posts.post("/api/posts/:ideaId/generate", async (c) => {
   if (!idea) return c.json({ error: "not_found" }, 404);
   if (!(await isOrgMember(auth.userId, idea.org_id))) {
     return c.json({ error: "not_org_member" }, 403);
+  }
+
+  const admitted = await requestContentPostGeneration(sql, { orgId: idea.org_id, ideaId }, {
+    platforms: body.platforms ?? null, guidance: body.guidance,
+  });
+  return c.json({ idea_id: ideaId, status: admitted.idea.status }, 200);
+});
+
+// POST /api/posts/:ideaId/polish — operator asks the agent to sharpen ONE idea's
+// hook/thesis IN PLACE. Enqueue a mode='polish' ideation_requests row (resolving
+// the owning instance from the idea); the Lima ideation worker refines it. Async,
+// like /ideate + /generate — the response is just "queued".
+posts.post("/api/posts/:ideaId/polish", async (c) => {
+  const auth = c.get("auth");
+  const ideaId = c.req.param("ideaId");
+  const sql = noelleDb();
+  const rows = await sql<Array<{ org_id: string }>>`
+    select org_id from noelle.post_ideas where id = ${ideaId} limit 1
+  `;
+  const idea = rows[0];
+  if (!idea) return c.json({ error: "not_found" }, 404);
+  if (!(await isOrgMember(auth.userId, idea.org_id))) {
+    return c.json({ error: "not_org_member" }, 403);
+  }
+  await requestContentPostPolish(sql, { orgId: idea.org_id, ideaId });
+  return c.json({ idea_id: ideaId, queued: true }, 200);
+});
+
+// POST /api/posts/:id/mark-ready — operator approves a generated post draft.
+// An edited body (operator's inline change) lands in final_body.
+posts.post("/api/posts/:id/mark-ready", async (c) => {
+  const auth = c.get("auth");
+  const id = c.req.param("id");
+  let body: PostMarkReadyIn;
+  try {
+    body = PostMarkReadyInSchema.parse(await c.req.json().catch(() => ({})));
+  } catch (err) {
+    return c.json({ error: "invalid_body", detail: err instanceof Error ? err.message : String(err) }, 400);
+  }
+
+  const sql = noelleDb();
+  const rows = await sql<Array<{ org_id: string }>>`
+    select org_id from noelle.post_drafts where id = ${id} limit 1
+  `;
+  const row = rows[0];
+  if (!row) return c.json({ error: "not_found" }, 404);
+  if (!(await isOrgMember(auth.userId, row.org_id))) {
+    return c.json({ error: "not_org_member" }, 403);
+  }
+
+  const edit = await markContentPostReady(sql, { orgId: row.org_id, draftId: id }, body.editedBody);
+  await recordContentEdit(sql, edit);
+  return c.json({ id, status: "ready" }, 200);
+});
+
+// POST /api/posts/:id/mark-posted — explicitly acknowledge manual publication.
+// Archives the draft (status='published') so it leaves the
+// active board. An optional posted URL is stored. Idempotent.
+posts.post("/api/posts/:id/mark-posted", async (c) => {
+  const auth = c.get("auth");
+  const id = c.req.param("id");
+  let body: PostMarkPostedIn;
+  try {
+    body = PostMarkPostedInSchema.parse(await c.req.json().catch(() => ({})));
+  } catch (err) {
+    return c.json({ error: "invalid_body", detail: err instanceof Error ? err.message : String(err) }, 400);
+  }
+
+  const sql = noelleDb();
+  const rows = await sql<Array<{ org_id: string }>>`
+    select org_id from noelle.post_drafts where id = ${id} limit 1
+  `;
+  const row = rows[0];
+  if (!row) return c.json({ error: "not_found" }, 404);
+  if (!(await isOrgMember(auth.userId, row.org_id))) {
+    return c.json({ error: "not_org_member" }, 403);
+  }
+
+  await markContentPostPosted(sql, { orgId: row.org_id, draftId: id }, body.postedUrl);
+  return c.json({ id, status: "published" }, 200);
+});
+
+// POST /api/posts/:draftId/patch — operator edits one platform variant's rich
+// column fields inline (hook / cta / notes / category / stage / body / postedUrl).
+// Only provided fields are written under the shared publication locks.
+posts.post("/api/posts/:draftId/patch", async (c) => {
+  const auth = c.get("auth"), draftId = c.req.param("draftId");
+  let patch: PostPatchIn;
+  try { patch = PostPatchInSchema.parse(await c.req.json().catch(() => ({}))); }
+  catch (err) { return c.json({ error: "invalid_body", detail: err instanceof Error ? err.message : String(err) }, 400); }
+  const sql = noelleDb();
+  const [row] = await sql<{ org_id: string }[]>`select org_id from noelle.post_drafts where id=${draftId} limit 1`;
+  if (!row) return c.json({ error: "not_found" }, 404);
+  if (!(await isOrgMember(auth.userId,row.org_id))) return c.json({ error: "not_org_member" }, 403);
+  const result = await patchContentPostDraft(sql, { orgId: row.org_id, draftId }, patch);
+  await recordContentEdit(sql, result.edit);
+  return c.json({ id: draftId, status: result.status, stage: result.stage }, 200);
+});
+
+// POST /api/posts/:ideaId/schedule — set (or clear) the day an idea sits on in
+// the weekly calendar. Powers drag-onto-a-day + the date picker in the Overview.
+posts.post("/api/posts/:ideaId/schedule", async (c) => {
+  const auth = c.get("auth");
+  const ideaId = c.req.param("ideaId");
+  let body: PostScheduleIn;
+  try {
+    body = PostScheduleInSchema.parse(await c.req.json().catch(() => ({})));
+  } catch (err) {
+    return c.json({ error: "invalid_body", detail: err instanceof Error ? err.message : String(err) }, 400);
+  }
+
+  const sql = noelleDb();
+  const rows = await sql<Array<{ org_id: string }>>`
+    select org_id from noelle.post_ideas where id = ${ideaId} limit 1
+  `;
+  const row = rows[0];
+  if (!row) return c.json({ error: "not_found" }, 404);
+  if (!(await isOrgMember(auth.userId, row.org_id))) {
+    return c.json({ error: "not_org_member" }, 403);
+  }
+
+  await scheduleContentPostIdea(sql, { orgId: row.org_id, ideaId }, body.day);
+  return c.json({ id: ideaId, suggested_day: body.day }, 200);
+});
+
+// POST /api/posts/:ideaId/chat — operator guidance for a post. We persist the
+// turn (drafter_notes scope='post'), optionally pin it as a standing rule, and
+// re-queue the idea so the post-drafter regenerates the post WITH the new
+// guidance (it re-gathers chat + standing notes). The new draft supersedes the
+// old one on the Drafts board. Async by design — the vault + models live on the
+// worker box, not here.
+posts.post("/api/posts/:ideaId/chat", async (c) => {
+  const auth = c.get("auth");
+  const ideaId = c.req.param("ideaId");
+  let body: PostChatIn;
+  try {
+    body = PostChatInSchema.parse(await c.req.json().catch(() => ({})));
+  } catch (err) {
+    return c.json({ error: "invalid_body", detail: err instanceof Error ? err.message : String(err) }, 400);
+  }
+
+  const sql = noelleDb();
+  const rows = await sql<Array<{ org_id: string }>>`
+    select org_id from noelle.post_ideas where id = ${ideaId} limit 1
+  `;
+  const idea = rows[0];
+  if (!idea) return c.json({ error: "not_found" }, 404);
+  if (!(await isOrgMember(auth.userId, idea.org_id))) {
+    return c.json({ error: "not_org_member" }, 403);
+  }
+
+  await requestContentPostGeneration(sql, { orgId: idea.org_id, ideaId }, {
+    guidance: body.message, pin: body.pin,
+    afterQueue: async (tx, current) => {
+      const directiveName = extractStyleDirective(body.message);
+      if (!directiveName) return;
+      const sources = await tx<Array<{ handle: string; display_name: string | null }>>`
+        select handle,display_name from noelle.account_feeder_sources
+        where agent_instance_id=${current.agent_instance_id} and platform='linkedin'
+      `;
+      const handle = resolveStyleSourceHandle(directiveName,
+        sources.map(source => ({ handle: source.handle, displayName: source.display_name })));
+      if (!handle) return;
+      await tx`update noelle.agent_instances set account_feeder_config=coalesce(account_feeder_config,'{}'::jsonb)
+        || jsonb_build_object('pinnedStyleHandle',${handle}::text),updated_at=now()
+        where id=${current.agent_instance_id} and org_id=${current.org_id}`;
+      const label = sources.find(source => source.handle === handle)?.display_name || handle;
+      await tx`insert into noelle.drafter_notes(org_id,agent_instance_id,scope,lane,idea_id,role,body,pinned)
+        values (${current.org_id},${current.agent_instance_id},'post','posts',${current.id},'agent',
+          ${`Styling with ${label}'s posts from now on — grounding drafts in their actual writing. Change or clear this with the Style picker.`},false)`;
+    },
+  });
+  return c.json({ idea_id: ideaId, queued: true, pinned: body.pin }, 200);
+});
+
+// POST /api/posts/notes/:noteId/pin — pin (or unpin) an existing chat turn as a
+// standing rule. Pinning copies it to a scope='standing' row.
+posts.post("/api/posts/notes/:noteId/pin", async (c) => {
+  const auth = c.get("auth");
+  const noteId = c.req.param("noteId");
+  let body: PostPinNoteIn;
+  try {
+    body = PostPinNoteInSchema.parse(await c.req.json().catch(() => ({})));
+  } catch (err) {
+    return c.json({ error: "invalid_body", detail: err instanceof Error ? err.message : String(err) }, 400);
+  }
+
+  const sql = noelleDb();
+  const rows = await sql<
+    Array<{ org_id: string; agent_instance_id: string; lane: string; body: string }>
+  >`
+    select org_id, agent_instance_id, lane, body from noelle.drafter_notes where id = ${noteId} limit 1
+  `;
+  const note = rows[0];
+  if (!note) return c.json({ error: "not_found" }, 404);
+  if (!(await isOrgMember(auth.userId, note.org_id))) {
+    return c.json({ error: "not_org_member" }, 403);
+  }
+
+  if (body.pinned) {
