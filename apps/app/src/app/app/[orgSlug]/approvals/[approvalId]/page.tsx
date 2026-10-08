@@ -398,3 +398,203 @@ export default async function ApprovalDetailPage({
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             {row.vipSignal?.vip ? (
+              <VipFlagBanner
+                orgSlug={orgSlug}
+                instanceId={approval.agent_instance_id}
+                approvalId={approval.id}
+                platform="x"
+                authorLabel={handle}
+                watchlistRef={lp.author_handle ?? null}
+                profileUrl={handleUrl}
+                alreadyWatched={authorWatched}
+                signal={row.vipSignal}
+              />
+            ) : null}
+            {angles.length > 0 ? (
+              <DraftReviewPanel
+                orgSlug={orgSlug}
+                approvalId={approval.id}
+                angles={angles}
+                nextHref={nextHref}
+                listHref={`/app/${orgSlug}/approvals${filterQuery}`}
+                postId={lp.post_id ?? lead?.external_id ?? null}
+              />
+            ) : null}
+            {dmPending ? (
+              <DMReviewPanel
+                orgSlug={orgSlug}
+                approvalId={dmApprovalId}
+                body={dmBody}
+                nextHref={nextHref}
+                listHref={`/app/${orgSlug}/approvals${filterQuery}`}
+                recipientId={lead?.author_id ?? lp.author_id ?? null}
+              />
+            ) : null}
+          </div>
+        )}
+
+        {/* RIGHT — source tweet + lead/classifier/cost cards */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div className="tweet">
+            <div className="tweet-head">
+              <div
+                style={{
+                  width: 42,
+                  height: 42,
+                  borderRadius: "50%",
+                  background: "var(--paper-2)",
+                  boxShadow: "0 0 0 0.5px var(--rule)",
+                  display: "grid",
+                  placeItems: "center",
+                  fontFamily: "var(--display)",
+                  fontSize: 18,
+                  color: "var(--ink)",
+                }}
+              >
+                {lp.author_handle?.[0]?.toUpperCase() ?? "?"}
+              </div>
+              <div>
+                <div className="tweet-h-name">
+                  {handleUrl ? (
+                    <a
+                      href={handleUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ color: "inherit", textDecoration: "none" }}
+                    >
+                      {handle}
+                    </a>
+                  ) : (
+                    handle
+                  )}
+                </div>
+                <div className="tweet-h-handle">
+                  {handle}
+                  {postedAt ? ` · ${timeAgo(postedAt)}` : ""}
+                </div>
+              </div>
+              {handleUrl ? (
+                <a
+                  href={handleUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="btn btn-sm btn-ghost"
+                  style={{
+                    marginLeft: "auto",
+                    textDecoration: "none",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  View post ↗
+                </a>
+              ) : null}
+            </div>
+            <div className="tweet-body">
+              {postText ?? "(post text not synced yet)"}
+            </div>
+            <div className="tweet-meta">
+              {followerLabel ? <span>{followerLabel}</span> : null}
+              {tier ? <span>tier {tier}</span> : null}
+              {classifierScore != null ? (
+                <span>score {Math.round(classifierScore * 100)}</span>
+              ) : null}
+              {classifierLabel ? <span>label · {classifierLabel}</span> : null}
+              {trigger ? <span>trigger · {trigger}</span> : null}
+              {!followerLabel &&
+              !tier &&
+              classifierScore == null &&
+              !classifierLabel &&
+              !trigger ? (
+                <span>classifier signals not synced</span>
+              ) : null}
+            </div>
+          </div>
+
+          {/* Context loaded — the voice anchors the drafter pulled from your
+              local knowledge base to ground this lead's replies + DM. */}
+          <div className="card">
+            <div className="eyebrow">Context loaded</div>
+            <div
+              style={{
+                marginTop: 10,
+                display: "flex",
+                flexDirection: "column",
+                gap: 6,
+              }}
+            >
+              {trigger ? (
+                <div
+                  style={{
+                    fontFamily: "var(--mono)",
+                    fontSize: 11.5,
+                    padding: "6px 8px",
+                    background: "var(--paper-2)",
+                    borderRadius: 6,
+                    color: "var(--ink-2)",
+                  }}
+                >
+                  <span style={{ color: "var(--accent)" }}>◆</span> matched:{" "}
+                  {trigger}
+                </div>
+              ) : null}
+              {anchors.length > 0 ? (
+                anchors.map((a, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      fontSize: 12,
+                      padding: "8px 10px",
+                      background: "var(--paper-2)",
+                      borderRadius: 6,
+                      color: "var(--ink-2)",
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontFamily: "var(--mono)",
+                        fontSize: 10.5,
+                        color: "var(--ink-muted)",
+                      }}
+                    >
+                      anchor {i + 1} · {a.score.toFixed(1)}
+                    </span>
+                    <div style={{ marginTop: 3 }}>{a.snippet}</div>
+                  </div>
+                ))
+              ) : (
+                <div
+                  style={{
+                    fontSize: 12,
+                    padding: "6px 8px",
+                    color: "var(--ink-muted)",
+                  }}
+                >
+                  No vault anchors recorded for this lead (drafted from general
+                  voice, or before anchor capture).
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Classifier — one compact line (score · label · tier · status). */}
+          <div className="card">
+            <div className="eyebrow">Classifier</div>
+            <div
+              style={{
+                marginTop: 8,
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                flexWrap: "wrap",
+                fontFamily: "var(--mono)",
+                fontSize: 12,
+                color: "var(--ink-2)",
+              }}
+            >
+              <span
+                style={{
+                  color:
+                    classifierScore == null
+                      ? "var(--ink-muted)"
+                      : classifierScore >= 0.75
