@@ -198,3 +198,203 @@ async function main() {
         (!drafterLaneOn ||
           (inst.status === "paused" && !isWorkerEnabled(inst, "watchlist")));
       const bus = busForInstance(inst);
+      const run = await recordRun({ sql, kind: "drafter", bus });
+      try {
+        // Admit a complete current rule set before any writer work or new claims.
+        const patternRules = await loadActivePatternRules(sql, {
+          orgId: inst.org_id,
+          agentInstanceId: inst.id,
+          role: "linkedin_intern",
+        });
+        const recoveredAtStartup = await recoverStartupClaims(inst.id);
+        if (recoveredAtStartup.requeued || recoveredAtStartup.reconciled || recoveredAtStartup.approvalsRepaired) {
+          log.warn({ org_id: inst.org_id, ...recoveredAtStartup }, "recovered drafting claims from previous worker process");
+        }
+        // Recover leads stranded at 'drafting' by a crash/restart mid-claim —
+        // without this they are invisible to every future claim (see reapStaleClaims).
+        const reaped = await reapStaleClaims(sql, {
+          agentInstanceId: inst.id,
+          claimedStatus: "drafting",
+          requeueStatus: "classified",
+        });
+        if (reaped.requeued || reaped.expired || reaped.reconciled || reaped.approvalsRepaired) {
+          log.warn({ org_id: inst.org_id, ...reaped }, "reaped stale drafting claims");
+        }
+        const relationshipDmDrafted = await runRelationshipDmsForInstance({
+          sql,
+          instance: inst,
+          runner,
+          postOutbound,
+          log,
+        });
+        // On-demand DM requests run first, independent of the goal/backpressure
+        // gates below — the operator explicitly asked for these DMs.
+        const dmRequests = await claimDmRequestLeads(sql, {
+          agentInstanceId: inst.id,
+          cap: 5,
+        });
+        const replyRequests = await claimReplyRequestLeads(sql, {
+          agentInstanceId: inst.id,
+          cap: 5,
+        });
+        let replyPipelineBlocked = false;
+        let dmDrafted = 0;
+        if (dmRequests.length > 0) {
+          // The DM ladder grounds on the post + person + rung (not the vault KB),
+          // so no Nella knowledge base is needed here. It reads sql to compute the
+          // person's rung (how many DMs already sent) + avoid repeating prior DMs.
+          dmDrafted = await runDmRequestTick({
+            log,
+            instance: inst,
+            claimedLeads: dmRequests,
+            runner,
+            postOutbound,
+            sql,
+          });
+        }
+
+        if (!drafterLaneOn && !notifLaneOn && replyRequests.length === 0) {
+          await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted + dmDrafted });
+          return;
+        }
+
+        // Reply drafting runs while ACTIVE (full funnel) OR while the always-on
+        // WATCHLIST lane is enabled — Lyra is watchlist-only, so a paused instance
+        // with watchlist_enabled keeps drafting replies to watched connections
+        // (e.g. after a goal stalls + auto-pauses). A paused instance with the
+        // watchlist lane OFF ticks here solely for the on-demand DM requests
+        // above, then stops. (The goal block below no-ops while paused — the goal
+        // is always cleared on pause — and the backpressure cap still applies, so
+        // the watchlist lane never buries the operator's inbox.)
+        if (inst.status === "paused" && !isWorkerEnabled(inst, "watchlist") && !notificationsOnly && replyRequests.length === 0) {
+          await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted + dmDrafted });
+          return;
+        }
+
+        // Goal auto-stop: once a goal-run has produced its N approvals, pause the
+        // instance and stop. Checked before any work/spend.
+        const ordinaryReplyLaneAvailable = drafterLaneOn || notifLaneOn || isWorkerEnabled(inst, "watchlist");
+        const goal = ordinaryReplyLaneAvailable
+          ? await enforceGoal(sql, inst, { stallMs: env.LINKEDIN_GOAL_STALL_MIN * 60_000 })
+          : null;
+        if (goal?.paused) {
+          log.info(
+            { org_id: inst.org_id, produced: goal.produced, target: goal.target, stalled: goal.stalled },
+            goal.stalled
+              ? "goal stalled (watchlist exhausted, no new leads) — pipeline paused"
+              : "goal reached — pipeline paused",
+          );
+          if (replyRequests.length === 0) {
+            await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted + dmDrafted });
+            return;
+          }
+          replyPipelineBlocked = true;
+        }
+
+        // Backpressure gate: when the operator's approval inbox is at the
+        // (effective) cap, generating more drafts just buries them.
+        const cap = effectiveDraftsCap(inst);
+        if (ordinaryReplyLaneAvailable && cap != null) {
+          const pending = await countPendingApprovalsForInstance(sql, inst.id);
+          if (pending >= cap) {
+            log.info(
+              { org_id: inst.org_id, pending, cap },
+              "drafter paused: pending approvals at cap",
+            );
+            if (replyRequests.length === 0) {
+              await run.finish({ status: "ok", rowsProcessed: relationshipDmDrafted });
+              return;
+            }
+            replyPipelineBlocked = true;
+          }
+        }
+
+        // Resolve the knowledge base for this tick. local/gcs are shared from
+        // boot; the legacy http backend needs a per-org key, fetched here.
+        let kb: KnowledgeBase;
+        if (sharedKb) {
+          kb = sharedKb;
+        } else {
+          let nellaKey = "";
+          await readyCache.ensure(inst.org_id, "drafter", async () => {
+            nellaKey = await secrets.getForOrg(inst.org_id, "nella-api-key");
+          });
+          if (!nellaKey) nellaKey = await secrets.getForOrg(inst.org_id, "nella-api-key");
+          kb = knowledgeBaseFromNella(createNellaClient({ apiKey: nellaKey, baseUrl: env.NELLA_BASE_URL }), kbWorkspace);
+        }
+
+        // Resolve the org's active Apify token for comment-energy (hot-swap), and
+        // capture the credential id so the comment-fetch spend is attributed to it.
+        let fetchPostComments: ((postUrl: string) => Promise<LinkedInComment[]>) | undefined;
+        if (resolveApify) {
+          try {
+            const apify = await resolveApify(inst.org_id);
+            if (apify) {
+              fetchPostComments = postUrl => withMeteredApifyCall({ client: apify.client, recorder, log,
+                orgId: inst.org_id, instanceId: inst.id, agentRole: "linkedin_intern", worker: "drafter",
+                actor: "linkedin-post-comments", startedAt: new Date(), credentialId: apify.credentialId },
+                operation => operation.postComments({ postUrl, maxComments: env.LINKEDIN_DRAFTER_COMMENT_MAX }));
+            }
+          } catch {
+            log.warn(
+              { org_id: inst.org_id },
+              "apify credential lookup failed; drafting without comment context",
+            );
+          }
+        }
+
+        // Vision caption (B2b): when a lead carries post images, caption them so
+        // the text-only drafter can react to the visual. We build the captionFn
+        // from the org's BYO Gemini key (the same key family the classifier uses);
+        // NOT_FOUND is the common case and just disables vision (captionImages
+        // returns empty context on transport failure). Secret errors disable
+        // captions; budget denial defers drafting for this tick.
+        let captionFn: CaptionFn | undefined;
+        const metering = { context: { orgId: inst.org_id, instanceId: inst.id, agentRole: "linkedin_intern" as const,
+          worker: "drafter", bucket: "vision_caption" }, budget, recorder };
+        try {
+          const geminiKey = await secrets.getForOrg(inst.org_id, "gemini-api-key");
+          if (geminiKey) captionFn = createGeminiCaptionFn({ apiKey: geminiKey, metering });
+        } catch (err) {
+          if (!(err instanceof SecretAccessError) || !/NOT_FOUND/.test(err.message)) {
+            log.warn({ org_id: inst.org_id, err: (err as Error).message }, "gemini key lookup for vision failed; captions disabled");
+          }
+        }
+        // No org BYO key: use the worker's global Gemini key (generativelanguage
+        // API — no ADC, no reauth). Preferred over Vertex ADC on the self-host box
+        // (ADC is flaky there) and keeps vision on a cheap Google path, never paid
+        // Bedrock. Transport failures return empty context; budget denial defers.
+        if (!captionFn && env.NOELLE_GEMINI_API_KEY) {
+          captionFn = createGeminiCaptionFn({ apiKey: env.NOELLE_GEMINI_API_KEY, metering });
+          log.info({ org_id: inst.org_id }, "vision captions via global Gemini key (no org key)");
+        }
+        // Self-host fallback: no Gemini key at all, but Vertex is enabled and the
+        // worker has a service account (GOOGLE_APPLICATION_CREDENTIALS). Caption
+        // via Vertex Gemini with ADC. Auth/transport failures return empty context;
+        // budget denial defers drafting.
+        if (!captionFn && env.NOELLE_VERTEX_ENABLED) {
+          captionFn = createVertexCaptionFn({
+            metering,
+            project: env.GCP_PROJECT,
+            location: env.VERTEX_LOCATION,
+          });
+          log.info({ project: env.GCP_PROJECT, location: env.VERTEX_LOCATION }, "vision captions via Vertex ADC (no gemini key)");
+        }
+        // Last-resort fallback: a vision-capable Claude on AWS Bedrock (PAID; the
+        // CLI subscription can't caption images). Default OFF now
+        // (NOELLE_VISION_BEDROCK) so image posts never silently bill AWS; set
+        // NOELLE_VISION_BEDROCK=1 to opt back in. Transport failures return empty
+        // context; budget denial defers drafting.
+        if (!captionFn && env.NOELLE_VISION_BEDROCK) {
+          captionFn = createBedrockCaptionFn({ metering });
+          log.info({ org_id: inst.org_id }, "vision captions via Bedrock Claude (opt-in)");
+        }
+
+
+
+        // The full drafter arg set, built once and reused by both paths
+        // (notifications-only and the normal two-lane claim) so they can never
+        // drift apart in their grounding, caps, verifier or style config.
+        // Return type pinned to runDrafterTick's parameter. Extracting the arg
+        // set out of the call expression lost CONTEXTUAL typing, so every
+        // callback in it (markStatus, pinNotification, getPriorReplies…) went
