@@ -398,3 +398,133 @@ export function SpeedrunRow({
                   style={{
                     fontFamily: "var(--body)",
                     fontSize: 10.5,
+                    letterSpacing: "0",
+                    textTransform: "none",
+                    color: isPicked ? "var(--accent)" : "var(--ink-muted)",
+                  }}
+                >
+                  {a.kind}
+                </div>
+                <div
+                  style={{
+                    fontFamily: "var(--body)",
+                    fontSize: 10,
+                    color: "var(--ink-soft)",
+                    marginTop: 3,
+                  }}
+                >
+                  {a.quality != null ? (
+                    <>q · {Math.round(a.quality * 100)} · </>
+                  ) : null}
+                  {a.text.length}ch
+                </div>
+                {/* Voice blend (Lyra only) — the same "Style: …%" the full
+                    review surface shows, so you can see whose form shaped the
+                    draft without leaving the speed lane. */}
+                {a.styleSource ? (
+                  <StyleSourceBadge
+                    styleSource={a.styleSource}
+                    className="tag tag-info"
+                    style={{
+                      marginTop: 5,
+                      fontSize: 9,
+                      whiteSpace: "normal",
+                      lineHeight: 1.25,
+                      display: "inline-block",
+                    }}
+                  />
+                ) : null}
+              </div>
+              <div className={styles.angleText}
+              >
+                {a.text}
+              </div>
+              <div
+                className={styles.angleActions}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <CopyButton text={a.text} />
+                {/* Copy the reply AND open the source post in one click — land
+                    on the post with the draft on your clipboard, then paste.
+                    Same affordance both interns share; X keeps its "↗ X" label,
+                    LinkedIn reads "Post ↗". */}
+                {d.postUrl ? (
+                  <a
+                    href={d.postUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={() => {
+                      onPick(a.id);
+                      void copy(a.text);
+                    }}
+                    className="btn btn-sm btn-ghost"
+                    style={{ padding: "0 10px", textDecoration: "none" }}
+                    title="Copy this reply and open the source post. Mark sent after you post it."
+                  >
+                    {openLabel}
+                  </a>
+                ) : null}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      ) : null}
+
+      {copyError ? <span role="status" className="tag" style={{ color: "var(--danger)", margin: 12 }}>{copyError}</span> : null}
+
+      {/* The lead's DM, in the SAME card — so you pick a reply angle AND see
+          the DM together (one boxed card per lead, not separate rows). */}
+      {d.dmText ? (
+        <div
+          style={{
+            padding: "16px 20px",
+            borderTop: "1px solid var(--rule)",
+            background: "var(--paper-2)",
+          }}
+        >
+          <div
+            style={{
+              fontFamily: "var(--body)",
+              fontSize: 10.5,
+              letterSpacing: "0",
+              textTransform: "none",
+              color: "var(--accent)",
+            }}
+          >
+            Direct message · {d.dmText.length}ch
+          </div>
+          <div
+            style={{
+              marginTop: 8,
+              fontSize: 13.5,
+              lineHeight: 1.5,
+              color: "var(--ink)",
+              whiteSpace: "pre-wrap",
+            }}
+          >
+            {d.dmText}
+          </div>
+          <div
+            style={{ display: "flex", gap: 8, marginTop: 12 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <CopyButton text={d.dmText} label="Copy DM" />
+            {canSend ? (
+              <a
+                href={buildXDmUrl(d.lead.recipientId, d.dmText)}
+                target="_blank"
+                rel="noreferrer"
+                className="btn btn-sm"
+                style={{ background: "var(--danger)", color: "#fff", borderColor: "var(--danger)", textDecoration: "none" }}
+                title="Open the X DM composer pre-filled — send it from X (one click)"
+              >
+                Send DM in X ↗
+              </a>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
