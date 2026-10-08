@@ -398,3 +398,26 @@ describe("LinkedIn actor observations API", () => {
   });
 
   it("accepts a direct activity identity without visiting the embed", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    await observation(app, [anonymous]);
+    const [row] = [...db.rows.values()]; db.qualify(row!.externalId);
+    const fetchMock = vi.fn(); vi.stubGlobal("fetch", fetchMock);
+    const response = await identityPost(app, row!.id, "urn:li:activity:7506985845665681408");
+    expect(await response.json()).toEqual({ resolved: true, duplicate: false });
+    expect(row?.externalId).toBe("7506985845665681408");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("tenant checks identity requests and rejects an unsafe identifier before fetching", async () => {
+    const db = fakeDb(); __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", linkedinDiscovery);
+    await observation(app, [anonymous]);
+    const [row] = [...db.rows.values()]; db.qualify(row!.externalId);
+    const fetchMock = vi.fn(); vi.stubGlobal("fetch", fetchMock);
+    expect((await identityGet(app, otherId)).status).toBe(403);
+    expect((await identityPost(app, row!.id, "urn:li:share:7506985844398911488", otherId)).status).toBe(403);
+    expect((await identityPost(app, row!.id, "https://evil.example/post")).status).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
