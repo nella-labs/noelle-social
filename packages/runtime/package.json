@@ -409,7 +409,7 @@
     "@google-cloud/storage": "^7.19.0",
     "@noelle/contracts": "workspace:*",
     "@noelle/secrets": "workspace:*",
-    "ai": "^7.0.107",
+    "ai": "^7.0.127",
     "google-auth-library": "^10.6.2",
     "minisearch": "^7.1.2",
     "openai": "^6.10.0",
