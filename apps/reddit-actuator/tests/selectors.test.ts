@@ -598,3 +598,203 @@ describe("findUpvoteButton (UPVOTE-ONLY)", () => {
   it("new Reddit: skips an already-upvoted post (aria-pressed='true')", () => {
     const post = newPostWithUpvote({ pressed: true });
     expect(findUpvoteButton(post, "new")).toBeNull();
+  });
+  it("old Reddit: returns the un-modded up arrow (never the down arrow)", () => {
+    const root = mount(`<div class="thing link"><div class="arrow up"></div><div class="arrow down"></div></div>`);
+    const btn = findUpvoteButton(root.querySelector(".thing.link")!, "old")!;
+    expect(btn.className).toContain("up");
+    expect(btn.className).not.toContain("down");
+  });
+  it("old Reddit: skips an already-upvoted arrow (.arrow.up.upmod)", () => {
+    const root = mount(`<div class="thing link"><div class="arrow up upmod"></div><div class="arrow down"></div></div>`);
+    expect(findUpvoteButton(root.querySelector(".thing.link")!, "old")).toBeNull();
+  });
+});
+
+describe("findFeedUpvoteTarget (first NOT-already-upvoted post)", () => {
+  it("old Reddit: returns the first post whose up arrow is un-modded", () => {
+    const root = mount(`
+      <div class="thing link" data-fullname="t3_a"><div class="arrow up upmod"></div></div>
+      <div class="thing link" data-fullname="t3_b"><div class="arrow up"></div></div>`);
+    const found = findFeedUpvoteTarget(root, "old")!;
+    expect(found).toBeTruthy();
+    expect(found.post.getAttribute("data-fullname")).toBe("t3_b"); // skipped the already-upvoted t3_a
+  });
+  it("old Reddit: null when every post is already upvoted", () => {
+    const root = mount(`<div class="thing link"><div class="arrow up upmod"></div></div>`);
+    expect(findFeedUpvoteTarget(root, "old")).toBeNull();
+  });
+  it("new Reddit: skips an already-upvoted post and returns the next upvotable one (shadow iteration)", () => {
+    document.body.innerHTML = "";
+    newPostWithUpvote({ pressed: true, id: "t3_a" });
+    newPostWithUpvote({ pressed: false, id: "t3_b" });
+    const found = findFeedUpvoteTarget(document.body, "new")!;
+    expect(found).toBeTruthy();
+    expect(found.post.getAttribute("id")).toBe("t3_b");
+  });
+
+  it("with an rng, picks a RANDOM upvotable post — not pinned to the topmost (ports #429)", () => {
+    const root = mount(`
+      <div class="thing link" data-fullname="t3_a"><div class="arrow up"></div></div>
+      <div class="thing link" data-fullname="t3_b"><div class="arrow up"></div></div>
+      <div class="thing link" data-fullname="t3_c"><div class="arrow up upmod"></div></div>
+      <div class="thing link" data-fullname="t3_d"><div class="arrow up"></div></div>`);
+    const picks = new Set<string>();
+    for (let seed = 1; seed <= 24; seed++) {
+      const found = findFeedUpvoteTarget(root, "old", makeRng(seed))!;
+      expect(found).toBeTruthy();
+      const name = found.post.getAttribute("data-fullname")!;
+      expect(name).not.toBe("t3_c"); // the already-upvoted post is never a candidate
+      picks.add(name);
+    }
+    expect(picks.size).toBeGreaterThan(1); // spread across candidates, not first-match
+  });
+
+  // ── In-view filter (ports LinkedIn locateLikeTarget's viewport restriction) ──
+  // After ambient scrolling the feed DOM holds pages of posts; a uniform pick
+  // over ALL of them regularly lands pages off-screen and the caller's
+  // scrollIntoView executes an instantaneous multi-page teleport with zero wheel
+  // gestures — a bot fingerprint (the class #429 removes). The random pick must
+  // therefore be restricted to posts in/just-below the viewport, falling back to
+  // every candidate only when none is in view.
+  function stubTop(el: Element, top: number): void {
+    (el as HTMLElement).getBoundingClientRect = () =>
+      ({ top, bottom: top + 100, left: 0, right: 100, x: 0, y: top, width: 100, height: 100, toJSON: () => ({}) }) as DOMRect;
+  }
+
+  it("random pick NEVER lands an off-screen post while one is in view (the multi-page scroll-teleport regression)", () => {
+    const root = mount(`
+      <div class="thing link" data-fullname="t3_above"><div class="arrow up"></div></div>
+      <div class="thing link" data-fullname="t3_inview"><div class="arrow up"></div></div>
+      <div class="thing link" data-fullname="t3_below1"><div class="arrow up"></div></div>
+      <div class="thing link" data-fullname="t3_below2"><div class="arrow up"></div></div>`);
+    // jsdom viewport: window.innerHeight = 768 → in-view band is (-200, ~1075).
+    stubTop(root.querySelector('[data-fullname="t3_above"]')!, -3000); // pages scrolled past
+    stubTop(root.querySelector('[data-fullname="t3_inview"]')!, 300); // on screen
+    stubTop(root.querySelector('[data-fullname="t3_below1"]')!, 5000); // pages below
+    stubTop(root.querySelector('[data-fullname="t3_below2"]')!, 9000); // pages below
+    for (let seed = 1; seed <= 32; seed++) {
+      const found = findFeedUpvoteTarget(root, "old", makeRng(seed))!;
+      expect(found.post.getAttribute("data-fullname")).toBe("t3_inview");
+    }
+  });
+
+  it("counts a post just below the fold (top < 1.4×viewport) as in view, like the LinkedIn reference", () => {
+    const root = mount(`
+      <div class="thing link" data-fullname="t3_far"><div class="arrow up"></div></div>
+      <div class="thing link" data-fullname="t3_near"><div class="arrow up"></div></div>`);
+    stubTop(root.querySelector('[data-fullname="t3_far"]')!, 5000);
+    stubTop(root.querySelector('[data-fullname="t3_near"]')!, 900); // just below the fold, within 1.4×768
+    for (let seed = 1; seed <= 16; seed++) {
+      const found = findFeedUpvoteTarget(root, "old", makeRng(seed))!;
+      expect(found.post.getAttribute("data-fullname")).toBe("t3_near");
+    }
+  });
+
+  it("falls back to ALL candidates when none is in view (never returns null just because the feed scrolled on)", () => {
+    const root = mount(`
+      <div class="thing link" data-fullname="t3_a"><div class="arrow up"></div></div>
+      <div class="thing link" data-fullname="t3_b"><div class="arrow up"></div></div>`);
+    stubTop(root.querySelector('[data-fullname="t3_a"]')!, 5000);
+    stubTop(root.querySelector('[data-fullname="t3_b"]')!, 9000);
+    const found = findFeedUpvoteTarget(root, "old", makeRng(3));
+    expect(found).toBeTruthy(); // fallback pool = every candidate
+  });
+
+  it("an already-upvoted post is never picked even when it is the only one in view", () => {
+    const root = mount(`
+      <div class="thing link" data-fullname="t3_voted"><div class="arrow up upmod"></div></div>
+      <div class="thing link" data-fullname="t3_fresh"><div class="arrow up"></div></div>`);
+    stubTop(root.querySelector('[data-fullname="t3_voted"]')!, 300); // in view but already upvoted
+    stubTop(root.querySelector('[data-fullname="t3_fresh"]')!, 5000); // off-screen but upvotable
+    for (let seed = 1; seed <= 8; seed++) {
+      const found = findFeedUpvoteTarget(root, "old", makeRng(seed))!;
+      expect(found.post.getAttribute("data-fullname")).toBe("t3_fresh");
+    }
+  });
+});
+
+describe("upvote skip diagnostics helpers (ports #410)", () => {
+  it("findFeedPosts counts feed containers per flavor", () => {
+    document.body.innerHTML = "";
+    newPostWithUpvote({ id: "t3_a" });
+    newPostWithUpvote({ id: "t3_b" });
+    expect(findFeedPosts(document.body, "new")).toHaveLength(2);
+    const old = mount(`<div class="thing link"></div><div class="thing link"></div><div class="thing comment"></div>`);
+    expect(findFeedPosts(old, "old")).toHaveLength(2); // comments never count as feed posts
+  });
+  it("postHasUpvoteButton is pressed-state-agnostic (unlike findUpvoteButton)", () => {
+    document.body.innerHTML = "";
+    const pressed = newPostWithUpvote({ pressed: true });
+    expect(findUpvoteButton(pressed, "new")).toBeNull(); // already upvoted → no target
+    expect(postHasUpvoteButton(pressed, "new")).toBe(true); // …but the button EXISTS
+    const old = mount(`<div class="thing link"><div class="arrow up upmod"></div></div>`);
+    expect(postHasUpvoteButton(old.querySelector(".thing.link")!, "old")).toBe(true);
+  });
+  it("countUpvoteButtons reaches shreddit-post shadow roots and counts light-DOM buttons once", () => {
+    document.body.innerHTML = "";
+    newPostWithUpvote({ id: "t3_a" });
+    newPostWithUpvote({ pressed: true, id: "t3_b" });
+    expect(countUpvoteButtons(document.body, "new")).toBe(2); // downvote buttons NEVER counted
+    const old = mount(`<div class="thing link"><div class="arrow up"></div><div class="arrow down"></div></div>`);
+    expect(countUpvoteButtons(old, "old")).toBe(1);
+  });
+});
+
+// ── Save (operator opt-in; DEFAULT-OFF; SAVE-ONLY, never a vote) ──────────────
+
+/** Build a new-Reddit shreddit-post with its overflow "…" menu opener in an OPEN
+ *  shadow root (same shadow reach as the upvote fixture). */
+function newPostWithSave(opts: { saved?: boolean; id?: string } = {}): Element {
+  const post = document.createElement("shreddit-post");
+  post.setAttribute("id", opts.id ?? "t3_abc123");
+  post.setAttribute("permalink", "/r/SaaS/comments/abc123/how-we-hit-10k-mrr/");
+  if (opts.saved) post.setAttribute("saved", ""); // boolean attr ⇒ already saved
+  const shadow = post.attachShadow({ mode: "open" });
+  shadow.innerHTML = `
+    <button data-action-bar-action="upvote" aria-pressed="false">Upvote</button>
+    <button data-action-bar-action="overflow" aria-label="more options">…</button>`;
+  document.body.appendChild(post);
+  return post;
+}
+
+describe("findSaveButton (SAVE-ONLY, never a vote)", () => {
+  it("new Reddit: reaches into shreddit-post's OPEN shadow root for the overflow menu opener", () => {
+    const post = newPostWithSave();
+    const btn = findSaveButton(post, "new")!;
+    expect(btn).toBeTruthy();
+    expect(btn.getAttribute("data-action-bar-action")).toBe("overflow"); // the "…" opener, NEVER a vote arrow
+  });
+  it("new Reddit: skips an already-saved post (the `saved` boolean attribute) — never re-save", () => {
+    const post = newPostWithSave({ saved: true });
+    expect(findSaveButton(post, "new")).toBeNull();
+  });
+  it("new Reddit: null when no overflow affordance is present (caller falls back to upvote)", () => {
+    const post = document.createElement("shreddit-post");
+    post.setAttribute("id", "t3_nobtn");
+    post.attachShadow({ mode: "open" }).innerHTML = `<button data-action-bar-action="upvote"></button>`;
+    document.body.appendChild(post);
+    expect(findSaveButton(post, "new")).toBeNull();
+  });
+  it("old Reddit: returns the direct .save-button link whose text is 'save'", () => {
+    const root = mount(`<div class="thing link"><form class="save-button"><a href="#">save</a></form></div>`);
+    const btn = findSaveButton(root.querySelector(".thing.link")!, "old")!;
+    expect(btn).toBeTruthy();
+    expect((btn.textContent ?? "").trim().toLowerCase()).toBe("save");
+  });
+  it("old Reddit: skips an already-saved link (text is 'unsave')", () => {
+    const root = mount(`<div class="thing link"><form class="save-button"><a href="#">unsave</a></form></div>`);
+    expect(findSaveButton(root.querySelector(".thing.link")!, "old")).toBeNull();
+  });
+  it("old Reddit: skips a .thing.link that already carries .saved", () => {
+    const root = mount(`<div class="thing link saved"><form class="save-button"><a href="#">save</a></form></div>`);
+    expect(findSaveButton(root.querySelector(".thing.link")!, "old")).toBeNull();
+  });
+  it("old Reddit: null when there is no save affordance at all", () => {
+    const root = mount(`<div class="thing link"><a class="title">no save here</a></div>`);
+    expect(findSaveButton(root.querySelector(".thing.link")!, "old")).toBeNull();
+  });
+});
+
+describe("findSaveMenuItem (open overflow menu — exact 'Save' word, never Saved/Unsave)", () => {
+  it("finds the Save menuitem by exact word", () => {
