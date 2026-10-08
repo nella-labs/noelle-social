@@ -198,3 +198,13 @@ export async function seedOperator(args: {
       select o.id, r.role, 'paused', r.display_name, ${config.budgetCapCents},
              false, true, false, false, false, false
       from noelle.organizations o,
+        (values ('x_intern','Vega'),('linkedin_intern','Lyra'),
+                ('reddit_intern','Orion'),('video_intern','Nova'))
+          as r(role, display_name)
+      where o.slug = ${orgSlug}
+      on conflict (org_id, role) do nothing
+    `;
+  } finally {
+    await sql.end({ timeout: 1 }).catch(() => {});
+  }
+}

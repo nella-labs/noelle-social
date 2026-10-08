@@ -2198,3 +2198,13 @@ async function main(): Promise<void> {
       break;
     default:
       ui.err(`unknown command: ${cmd}`);
+      printHelp();
+      code = 2;
+  }
+  process.exit(code);
+}
+
+main().catch((err) => {
+  console.error("noelle: fatal:", err instanceof Error ? err.message : err);
+  process.exit(1);
+});
