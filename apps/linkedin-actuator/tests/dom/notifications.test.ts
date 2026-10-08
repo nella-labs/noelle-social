@@ -798,3 +798,4 @@ describe("page furniture is never harvested as somebody's comment", () => {
       </article>`);
     expect(harvestNotifications(root)).toEqual([]);
   });
+});
