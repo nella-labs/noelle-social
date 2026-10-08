@@ -398,3 +398,203 @@ export function findCommentSubmitInfo(root: ParentNode): CommentSubmitHit | null
     if (submitEligible(el)) return { el, via: "bem" };
   }
 
+  // 3) Global scan, but only wordy AND submit-styled — and when a composer box
+  //    exists the hit must FOLLOW it in document order (the submit always
+  //    renders after the editor; the toggle always precedes it). There is
+  //    deliberately NO bare global word pass anymore — that was the proven
+  //    toggle-hijack channel.
+  for (const el of submitCandidates(root)) {
+    if (!(submitWordy(el) && submitPrimary(el))) continue;
+    if (box && !(box.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+    return { el, via: "global-primary" };
+  }
+  return null;
+}
+
+export function findCommentSubmit(root: ParentNode): HTMLElement | null {
+  return findCommentSubmitInfo(root)?.el ?? null;
+}
+
+export interface SubmitSearchDiag {
+  /** a composer box was found at all */
+  box: boolean;
+  /** buttons that are submit-WORDED, FOLLOW the box, and aren't a
+   * toggle/comment-item/messaging button — the exact pool the anchored/global
+   * passes draw from. */
+  wf: number;
+  /** of `wf`, how many are enabled */
+  en: number;
+  /** of the enabled ones, how many have a non-zero layout rect (a click could
+   * actually land) — `en>0, vis=0` means the submit exists and is enabled but
+   * has no box yet (the locator's zero-rect skip fires). */
+  vis: number;
+  /** any button whose aria/text is a submit word anywhere on the page,
+   * including the toggle and thread replies — a floor on "does a 'Comment'-ish
+   * button even exist on this surface". */
+  all: number;
+  /** the most informative candidate + WHY it was rejected, as
+   * `<label>_<dis|zr|pre|tog|itm|msg|nobox|ok>`. */
+  top: string;
+  /** compact dump of the buttons in/around the composer (the 6-hop climb region
+   * plus any worded button), each as
+   * `<label>_<pos><type>_<disabled><zerorect><worded>_g<group>` —
+   *   pos:  f=follows box, p=precedes, n=no box
+   *   type: s=submit, b=button, x=other/none
+   *   group: t=toggle, i=comment-item, m=messaging, n=none
+   * This shows the REAL submit's shape even when it's icon-only (worded=0) or
+   * mis-ordered — the thing the counts alone can't reveal. Space-separated so it
+   * survives the reason sanitizer. */
+  region: string;
+  /** the composer editor + real submit, to answer WHY the submit stays disabled
+   * with text present:
+   *   bx=<tag>.<cls>  the box findCommentBox typed into
+   *   al=<aria>       its aria-label (should be "…creating comment")
+   *   pm=<0/1>        is it inside a ProseMirror/TipTap editor?
+   *   len=<n>         box.textContent length (did our text land here?)
+   *   nce=<n>         how many contenteditables on the page (wrong-box risk)
+   *   sub=<cls>       the type=submit button's classes
+   *   ad=<v>          its aria-disabled
+   *   dis=<v>         its .disabled property
+   * If pm=1,len>0 but dis=true, the editor has our text in the DOM but not its
+   * model. If pm=0 or nce>1, we may be typing into the wrong node. */
+  dom: string;
+}
+
+/**
+ * Why did findCommentSubmitInfo return null? `submit-not-found` collapses three
+ * very different failures — no worded submit exists, one exists but stays
+ * disabled the whole poll, one is enabled but has no layout box (the zero-rect
+ * skip) — into a single reason. This re-walks the same predicates and counts
+ * each bucket so a failure row in linkedin_activity says WHICH, without a live
+ * DevTools session (unavailable during a run). `isZeroRect` is injected: the
+ * content script measures real rects, tests stub it. Read-only, no side effects.
+ */
+export function diagnoseCommentSubmit(
+  root: ParentNode,
+  isZeroRect: (el: HTMLElement) => boolean,
+): SubmitSearchDiag {
+  const box = findCommentBox(root);
+  const buttons = Array.from(root.querySelectorAll<HTMLElement>("button, [role='button']"));
+  const worded = buttons.filter(submitWordy);
+  const follows = (el: HTMLElement) =>
+    !!box && (box.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  const wf = worded.filter(
+    (el) => follows(el) && !toggleLike(el) && el.closest(COMMENT_ITEM_SEL) === null && el.closest(MESSAGING_SEL) === null,
+  );
+  const en = wf.filter((el) => !submitDisabled(el));
+  const vis = en.filter((el) => !isZeroRect(el));
+  const label = (el: HTMLElement) => ((el.getAttribute("aria-label") || el.textContent) ?? "").trim().slice(0, 12);
+  const why = (el: HTMLElement): string =>
+    !box ? "nobox"
+      : submitDisabled(el) ? "dis"
+      : !follows(el) ? "pre"
+      : toggleLike(el) ? "tog"
+      : el.closest(COMMENT_ITEM_SEL) ? "itm"
+      : el.closest(MESSAGING_SEL) ? "msg"
+      : isZeroRect(el) ? "zr"
+      : "ok";
+  // Name the most telling candidate, in priority of what best explains the
+  // failure: an enabled-but-invisible one (locator saw it, skipped on zero rect
+  // → `zr`), then a disabled would-be submit (never enabled → `dis`), then a
+  // healthy enabled+visible one (`ok` — it SHOULD have been clicked, so a real
+  // locator logic bug), then any worded button whose `why` reveals what
+  // excluded it (the only "Comment" is the action-bar toggle → `tog`/`pre`).
+  const pick = en.find(isZeroRect) ?? wf.find(submitDisabled) ?? vis[0] ?? worded[0];
+
+  // Region dump: every button within the box's 6-hop climb scope (where the
+  // real submit must live if the locator is to find it) plus any worded button
+  // elsewhere (the toggles). Names each button's shape so an icon-only or
+  // mis-ordered real submit is visible in the failure row.
+  let region: ParentNode = root;
+  if (box) {
+    let s: HTMLElement = box;
+    for (let i = 0; i < 6 && s.parentElement; i++) s = s.parentElement;
+    region = s;
+  }
+  const near = new Set<HTMLElement>(Array.from(region.querySelectorAll<HTMLElement>("button, [role='button']")));
+  for (const w of worded) near.add(w);
+  // Also every type=submit document-wide — if the real submit sits outside the
+  // 6-hop climb region or precedes the box, it must still surface in the dump.
+  for (const s of Array.from(root.querySelectorAll<HTMLElement>("button[type='submit'], [role='button'][type='submit']"))) near.add(s);
+  const typeChar = (el: HTMLElement) => {
+    const t = el.getAttribute("type");
+    return t === "submit" ? "s" : t === "button" ? "b" : "x";
+  };
+  const groupChar = (el: HTMLElement) =>
+    toggleLike(el) ? "t" : el.closest(COMMENT_ITEM_SEL) ? "i" : el.closest(MESSAGING_SEL) ? "m" : "n";
+  const token = (el: HTMLElement) =>
+    `${label(el).slice(0, 10)}_${box ? (follows(el) ? "f" : "p") : "n"}${typeChar(el)}_` +
+    `${submitDisabled(el) ? 1 : 0}${isZeroRect(el) ? 1 : 0}${submitWordy(el) ? 1 : 0}_g${groupChar(el)}`;
+  const region_ = Array.from(near).slice(0, 8).map(token).join(" ");
+
+  // Composer/editor descriptor — the ground truth for a disabled submit while
+  // text is present. Uses only sanitizer-safe chars ([A-Za-z0-9 _-]); class
+  // names are hashed on 2026 surfaces, so a short fingerprint only — the
+  // booleans (pm/len/nce, ad/dis) carry the signal. Tokens are `key_value`,
+  // space-separated.
+  const safe = (s: string, n: number) => s.replace(/\s+/g, "-").replace(/[^A-Za-z0-9_-]/g, "").slice(0, n);
+  const clsF = (el: Element | null) => (el ? safe((el.className || "").toString(), 16) || "x" : "x");
+  // Describe the button the locator actually resolves to (or the first
+  // submit-worded following candidate when it resolves to none) — NOT merely the
+  // first type=submit on the page, which on LinkedIn is often an unrelated
+  // element (e.g. the Grammarly overlay's hidden submit).
+  const sub =
+    findCommentSubmitInfo(root)?.el ??
+    (box ? worded.find((el) => follows(el)) : undefined) ??
+    null;
+  const nce = root.querySelectorAll("[contenteditable='true']").length;
+  const pmBox = box?.closest(".ProseMirror, .tiptap, [data-testid*='tiptap' i], [data-testid*='editor' i]") ?? null;
+  const dom = box
+    ? `bx_${box.tagName.toLowerCase()} cls_${clsF(box)} al_${safe(box.getAttribute("aria-label") ?? "", 16) || "none"} ` +
+      `pm_${pmBox ? 1 : 0} len_${(box.textContent ?? "").trim().length} nce_${nce} ` +
+      (sub ? `sub_${clsF(sub)} ad_${safe(sub.getAttribute("aria-disabled") ?? "na", 6)} dis_${(sub as HTMLButtonElement).disabled}` : "sub_none")
+    : `bx_none nce_${nce}`;
+
+  return {
+    box: !!box,
+    wf: wf.length,
+    en: en.length,
+    vis: vis.length,
+    all: worded.length,
+    top: pick ? `${label(pick)}_${why(pick)}` : "none",
+    region: region_,
+    dom,
+  };
+}
+
+/**
+ * Returns a button that opens a post's comments to READ them, or null. Ambient
+ * (read-only) decoy: a human scrolling the feed regularly opens the discussion
+ * under a post. Prefers the social-counts "N comments" button — it expands the
+ * thread *without* focusing the composer — and falls back to the action-bar
+ * "Comment" button. Never returns the composer's "Post comment" submit.
+ */
+export function findCommentsToggle(post: Element): HTMLElement | null {
+  // Primary: the social-counts "12 comments" button — opens the thread to read.
+  const counts =
+    post.querySelector<HTMLElement>("button.social-details-social-counts__comments") ??
+    post.querySelector<HTMLElement>(".social-details-social-counts__comments button") ??
+    post.querySelector<HTMLElement>(".social-details-social-counts button[aria-label*='comment' i]");
+  if (counts) return counts;
+
+  // Any button whose aria-label reads like a comment count ("12 comments").
+  for (const btn of Array.from(post.querySelectorAll<HTMLElement>("button[aria-label]"))) {
+    if (/\b\d[\d,]*\s+comments?\b/i.test(btn.getAttribute("aria-label") ?? "")) return btn;
+  }
+
+  // Fallback: the action-bar "Comment" button (opens the section + focuses the
+  // composer). aria-label starts with "Comment" ("Comment on Jane's post"),
+  // which never matches the "Post comment" submit or the "React Like" button.
+  return (
+    post.querySelector<HTMLElement>(".feed-shared-social-action-bar button[aria-label^='Comment' i]") ??
+    post.querySelector<HTMLElement>("button[aria-label^='Comment' i]") ??
+    null
+  );
+}
+
+/** True if the post exposes a comments-open affordance. */
+export function hasComments(post: Element): boolean {
+  return findCommentsToggle(post) !== null;
+}
+
+export function findMessageCompose(root: ParentNode): HTMLElement | null {
