@@ -1398,3 +1398,203 @@ async function deployStatus(vm: string, args: Args): Promise<number> {
       "⚠ VM is behind origin/main — a deploy is pending (or the last one failed). Check `noelle deploy log`.",
     );
   return 0;
+}
+
+async function cmdWorktrees(args: Args): Promise<number> {
+  const sub = args._[1] ?? "prune";
+  if (sub !== "prune") {
+    ui.err(`unknown worktrees subcommand: ${sub} — try: noelle worktrees prune [--force]`);
+    return 2;
+  }
+  const force = bool(args.flags, "force");
+  const repoRoot = str(args.flags, "repo") ? expandHome(str(args.flags, "repo")!) : findRepoRoot();
+  await run("git", ["-C", repoRoot, "fetch", "origin", "main"], { allowFailure: true });
+  const wts = await listWorktrees(repoRoot);
+  if (wts.length === 0) {
+    ui.info("No .claude/worktrees/ worktrees found.");
+    return 0;
+  }
+
+  const removable = wts.filter((w) => classifyWorktree(w) === "removable");
+  const kept = wts.filter((w) => classifyWorktree(w) !== "removable");
+
+  ui.step(
+    force
+      ? "Pruning merged + clean worktrees"
+      : "Worktrees prune (dry-run — pass --force to remove)",
+  );
+  for (const w of removable) {
+    if (force) {
+      const ok = await removeWorktree(repoRoot, w.path);
+      ui.plain(`  ${ok ? "removed" : "FAILED"}  ${w.branch}  ${w.path}`);
+    } else {
+      ui.plain(`  would remove  ${w.branch}  ${w.path}`);
+    }
+  }
+  for (const w of kept) ui.plain(`  keep (${classifyWorktree(w)})  ${w.branch}  ${w.path}`);
+  ui.ok(`${removable.length} removable, ${kept.length} kept.`);
+  return 0;
+}
+
+async function cmdAutoupdate(args: Args): Promise<number> {
+  if (!requireDarwinHost("autoupdate")) return 2;
+  const sub = args._[1] ?? "status";
+  const vm = str(args.flags, "vm") ?? "default";
+
+  if (sub === "install") {
+    // Native install: the same launcher runs `noelle sync` (which dispatches to
+    // the native path), plus a post-commit hook so commits deploy immediately.
+    const nativeCfg = loadConfig();
+    if (isNativeRuntime(nativeCfg)) {
+      const repoRoot = str(args.flags, "repo")
+        ? expandHome(str(args.flags, "repo")!)
+        : findRepoRoot();
+      const branch = str(args.flags, "branch") ?? nativeCfg!.autoUpdate.branch;
+      const intervalMinutes =
+        Number(str(args.flags, "interval")) || nativeCfg!.autoUpdate.intervalMinutes;
+      ui.step("Installing the auto-update LaunchAgent (native)");
+      ui.info(`repo: ${repoRoot}`);
+      ui.info(`tracking: ${branch} every ${intervalMinutes}min`);
+      const pathDirs = await resolvePathDirs();
+      const nodeBin = await resolveStableNode();
+      await autoupdateInstall({ repoRoot, nodeBin, pathDirs, intervalMinutes });
+      installPostCommitHook(repoRoot, {
+        nodeBin,
+        cliEntry: resolve(repoRoot, "apps/cli/dist/index.js"),
+      });
+      nativeCfg!.autoUpdate = { ...nativeCfg!.autoUpdate, enabled: true, branch, intervalMinutes };
+      saveConfig(nativeCfg!);
+      ui.ok(
+        `Installed (${AUTOUPDATE_LABEL}). \`noelle sync\` runs every ${intervalMinutes}min; a post-commit hook fires it on each commit.`,
+      );
+      ui.info(`Test now:  launchctl kickstart -k gui/$(id -u)/${AUTOUPDATE_LABEL}`);
+      return 0;
+    }
+    if (!(await limaInstalled())) {
+      ui.err("limactl not found — this self-host runs inside a Lima VM.");
+      return 1;
+    }
+    const config = await readVmConfig(vm);
+    if (!config) {
+      ui.err(`Could not read VM config for "${vm}"; start + init it first (\`noelle up\`).`);
+      return 1;
+    }
+    const repoRoot = str(args.flags, "repo")
+      ? expandHome(str(args.flags, "repo")!)
+      : findRepoRoot();
+    const branch = str(args.flags, "branch") ?? config.autoUpdate.branch;
+    const intervalMinutes =
+      Number(str(args.flags, "interval")) || config.autoUpdate.intervalMinutes;
+    ui.step("Installing the auto-update LaunchAgent");
+    ui.info(`repo (host): ${repoRoot}`);
+    ui.info(`tracking: ${branch} every ${intervalMinutes}min`);
+    const pathDirs = await resolvePathDirs();
+    const nodeBin = await resolveStableNode();
+    await autoupdateInstall({ repoRoot, nodeBin, pathDirs, intervalMinutes });
+
+    config.autoUpdate = { ...config.autoUpdate, enabled: true, branch, intervalMinutes };
+    await writeVmConfig(vm, config);
+    ui.ok(
+      `Installed (${AUTOUPDATE_LABEL}). The Mac FFs ${branch}, builds, and rsyncs into "${vm}" every ${intervalMinutes}min.`,
+    );
+    ui.info(`Test now without waiting:  launchctl kickstart -k gui/$(id -u)/${AUTOUPDATE_LABEL}`);
+    return 0;
+  }
+  if (sub === "uninstall") {
+    await autoupdateUninstall();
+    const config = await readVmConfig(vm);
+    if (config) {
+      config.autoUpdate.enabled = false;
+      await writeVmConfig(vm, config);
+    }
+    ui.ok("Auto-update LaunchAgent removed. The VM will no longer track the branch.");
+    return 0;
+  }
+  // status (default)
+  const st = await autoupdateStatus();
+  ui.step("Auto-update (periodic Mac → VM sync)");
+  ui.plain(`  loaded     ${st.loaded ? "✓ yes" : "· no"}`);
+  ui.plain(`  plist      ${st.plistExists ? st.plist : "(not installed)"}`);
+  if (st.lastLog) {
+    ui.plain("  recent log:");
+    for (const line of st.lastLog.split("\n")) ui.plain(`    ${line}`);
+  }
+  return 0;
+}
+
+// `noelle doctor` overloads one verb: bare `doctor` runs the read-only
+// self-host preflight it always has; `doctor status|start|logs` drive the
+// actuator-doctor watchdog (apps/actuator-doctor). One command name — as
+// docs/chrome-bridge.md prescribes — without breaking the preflight.
+async function cmdDoctor(args: Args): Promise<number> {
+  const sub = args._[1];
+  if (sub === "status") return doctorStatus();
+  if (sub === "start") return doctorStart(args);
+  if (sub === "logs") return doctorLogs(args);
+  // No sub (or an unrecognized token) → the self-host preflight, unchanged.
+  return doctorPreflight();
+}
+
+// Read-only self-host preflight (container runtime, ports, provider creds, WIF
+// leak check) — the original `noelle doctor`, untouched.
+async function doctorPreflight(): Promise<number> {
+  const config = loadConfig() ?? defaultConfig();
+  ui.step(`Doctor (${platform()})`);
+  const runtime = await detectContainerRuntime();
+  ui.plain(`  container rt   ${runtime ? `✓ ${runtime}` : "· none (native PG mode)"}`);
+  ui.plain(`  pnpm           ${(await hasCommand("pnpm")) ? "✓" : "✗ required"}`);
+  ui.plain(
+    `  cloudflared    ${(await cloudflaredInstalled()) ? "✓ (tunnel ready)" : "· optional"}`,
+  );
+  if (platform() === "darwin") {
+    ui.plain(
+      `  tailscale      ${(await tailscaleInstalled()) ? "✓ (phone access ready)" : "· optional"}`,
+    );
+    ui.plain(`  limactl        ${(await limaInstalled()) ? "✓ (autostart ready)" : "· optional"}`);
+    ui.plain(
+      `  autostart      ${(await autostartLoaded()) ? "✓ login agent loaded" : "· not installed"}`,
+    );
+  }
+
+  for (const [label, port] of [
+    ["postgres", config.postgres.port],
+    ["api-vm", config.ports.apiVm],
+    ["dashboard", config.ports.app],
+  ] as const) {
+    const inUse = await portInUse(port);
+    ui.plain(`  port ${port} (${label})  ${inUse ? "· in use (ok if Noelle owns it)" : "✓ free"}`);
+  }
+
+  // WIF leak check — these must be ABSENT or apps/app uses the IAM connector.
+  const wif = [
+    "NOELLE_GCP_PROJECT_NUMBER",
+    "NOELLE_GCP_POOL_ID",
+    "NOELLE_GCP_PROVIDER_ID",
+    "NOELLE_GCP_SA_EMAIL",
+    "NOELLE_CLOUDSQL_INSTANCE",
+  ].filter((k) => process.env[k]);
+  if (wif.length > 0)
+    ui.warn(
+      `WIF env vars present (${wif.join(", ")}) — unset them; they force the GCP DB connector.`,
+    );
+  else ui.ok("no WIF env vars set");
+
+  const { missing } = collectProviderEnv(config.llmProvider, process.env);
+  if (missing.length > 0)
+    ui.warn(`provider "${config.llmProvider}" missing: ${missing.join(", ")}`);
+  else ui.ok(`provider "${config.llmProvider}" creds present`);
+  return 0;
+}
+
+/** A fetch that failed because nothing is listening (bridge/doctor is down). */
+function isConnRefused(e: unknown): boolean {
+  const code = (e as { cause?: { code?: string }; code?: string })?.cause?.code ?? (e as { code?: string })?.code;
+  return code === "ECONNREFUSED" || (e instanceof Error && /ECONNREFUSED/.test(e.message));
+}
+
+// `noelle doctor status` — read the actuator-doctor's latest tick from
+// ~/.noelle/doctor/last-report.json (a DoctorReport) and summarize it. The
+// doctor writes this file each tick; absence = it hasn't run yet.
+async function doctorStatus(): Promise<number> {
+  const p = paths();
+  const reportPath = resolve(p.doctor, "last-report.json");
