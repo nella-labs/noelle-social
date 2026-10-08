@@ -198,3 +198,203 @@ const SkipInput = z.object({
 
 export type SkipDraftInput = z.infer<typeof SkipInput>;
 
+export type SkipDraftResult =
+  | { ok: true; status: import("@noelle/contracts").ApprovalStatus }
+  | {
+      ok: false;
+      error: {
+        code: string;
+        message: string;
+        status: number;
+        retry_after_ms?: number;
+      };
+    };
+
+// Skip shares the 'approvals.send' bucket so the limit is "approvals work"
+// as a whole, not send vs skip separately. Same cap (60), cost 2 → 30/min.
+export const skipDraft = withRateLimit(
+  "approvals.send",
+  { capacity: 60, refillPerSecond: 1, cost: 2 },
+  async (input: SkipDraftInput): Promise<SkipDraftResult> => {
+    const parsed = SkipInput.parse(input);
+    const wire: DraftSkipIn = { reason: parsed.reason };
+    DraftSkipInSchema.parse(wire);
+
+    try {
+      const res = await noelleFetch<DraftSkipOut>(
+        `/api/drafts/${encodeURIComponent(parsed.approvalId)}/skip`,
+        { method: "POST", body: wire },
+      );
+      DraftSkipOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals`);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals/${parsed.approvalId}`);
+      return { ok: true, status: res.status };
+    } catch (e) {
+      if (e instanceof NoelleApiError) {
+        return {
+          ok: false,
+          error: {
+            code: e.code,
+            message: e.message,
+            status: e.status,
+            retry_after_ms: e.retryAfterMs,
+          },
+        };
+      }
+      throw e;
+    }
+  },
+);
+
+const BulkSkipInput = z.object({
+  orgSlug: z.string().min(1),
+  orgId: z.string().uuid(),
+  approvalIds: z.array(z.string().uuid()).min(1).max(200),
+  reason: z.string().max(500).optional(),
+});
+export type BulkSkipActionResult =
+  | { ok: true; count: number }
+  | { ok: false; error: { code: string; message: string; status: number } };
+
+/**
+ * Soft-skip a batch of picked approvals — the inbox "Skip selected" action.
+ * POSTs to /api/drafts/bulk-skip which flips the pending ones to 'skipped'.
+ * Shares the approvals.send rate bucket (same "approvals work" cap).
+ */
+export const bulkSkipDrafts = withRateLimit(
+  "approvals.send",
+  { capacity: 60, refillPerSecond: 1, cost: 2 },
+  async (input: z.infer<typeof BulkSkipInput>): Promise<BulkSkipActionResult> => {
+    const parsed = BulkSkipInput.parse(input);
+    try {
+      const res = await noelleFetch<BulkSkipOut>(`/api/drafts/bulk-skip`, {
+        method: "POST",
+        body: { org_id: parsed.orgId, approval_ids: parsed.approvalIds, reason: parsed.reason },
+      });
+      BulkSkipOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals`);
+      return { ok: true, count: res.skipped_count };
+    } catch (e) {
+      if (e instanceof NoelleApiError) {
+        return { ok: false, error: { code: e.code, message: e.message, status: e.status } };
+      }
+      throw e;
+    }
+  },
+);
+
+const UnskipInput = z.object({
+  orgSlug: z.string().min(1),
+  approvalId: z.string().uuid(),
+});
+export type UnskipDraftResult =
+  | { ok: true; status: import("@noelle/contracts").ApprovalStatus }
+  | { ok: false; error: { code: string; message: string; status: number; retry_after_ms?: number } };
+
+/**
+ * Reverse a soft-skip ('skipped' -> 'pending') so an accidentally-skipped row
+ * returns to the queue. Shares the approvals.send bucket.
+ */
+export const unskipDraft = withRateLimit(
+  "approvals.send",
+  { capacity: 60, refillPerSecond: 1, cost: 2 },
+  async (input: z.infer<typeof UnskipInput>): Promise<UnskipDraftResult> => {
+    const parsed = UnskipInput.parse(input);
+    try {
+      const res = await noelleFetch<DraftUnskipOut>(
+        `/api/drafts/${encodeURIComponent(parsed.approvalId)}/unskip`,
+        { method: "POST", body: {} },
+      );
+      DraftUnskipOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals`);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals/${parsed.approvalId}`);
+      return { ok: true, status: res.status };
+    } catch (e) {
+      if (e instanceof NoelleApiError) {
+        return { ok: false, error: { code: e.code, message: e.message, status: e.status, retry_after_ms: e.retryAfterMs } };
+      }
+      throw e;
+    }
+  },
+);
+
+const ParkInput = z.object({
+  orgSlug: z.string().min(1),
+  approvalId: z.string().uuid(),
+});
+export type ParkDraftResult =
+  | { ok: true; status: import("@noelle/contracts").ApprovalStatus }
+  | { ok: false; error: { code: string; message: string; status: number; retry_after_ms?: number } };
+
+/**
+ * "Wait for reply": park a DM (status -> 'deferred'). It leaves the pending
+ * inbox and shows on the person's Contacts page with a "Send DM" button.
+ * Shares the approvals.send bucket.
+ */
+export const parkDraft = withRateLimit(
+  "approvals.send",
+  { capacity: 60, refillPerSecond: 1, cost: 2 },
+  async (input: z.infer<typeof ParkInput>): Promise<ParkDraftResult> => {
+    const parsed = ParkInput.parse(input);
+    try {
+      const res = await noelleFetch<DraftParkOut>(
+        `/api/drafts/${encodeURIComponent(parsed.approvalId)}/park`,
+        { method: "POST", body: {} },
+      );
+      DraftParkOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals`);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals/${parsed.approvalId}`);
+      revalidatePath(`/app/${parsed.orgSlug}/contacts`, "layout");
+      return { ok: true, status: res.status };
+    } catch (e) {
+      if (e instanceof NoelleApiError) {
+        return { ok: false, error: { code: e.code, message: e.message, status: e.status, retry_after_ms: e.retryAfterMs } };
+      }
+      throw e;
+    }
+  },
+);
+
+const ScheduleAutoSendInput = z.object({
+  orgSlug: z.string().min(1),
+  orgId: z.string().uuid(),
+  approvalIds: z.array(z.string().uuid()).min(1).max(200),
+});
+export type ScheduleAutoSendActionResult =
+  | { ok: true; count: number; withheld: number; firstAt: string | null; lastAt: string | null }
+  | { ok: false; error: { code: string; message: string; status: number } };
+
+/**
+ * Queue a batch of picked reply approvals for staggered, jittered auto-send.
+ * The api-vm stamps each with a believable target time + skips siblings; the
+ * send worker fires them rate-braked. Shares the approvals.send rate bucket.
+ */
+export const scheduleAutoSend = withRateLimit(
+  "approvals.send",
+  { capacity: 60, refillPerSecond: 1, cost: 2 },
+  async (
+    input: z.infer<typeof ScheduleAutoSendInput>,
+  ): Promise<ScheduleAutoSendActionResult> => {
+    const parsed = ScheduleAutoSendInput.parse(input);
+    try {
+      const res = await noelleFetch<ScheduleAutoSendOut>(
+        `/api/drafts/schedule-auto-send`,
+        { method: "POST", body: { org_id: parsed.orgId, approval_ids: parsed.approvalIds } },
+      );
+      const parsedOut = ScheduleAutoSendOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/approvals`);
+      const times = res.scheduled.map((s) => s.target_at).sort();
+      return {
+        ok: true,
+        count: parsedOut.count,
+        withheld: parsedOut.withheld,
+        firstAt: times[0] ?? null,
+        lastAt: times[times.length - 1] ?? null,
+      };
+    } catch (e) {
+      if (e instanceof NoelleApiError) {
+        return { ok: false, error: { code: e.code, message: e.message, status: e.status } };
+      }
+      throw e;
+    }
+  },
