@@ -398,3 +398,203 @@ code, pre { font-family: "JetBrains Mono", ui-monospace, monospace; }
 .chart-x span { flex: 1; text-align: center; }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+
+/* Loading-skeleton shimmer (opacity, not the dot glow above). */
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+
+/* empty/placeholder for hire */
+.placeholder-card {
+  background: var(--paper); border-radius: 18px; padding: 36px;
+  box-shadow: 0 0 0 0.5px var(--rule);
+  max-width: 620px; margin: 0 auto;
+  text-align: center; position: relative; overflow: hidden;
+}
+/* Visually hidden, still announced. The guided panel's state glyphs are
+   aria-hidden, so the state itself has to reach a screen reader some other way. */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   Guided setup panel
+
+   Replaces the old "bring your agents online" hero, which advertised one step
+   and linked only to Connections. Ink card + star field + accent eyebrow, built
+   from defined tokens only, so it flips with [data-theme] instead of hardcoding
+   hex the way the vault-wizard CSS module did.
+   --------------------------------------------------------------------------- */
+.guided {
+  position: relative;
+  background: var(--ink);
+  color: var(--paper);
+  border-radius: 18px;
+  padding: 26px 28px;
+  margin-bottom: 28px;
+  overflow: hidden;
+  box-shadow: 0 0 0 0.5px var(--ink), 0 18px 36px -16px rgba(31, 26, 18, 0.5);
+}
+.guided-stars {
+  position: absolute; inset: 0; pointer-events: none; opacity: 0.4;
+  background:
+    radial-gradient(circle at 18% 22%, color-mix(in oklch, var(--accent) 80%, transparent) 0 1.6px, transparent 2px),
+    radial-gradient(circle at 82% 18%, var(--paper) 0 1px, transparent 1.6px),
+    radial-gradient(circle at 70% 72%, var(--paper) 0 1.2px, transparent 1.8px),
+    radial-gradient(circle at 32% 82%, color-mix(in oklch, var(--accent) 70%, transparent) 0 1px, transparent 1.6px);
+}
+.guided-body { position: relative; z-index: 1; }
+
+.guided-head { display: flex; align-items: flex-start; gap: 16px; }
+.guided-head-text { flex: 1; min-width: 0; }
+/* --accent-soft, not --accent: this card is inverted (background: var(--ink)),
+   so in the dark theme --accent is a light rust on a light card. --accent-soft
+   flips with the theme (0.88 light / 0.32 dark) and stays legible on both. */
+.guided-eyebrow {
+  font-family: var(--mono, "JetBrains Mono", ui-monospace, monospace);
+  font-size: 12px; font-weight: 500;
+  color: var(--accent-soft);
+}
+.guided-title {
+  font-family: var(--display, "Instrument Serif", Georgia, serif);
+  font-size: 32px; line-height: 1.05; letter-spacing: -0.015em;
+  font-weight: 500; margin: 8px 0 12px;
+  color: var(--paper);
+}
+.guided-title em { font-style: normal; color: inherit; }
+.guided-status {
+  margin: 0;
+  max-width: 68ch;
+  font-size: 13.5px; line-height: 1.55;
+  color: color-mix(in oklch, var(--paper) 78%, transparent);
+}
+
+/* Progress bar — required steps only. */
+.guided-bar {
+  margin: 18px 0 6px;
+  height: 4px; border-radius: 999px;
+  background: color-mix(in oklch, var(--paper) 12%, transparent);
+  overflow: hidden;
+}
+.guided-bar-fill {
+  height: 100%; border-radius: 999px;
+  background: var(--accent-soft);
+  transition: width 0.4s ease;
+}
+.guided-count {
+  font-family: var(--mono, "JetBrains Mono", ui-monospace, monospace);
+  font-size: 10.5px; letter-spacing: 0.06em;
+  color: color-mix(in oklch, var(--paper) 50%, transparent);
+}
+
+/* Step rows */
+.guided-steps { list-style: none; margin: 14px 0 0; padding: 0; }
+.guided-step {
+  display: grid;
+  grid-template-columns: 24px 1fr auto;
+  gap: 14px;
+  align-items: start;
+  padding: 14px 0;
+  border-top: 1px solid color-mix(in oklch, var(--paper) 12%, transparent);
+}
+.guided-step:first-child { border-top: none; }
+
+.guided-mark {
+  width: 24px; height: 24px; border-radius: 999px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; line-height: 1;
+  background: color-mix(in oklch, var(--paper) 10%, transparent);
+  color: color-mix(in oklch, var(--paper) 60%, transparent);
+  box-shadow: 0 0 0 0.5px color-mix(in oklch, var(--paper) 16%, transparent);
+}
+.guided-step[data-state="done"] .guided-mark {
+  background: var(--accent-soft); color: var(--ink);
+  box-shadow: none;
+}
+.guided-step[data-state="current"] .guided-mark {
+  background: transparent;
+  color: var(--accent-soft);
+  box-shadow: 0 0 0 1.5px var(--accent-soft);
+}
+.guided-step[data-state="blocked"] .guided-mark,
+.guided-step[data-state="waiting"] .guided-mark {
+  color: color-mix(in oklch, var(--paper) 40%, transparent);
+}
+
+.guided-step-title {
+  font-size: 14px; font-weight: 500;
+  color: var(--paper);
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.guided-step[data-state="done"] .guided-step-title {
+  color: color-mix(in oklch, var(--paper) 55%, transparent);
+}
+.guided-step[data-state="blocked"] .guided-step-title {
+  color: color-mix(in oklch, var(--paper) 45%, transparent);
+}
+.guided-step-blurb,
+.guided-step-reason {
+  margin: 5px 0 0;
+  font-size: 12.5px; line-height: 1.5;
+  color: color-mix(in oklch, var(--paper) 62%, transparent);
+  max-width: 62ch;
+}
+.guided-step-reason { color: color-mix(in oklch, var(--paper) 48%, transparent); }
+
+.guided-tag {
+  font-family: var(--mono, "JetBrains Mono", ui-monospace, monospace);
+  font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 999px;
+  color: color-mix(in oklch, var(--paper) 55%, transparent);
+  box-shadow: 0 0 0 0.5px color-mix(in oklch, var(--paper) 20%, transparent);
+}
+.guided-tag[data-tier="recommended"] { color: var(--accent-soft); box-shadow: 0 0 0 0.5px var(--accent-soft); }
+/* --warn is light in both themes, so on the inverted card it must be pulled
+   toward the card's own text colour (--paper) to stay above 4.5:1.
+   Measured: 45% warn -> 10.54:1 light, 5.57:1 dark. At 55% the dark theme
+   drops to 4.33:1 and fails AA. */
+.guided-tag[data-tier="advanced"] {
+  color: color-mix(in oklch, var(--warn) 45%, var(--paper));
+  box-shadow: 0 0 0 0.5px color-mix(in oklch, var(--warn) 45%, transparent);
+}
+
+.guided-cta {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 30px; padding: 0 12px;
+  border-radius: 8px;
+  font-size: 12.5px; white-space: nowrap;
+  background: color-mix(in oklch, var(--paper) 8%, transparent);
+  color: var(--paper);
+  box-shadow: 0 0 0 0.5px color-mix(in oklch, var(--paper) 18%, transparent);
+  transition: background 0.15s, transform 0.12s;
+}
+.guided-cta:hover { background: color-mix(in oklch, var(--paper) 14%, transparent); transform: translateY(-1px); }
+.guided-step[data-state="current"] .guided-cta {
+  background: var(--accent-soft); color: var(--ink); box-shadow: none; font-weight: 500;
+}
+.guided-step[data-state="current"] .guided-cta:hover {
+  background: color-mix(in oklch, var(--accent-soft) 88%, var(--ink));
+}
+
+.guided-caveats {
+  margin: 18px 0 0; padding: 12px 14px;
+  border-radius: 12px;
+  background: color-mix(in oklch, var(--warn) 12%, transparent);
+  box-shadow: 0 0 0 0.5px color-mix(in oklch, var(--warn) 40%, transparent);
+}
+.guided-caveat {
+  margin: 0; font-size: 12.5px; line-height: 1.5;
+  color: color-mix(in oklch, var(--paper) 80%, transparent);
+}
+.guided-caveat + .guided-caveat { margin-top: 6px; }
+
+.guided-foot {
+  margin-top: 20px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
