@@ -198,3 +198,49 @@ describe("POST /api/post-drafts generation request correlation", () => {
   });
 
   it("saves explicit X generation requests without schedule reads, writes, or auto-dismissal", async () => {
+    process.env.NOELLE_POST_AUTOSCHEDULE = "true";
+    process.env.NOELLE_POST_AUTOSCHEDULE_AUTOPUBLISH = "true";
+    process.env.NOELLE_POST_AUTOSCHEDULE_MIN_SCORE = "70";
+    const db = makeDb({ role: "x_intern" });
+    __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", postDrafts);
+
+    const res = await app.request("/api/post-drafts", {
+      method: "POST",
+      body: JSON.stringify(draftPayload("x", REQUEST_ID, { generationComplete: true })),
+    });
+
+    expect(res.status).toBe(200);
+    expect(db.drafts).toHaveLength(1);
+    expect(db.drafts[0]).toMatchObject({ platform: "x", generation_request_id: REQUEST_ID });
+    expect(db.scheduleActions).toEqual([]);
+    expect(db.insertQueries[0]).toContain("and <<v2>>::uuid is null");
+    expect(db.requestStatusWrites).toEqual(["drafting"]);
+  });
+
+  it("still auto-schedules ordinary X drafts for Vega when auto-publish is on", async () => {
+    process.env.NOELLE_POST_AUTOSCHEDULE = "true";
+    process.env.NOELLE_POST_AUTOSCHEDULE_AUTOPUBLISH = "true";
+    process.env.NOELLE_POST_AUTOSCHEDULE_MIN_SCORE = "70";
+    const db = makeDb({ role: "x_intern" });
+    __setDbClientForTests(db.sql);
+    const app = new Hono().route("/", postDrafts);
+
+    const res = await app.request("/api/post-drafts", {
+      method: "POST",
+      body: JSON.stringify(draftPayload("x", null)),
+    });
+
+    expect(res.status).toBe(200);
+    expect(db.drafts).toHaveLength(1);
+    expect(db.drafts[0]).toMatchObject({ platform: "x", generation_request_id: null });
+    expect(db.scheduleActions).toEqual([
+      "bind-waiting-slot",
+      "read-existing-slots",
+      "read-last-slot",
+      "insert-auto-slot:auto_publish=true",
+      "mark-draft-scheduled",
+      "mark-idea-ready",
+    ]);
+  });
+});

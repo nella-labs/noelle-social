@@ -598,3 +598,7 @@ describe.skipIf(!url)("native permanent Reddit reply reservations", () => {
         await sql<
           { allowed: boolean }[]
         >`select has_table_privilege('noelle_app','noelle.reddit_reply_claims','DELETE') as allowed`
+      )[0]!.allowed,
+    ).toBe(false);
+  });
+});
