@@ -1,0 +1,4 @@
+listmonk.trynoelle.com {
+  reverse_proxy 127.0.0.1:9000
+  encode gzip
+}
