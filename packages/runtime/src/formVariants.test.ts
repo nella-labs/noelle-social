@@ -198,3 +198,203 @@ describe("TONE_FIRST_ENERGIES", () => {
     // celebration could be handed FLAT_DISAGREE. Nothing else catches that,
     // which is exactly why the two constants now live in the same file.
     for (const energy of TONE_FIRST_ENERGIES) {
+      expect(Object.keys(ENERGY_SHAPE_IDS)).toContain(energy);
+      for (const set of [FORM_VARIANTS, X_FORM_VARIANTS]) {
+        expect(shapesForEnergy(energy, set).length).toBeLessThan(set.length);
+      }
+    }
+  });
+
+  it("every shape is reachable on at least one tone-first energy", () => {
+    // ENERGY_SHAPE_IDS is an ALLOWLIST, so a shape added to a variant set and
+    // not added here becomes silently unreachable on every tone-first energy.
+    // shapesForEnergy cannot tell "left out on purpose" from "forgotten", so
+    // this is the only place that notices.
+    for (const set of [FORM_VARIANTS, X_FORM_VARIANTS, REDDIT_FORM_VARIANTS]) {
+      for (const v of set) {
+        const reachable = [...TONE_FIRST_ENERGIES].some((e) =>
+          shapesForEnergy(e, set).some((x) => x.id === v.id),
+        );
+        expect(reachable, `${v.id} is unreachable on every tone-first energy`).toBe(true);
+      }
+    }
+  });
+
+  it("does not scope an energy that is NOT tone-first", () => {
+    for (const energy of Object.keys(ENERGY_SHAPE_IDS)) {
+      expect(TONE_FIRST_ENERGIES.has(energy)).toBe(true);
+    }
+  });
+});
+
+describe("shapesForEnergy", () => {
+  const X_IDS = X_FORM_VARIANTS.map((v) => v.id);
+
+  it("narrows every tone-first energy on both platforms", () => {
+    for (const energy of ["celebration", "joke", "vent", "hot_take"]) {
+      for (const set of [FORM_VARIANTS, X_FORM_VARIANTS]) {
+        const pool = shapesForEnergy(energy, set);
+        expect(pool.length).toBeGreaterThanOrEqual(3);
+        expect(pool.length).toBeLessThan(set.length);
+      }
+    }
+  });
+
+  it("keeps the wrong shape out of the wrong room", () => {
+    const ids = (energy: string) => shapesForEnergy(energy, X_FORM_VARIANTS).map((v) => v.id);
+    // You cannot disagree with someone's launch, or grade a detail of it.
+    expect(ids("celebration")).not.toContain("FLAT_DISAGREE");
+    expect(ids("celebration")).not.toContain("DETAIL_ZOOM");
+    // Joking at someone venting, or telling them they are wrong about it.
+    expect(ids("vent")).not.toContain("RIFF");
+    expect(ids("vent")).not.toContain("FLAT_DISAGREE");
+    expect(ids("vent")).not.toContain("QUESTION_ONLY");
+    // An earnest three-beat analysis under a shitpost is the bot tell.
+    expect(ids("joke")).not.toContain("THREE_BEAT");
+    expect(ids("joke")).not.toContain("OBSERVE_ASK");
+    // A hot take is answered flat.
+    expect(ids("hot_take")).toContain("FLAT_DISAGREE");
+  });
+
+  it("fails OPEN on an unknown energy, on null, and on analytical", () => {
+    for (const energy of [null, undefined, "analytical", "question", "nonsense"]) {
+      expect(shapesForEnergy(energy, X_FORM_VARIANTS)).toHaveLength(X_FORM_VARIANTS.length);
+      expect(shapesExcludedForEnergy(energy, X_FORM_VARIANTS)).toEqual([]);
+    }
+  });
+
+  it("fails OPEN when a subset resolves too narrowly against a platform's set", () => {
+    // Every id in the table must exist on at least one platform, but a subset
+    // that lands under the floor for THIS platform must return the full set
+    // rather than a two-shape rut.
+    // OBSERVE_ASK / TWO_FLAT / RUN_ON / ASIDE — only ASIDE is a joke shape, so
+    // the subset resolves to 1, under the floor of 3.
+    const narrow = X_FORM_VARIANTS.slice(4, 8);
+    expect(narrow.filter((v) => ENERGY_SHAPE_IDS["joke"]!.includes(v.id)).length).toBeLessThan(3);
+    expect(shapesForEnergy("joke", narrow)).toHaveLength(narrow.length);
+    expect(shapesExcludedForEnergy("joke", narrow)).toEqual([]);
+  });
+
+  it("every id in the table exists on at least one platform", () => {
+    const known = new Set([...FORM_VARIANTS, ...X_FORM_VARIANTS].map((v) => v.id));
+    for (const [energy, ids] of Object.entries(ENERGY_SHAPE_IDS)) {
+      for (const id of ids) {
+        expect(known, `${energy} lists unknown shape ${id}`).toContain(id);
+      }
+    }
+    expect(X_IDS.length).toBeGreaterThan(0);
+  });
+
+  it("shapesExcludedForEnergy is the exact complement of the pool", () => {
+    for (const energy of ["celebration", "joke", "vent", "hot_take"]) {
+      const pool = shapesForEnergy(energy, X_FORM_VARIANTS).map((v) => v.id);
+      const excluded = shapesExcludedForEnergy(energy, X_FORM_VARIANTS);
+      expect([...pool, ...excluded].sort()).toEqual([...X_IDS].sort());
+      expect(pool.some((id) => excluded.includes(id))).toBe(false);
+    }
+  });
+
+  it("leaves a rotation with memory at least one candidate on every energy", () => {
+    // The rotation excludes DEFAULT_ROTATION_MEMORY recent shapes on top of the
+    // energy exclusion. If that emptied the pool, pickFormVariant would fall
+    // back to the FULL set and the energy scoping would silently vanish.
+    for (const energy of ["celebration", "joke", "vent", "hot_take"]) {
+      for (const set of [FORM_VARIANTS, X_FORM_VARIANTS]) {
+        const rotation = createFormVariantRotation(set);
+        const excluded = shapesExcludedForEnergy(energy, set);
+        const allowed = new Set(shapesForEnergy(energy, set).map((v) => v.id));
+        const rng = makeLcg(energy.length + set.length);
+        for (let i = 0; i < 100; i++) {
+          expect(allowed).toContain(rotation.next(rng, excluded).id);
+        }
+      }
+    }
+  });
+});
+
+describe("createFormVariantRotation", () => {
+  it("never hands out the same variant twice in a row", () => {
+    const rng = makeLcg(42);
+    const rotation = createFormVariantRotation();
+    let prev: string | null = null;
+    for (let i = 0; i < 500; i++) {
+      const v = rotation.next(rng);
+      expect(v.id).not.toBe(prev);
+      prev = v.id;
+    }
+  });
+
+  it("honours a per-call lane exclusion on top of the anti-repeat", () => {
+    const rng = makeLcg(9);
+    const rotation = createFormVariantRotation();
+    let prev: string | null = null;
+    for (let i = 0; i < 500; i++) {
+      const v = rotation.next(rng, LIGHT_EXCLUDED_VARIANT_IDS);
+      expect(LIGHT_EXCLUDED_VARIANT_IDS).not.toContain(v.id);
+      expect(v.id).not.toBe(prev);
+      prev = v.id;
+    }
+  });
+
+  it("remembers 3 picks by default", () => {
+    // Pinned, because the two window tests below assert against the CONSTANT
+    // and so would still pass if it regressed to 1. Only this and the
+    // alternation test below catch that.
+    expect(DEFAULT_ROTATION_MEMORY).toBe(3);
+  });
+
+  it("never repeats a shape within the default 3-pick memory window", () => {
+    const rng = makeLcg(42);
+    const rotation = createFormVariantRotation();
+    const seen: string[] = [];
+    for (let i = 0; i < 500; i++) {
+      const v = rotation.next(rng);
+      expect(seen.slice(-DEFAULT_ROTATION_MEMORY)).not.toContain(v.id);
+      seen.push(v.id);
+    }
+  });
+
+  it("holds the memory window across a per-call lane exclusion", () => {
+    const rng = makeLcg(9);
+    const rotation = createFormVariantRotation(X_FORM_VARIANTS);
+    const seen: string[] = [];
+    for (let i = 0; i < 500; i++) {
+      const v = rotation.next(rng, LIGHT_EXCLUDED_VARIANT_IDS);
+      expect(LIGHT_EXCLUDED_VARIANT_IDS).not.toContain(v.id);
+      expect(seen.slice(-DEFAULT_ROTATION_MEMORY)).not.toContain(v.id);
+      seen.push(v.id);
+    }
+  });
+
+  it("kills the A/B/A/B alternation the 1-deep window allowed", () => {
+    // The old rotation excluded only the previous pick, so alternating between
+    // the two heaviest shapes was legal and, on X where MICRO and RUN_ON carry
+    // the top weights, common. Count 4-long alternating runs (x,y,x,y).
+    const rng = makeLcg(7);
+    const rotation = createFormVariantRotation(X_FORM_VARIANTS);
+    const ids: string[] = [];
+    for (let i = 0; i < 1000; i++) ids.push(rotation.next(rng).id);
+    let alternations = 0;
+    for (let i = 3; i < ids.length; i++) {
+      if (ids[i] === ids[i - 2] && ids[i - 1] === ids[i - 3]) alternations++;
+    }
+    expect(alternations).toBe(0);
+  });
+
+  it("trims the memory rather than silently sampling the full set", () => {
+    // pickFormVariant falls back to the FULL variant list when exclusions empty
+    // the pool. So an over-wide window does not throw, it quietly reintroduces
+    // repeats — and a naive window test still passes. Drive a pool small enough
+    // that memory + lane exclusion would empty it, and assert the LANE
+    // exclusion (the one that must never be violated) still holds.
+    const tiny = X_FORM_VARIANTS.slice(0, 4);
+    const lane = [tiny[0]!.id];
+    const rotation = createFormVariantRotation(tiny, 10);
+    const rng = makeLcg(11);
+    for (let i = 0; i < 200; i++) {
+      const v = rotation.next(rng, lane);
+      expect(lane).not.toContain(v.id);
+      expect(tiny.map((t) => t.id)).toContain(v.id);
+    }
+  });
+
