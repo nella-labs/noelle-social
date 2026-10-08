@@ -1198,3 +1198,106 @@ export async function verifyDrafts(
         diversityScore = score;
         if (mostSimilar) {
           const snippet = mostSimilar.length > 120 ? `${mostSimilar.slice(0, 117)}…` : mostSimilar;
+          diversityFix = `This reply reads too much like one you sent recently ("${snippet}"). Take a different shape — change the opener, length, rhythm, and phrasing so it does not echo your recent replies.`;
+        }
+      }
+    }
+  }
+
+  // Fail-open on a broken judge: pass the content dimensions so a flaky judge
+  // never blocks the pipeline. Format + diversity (deterministic) still apply.
+  // Novelty only applies when there's per-person history to compare against;
+  // otherwise force 1.0 so a first-contact reply is never penalized. Also 1.0 on
+  // a failed judge (fail-open).
+  const scores: DimensionScores = {
+    voice: clearScore("voice", judged ? judged.voice : 1),
+    grounding: clearScore("grounding", judged ? judged.grounding : 1),
+    relevance: clearScore("relevance", judged ? judged.relevance : 1),
+    format: formatScore,
+    novelty: hasHistory ? clearScore("novelty", judged ? judged.novelty : 1) : 1,
+    diversity: diversityScore,
+  };
+  const reasons = [
+    ...(judged?.reasons ?? []),
+    ...formatReasons,
+    ...(diversityScore < threshold ? ["reply too similar to a recent reply across the feed — vary the shape"] : []),
+    ...(judgeFailed ? ["verifier judge unavailable — passed open"] : []),
+  ];
+  const pass =
+    scores.voice >= threshold &&
+    scores.grounding >= threshold &&
+    scores.relevance >= threshold &&
+    scores.format >= threshold &&
+    scores.novelty >= threshold &&
+    scores.diversity >= threshold;
+  // The fix the worker appends to the drafter prompt on a regenerate. ALWAYS
+  // surface the deterministic format violations (em dash, slop phrases, choppy)
+  // verbatim so the drafter is told exactly what to drop and why, then add the
+  // judge's voice/grounding fix. (operator: "those stuff I say to AVOID should
+  // land a shitty score and explain why to the drafter".)
+  const fixParts: string[] = [];
+  if (formatReasons.length) fixParts.push(`Hard rule violations — you MUST fix all: ${formatReasons.join("; ")}.`);
+  if (judged?.fix) fixParts.push(judged.fix);
+  if (diversityScore < threshold && diversityFix) fixParts.push(diversityFix);
+  const fix = fixParts.length ? fixParts.join(" ") : null;
+  return { pass, scores, reasons, fix, judgeOk: !judgeFailed, judgeProvider };
+}
+
+function median(nums: number[]): number {
+  if (nums.length === 0) return 0;
+  const s = [...nums].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+}
+
+/**
+ * Tiered verification. Runs `calls.length` independent judges over the same
+ * drafts and combines them:
+ *   - pass = MAJORITY of judges pass (≥ ceil(n/2))
+ *   - each dimension score = MEDIAN across judges (robust to one outlier)
+ *   - reasons/fix taken from the strictest (lowest-scoring) judge
+ * One judge → identical to verifyDrafts. Three judges → adversarial majority
+ * vote (reserve for high-value watchlist leads — it ~3x's the cost).
+ */
+export async function verifyTiered(
+  drafts: DraftToVerify[],
+  ctx: VerifyContext,
+  calls: VerifierCall[],
+  opts?: { passThreshold?: number; jevRun?: JevRun },
+): Promise<DraftVerdict> {
+  if (calls.length <= 1) {
+    return verifyDrafts(drafts, ctx, calls[0]!, opts);
+  }
+  const verdicts = await Promise.all(
+    calls.map((c) => verifyDrafts(drafts, ctx, c, opts)),
+  );
+  const passVotes = verdicts.filter((v) => v.pass).length;
+  const pass = passVotes >= Math.ceil(verdicts.length / 2);
+  const scores: DimensionScores = {
+    voice: median(verdicts.map((v) => v.scores.voice)),
+    grounding: median(verdicts.map((v) => v.scores.grounding)),
+    relevance: median(verdicts.map((v) => v.scores.relevance)),
+    format: Math.min(...verdicts.map((v) => v.scores.format)),
+    novelty: median(verdicts.map((v) => v.scores.novelty)),
+    // Deterministic + identical across judges, so min == median; min keeps it
+    // strict if a judge ever varied.
+    diversity: Math.min(...verdicts.map((v) => v.scores.diversity)),
+  };
+  // Strictest judge (lowest mean) supplies the actionable fix + reasons.
+  const strictest = [...verdicts].sort(
+    (a, b) =>
+      a.scores.voice + a.scores.grounding + a.scores.relevance + a.scores.novelty -
+      (b.scores.voice + b.scores.grounding + b.scores.relevance + b.scores.novelty),
+  )[0]!;
+  return {
+    pass,
+    scores,
+    reasons: strictest.reasons,
+    fix: strictest.fix,
+    // Strict: every adversarial judge must have genuinely returned, else the set
+    // is not judge-ok (fail-CLOSED for the unattended auto-send gate).
+    judgeOk: verdicts.every((v) => v.judgeOk === true),
+    judgeProvider: verdicts.every((v) => v.judgeProvider === verdicts[0]!.judgeProvider)
+      ? (verdicts[0]!.judgeProvider ?? "none") : "mixed",
+  };
+}

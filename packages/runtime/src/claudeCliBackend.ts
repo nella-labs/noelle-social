@@ -198,3 +198,100 @@ const AUTH_PATTERN = /invalid api key|oauth|not logged in|log ?in|credit balance
  */
 const NO_TOOLS: readonly string[] = ["--tools", "", "--disable-slash-commands"];
 
+/** Pre-`--tools` deny-list, kept only for the old-CLI fallback below. */
+const LEGACY_DISALLOWED_TOOLS =
+  "Bash Edit Write Read Glob Grep WebFetch WebSearch Task NotebookEdit";
+
+/** commander's complaint when the installed CLI does not know a flag. */
+const UNKNOWN_OPTION = /(?:unknown|unrecognized) option[\s:=]+['"`]?--(?:tools|disable-slash-commands)\b/i;
+
+export function createClaudeCliBackend(
+  opts?: CreateClaudeCliBackendOptions,
+): ClaudeCliBackend {
+  const cliPath = opts?.cliPath ?? (process.env.NOELLE_CLAUDE_CLI_PATH?.trim() || "claude");
+  const configuredTimeout = process.env.NOELLE_CLAUDE_CLI_TIMEOUT_MS?.trim();
+  const defaultTimeoutMs = opts?.timeoutMs ?? (configuredTimeout ? Number(configuredTimeout) : 180_000);
+  const spawn = opts?.spawnImpl ?? nodeSpawn;
+
+  const runCli = async (argv: string[], prompt: string, timeoutMs: number) => {
+    const childEnv = { ...process.env };
+    for (const key of SANITIZED_KEYS) delete childEnv[key];
+    let output: Awaited<ReturnType<typeof runCliProcess>>;
+    try {
+      output = await runCliProcess({ command: cliPath, argv, prompt, timeoutMs,
+        env: childEnv, cwd: tmpdir(), spawnImpl: spawn });
+    } catch (error) {
+      const reason = error instanceof CliProcessError ? error.code : "failed";
+      const detail = reason === "timed_out" ? `timed out after ${timeoutMs}ms` : reason;
+      throw new ClaudeCliError(`claude cli ${detail}`, error instanceof CliProcessError ? error.stderr : undefined);
+    }
+    const { stdout, stderr, code } = output;
+    let json: { type?: unknown; is_error?: unknown; result?: unknown; subtype?: unknown; total_cost_usd?: unknown;
+      usage?: { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number; output_tokens?: number } } | null = null;
+    try {
+      const value: unknown = JSON.parse(stdout.trim());
+      if (value !== null && typeof value === "object" && !Array.isArray(value)) json = value;
+    } catch { /* Handled as an invalid completion below. */ }
+    if (json?.is_error === true) {
+      const detail = typeof json.result === "string" ? json.result : typeof json.subtype === "string" ? json.subtype : "unknown";
+      if (AUTH_PATTERN.test(detail) || AUTH_PATTERN.test(stderr)) {
+        throw new ClaudeCliAuthError(`claude cli auth failure: ${detail}`, stderr);
+      }
+      throw new ClaudeCliError(`claude cli result error: ${detail}`, stderr);
+    }
+    if (code !== 0) {
+      if (AUTH_PATTERN.test(stderr)) throw new ClaudeCliAuthError(`claude cli auth failure (exit ${code ?? "null"})`, stderr);
+      throw new ClaudeCliError(`claude cli exited ${code ?? "null"}`, stderr);
+    }
+    if (!json || json.type !== "result" || (json.is_error !== undefined && json.is_error !== false)
+      || typeof json.result !== "string" || !json.result.trim()) {
+      throw new ClaudeCliError("claude cli returned an invalid completion", stderr);
+    }
+    const usage: TokenUsage = {
+      ...reportedAnthropicUsage(json.usage),
+      ...(typeof json.total_cost_usd === "number" && Number.isFinite(json.total_cost_usd) && json.total_cost_usd >= 0
+        ? { cost_usd: json.total_cost_usd } : {}),
+    };
+    return { text: json.result, usage };
+  };
+
+  return {
+    async call(args) {
+      const target = resolveClaudeCliTarget(args.model);
+      const base = [
+        "--print",
+        "--output-format",
+        "json",
+        "--model",
+        target.model,
+        ...(target.effort ? ["--effort", target.effort] : []),
+        "--system-prompt",
+        args.system,
+        "--strict-mcp-config",
+      ];
+
+      // A per-call budget wins over the backend default: one global timeout
+      // cannot serve both a ~9s drafter reply and a ~160s pattern-breaker run.
+      let timeoutMs: number;
+      try { timeoutMs = cliTimeoutMs(args.timeoutMs ?? defaultTimeoutMs); }
+      catch { throw new ClaudeCliError("claude cli invalid_request"); }
+      const deadline = performance.now() + timeoutMs;
+      try {
+        return await runCli([...base, ...NO_TOOLS], args.prompt, timeoutMs);
+      } catch (err) {
+        // Nothing pins the CLI version on the VM. On a binary that predates
+        // `--tools`, commander rejects the flag and EVERY call fails — and
+        // because callAgentModel rewrites the routing FALLBACK through this
+        // same engine for an llm_backend='claude' org, there is no unpaid
+        // rescue behind it. Degrade to the old deny-list instead of losing the
+        // call: expensive, but the org keeps working.
+        if (err instanceof ClaudeCliError && UNKNOWN_OPTION.test(err.stderr ?? "")) {
+          const remainingMs = Math.ceil(deadline - performance.now());
+          if (remainingMs < 1) throw new ClaudeCliError(`claude cli timed out after ${timeoutMs}ms`);
+          return await runCli([...base, "--disallowed-tools", LEGACY_DISALLOWED_TOOLS], args.prompt, remainingMs);
+        }
+        throw err;
+      }
+    },
+  };
+}
