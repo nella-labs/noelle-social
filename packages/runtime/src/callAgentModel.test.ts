@@ -798,3 +798,203 @@ describe("codex failover when Claude authentication expires", () => {
       },
       {
         ...deps({ vertex, "claude-cli": cli, "codex-cli": codex }),
+        getLlmBackend: async () => "claude",
+      },
+    );
+
+    expect(res.text).toBe("codex-text");
+    expect(res.engineUsed).toEqual({ engine: "codex-cli", model: "gpt-5" });
+    expect(res.outcome).toBe("fallback");
+    expect(vertex.call).toHaveBeenCalledOnce();
+    expect(cli.call).toHaveBeenCalledOnce();
+    expect(codex.call).toHaveBeenCalledOnce();
+  });
+});
+
+describe("Codex primary mode", () => {
+  it("keeps an explicit subscription-only call on Codex at the requested effort", async () => {
+    const paid = failingBackend(new Error("paid primary must not be called"));
+    const cli = failingBackend(new Error("Claude must not be called"));
+    const codex = stubBackend("codex-only");
+
+    const res = await callAgentModel(
+      {
+        ...baseArgs,
+        codexSubscriptionOnly: true,
+        codexReasoningEffort: "high",
+        routing: { primary: { engine: "vertex", model: "gemini-2-5-pro" } },
+      },
+      deps({ vertex: paid, "claude-cli": cli, "codex-cli": codex }),
+    );
+
+    expect(res.text).toBe("codex-only");
+    expect(res.engineUsed).toEqual({ engine: "codex-cli", model: "gpt-5" });
+    expect(res.outcome).toBe("ok");
+    expect(codex.call).toHaveBeenCalledWith(expect.objectContaining({ reasoningEffort: "high" }));
+    expect(codex.call).toHaveBeenCalledOnce();
+    expect(cli.call).not.toHaveBeenCalled();
+    expect(paid.call).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when Codex is not wired", async () => {
+    const paid = failingBackend(new Error("paid primary must not be called"));
+    const cli = failingBackend(new Error("Claude must not be called"));
+
+    await expect(
+      callAgentModel(
+        {
+          ...baseArgs,
+          codexSubscriptionOnly: true,
+          routing: { primary: { engine: "openai", model: "gpt-5" } },
+        },
+        deps({ openai: paid, "claude-cli": cli }),
+      ),
+    ).rejects.toThrow('engine "codex-cli" not configured');
+
+    expect(cli.call).not.toHaveBeenCalled();
+    expect(paid.call).not.toHaveBeenCalled();
+  });
+
+  it("uses Codex directly without probing the configured Claude subscription", async () => {
+    const prev = process.env.NOELLE_CODEX_PRIMARY;
+    process.env.NOELLE_CODEX_PRIMARY = "1";
+    try {
+      const cli = failingBackend(new Error("Claude must not be called"));
+      const codex = stubBackend("codex-primary");
+
+      const res = await callAgentModel(
+        {
+          ...baseArgs,
+          routing: { primary: { engine: "bedrock", model: "claude-opus-4-6" } },
+        },
+        {
+          ...deps({ "claude-cli": cli, "codex-cli": codex }),
+          getLlmBackend: async () => "claude",
+        },
+      );
+
+      expect(res.text).toBe("codex-primary");
+      expect(res.engineUsed).toEqual({ engine: "codex-cli", model: "gpt-5" });
+      expect(res.outcome).toBe("ok");
+      expect(codex.call).toHaveBeenCalledOnce();
+      expect(cli.call).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.NOELLE_CODEX_PRIMARY;
+      else process.env.NOELLE_CODEX_PRIMARY = prev;
+    }
+  });
+
+  it("falls back to the configured engine without probing Claude when Codex fails", async () => {
+    const prev = process.env.NOELLE_CODEX_PRIMARY;
+    process.env.NOELLE_CODEX_PRIMARY = "1";
+    try {
+      const bedrock = stubBackend("bedrock-fallback");
+      const cli = failingBackend(new Error("Claude must not be called"));
+      const codex = failingBackend(new Error("codex unavailable"));
+
+      const res = await callAgentModel(
+        {
+          ...baseArgs,
+          routing: { primary: { engine: "bedrock", model: "claude-opus-4-6" } },
+        },
+        {
+          ...deps({ bedrock, "claude-cli": cli, "codex-cli": codex }),
+          getLlmBackend: async () => "claude",
+        },
+      );
+
+      expect(res.text).toBe("bedrock-fallback");
+      expect(res.engineUsed).toEqual({ engine: "bedrock", model: "claude-opus-4-6" });
+      expect(res.outcome).toBe("fallback");
+      expect(codex.call).toHaveBeenCalledOnce();
+      expect(bedrock.call).toHaveBeenCalledOnce();
+      expect(cli.call).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.NOELLE_CODEX_PRIMARY;
+      else process.env.NOELLE_CODEX_PRIMARY = prev;
+    }
+  });
+
+  it("uses the supplied Bedrock route directly when the caller opts out of global overrides", async () => {
+    const prev = process.env.NOELLE_CODEX_PRIMARY;
+    process.env.NOELLE_CODEX_PRIMARY = "1";
+    try {
+      const bedrock: EngineBackend = {
+        call: vi
+          .fn()
+          .mockRejectedValueOnce(new Error("sonnet unavailable"))
+          .mockResolvedValueOnce({
+            text: "opus-repair",
+            usage: { input_tokens: 10, output_tokens: 20 },
+          }),
+      };
+      const codex = stubBackend("codex-primary");
+      const cli = stubBackend("claude-cli-primary");
+      const getLlmBackend = vi.fn(async () => "claude" as const);
+
+      const res = await callAgentModel(
+        {
+          ...baseArgs,
+          directRouting: true,
+          routing: {
+            primary: { engine: "bedrock", model: "claude-sonnet-4-6" },
+            fallback: { engine: "bedrock", model: "claude-opus-4-6" },
+          },
+        },
+        {
+          ...deps({ bedrock, "claude-cli": cli, "codex-cli": codex }),
+          getLlmBackend,
+        },
+      );
+
+      expect(res.text).toBe("opus-repair");
+      expect(res.engineUsed).toEqual({ engine: "bedrock", model: "claude-opus-4-6" });
+      expect(res.outcome).toBe("fallback");
+      expect(bedrock.call).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(bedrock.call).mock.calls.map(([call]) => call.model)).toEqual([
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+      ]);
+      expect(codex.call).not.toHaveBeenCalled();
+      expect(cli.call).not.toHaveBeenCalled();
+      expect(getLlmBackend).not.toHaveBeenCalled();
+    } finally {
+      if (prev === undefined) delete process.env.NOELLE_CODEX_PRIMARY;
+      else process.env.NOELLE_CODEX_PRIMARY = prev;
+    }
+  });
+});
+
+describe("the codex pot has a ceiling of its own", () => {
+  const overCap: CallAgentModelDeps["budget"] = {
+    estimateCents: () => 100,
+    adapters: {
+      fetchSpend: vi.fn(async () => ({ bucket: 9999, org: 9999, instance: 9999 })),
+      fetchCaps: vi.fn(async () => ({ bucket: 10000, org: 10000, instance: 10000 })),
+    },
+  };
+  const withCodexSpend = (cents: number): CallAgentModelDeps["budget"] => ({
+    ...overCap,
+    adapters: { ...overCap.adapters, fetchEngineSpend: vi.fn(async () => cents) },
+  });
+  const routing = { primary: { engine: "claude-cli" as const, model: "claude-opus-4-6" as const } };
+
+  it("fails over while the ChatGPT pot has room", async () => {
+    const codex = stubBackend("codex-text");
+    const res = await callAgentModel(
+      { ...baseArgs, routing },
+      { engines: { "claude-cli": stubBackend("x"), "codex-cli": codex },
+        budget: withCodexSpend(10_000), recorder: noopSpendRecorder },
+    );
+    expect(res.text).toBe("codex-text");
+  });
+
+  it("stops instead of failing over once the ChatGPT pot is spent too", async () => {
+    // 'Exempt from the Claude cap' was left meaning 'unbounded'. Both pots
+    // spent means the work genuinely stops, which is the point of a budget.
+    const err = await callAgentModel(
+      { ...baseArgs, routing },
+      { engines: { "claude-cli": stubBackend("x"), "codex-cli": stubBackend("codex") },
+        budget: withCodexSpend(50_000), recorder: noopSpendRecorder },
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(BudgetExceededError);
