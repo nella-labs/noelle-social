@@ -198,3 +198,49 @@ function EngagementSection({ published, color }: { published: NonNullable<Awaite
                 <MetricTh>Impr.</MetricTh>
                 <MetricTh>Likes</MetricTh>
                 <MetricTh>Reposts</MetricTh>
+                <MetricTh>Replies</MetricTh>
+              </tr>
+            </thead>
+            <tbody>
+              {top.map((p) => (
+                <PostRow key={p.externalId} post={p} color={color} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MetricTh({ children }: { children: ReactNode }) {
+  return <th style={{ padding: "6px 8px", fontWeight: 400, textAlign: "right", whiteSpace: "nowrap" }}>{children}</th>;
+}
+
+function PostRow({ post, color }: { post: PublishedPostPerf; color: string }) {
+  const label = post.preview && post.preview.length > 0 ? post.preview : `tweet ${post.externalId}`;
+  const clipped = label.length > 90 ? `${label.slice(0, 90)}…` : label;
+  return (
+    <tr style={{ borderTop: "0.5px solid var(--rule)" }}>
+      <td style={{ padding: "9px 8px 9px 0", maxWidth: 380 }}>
+        {post.url ? (
+          <a href={post.url} target="_blank" rel="noreferrer" style={{ color: "var(--ink)", textDecoration: "none" }}>
+            {clipped}
+          </a>
+        ) : (
+          <span style={{ color: "var(--ink)" }}>{clipped}</span>
+        )}
+      </td>
+      <td style={{ padding: "9px 8px", textAlign: "right", fontFamily: "var(--mono)", color: post.views == null ? "var(--ink-soft)" : color, whiteSpace: "nowrap" }}>
+        {post.views == null ? "—" : fmt(post.views)}
+      </td>
+      <MetricTd>{fmt(post.likes)}</MetricTd>
+      <MetricTd>{fmt(post.reposts)}</MetricTd>
+      <MetricTd>{fmt(post.replies)}</MetricTd>
+    </tr>
+  );
+}
+
+function MetricTd({ children }: { children: ReactNode }) {
+  return <td style={{ padding: "9px 8px", textAlign: "right", fontFamily: "var(--mono)", color: "var(--ink)", whiteSpace: "nowrap" }}>{children}</td>;
+}
