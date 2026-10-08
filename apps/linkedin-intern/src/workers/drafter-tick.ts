@@ -3198,3 +3198,52 @@ export async function runIntroDmTick(args: RunIntroDmTickArgs): Promise<number> 
       // Synthetic, POST-LESS lead. There is no source post — this is a first-touch
       // DM — so the lead fields describe the PERSON, not a post: a stable
       // `<fsd>:intro` id, the placeholder post text, the person's profile URL, and
+      // a single kind="dm" draft. No autoSend (Lyra is draft-only).
+      const publicIdOrFsd = person.publicId || person.fsdProfileId;
+      const outbound: OutboundIn = {
+        leadId: `${person.fsdProfileId}:intro`,
+        batchNumber: null,
+        platform: "linkedin",
+        authorHandle: person.publicId ?? person.fsdProfileId,
+        authorId: person.fsdProfileId,
+        authorFollowers: null,
+        allowsDms: null,
+        originalPostId: `${person.fsdProfileId}:intro`,
+        originalPostText: INTRO_DM_POST_TEXT,
+        originalPostUrl: `https://www.linkedin.com/in/${publicIdOrFsd}/`,
+        postedAt: null,
+        matchedTrigger: null,
+        drafts: [
+          {
+            id: randomUUID(),
+            kind: "dm",
+            angle: null,
+            body,
+            charCount,
+            dmVoiceCheck: { pass: true, attempts: reviewed.attempts, reasons: reviewed.reasons },
+          },
+        ],
+        tier: null,
+        postKind: "intro_dm",
+        verifierMeta: null,
+        // NO autoSend block — Lyra never auto-sends.
+      };
+      await postOutbound(outbound);
+      drafted++;
+      await markStatus?.({ fsdProfileId: person.fsdProfileId, status: "drafted", meta: { engine: res.engine, model: res.model } });
+      log.info(
+        { fsdProfileId: person.fsdProfileId, handle: person.publicId ?? person.fsdProfileId, chars: charCount },
+        "intro-dm: queued one-time intro DM",
+      );
+    } catch (err) {
+      // Fail-open per person: one failure must never abort the tick (or strand the
+      // other claimed people). The person is already stamped, so this DM is lost.
+      log.error(
+        { fsdProfileId: person.fsdProfileId, err: (err as Error).message },
+        "intro-dm: generation failed; continuing",
+      );
+      await markStatus?.({ fsdProfileId: person.fsdProfileId, status: "errored", meta: { error: (err as Error).message } }).catch(() => {});
+    }
+  }
+  return drafted;
+}
