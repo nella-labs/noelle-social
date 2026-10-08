@@ -198,3 +198,35 @@ describe("verified dashboard cookie identity", () => {
     expect(await result).toBeNull();
   });
   it("deduplicates verification only for the same request cookie jar and separates another user", async () => {
+    cookie({ access_token: token({}, "HS256") });
+    const server = fetch;
+    expect(await getUserFromCookies()).toMatchObject({ id: userId });
+    expect(await getUserFromCookies()).toMatchObject({ id: userId });
+    expect(server).toHaveBeenCalledTimes(1);
+    cookie({ access_token: token({ sub: otherId }, "HS256") });
+    expect(await getUserFromCookies()).toMatchObject({ id: otherId });
+    expect(server).toHaveBeenCalledTimes(2);
+  });
+  it("preserves the configured native operator identity without a Supabase request", async () => {
+    vi.stubEnv("NOELLE_AUTH_MODE", "local");
+    vi.stubEnv("NOELLE_LOCAL_OPERATOR_SUB", otherId);
+    vi.stubEnv("NOELLE_LOCAL_OPERATOR_EMAIL", "operator@example.com");
+    cookie({ user: { id: userId, email: "unsigned@example.com" } });
+    expect(await getUserFromCookies()).toMatchObject({
+      id: otherId,
+      email: "operator@example.com",
+      app_metadata: { provider: "local" },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it("resolves the native operator first organization through the same identity owner", async () => {
+    vi.stubEnv("NOELLE_AUTH_MODE", "local");
+    vi.stubEnv("NOELLE_LOCAL_OPERATOR_SUB", otherId);
+    const response = await firstOrg(
+      new Request("https://dashboard.example/api/onboarding/first-org-slug"),
+    );
+    expect(await response.json()).toEqual({ slug: "member-org" });
+    expect(state.sql.mock.calls[0]?.[1]).toBe(otherId);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});
