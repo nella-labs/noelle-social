@@ -198,3 +198,156 @@ const TOOLS: Tool[] = [
       properties: {
         action: { type: "string", enum: ["attach", "command", "detach"], description: "attach = take the slot, command = send a CDP method, detach = release." },
         tabId: { type: "number", description: "Target tab id." },
+        method: { type: "string", description: "CDP method for action:'command', e.g. 'Runtime.evaluate'." },
+        params: { type: "object", description: "CDP params object for action:'command', e.g. { expression: '1+1' }." },
+        force: { type: "boolean", description: "For action:'attach' only: attach even on an actuator domain or an already-attached tab. Use with care — it can derail a live actuator run." },
+      },
+      required: ["action", "tabId"],
+    },
+  },
+  {
+    name: "chrome_logs",
+    description:
+      "Query the actuator log sink (~/.noelle/logs/actuators). Filter by source (e.g. 'x-actuator', 'linkedin-actuator', 'reddit-intern', 'actuator-doctor', 'chrome-bridge-ext'), sinceMs (unix ms lower bound), level, grep (substring on the message), and limit.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Filter to one source slug." },
+        sinceMs: { type: "number", description: "Only entries at/after this unix-ms timestamp." },
+        level: { type: "string", enum: ["debug", "info", "warn", "error"], description: "Minimum/exact level filter (bridge-defined)." },
+        grep: { type: "string", description: "Substring match on the log message." },
+        limit: { type: "number", description: "Max entries to return." },
+      },
+    },
+  },
+  {
+    name: "chrome_heartbeats",
+    description:
+      "Bridge + extension health (is Chrome connected? ext/chrome versions) plus the latest heartbeat per actuator source (state, age, stale flag). The one-glance 'is everything alive' check.",
+    inputSchema: NO_ARGS,
+  },
+  {
+    name: "chrome_doctor",
+    description:
+      "The actuator-doctor's latest health snapshot (read from ~/.noelle/doctor/last-report.json): current probes, matched failure signatures, and remediation state. Empty with a hint if the doctor has not run yet.",
+    inputSchema: NO_ARGS,
+  },
+];
+
+// Build the raw ChromeOp for an op-backed tool (validated by ChromeOpSchema
+// before it leaves). Returns null when the tool is not op-backed / unknown.
+function buildOp(name: string, a: Args): unknown {
+  switch (name) {
+    case "chrome_tabs":
+      return { op: "tabs.list", urlPattern: str(a, "urlPattern") };
+    case "chrome_open":
+      return { op: "tabs.create", url: str(a, "url"), active: bool(a, "active") };
+    case "chrome_navigate":
+      return { op: "tabs.navigate", tabId: num(a, "tabId"), url: str(a, "url") };
+    case "chrome_close":
+      return { op: "tabs.close", tabId: num(a, "tabId") };
+    case "chrome_eval":
+      return { op: "dom.eval", tabId: num(a, "tabId"), expression: str(a, "expression"), world: str(a, "world") };
+    case "chrome_click":
+      return { op: "dom.click", tabId: num(a, "tabId"), selector: str(a, "selector") };
+    case "chrome_type":
+      return { op: "dom.type", tabId: num(a, "tabId"), selector: str(a, "selector"), text: str(a, "text") };
+    case "chrome_query":
+      return { op: "dom.query", tabId: num(a, "tabId"), selector: str(a, "selector"), limit: num(a, "limit") };
+    case "chrome_screenshot":
+      return { op: "page.screenshot", tabId: num(a, "tabId") };
+    case "chrome_console":
+      return { op: "page.console", tabId: num(a, "tabId"), limit: num(a, "limit") };
+    case "chrome_extensions":
+      return { op: "ext.list" };
+    case "chrome_reload_extension":
+      return { op: "ext.reload", extId: str(a, "extId") };
+    case "chrome_debugger": {
+      const action = str(a, "action");
+      const tabId = num(a, "tabId");
+      switch (action) {
+        case "attach":
+          return { op: "debugger.attach", tabId, force: bool(a, "force") };
+        case "command":
+          return { op: "debugger.command", tabId, method: str(a, "method"), params: rec(a, "params") };
+        case "detach":
+          return { op: "debugger.detach", tabId };
+        default:
+          throw new Error(`chrome_debugger: action must be 'attach', 'command', or 'detach' (got ${action ?? "undefined"}).`);
+      }
+    }
+    default:
+      return null;
+  }
+}
+
+async function handle(name: string, a: Args): Promise<ToolResult> {
+  switch (name) {
+    case "chrome_logs": {
+      const result = await client.logs({
+        source: str(a, "source"),
+        sinceMs: num(a, "sinceMs"),
+        level: str(a, "level"),
+        grep: str(a, "grep"),
+        limit: num(a, "limit"),
+      });
+      return toolResult(result, isFailure(result));
+    }
+    case "chrome_heartbeats": {
+      // Surface bridge/ext health alongside the actuator heartbeats — the agent
+      // wants to know Chrome is even connected before trusting stale heartbeats.
+      const [heartbeats, bridge] = await Promise.all([client.heartbeats(), client.health()]);
+      return toolResult({ bridge, heartbeats }, isFailure(bridge) || isFailure(heartbeats));
+    }
+    case "chrome_doctor": {
+      const result = await client.doctorReport();
+      return toolResult(result, isFailure(result));
+    }
+    default: {
+      const raw = buildOp(name, a);
+      if (raw === null) return errorResult(`Unknown tool: ${name}`);
+      const op = ChromeOpSchema.parse(raw); // fills defaults, rejects bad input
+      const result = await client.op(op);
+      return toolResult(result, isFailure(result));
+    }
+  }
+}
+
+async function main(): Promise<void> {
+  const server = new Server(
+    { name: "chrome-bridge", version: "0.0.1-alpha.0" },
+    { capabilities: { tools: {} } },
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const name = req.params.name;
+    const args = (req.params.arguments ?? {}) as Args;
+    try {
+      return await handle(name, args);
+    } catch (err) {
+      if (err instanceof ZodError) {
+        const detail = err.issues
+          .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+          .join("; ");
+        return errorResult(`invalid arguments for ${name}: ${detail}`);
+      }
+      return errorResult(`executing ${name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  // stdout is the JSON-RPC channel; all logging must go to stderr.
+  console.error(`[chrome-bridge-mcp] ready — ${TOOLS.length} tools (bridge ${process.env.NOELLE_BRIDGE_URL || "http://127.0.0.1:18792"})`);
+
+  const shutdown = (): void => process.exit(0);
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+main().catch((err) => {
+  console.error("[chrome-bridge-mcp] fatal:", err);
+  process.exit(1);
+});
