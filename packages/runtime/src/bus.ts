@@ -198,3 +198,55 @@ export function createBus(args: CreateBusArgs): Bus {
     async get<T = unknown>(bucket: BusBucket, key: string): Promise<T | null> {
       const rows = await exec(
         `select value
+           from noelle.bus_state
+          where org_id = $1 and bucket = $2 and key = $3
+            and (expires_at is null or expires_at > now())
+          limit 1`,
+        [orgId, bucket, key],
+      );
+      const r = rows[0];
+      if (!r) return null;
+      return parseJson(r.value) as T;
+    },
+
+    async list(bucket) {
+      const rows = await exec(
+        `select bucket, key, value, version, updated_by_worker, updated_at
+           from noelle.bus_state
+          where org_id = $1 and bucket = $2
+            and (expires_at is null or expires_at > now())
+          order by key`,
+        [orgId, bucket],
+      );
+      return rows.map((r) => ({
+        bucket: String(r.bucket),
+        key: String(r.key),
+        value: parseJson(r.value),
+        version: Number(r.version), // bigint comes back as a string
+        updatedByWorker: (r.updated_by_worker as string | null) ?? null,
+        updatedAt: toIso(r.updated_at),
+      }));
+    },
+
+    async tail(opts) {
+      const limit = BusEventsQuerySchema.shape.limit.parse(
+        Math.max(1, Math.min(Math.floor(opts?.limit ?? 50), 500)),
+      );
+      const params: unknown[] = [orgId];
+      let where = "org_id = $1";
+      if (opts?.topic) {
+        params.push(opts.topic);
+        where += " and topic = $2";
+      }
+      const rows = await exec(
+        `select id, agent_instance_id, agent_role, worker, topic, severity, summary, payload, correlation_id, created_at
+           from noelle.bus_events
+          where ${where}
+          order by created_at desc
+          limit ${limit}`,
+        params,
+      );
+      return rows.map(mapEvent);
+    },
+  };
+}
