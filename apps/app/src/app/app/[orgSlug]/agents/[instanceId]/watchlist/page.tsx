@@ -798,3 +798,203 @@ function NumField({
   step,
 }: {
   name: string;
+  label: string;
+  hint: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+}) {
+  return (
+    <label style={{ display: "block" }}>
+      <span style={{ display: "block", fontSize: 12.5, fontWeight: 600, marginBottom: 4 }}>{label}</span>
+      <input
+        className="input"
+        type="number"
+        name={name}
+        defaultValue={value}
+        min={min}
+        max={max}
+        step={step ?? 1}
+        style={{ width: "100%" }}
+      />
+      <span style={{ display: "block", fontSize: 11, color: "var(--ink-muted)", marginTop: 4, lineHeight: 1.35 }}>
+        {hint}
+      </span>
+    </label>
+  );
+}
+
+function CreatorColumn({
+  orgSlug,
+  instanceId,
+  rows,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  rows: VideoSourceRow[];
+}) {
+  return (
+    <section className="card">
+      <div className="card-h">
+        <h3>Creators</h3>
+        <span className="tag">{rows.length}</span>
+      </div>
+      <p className="muted" style={{ fontSize: 12, margin: "0 0 12px" }}>
+        The IG/TikTok creators Nova studies. Add a handle (no @). Disable one to skip it on the next harvest without removing it.
+      </p>
+      <form
+        action={async (fd: FormData) => {
+          "use server";
+          const handle = String(fd.get("handle") ?? "");
+          if (!handle) return;
+          const platform = String(fd.get("platform") ?? "instagram") === "tiktok" ? "tiktok" : "instagram";
+          await addVideoSource({ orgSlug, instanceId, handle, platform });
+        }}
+        style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}
+      >
+        <input name="handle" placeholder="chrisdoesviral" className="input" style={{ flex: "1 1 140px", minWidth: 0 }} required maxLength={200} />
+        <select name="platform" className="input" style={{ flex: "0 0 110px" }} defaultValue="instagram">
+          <option value="instagram">Instagram</option>
+          <option value="tiktok">TikTok</option>
+        </select>
+        <button className="btn btn-sm btn-accent" type="submit">Add</button>
+      </form>
+      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        {rows.map((r) => (
+          <li
+            key={r.id}
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              padding: "8px 0",
+              borderTop: "1px dashed var(--rule-soft)",
+            }}
+          >
+            <div style={{ minWidth: 0 }}>
+              <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, opacity: r.enabled ? 1 : 0.5 }}>
+                {r.platform === "tiktok" ? "tiktok" : "ig"} · @{r.handle}
+              </span>
+              <div style={{ fontSize: 11.5, color: "var(--ink-muted)", marginTop: 2 }}>
+                {r.follower_count != null ? `${fmtCount(r.follower_count)} followers` : "followers unknown"}
+                {r.enabled ? "" : " · disabled"}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <form
+                action={async () => {
+                  "use server";
+                  await toggleVideoSource({ orgSlug, instanceId, rowId: r.id, enabled: !r.enabled });
+                }}
+              >
+                <button className="btn btn-xs" type="submit">{r.enabled ? "Disable" : "Enable"}</button>
+              </form>
+              <form
+                action={async () => {
+                  "use server";
+                  await removeVideoSource({ orgSlug, instanceId, rowId: r.id });
+                }}
+              >
+                <button className="btn btn-xs" type="submit">×</button>
+              </form>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function NicheColumn({
+  orgSlug,
+  instanceId,
+  rows,
+  hasObjective,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  rows: VideoNicheRow[];
+  hasObjective: boolean;
+}) {
+  return (
+    <section className="card">
+      <div className="card-h">
+        <h3>Niche lanes</h3>
+        <span className="tag">{rows.length}</span>
+      </div>
+      <p className="muted" style={{ fontSize: 12, margin: "0 0 12px" }}>
+        Keyword/hashtag lanes for the newest top performers in a niche (no # needed).
+        Let Nova plan them from your objective, or add your own.
+      </p>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
+        <PlanLanesButton orgSlug={orgSlug} instanceId={instanceId} hasObjective={hasObjective} />
+      </div>
+      <form
+        action={async (fd: FormData) => {
+          "use server";
+          const query = String(fd.get("query") ?? "");
+          if (!query) return;
+          const platform = String(fd.get("platform") ?? "instagram") === "tiktok" ? "tiktok" : "instagram";
+          await addVideoNiche({ orgSlug, instanceId, query, platform });
+        }}
+        style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}
+      >
+        <input name="query" placeholder="ai founders" className="input" style={{ flex: "1 1 140px", minWidth: 0 }} required maxLength={200} />
+        <select name="platform" className="input" style={{ flex: "0 0 110px" }} defaultValue="instagram">
+          <option value="instagram">Instagram</option>
+          <option value="tiktok">TikTok</option>
+        </select>
+        <button className="btn btn-sm btn-accent" type="submit">Add</button>
+      </form>
+      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        {rows.map((r) => (
+          <li
+            key={r.id}
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              padding: "8px 0",
+              borderTop: "1px dashed var(--rule-soft)",
+            }}
+          >
+            <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, opacity: r.enabled ? 1 : 0.5 }}>
+              {r.platform === "tiktok" ? "tiktok" : "ig"} · #{r.query}
+            </span>
+            <form
+              action={async () => {
+                "use server";
+                await removeVideoNiche({ orgSlug, instanceId, rowId: r.id });
+              }}
+            >
+              <button className="btn btn-xs" type="submit">×</button>
+            </form>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function DiscoverList({ clips }: { clips: VideoClipRow[] }) {
+  if (clips.length === 0) {
+    return (
+      <section className="card">
+        <div className="card-h">
+          <h3>Discover — top harvested videos</h3>
+        </div>
+        <p className="muted" style={{ fontSize: 12, margin: 0 }}>
+          Nothing harvested yet. Add creators above and hit “Harvest now”.
+        </p>
+      </section>
+    );
+  }
+  return (
+    <section className="card">
+      <div className="card-h">
+        <h3>Discover — top harvested videos</h3>
+        <span className="tag">{clips.length}</span>
+      </div>
