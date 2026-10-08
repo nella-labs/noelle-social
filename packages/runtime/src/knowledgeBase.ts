@@ -598,3 +598,160 @@ export function createLocalFsKnowledgeBase(
           if (debounceTimer) clearTimeout(debounceTimer);
           debounceTimer = setTimeout(() => {
             dirty = true;
+          }, debounceMs);
+          if (debounceTimer.unref) debounceTimer.unref();
+        });
+        w.on("error", () => {
+          // watch unsupported on this mount; mtime+TTL still cover us.
+        });
+        watchers.push(w);
+      } catch {
+        // missing dir / watch unsupported — mtime+TTL fallback still covers us.
+      }
+    }
+  }
+
+  /** All markdown paths across the scoped roots, de-duped (roots may overlap). */
+  async function scopedPaths(): Promise<string[]> {
+    const out: string[] = [];
+    for (const root of roots) out.push(...(await walkMarkdown(root)));
+    return [...new Set(out)];
+  }
+
+  async function rebuild(): Promise<BuiltIndex> {
+    const paths = await scopedPaths();
+    if (opts.includeDirs && opts.includeDirs.length > 0 && paths.length === 0 && !warnedEmptyScope) {
+      warnedEmptyScope = true;
+      // Loud, because the caller's relevance gate will skip every non-bypass lead
+      // when the corpus is empty — a misconfigured NOELLE_VOICE_DIRS must not fail
+      // silently. We deliberately do NOT fall back to the whole vault (that would
+      // quietly reintroduce the pollution this scoping exists to remove).
+      console.warn(
+        `[knowledgeBase] includeDirs ${JSON.stringify(opts.includeDirs)} under ${opts.dir} matched ZERO markdown files — the voice index is empty and gated drafts will be skipped. Check the paths.`,
+      );
+    }
+    const chunks: MarkdownChunk[] = [];
+    for (const p of paths) {
+      let body = "";
+      try {
+        body = await readFile(p, "utf8");
+      } catch {
+        continue;
+      }
+      const rel = relative(opts.dir, p);
+      for (const c of chunkMarkdown(rel, body)) chunks.push(c);
+    }
+    const index = buildChunkIndex(chunks);
+    const chunkPos = new Map<MarkdownChunk, number>();
+    chunks.forEach((c, i) => chunkPos.set(c, i));
+    // Embed the corpus for the dense lane (once per rebuild, amortized over the
+    // TTL window). Fail-open: null ⇒ search serves pure BM25.
+    const dense = denseCfg ? await buildDenseForCorpus(chunks, denseCfg) : null;
+    return {
+      index,
+      chunks,
+      chunkPos,
+      dense,
+      builtAt: Date.now(),
+      signature: await corpusSignature(paths),
+    };
+  }
+
+  async function ensureBuilt(): Promise<BuiltIndex> {
+    const ttlExpired = built ? Date.now() - built.builtAt >= ttl : true;
+    if (built && !dirty && !ttlExpired) {
+      // Cheap watch-fallback: rebuild only if the corpus signature changed.
+      const sig = await corpusSignature(await scopedPaths());
+      if (sig === built.signature) return built;
+    }
+    built = await rebuild();
+    dirty = false;
+    return built;
+  }
+
+  return {
+    async search(query, topK = DEFAULT_TOP_K, opts) {
+      topK = searchResultLimit(topK);
+      if (!query.trim() || topK === 0) return [];
+      const built = await ensureBuilt();
+      const filterDirs = opts?.filterDirs;
+
+      // Pure BM25 (the default, and the fallback when the corpus embed failed).
+      // Byte-identical to the pre-dense behavior.
+      if (!built.dense || !denseCfg) {
+        // When scoping, rank a widened pool then filter so we still return topK
+        // hits from the allowed dirs (the index ranks-then-slices to its arg).
+        const ranked = built.index.search(query, scopedCandidateTopK(topK, filterDirs));
+        const hits: KbHit[] = [];
+        for (const { chunk, score, highlights } of ranked) {
+          if (!filePathInDirs(chunk.filePath, filterDirs)) continue;
+          hits.push(toKbHit(chunk, score, highlights));
+          if (hits.length >= topK) break;
+        }
+        return hits;
+      }
+
+      return hybridSearch(built, denseCfg, query, topK, filterDirs);
+    },
+    async ready() {
+      try {
+        await readdir(opts.dir);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    close() {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      for (const w of watchers) w.close();
+      watchers.length = 0;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Adapter: wrap an existing NellaClient (gcs shim / legacy http) as a KB
+// ---------------------------------------------------------------------------
+
+/**
+ * Adapt a NellaClient to the KnowledgeBase interface. Used for the managed
+ * (GCS) and legacy (HTTP) backends so the drafter only knows KnowledgeBase.
+ * `workspace` is fixed at construction (the last vestige of the Nella model).
+ * A blank workspace disables retrieval without contacting the backend.
+ */
+export function knowledgeBaseFromNella(
+  client: Pick<NellaClient, "searchContext">,
+  workspace: string,
+): KnowledgeBase {
+  workspace = workspace.trim();
+  if (!workspace) {
+    return {
+      async search() { return []; },
+      async ready() { return false; },
+    };
+  }
+  return {
+    async search(query, topK = DEFAULT_TOP_K, opts) {
+      topK = searchResultLimit(topK);
+      if (!query.trim() || topK === 0) return [];
+      // Scoping (widen-then-filter) is handled inside the NellaClient backend.
+      const args: Parameters<typeof client.searchContext>[0] = { workspace, query, topK };
+      if (opts?.filterDirs && opts.filterDirs.length > 0) args.filterDirs = opts.filterDirs;
+      const hits = await client.searchContext(args);
+      return hits.map((h) => ({
+        snippet: h.snippet,
+        score: h.score,
+        highlights: [...h.highlights],
+        source: { filePath: h.filePath, startLine: h.startLine, endLine: h.endLine },
+      }));
+    },
+    async ready() {
+      try {
+        await client.searchContext({ workspace, query: "ping", topK: 1 });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
