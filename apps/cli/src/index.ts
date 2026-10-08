@@ -798,3 +798,203 @@ async function cmdAutostartRun(args: Args): Promise<number> {
     if (await tailscaleInstalled()) {
       try {
         await tailscaleServe(appPort, mode, port);
+        const url = await tailscaleResolveUrl(mode, port);
+        config.remoteAccess.tailscale.url = url;
+        await writeVmConfig(vm, config);
+        ui.ok(`Exposed → ${url ?? "(url unresolved)"}`);
+      } catch (err) {
+        ui.warn(`tailscale serve failed: ${(err as Error).message}`);
+      }
+    } else {
+      ui.warn("tailscale not installed; skipping expose.");
+    }
+  } else {
+    ui.info("Tailscale expose disabled in config; skipping.");
+  }
+  ui.ok("[autostart-run] done");
+  return 0;
+}
+
+/** Native login bring-up: start the stack on this Mac, then expose over Tailscale. No VM. */
+async function autostartRunNative(args: Args, config: SelfHostConfig): Promise<number> {
+  ui.step("[autostart-run] native (no VM)");
+  const upCode = await cmdUp(args); // ensures Postgres + pm2 (dev dashboard) locally
+  if (upCode !== 0) ui.warn(`noelle up exited ${upCode} (continuing to expose)`);
+  if (config.remoteAccess.tailscale.enabled && (await tailscaleInstalled())) {
+    const { mode, port } = config.remoteAccess.tailscale;
+    try {
+      await tailscaleServe(config.ports.app, mode, port);
+      const url = await tailscaleResolveUrl(mode, port);
+      config.remoteAccess.tailscale.url = url;
+      saveConfig(config);
+      ui.ok(`Exposed → ${url ?? "(url unresolved)"}`);
+    } catch (err) {
+      ui.warn(`tailscale serve failed: ${(err as Error).message}`);
+    }
+  }
+  ui.ok("[autostart-run] done (native)");
+  return 0;
+}
+
+/**
+ * Internal: invoked by the auto-update LaunchAgent (and runnable by hand).
+ * Fast-forward the tracked branch on the Mac, build here (the 4 GB VM OOM-kills
+ * on `next build`), then rsync the built repo into the VM. Skips build+ship when
+ * the branch head hasn't moved since the last sync.
+ */
+/**
+ * The one deploy pipeline. Called by `noelle sync` (auto:true, run by the
+ * LaunchAgent) and `noelle deploy` (auto:false, manual). Serialized by the Mac
+ * deploy lock; ships only when origin/<branch> advanced past lastSyncedSha;
+ * stamps the shipped SHA into the tree; restarts VM workers; advances
+ * lastSyncedSha ONLY after a successful restart so a failed restart self-heals.
+ */
+async function runDeploy(args: Args, opts: { auto: boolean }): Promise<number> {
+  // Git exports GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE to hook children (the
+  // post-commit hook spawns `noelle sync`). Inherited, they silently retarget
+  // every `git -C <repoRoot>` call at the COMMITTING repo — a worktree commit
+  // once deployed a branch sha this way. The hook scrubs too; this is the
+  // belt-and-braces for every other entry path.
+  delete process.env.GIT_DIR;
+  delete process.env.GIT_WORK_TREE;
+  delete process.env.GIT_INDEX_FILE;
+  const vm = str(args.flags, "vm") ?? "default";
+  if (platform() !== "darwin") {
+    ui.err("deploy is host-only — it builds on the Mac and rsyncs into the VM.");
+    return 2;
+  }
+  // Native install: no VM. Build the local checkout + restart local workers.
+  const hostConfig = loadConfig();
+  if (isNativeRuntime(hostConfig)) return runDeployNative(args, opts, hostConfig!);
+  const force = bool(args.flags, "force");
+  const config = await readVmConfig(vm);
+  if (!config) {
+    ui.err(`Could not read VM config for "${vm}"; is the VM up and initialized?`);
+    return 1;
+  }
+  const repoRoot = str(args.flags, "repo") ? expandHome(str(args.flags, "repo")!) : findRepoRoot();
+  const branch = config.autoUpdate.branch;
+
+  // Acquire the deploy lock (serialize against the LaunchAgent / other deploys).
+  const got = acquireLock({
+    pid: process.pid,
+    host: hostname(),
+    sha: "pending",
+    stage: "fast-forward",
+  });
+  if (!got.ok) {
+    const h = got.holder;
+    if (!h) { ui.err("[deploy] existing lock ownership cannot be verified; deploy skipped."); return 1; }
+    const ageMin = Math.round((Date.now() - h.startedAt) / 60000);
+    if (opts.auto && !force) {
+      ui.info(
+        `[deploy] another deploy in progress (pid ${h.pid}, stage ${h.stage}, ${ageMin}m) — next tick will catch it.`,
+      );
+      return 0; // launchd re-polls; nothing to do
+    }
+    ui.err(
+      `[deploy] locked by pid ${h.pid} on ${h.host} (stage ${h.stage}, sha ${h.sha.slice(0, 8)}, ${ageMin}m ago).`,
+    );
+    ui.info("Wait for the current deploy to finish. A live holder keeps its lock.");
+    return 1;
+  }
+
+  try {
+    ui.step(`[deploy] fast-forwarding ${branch} (host repo: ${repoRoot})`);
+    const sha = await macFastForward(repoRoot, branch);
+    if (sha === config.autoUpdate.lastSyncedSha && !force) {
+      ui.info(`[deploy] already at ${sha.slice(0, 8)} — nothing to build or ship.`);
+      return 0;
+    }
+
+    updateStage("build");
+    // Install before building: a merged PR that added a workspace package or
+    // dependency has no node_modules here yet (see pnpmInstallArgs). No-op
+    // when nothing changed.
+    ui.step("[deploy] installing workspace deps");
+    await run("pnpm", pnpmInstallArgs(), { cwd: repoRoot, inherit: true });
+    ui.step("[deploy] building on the Mac (the VM OOM-kills on `next build`)");
+    // Exclude the browser extensions (apps/*-actuator, `wxt build`): they are
+    // built separately into dist-unpacked and loaded in Chrome — NOT server
+    // artifacts. A missing/cleared wxt node_modules in the deploy checkout must
+    // never break a prod deploy (it silently did, wedging the workers stale).
+    await run("pnpm", ["-r", "--filter=!@noelle/x-actuator", "--filter=!@noelle/linkedin-actuator", "--filter=!@noelle/reddit-actuator", "--filter=!@noelle/chrome-bridge-ext", "build"], { cwd: repoRoot, inherit: true });
+
+    updateStage("rsync");
+    writeDeployStamp(repoRoot, deployStampPayload(sha, hostname(), new Date().toISOString()));
+    ui.step(`[deploy] rsyncing the built repo into VM "${vm}"`);
+    await syncToVm(repoRoot, vm);
+
+    updateStage("restart");
+    ui.step("[deploy] restarting VM workers");
+    const restart = await restartVmWorkers(vm);
+    if (!restart.ok) {
+      ui.warn(
+        `[deploy] code shipped ${sha.slice(0, 8)} but VM restart FAILED — workers may be stale. ${restart.detail}`,
+      );
+      ui.info("Fix + re-run `noelle deploy` (lastSyncedSha not advanced, so it retries).");
+      return 1; // do NOT advance lastSyncedSha — next run self-heals
+    }
+
+    config.autoUpdate.lastSyncedSha = sha;
+    await writeVmConfig(vm, config);
+    ui.ok(`[deploy] done → ${sha.slice(0, 8)} shipped + workers restarted on VM "${vm}".`);
+    return 0;
+  } finally {
+    releaseLock(process.pid);
+  }
+}
+
+/**
+ * Native deploy (runtime === "native"). No VM: build the LOCAL working tree
+ * (dashboard included — it serves a prod build via `next start`) and restart
+ * every local pm2 app. Manual/force always builds; the auto-tick skips a rebuild
+ * when local HEAD hasn't moved since the last build (lastBuiltSha), so idle
+ * launchd ticks never bounce the workers. Serialized by the same deploy lock.
+ */
+async function runDeployNative(
+  args: Args,
+  opts: { auto: boolean },
+  config: SelfHostConfig,
+): Promise<number> {
+  const force = bool(args.flags, "force");
+  const repoRoot = str(args.flags, "repo") ? expandHome(str(args.flags, "repo")!) : findRepoRoot();
+  const home = paths();
+
+  // Refuse to deploy from a checkout other than the one pm2 serves. A
+  // worktree-built CLI running `noelle sync` would otherwise build the
+  // worktree, restart the SHARED pm2 fleet, and stamp lastBuiltSha with a
+  // sha the runtime checkout never built, silently skipping the next real
+  // deploy. Fail-open when no ecosystem exists yet (pre-init).
+  if (existsSync(home.ecosystem)) {
+    const liveRepo = ecosystemRepoRoot(readFileSync(home.ecosystem, "utf8"));
+    if (liveRepo && !sameCheckout(liveRepo, repoRoot)) {
+      ui.err(
+        `[deploy] this checkout (${repoRoot}) is not the runtime checkout (${liveRepo}) the pm2 apps run from.`,
+      );
+      ui.info(
+        "Run `noelle sync` / `noelle deploy` from the runtime checkout, or land the change on main and let the auto tick ship it.",
+      );
+      return 2;
+    }
+  }
+
+  const got = acquireLock({ pid: process.pid, host: hostname(), sha: "pending", stage: "build" });
+  if (!got.ok) {
+    const h = got.holder;
+    if (!h) { ui.err("[deploy] existing lock ownership cannot be verified; deploy skipped."); return 1; }
+    if (opts.auto && !force) {
+      // Say so. This used to be a bare `return 0`, so a `noelle sync` that
+      // landed while the LaunchAgent tick held the lock printed NOTHING and
+      // exited 0 — indistinguishable from a successful no-op deploy, which is
+      // how you end up re-running it and wondering why HEAD never ships. The VM
+      // path above has always logged this; the native path never did.
+      const ageMin = Math.round((Date.now() - h.startedAt) / 60000);
+      ui.info(
+        `[deploy] another deploy in progress (pid ${h.pid}, stage ${h.stage}, ${ageMin}m) — next tick will catch it.`,
+      );
+      return 0; // launchd re-polls
+    }
+    ui.err(
+      `[deploy] locked by pid ${h.pid} (stage ${h.stage}); wait for the current deploy to finish.`,
+    );
