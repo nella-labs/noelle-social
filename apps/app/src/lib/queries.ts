@@ -998,3 +998,203 @@ function unpackJoined(r: JoinedRowRaw): PendingApprovalRow {
         id: r.d_id,
         lead_id: r.d_lead_id!,
         org_id: r.d_org_id!,
+        payload: r.d_payload,
+        synced_at: r.d_synced_at!,
+      } as NoelleDraft)
+    : null;
+
+  const lead: NoelleLead | null = r.l_id
+    ? ({
+        id: r.l_id,
+        external_id: r.l_external_id!,
+        org_id: r.l_org_id!,
+        payload: r.l_payload,
+        synced_at: r.l_synced_at!,
+        tier:
+          r.l_tier === "T1" || r.l_tier === "T2" || r.l_tier === "T3"
+            ? r.l_tier
+            : null,
+        classifier_label: r.l_classifier_label,
+        classifier_score:
+          r.l_classifier_score == null
+            ? null
+            : typeof r.l_classifier_score === "string"
+              ? Number(r.l_classifier_score)
+              : r.l_classifier_score,
+        platform: (r.l_platform as SocialPlatform | null) ?? "x",
+        priority: r.l_priority ?? null,
+      } as NoelleLead)
+    : null;
+
+  return { approval, draft, lead, vipSignal: parseVipSignal(r.l_vip_signal) };
+}
+
+export async function getOrgSpendForMonth(
+  orgId: string,
+  monthIsoFirstOfMonth: string,
+): Promise<NoelleOrgSpendMonth[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<NoelleOrgSpendMonth[]>`
+    select * from noelle.org_spend_month
+    where org_id = ${orgId} and month = ${monthIsoFirstOfMonth}
+  `;
+  // `org_spend_month.cents` is a BIGINT, and postgres.js returns bigint columns
+  // as JS strings. Callers sum these with `acc + row.cents`, so a string slips
+  // through as concatenation ("3" + "70" + "41" + "280" → "037041280" →
+  // $370412.80) instead of addition. Coerce to a number at the source so every
+  // consumer (nav meter, dashboard, billing) is correct. The generated type
+  // already claims `number`, so this just makes runtime match it.
+  return rows.map((r) => ({ ...r, cents: Number(r.cents ?? 0) }));
+}
+
+/**
+ * Sum of per-agent `budget_cap_cents` for the org — the closest thing the
+ * schema has to a monthly org spend cap. Returns 0 when no caps are set.
+ */
+export async function getOrgBudgetCapCents(orgId: string): Promise<number> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<Array<{ cents: number }>>`
+    select coalesce(sum(budget_cap_cents), 0)::int as cents
+    from noelle.agent_instances
+    where org_id = ${orgId}
+  `;
+  return rows[0]?.cents ?? 0;
+}
+
+/** First-of-month (UTC) ISO date, the key `org_spend_month` rows are bucketed by. */
+export function currentMonthIso(d = new Date()): string {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)).toISOString().slice(0, 10);
+}
+
+/**
+ * True when a `org_spend_month.bucket` row is an Apify data-fetch bucket
+ * (apifySpendRow names them `apify-<worker>`, e.g. "apify-drafter"). Apify spend
+ * is recorded for visibility but is EXCLUDED from the cap-relevant "spent this
+ * month" total — it never counts toward the limit. Mirrors the cap reader's
+ * apify exemption (packages/runtime/src/pgBudgetAdapters.ts).
+ */
+export function isApifyBucket(bucket: string | null | undefined): boolean {
+  return typeof bucket === "string" && bucket.startsWith("apify");
+}
+
+export interface XApiSpend {
+  /** The configured flat MONTHLY subscription cost (cents). */
+  monthlyCostCents: number;
+  tier: string;
+  /** Writes metered this calendar month (visibility only — never capped). */
+  postsThisMonth: number;
+  repliesThisMonth: number;
+}
+
+/**
+ * The org's X API subscription line for the Spends page: the configured flat
+ * monthly cost (noelle.x_api_config) + this month's write counts from
+ * noelle.llm_calls (engine='xapi'). The X API bills a flat tier, so its cost
+ * never counts toward the per-call LLM cap.
+ */
+export async function loadXApiSpend(orgId: string): Promise<XApiSpend> {
+  const userId = await requiredUserId();
+  await assertOrgMember(pgOrgMembersClient(), userId, orgId);
+  const [cfgRows, countRows] = await Promise.all([
+    readSql<Array<{ tier: string; monthly_cost_cents: string | number }>>`
+      select tier, monthly_cost_cents from noelle.x_api_config where org_id = ${orgId}
+    `.catch(() => [] as Array<{ tier: string; monthly_cost_cents: string | number }>),
+    readSql<Array<{ bucket: string; n: string | number }>>`
+      select bucket, count(*) as n from noelle.llm_calls
+      where org_id = ${orgId} and engine = 'xapi'
+        and started_at >= date_trunc('month', now())
+      group by bucket
+    `.catch(() => [] as Array<{ bucket: string; n: string | number }>),
+  ]);
+  const cfg = cfgRows[0];
+  const posts = Number(countRows.find((r) => r.bucket === "xapi-post")?.n ?? 0);
+  const replies = Number(countRows.find((r) => r.bucket === "xapi-reply")?.n ?? 0);
+  return {
+    monthlyCostCents: Number(cfg?.monthly_cost_cents ?? 0),
+    tier: cfg?.tier ?? "none",
+    postsThisMonth: posts,
+    repliesThisMonth: replies,
+  };
+}
+
+export interface XApiConnection {
+  /** Whether Vega has X API creds saved. */
+  connected: boolean;
+  handle: string | null;
+  authKind: string | null;
+  writeEnabled: boolean;
+  /** True when the org has an x_intern (Vega) to connect at all. */
+  hasVega: boolean;
+}
+
+/** X API connection status for the org's Vega instance (Connections page). */
+export async function getXApiConnection(orgId: string): Promise<XApiConnection> {
+  const userId = await requiredUserId();
+  await assertOrgMember(pgOrgMembersClient(), userId, orgId);
+  const rows = await readSql<Array<{ x_handle: string | null; auth_kind: string | null; write_enabled: boolean }>>`
+    select t.x_handle, t.auth_kind, i.x_api_write_enabled as write_enabled
+    from noelle.agent_instances i
+    left join noelle.x_api_tokens t on t.agent_instance_id = i.id
+    where i.org_id = ${orgId} and i.role = 'x_intern'
+    limit 1
+  `;
+  const r = rows[0];
+  return {
+    connected: !!r?.auth_kind,
+    handle: r?.x_handle ?? null,
+    authKind: r?.auth_kind ?? null,
+    writeEnabled: r?.write_enabled ?? false,
+    hasVega: rows.length > 0,
+  };
+}
+
+/**
+ * Daily spend for the trailing 14 days, in cents. Returns a 14-length array
+ * with `0` for any day that had no llm_calls — caller treats this as the raw
+ * input to the Spend page sparkline.
+ *
+ * Reads from noelle.llm_calls (the per-invocation log), NOT org_spend_month —
+ * the rollup table is bucketed by month, not by day, so it can't drive a daily
+ * chart. Tenancy guard before the query.
+ */
+export async function getOrgSpendDaily14(orgId: string): Promise<number[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<Array<{ day: string; cents: string | number }>>`
+    with days as (
+      select generate_series(
+        (current_date - interval '13 days')::date,
+        current_date,
+        interval '1 day'
+      )::date as day
+    )
+    select
+      d.day::text as day,
+      coalesce(sum(l.cents), 0)::bigint as cents
+    from days d
+    left join noelle.llm_calls l
+      on l.org_id = ${orgId}
+     and l.started_at::date = d.day
+    group by d.day
+    order by d.day asc
+  `;
+  return rows.map((r) => Number(r.cents));
+}
+
+export interface SpendDayPoint {
+  /** ISO date (YYYY-MM-DD) for this day. */
+  day: string;
+  /** LLM spend (engine <> 'apify') in cents — what counts toward the cap. */
+  llmCents: number;
+  /** Apify spend (engine = 'apify') in cents — never counts toward the cap. */
+  apifyCents: number;
+}
+
+/**
+ * Daily spend for the trailing `days` days (default 30), SPLIT into LLM vs Apify
+ * so the spend-over-time chart can stack the cap-relevant LLM spend separately
