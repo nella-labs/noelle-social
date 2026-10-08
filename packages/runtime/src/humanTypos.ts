@@ -198,3 +198,203 @@ function eligibleIndices(tokens: string[], kind: TypoKind): number[] {
         if (/^[a-z]{5,}$/.test(core)) out.push(i);
         break;
       case "DOUBLE_WORD":
+        if (/^[a-z]{1,4}$/.test(core)) out.push(i);
+        break;
+      case "KEY_NEIGHBOR":
+        // Needs an interior letter (never the first, which is the letter a
+        // reader uses to recognise the word) that has a same-row neighbour.
+        if (/^[a-z]{4,}$/.test(core) && [...core.slice(1)].some((ch) => KEY_NEIGHBORS[ch])) {
+          out.push(i);
+        }
+        break;
+      case "MISSING_SPACE":
+        // Joins THIS token with the next one, so the next token must also be
+        // safe and must not be the last (the last token is never touched).
+        if (i + 1 <= tokens.length - 2) {
+          const nextCore = coreOf(tokens[i + 1]!);
+          // The join must stay readable as two run-together words, so both
+          // sides are short and the raw tokens carry no punctuation between
+          // them ("word, the" must not become "word,the").
+          if (
+            isSafeToken(nextCore) &&
+            /^[a-z]{2,6}$/.test(core) &&
+            /^[a-z]{2,6}$/.test(nextCore) &&
+            tokens[i] === core &&
+            tokens[i + 1] === nextCore
+          ) {
+            out.push(i);
+          }
+        }
+        break;
+      case "DOUBLE_LETTER":
+        // A held key. The word must contain NO existing double anywhere: with
+        // no double in it, no letter equals either of its neighbours, so
+        // doubling any interior letter can never produce a triple ("aabc" ->
+        // "aaabc" is the bug this guard exists for).
+        if (/^(?!.*([a-z])\1)[a-z]{4,}$/.test(core)) out.push(i);
+        break;
+    }
+  }
+  return out;
+}
+
+/** Apply `kind` to token index `i`. Returns the new token list, or null on no-op. */
+function mutate(tokens: string[], i: number, kind: TypoKind, rng: () => number): string[] | null {
+  const raw = tokens[i]!;
+  const lead = raw.match(TRIM_LEAD)?.[0] ?? "";
+  const trail = raw.match(TRIM_TRAIL)?.[0] ?? "";
+  const core = raw.slice(lead.length, raw.length - trail.length);
+  const next = [...tokens];
+  switch (kind) {
+    case "DROP_WORD": {
+      // A dropped word takes its own punctuation with it, which is what happens
+      // when a thumb skips a word entirely.
+      next.splice(i, 1);
+      return next;
+    }
+    case "DROP_APOSTROPHE": {
+      next[i] = `${lead}${core.replace("'", "")}${trail}`;
+      return next[i] === raw ? null : next;
+    }
+    case "TRANSPOSE": {
+      // Collect every adjacent pair of DIFFERENT letters, then pick one.
+      const pairs: number[] = [];
+      for (let k = 0; k < core.length - 1; k++) {
+        if (core[k] !== core[k + 1]) pairs.push(k);
+      }
+      if (pairs.length === 0) return null;
+      const k = pairs[Math.min(pairs.length - 1, Math.floor(rng() * pairs.length))]!;
+      const swapped = `${core.slice(0, k)}${core[k + 1]}${core[k]}${core.slice(k + 2)}`;
+      next[i] = `${lead}${swapped}${trail}`;
+      return next;
+    }
+    case "DROP_LETTER": {
+      // Prefer halving a doubled letter ("really" -> "realy") — the most common
+      // real misspelling. Otherwise drop one interior letter.
+      const dbl = core.search(/([a-z])\1/);
+      const k = dbl >= 0 ? dbl : 1 + Math.min(core.length - 3, Math.floor(rng() * (core.length - 2)));
+      const dropped = `${core.slice(0, k)}${core.slice(k + 1)}`;
+      next[i] = `${lead}${dropped}${trail}`;
+      return next;
+    }
+    case "DOUBLE_WORD": {
+      // The classic scroll-past duplicate: "and and". The copy carries no
+      // punctuation, so "so, so," never happens.
+      next.splice(i, 0, core);
+      return next;
+    }
+    case "KEY_NEIGHBOR": {
+      // Every interior position whose letter has a same-row neighbour, then one
+      // of them at random, then one of THAT letter's neighbours.
+      const spots: number[] = [];
+      for (let k = 1; k < core.length; k++) {
+        if (KEY_NEIGHBORS[core[k]!]) spots.push(k);
+      }
+      if (spots.length === 0) return null;
+      const k = spots[Math.min(spots.length - 1, Math.floor(rng() * spots.length))]!;
+      const options = KEY_NEIGHBORS[core[k]!]!;
+      const ch = options[Math.min(options.length - 1, Math.floor(rng() * options.length))]!;
+      next[i] = `${lead}${core.slice(0, k)}${ch}${core.slice(k + 1)}${trail}`;
+      return next[i] === raw ? null : next;
+    }
+    case "MISSING_SPACE": {
+      // Eligibility already proved both tokens are bare lowercase words, so the
+      // join is exactly the two cores with the space swallowed.
+      next.splice(i, 2, `${core}${tokens[i + 1]}`);
+      return next;
+    }
+    case "DOUBLE_LETTER": {
+      // Prefer a letter a real thumb lingers on (a vowel or l/s/t), else any
+      // interior letter. Eligibility already excluded words with an existing
+      // double, so this can never produce a triple.
+      const spots: number[] = [];
+      const preferred: number[] = [];
+      for (let k = 1; k < core.length; k++) {
+        spots.push(k);
+        if ("aeioults".includes(core[k]!)) preferred.push(k);
+      }
+      const pool = preferred.length > 0 ? preferred : spots;
+      if (pool.length === 0) return null;
+      const k = pool[Math.min(pool.length - 1, Math.floor(rng() * pool.length))]!;
+      next[i] = `${lead}${core.slice(0, k)}${core[k]}${core.slice(k)}${trail}`;
+      return next;
+    }
+  }
+}
+
+export interface HumanizeOptions {
+  /** Share of bodies that get one slip. Default DEFAULT_TYPO_RATE (0.18). */
+  rate?: number;
+  /** Injectable RNG for deterministic tests. Defaults to Math.random. */
+  rng?: () => number;
+  /** Hard character ceiling (X = 280). A mutation that exceeds it is discarded. */
+  maxLength?: number;
+}
+
+export interface HumanizeResult {
+  body: string;
+  /** The slip that landed, or null when the body was left untouched. */
+  applied: TypoKind | null;
+}
+
+/**
+ * Roll `rate` and, on a hit, apply exactly ONE believable typing slip to `body`.
+ *
+ * Returns the body unchanged (applied: null) when the roll misses, when the body
+ * is too short to carry a slip, or when no kind found an eligible token — the
+ * pass NEVER fails the draft, it just declines to touch it. A body with no safe
+ * token (all handles, links, and proper nouns) simply ships clean.
+ */
+export function humanizeTypos(body: string, opts: HumanizeOptions = {}): HumanizeResult {
+  const rate = opts.rate ?? DEFAULT_TYPO_RATE;
+  const rng = opts.rng ?? Math.random;
+  if (!(rate > 0)) return { body, applied: null };
+  if (rng() >= rate) return { body, applied: null };
+
+  // Replies are a single paragraph, so a plain space split round-trips exactly
+  // (join(" ") rebuilds the original). A token that swallowed a newline fails
+  // isSafeToken and is skipped, so a multi-line body degrades to "no slip"
+  // rather than to mangled whitespace.
+  const tokens = body.split(" ");
+  if (
+    tokens.filter((t) => t.trim().length > 0).length < MIN_WORDS ||
+    [...body].length < MIN_CHARS
+  ) {
+    return { body, applied: null };
+  }
+
+  const tried: TypoKind[] = [];
+  for (;;) {
+    const kind = pickTypoKind(rng, tried);
+    if (!kind) return { body, applied: null };
+    tried.push(kind);
+    const candidates = eligibleIndices(tokens, kind);
+    if (candidates.length === 0) continue;
+    const idx = candidates[Math.min(candidates.length - 1, Math.floor(rng() * candidates.length))]!;
+    const mutated = mutate(tokens, idx, kind, rng);
+    if (!mutated) continue;
+    const next = mutated.join(" ");
+    if (next === body) continue;
+    // Never INVENT an offensive word. See NEVER_CREATE: "shot" -> "shit" is
+    // reachable through a same-row key slip, and Orion auto-sends.
+    if (inventsBannedWord(body, next)) continue;
+    if (opts.maxLength != null && [...next].length > opts.maxLength) continue;
+    return { body: next, applied: kind };
+  }
+}
+
+/**
+ * Read the typo-pass config off the environment.
+ *
+ * Enabled by default at 18%. `NOELLE_HUMAN_TYPOS=0` disables the pass;
+ * `NOELLE_HUMAN_TYPO_RATE` (0..1) retunes the share. A malformed rate falls back
+ * to the default rather than disabling the pass silently.
+ */
+export function typoRateFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  if (env["NOELLE_HUMAN_TYPOS"] === "0") return 0;
+  const raw = env["NOELLE_HUMAN_TYPO_RATE"];
+  if (raw == null || raw === "") return DEFAULT_TYPO_RATE;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 1) return DEFAULT_TYPO_RATE;
+  return n;
+}
