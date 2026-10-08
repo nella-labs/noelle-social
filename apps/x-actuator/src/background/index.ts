@@ -2198,3 +2198,53 @@ chrome.runtime.onMessage.addListener((msg: { cmd: string; params?: never; cap?: 
         if (!NOTIFICATIONS_ACTOR_ENABLED) {
           reply({ ok: false, error: "notifications actor is disabled in code (lib/notifications-feature.ts)" });
           return;
+        }
+        const run = reserveStart();
+        await prepareDrain(run, { curfew: true, notifications: true });
+        const epoch = requireStarted(await startDrain({ manual: true, curfew: true, notifications: true }, run));
+        void publishLocalIntent("running", epoch);
+        reply({ ok: true });
+      }
+      else if (msg.cmd === "stopRun") {
+        const terminal = reserveStop();
+        const epoch = await terminal;
+        await runIfCurrent(epoch, async () => {
+          await chrome.storage.local.remove([DRAIN_INTENT_KEY, DISCOVERY_MODE_KEY]);
+          await chrome.storage.local.set({ [REMOTE_STATE_KEY]: "stopped" });
+        });
+        await endRun("stopped", terminal);
+        const cfg = await getConfig();
+        if (cfg?.autonomous) {
+          await runIfCurrent(epoch, () => chrome.storage.local.set({
+            [AUTO_START_DAY_KEY]: localDayKey(new Date()),
+            [STOP_DAY_KEY]: localDayKey(new Date()),
+          }));
+        }
+        void publishLocalIntent("stopped", epoch);
+        reply({ ok: true });
+      }
+      else if (msg.cmd === "getDiscoveryCapacity") {
+        const cfg = await getConfig();
+        if (!cfg) throw new Error("actor not configured");
+        reply({ ok: true, capacity: await new ActuatorApi(cfg).fetchDiscoveryCapacity() });
+      }
+      else if (msg.cmd === "getReplyCap" || msg.cmd === "setReplyCap") {
+        const cfg = await getConfig();
+        if (!cfg) throw new Error("actor not configured");
+        const write = msg.cmd === "setReplyCap" ? ActorReplyCapWriteSchema.parse({ cap: msg.cap,
+          ...(msg.minimum === undefined ? {} : { minimum: msg.minimum }) }) : undefined;
+        const api = new ActuatorApi(cfg);
+        reply({ ok: true, cap: msg.cmd === "getReplyCap"
+          ? await api.fetchReplyCap() : await api.setReplyCap(write!.cap, write!.minimum) });
+      }
+      else if (msg.cmd === "getState") { reply({ ok: true, state: await loadState(), discoveryActive: await browserDiscoveryEnabled() }); }
+      else if (msg.cmd === "tick") { await tick(); reply({ ok: true }); } // content-script-driven loop (reliable, unlike SW timers)
+      else reply({ ok: false, error: "unknown command" });
+    } catch (e) {
+      // Surface the real reason to the panel — DevTools can't be open during a
+      // run (it blocks chrome.debugger), so the panel log is the only window in.
+      reply({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  })();
+  return true;
+});
