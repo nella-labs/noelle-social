@@ -198,3 +198,18 @@ post with 💀 is kept.
 seeded lead sequence under two rule sets and reports the distributions. It opts
 into the same X marker pool as the live worker. Run it before and after any
 change to these lanes.
+
+```
+pnpm --filter @noelle/runtime build
+node scripts/reply-variation-sim.mjs 400 --samples
+```
+
+`scripts/reply-variation-samples.mjs` generates REAL drafts through `claude -p`
+for a handful of posts, one per rule set. It illustrates; it does not measure.
+
+**Assert mean AND median on every dimension, against the baseline.** A floor and
+a ceiling both holding does not mean the distribution is unchanged — reshaping it
+moves its centre. This change moved the mean target length from 94 to 100 chars
+while the median held at 80, because fewer leads sit in the default band and more
+take a longer shape. That is intended here, but it is exactly the kind of shift
+that has to be looked at rather than assumed.
