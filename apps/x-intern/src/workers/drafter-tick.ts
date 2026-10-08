@@ -1598,3 +1598,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
             body: dmBody,
             charCount: [...dmBody].length,
             dmVoiceCheck: { pass: true, attempts: dmCheck!.attempts, reasons: dmCheck!.reasons },
+          }
+        : null;
+
+      // The DM gets the same commitment guard as the replies, and is dropped on
+      // its own — a committing DM must not take otherwise-good replies with it.
+      // A cold DM is the likeliest place for the model to offer a call.
+      const safeDmRow = dmRow && makesCommitment(dmRow.body) ? null : dmRow;
+      if (dmRow && !safeDmRow) {
+        log.warn(
+          { leadId: lead.id, reason: commitmentReason(detectCommitments(dmRow.body)) },
+          "commitment guard dropped the DM",
+        );
+      }
+
+      const draftRows = safeDmRow ? [...finalReplyRows, safeDmRow] : finalReplyRows;
+
+      // X API auto-send stamping is REMOVED. X replies are actuated by the
+      // browser extension (auto-drain), not the X API. Every reply lands as a
+      // plain pending approval; the actuator drains the queue (unattended when
+      // auto_send_enabled is on — like Lyra/LinkedIn — else on a manual Run).
+      // Never stamp auto_send_target_at (that routes to the unused API send
+      // worker and excludes the row from the actuator feed).
+      const autoSend: OutboundIn["autoSend"] = null;
+      const requestOutbound = replyRequest
+        ? {
+            owner: { orgId: instance.org_id, agentInstanceId: instance.id },
+            replyRequestKey: replyRequest.requestKey,
+            humanReviewRequired: replyRequest.humanReviewRequired,
+          }
+        : {};
+
+      const body: OutboundIn = {
+        leadId: lead.external_id,
+        batchNumber: null,
+        platform: "x",
+        authorHandle: lead.author_handle,
+        authorId: lead.author_id ?? "0",
+        authorFollowers: typeof payload.followers === "number" ? payload.followers : null,
+        allowsDms: null,
+        originalPostId: lead.external_id,
+        originalPostText: postText,
+        originalPostUrl:
+          payload.url ?? `https://x.com/${lead.author_handle}/status/${lead.external_id}`,
+        postedAt,
+        matchedTrigger: null,
+        drafts: draftRows,
+        tier: lead.tier ?? null,
+        postKind: lead.classifier_label,
+        // Account Feeder style-source blend for the approval card's "Style: …"
+        // badge — null when style is off / no exemplars chosen (base voice only).
+        styleSource: buildStyleSource(styleForLead),
+        // Persist the voice anchors that grounded this lead's drafts so the
+        // approval detail's "Context loaded" card can show what the DM/replies
+        // were anchored on (snippet + BM25 score). Capped at 5 for payload size.
+        anchors: anchors.slice(0, 5).map((a) => ({ snippet: a.snippet, score: a.score })),
+        autoSend,
+        verifierMeta,
+        ...requestOutbound,
+      };
+      try {
+        await postOutbound(body);
+      } catch (outboundErr) {
+        // The drafts are already generated — an outbound POST failure is
+        // transport, not content. Hold the lead as 'classified' so the next
+        // tick retries (outbound writes are upserts, so a re-POST after a
+        // half-landed write is safe) instead of terminally erroring a good
+        // reply. One retry only: a second consecutive outbound failure errors
+        // the lead so a persistent api-vm/HMAC fault can't loop forever.
+        const msg = (outboundErr as Error).message.slice(0, 300);
+        const alreadyRetried = Boolean((lead.payload as Record<string, unknown>)?.outbound_error);
+        log.error(
+          { leadId: lead.id, retry: alreadyRetried, err: msg },
+          alreadyRetried
+            ? "outbound POST failed twice; erroring lead"
+            : "outbound POST failed; holding lead as classified for one retry",
+        );
+        await markStatus({
+          leadId: lead.id,
+          status: alreadyRetried ? "errored" : "classified",
+          meta: { outbound_error: msg },
+        });
+        continue;
+      }
+      await markStatus({
+        leadId: lead.id,
+        status: "drafted",
+        meta: {
+          engine: res.engine,
+          model: res.model,
+          ...(replyRequest ? { reply_request_key: replyRequest.requestKey } : {}),
+        },
+      });
+      await bus?.emit({
+        topic: "draft.created",
+        worker: "drafter",
+        summary: `drafted ${draftRows.length} for @${lead.author_handle}`,
+        payload: {
+          lead_id: lead.id,
+          angles: draftRows.map((d) => d.angle),
+          tier: lead.tier ?? null,
+          kind: lead.classifier_label ?? null,
+        },
+        correlationId: lead.id,
+      });
+      processed++;
+      // Successful tick clears the 5xx counter — only a sustained run
+      // of failures should trip the auto-pause.
+      resetModelErrorCounter(instance.id);
+    } catch (err) {
+      if (err instanceof BudgetExceededError) {
+        // A watched-account (priority) lead must never be lost to a temporary
+        // cap: hold it as re-claimable `classified` so it drafts the moment
+        // budget frees (cap raised / new month). Only non-priority leads drop
+        // to `errored` (won't retry). The claim batch is small (3), so the
+        // re-claim churn while at cap is bounded.
+        const holdPriority = lead.priority === true;
+        log.warn(
+          {
+            leadId: lead.id,
+            priority: holdPriority,
+            layer: err.layer,
+            spent_cents: err.spentCents,
+            cap_cents: err.capCents,
+          },
+          holdPriority
+            ? "drafter blocked by budget cap; holding priority lead as classified (retries when budget frees)"
+            : "drafter blocked by budget cap; marking lead errored, will not retry",
+        );
+        await markStatus({
+          leadId: lead.id,
+          status: holdPriority ? "classified" : "errored",
+          meta: {
+            error: "budget_exceeded",
+            layer: err.layer,
+            spent_cents: err.spentCents,
+            cap_cents: err.capCents,
+            estimated_cents: err.estimatedCents,
+          },
+        });
+        // escalate_on_cap: record the block so the dashboard can surface it.
+        // Must live INSIDE this branch — the `continue` below meant the old
+        // check in the generic path was unreachable and budget_escalations
+        // stayed empty forever (part of why the 07-09 classifier cap pause
+        // went unnoticed). Best-effort; SQL failures are logged + swallowed.
+        if (sql) {
+          await recordBudgetEscalation({
+            sql,
+            log,
+            err,
+            orgId: instance.org_id,
+            instanceId: instance.id,
+            leadId: lead.id,
+            escalateOnCap: instance.escalate_on_cap ?? true,
+            ...(args.notifier ? { notifier: args.notifier } : {}),
+          });
+        }
+        continue;
+      }
+      log.error({ leadId: lead.id, err: (err as Error).message }, "drafter tick failed for lead");
+      await markStatus({ leadId: lead.id, status: "errored", meta: { error: (err as Error).message } });
+      // pause_on_5xx: model 5xx (or transient network error) bumps the
+      // counter; on threshold + policy enabled, flip the instance to
+      // paused. No-op when sql is absent (tests) or when the error
+      // doesn't look 5xx-shaped. BudgetExceededError has no status →
+      // isServerSideModelError returns false → no double-count.
+      if (sql && isServerSideModelError(err)) {
+        await recordModelError({
+          sql,
+          log,
+          instanceId: instance.id,
+          pauseOn5xx: instance.pause_on_5xx ?? true,
+        });
+      }
+    }
+  }
+  return processed;
+}
+
+// Phrases the model uses when it has decided a lead is off-topic but
+// fails to follow the documented `SKIP: <reason>` format. Empirically
+// gathered from Bedrock Claude Sonnet 4.6 outputs in production logs
+// (2026-05-26). Hits are case-insensitive substring matches.
+const PROSE_SKIP_MARKERS = [
+  "no nella connection",
+  "no overlap with nella",
+  "no nella fit",
+  "not a nella fit",
+  "recommending skip",
+  "recommend skipping",
+  "skip this lead",
+];
+
+function looksLikeProseSkip(s: string): boolean {
+  const lower = s.toLowerCase();
+  return PROSE_SKIP_MARKERS.some((m) => lower.includes(m));
+}
+
+function safeJsonParse(s: string): unknown {
+  // 1. Direct parse — happy path.
+  try { return normalizeSkipShape(JSON.parse(s)); } catch { /* fall through */ }
