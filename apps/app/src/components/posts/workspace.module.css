@@ -1,0 +1,36 @@
+.workspace { min-width: 0; }
+.navigation { display: grid; gap: 18px; margin-bottom: 24px; }
+.lanes { display: flex; flex-wrap: wrap; gap: 8px; }
+.lane { padding: 9px 14px; border: 1px solid var(--rule); border-radius: 8px; background: var(--paper); font-size: 12px; font-weight: 600; }
+.lane:hover { border-color: var(--accent); }
+.laneActive { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.sectionRow { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--rule); gap: 12px; }
+.sections { display: flex; align-items: center; gap: 4px; overflow-x: auto; }
+.section { display: inline-flex; align-items: center; gap: 8px; padding: 12px 14px; white-space: nowrap; font-size: 12px; color: var(--ink-muted); }
+.section:hover { color: var(--ink); }
+.sectionActive { color: var(--accent); box-shadow: inset 0 -2px var(--accent); font-weight: 700; }
+.count { padding: 2px 6px; border-radius: 5px; background: var(--paper-2); font-size: 10px; font-variant-numeric: tabular-nums; }
+.resources { position: relative; flex-shrink: 0; font-size: 12px; color: var(--ink-muted); }
+.resources summary { padding: 12px; cursor: pointer; }
+.resources nav { position: absolute; z-index: 10; right: 0; top: 100%; display: grid; min-width: 160px; background: var(--paper); border: 1px solid var(--rule); border-radius: 8px; padding: 4px; box-shadow: var(--shadow-sm); }
+.lane:focus-visible, .section:focus-visible, .resources summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.workspace :global(.ideas-empty) { background: var(--paper); border: 1px solid var(--rule); border-radius: 12px; box-shadow: none; min-height: 230px; }
+.workspace :global(.media-panel) { gap: 20px; }
+.workspace :global(.media-head), .workspace :global(.media-toolbar) { padding: 16px 20px; background: var(--paper); border: 1px solid var(--rule); border-radius: 12px; }
+.workspace :global(.media-toolbar) { gap: 12px; }
+.workspace :global(.media-grid) { grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 18px; }
+.workspace :global(.media-card) { border: 1px solid var(--rule); border-radius: 12px; background: var(--paper); box-shadow: none; }
+.workspace :global(.media-thumb-wrap) { aspect-ratio: 4 / 5; }
+.workspace :global(.media-card__foot) { padding: 15px; gap: 8px; }
+.workspace :global(.media-card__actions) { margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--rule-soft); }
+.workspace :global(.media-group__head) { padding-bottom: 12px; }
+.workspace :global(.media-tabs) { padding: 4px; border-radius: 100px; }
+.workspace :global(.media-tab) { padding: 8px 16px; border-radius: 100px; }
+.workspace :global(.media-tab.is-active) { background: var(--ink); color: var(--paper); box-shadow: none; }
+@media (max-width: 640px) {
+  .lanes { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; }
+  .lane { flex-shrink: 0; }
+  .section { padding: 12px 10px; }
+  .navigation { gap: 12px; margin-bottom: 20px; }
+  .workspace :global(.media-head), .workspace :global(.media-toolbar) { padding: 14px; }
+}
