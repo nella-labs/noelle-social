@@ -198,3 +198,87 @@ export async function mutatePatternAlertInTx(
     decidedBy: string;
   },
 ): Promise<{ status: string; requestId: string | null } | null> {
+  if (
+    !validPatternScope(scope) ||
+    !UuidSchema.safeParse(args.alertId).success ||
+    (args.note !== undefined && (typeof args.note !== "string" || args.note.length > 600)) ||
+    (args.expectedRequestId !== undefined && !UuidSchema.safeParse(args.expectedRequestId).success)
+  )
+    return null;
+  if (!(await lockPatternOwner(tx, scope))) return null;
+  if (args.action === "refine") {
+    const [candidate] = await tx<RefiningAlertRow[]>`
+      select ${refiningFields(tx)} from noelle.pattern_alerts a join noelle.pattern_rules r on ${scopedRuleJoin(tx)}
+      where a.id=${args.alertId} and a.org_id=${scope.orgId} and a.agent_instance_id=${scope.agentInstanceId}
+        and a.status in ('open','refined','refining') and r.active
+        and ${admittedRuleSql(tx)} and ${admittedAlertSql(tx)} and ${coherentAlertSources(tx, scope)}`;
+    if (!candidate || (await capturedAlertSources(tx, scope, candidate)) === null) return null;
+  }
+  const [rule] = await tx<{ id: string }[]>`
+    select r.id from noelle.pattern_rules r join noelle.pattern_alerts a on ${scopedRuleJoin(tx)}
+    where a.id=${args.alertId} and a.org_id=${scope.orgId} and a.agent_instance_id=${scope.agentInstanceId}
+    order by r.id for no key update of r`;
+  const [alert] = await tx<
+    {
+      rule_id: string | null;
+      status: string;
+      refine_request_id: string | null;
+      refine_claim_id: string | null;
+    }[]
+  >`
+    select rule_id,status,refine_request_id,refine_claim_id from noelle.pattern_alerts
+    where id=${args.alertId} and org_id=${scope.orgId} and agent_instance_id=${scope.agentInstanceId} for no key update`;
+  if (!alert || (alert.rule_id !== null && !rule)) return null;
+  if (args.action === "refine") {
+    if (!rule || !["open", "refined", "refining"].includes(alert.status)) return null;
+    if (args.expectedRequestId !== undefined) {
+      if (alert.refine_request_id !== args.expectedRequestId.toLowerCase()) return null;
+    } else if (
+      alert.status === "refining" ||
+      (alert.status === "open" && alert.refine_claim_id !== null)
+    )
+      return null;
+    const requestId = randomUUID();
+    await tx`update noelle.pattern_alerts set status='refining',refine_note=${args.note ?? null},
+      refine_request_id=${requestId},refine_claim_id=null,decided_at=now(),decided_by=${args.decidedBy}
+      where id=${args.alertId}`;
+    return { status: "refining", requestId };
+  }
+  if (!["open", "refined", "refining"].includes(alert.status)) return null;
+  const status = args.action === "revert" ? "reverted" : "acknowledged";
+  if (args.action === "revert" && rule) {
+    await tx`update noelle.pattern_rules set active=false,updated_at=clock_timestamp() where id=${rule.id}`;
+  }
+  await tx`update noelle.pattern_alerts set status=${status},decided_at=now(),decided_by=${args.decidedBy}
+    where id=${args.alertId}`;
+  return { status, requestId: alert.refine_request_id };
+}
+export function mutatePatternAlert(
+  parent: Sql,
+  scope: PatternScope,
+  args: Parameters<typeof mutatePatternAlertInTx>[2],
+) {
+  return patternSession(parent).run((sql) =>
+    sql.begin((tx) => mutatePatternAlertInTx(tx, scope, args)),
+  );
+}
+export async function setPatternRuleActiveInTx(
+  tx: TransactionSql,
+  scope: PatternScope,
+  ruleId: string,
+  active: boolean,
+): Promise<boolean> {
+  if (
+    !validPatternScope(scope) ||
+    !UuidSchema.safeParse(ruleId).success ||
+    !(await lockPatternOwner(tx, scope))
+  )
+    return false;
+  const rows =
+    await tx`update noelle.pattern_rules set active=${active},updated_at=clock_timestamp()
+    where id=${ruleId} and org_id=${scope.orgId} and agent_instance_id=${scope.agentInstanceId} returning id`;
+  if (!rows.length) return false;
+  await tx`update noelle.pattern_alerts set status=${active ? "acknowledged" : "reverted"},decided_at=now(),decided_by=${scope.userId ?? null}
+    where rule_id=${ruleId} and org_id=${scope.orgId} and agent_instance_id=${scope.agentInstanceId}`;
+  return true;
+}
