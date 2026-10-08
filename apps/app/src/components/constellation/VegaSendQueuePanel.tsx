@@ -198,3 +198,203 @@ function AutopilotBanner({
 
 /**
  * Next stamped send time, quiet-aware. Mount-guarded (renders a stable
+ * placeholder until `now` is set) so it never diverges between server and
+ * client hydration.
+ */
+function NextSendReadout({ targetAt }: { targetAt: string }) {
+  const [now, setNow] = useState<number | null>(null);
+  useEffect(() => {
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const mounted = now !== null;
+  const targetMs = new Date(targetAt).getTime();
+  const deltaSec = mounted ? Math.round((targetMs - now) / 1000) : 0;
+  const due = mounted && deltaSec <= 0;
+  const holdEnd =
+    due && now !== null
+      ? quietHoldEndMs(now, {
+          startHourUtc: QUIET_START_HOUR_UTC,
+          endHourUtc: QUIET_END_HOUR_UTC,
+        })
+      : null;
+  const quietHeld = holdEnd !== null;
+  const text = !mounted
+    ? "next send scheduled"
+    : quietHeld
+      ? `holds till ${fmtQuietClock(holdEnd!)} · quiet hours`
+      : due
+        ? "next send due now"
+        : `next send in ${formatDelta(deltaSec)}`;
+  return (
+    <span
+      style={{
+        fontFamily: "var(--mono)",
+        fontSize: 11,
+        color: quietHeld ? "var(--ink-muted)" : due ? "var(--accent)" : "var(--ink-soft)",
+      }}
+    >
+      {text}
+    </span>
+  );
+}
+
+/** How many recently-sent rows to show before "Show more". */
+const SENT_COLLAPSED = 3;
+
+function RecentlySent({ rows }: { rows: SentApprovalRow[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const visible = expanded ? rows : rows.slice(0, SENT_COLLAPSED);
+  const hidden = rows.length - visible.length;
+  return (
+    <>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          justifyContent: "space-between",
+          marginBottom: 10,
+        }}
+      >
+        <div className="eyebrow" style={{ fontSize: 11, letterSpacing: "0.1em" }}>
+          Recently sent
+        </div>
+        <span
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "var(--ink-soft)",
+          }}
+        >
+          {visible.length} of {rows.length}
+        </span>
+      </div>
+      <SentList rows={visible} />
+      {rows.length > SENT_COLLAPSED ? (
+        <button
+          type="button"
+          className="btn btn-xs"
+          onClick={() => setExpanded((v) => !v)}
+          style={{ marginTop: 12, width: "100%", justifyContent: "center" }}
+        >
+          {expanded ? "Show less" : `Show ${hidden} more`}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
+function QueueList({ rows }: { rows: AutoSendQueueRow[] }) {
+  if (rows.length === 0) {
+    return (
+      <div
+        style={{
+          padding: "16px 0",
+          fontSize: 12.5,
+          color: "var(--ink-muted)",
+          fontFamily: "var(--mono)",
+        }}
+      >
+        Nothing queued. Drafter will stamp the next eligible approval here.
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column" }}>
+      {rows.map((row, i) => (
+        <QueueRow key={row.approvalId} row={row} first={i === 0} />
+      ))}
+    </div>
+  );
+}
+
+function QueueRow({ row, first }: { row: AutoSendQueueRow; first: boolean }) {
+  // `null` until mounted so the server render and the first client render
+  // agree (see useMounted); then it ticks every second.
+  const [now, setNow] = useState<number | null>(null);
+  useEffect(() => {
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const mounted = now !== null;
+  const targetMs = new Date(row.targetAt).getTime();
+  const deltaSec = mounted ? Math.round((targetMs - now) / 1000) : 0;
+  const due = mounted && deltaSec <= 0;
+  // A past-due row inside the overnight quiet window is deliberately held by
+  // the send worker, not stalled — label it honestly instead of "due now".
+  const holdEnd =
+    due && now !== null
+      ? quietHoldEndMs(now, {
+          startHourUtc: QUIET_START_HOUR_UTC,
+          endHourUtc: QUIET_END_HOUR_UTC,
+        })
+      : null;
+  const quietHeld = holdEnd !== null;
+
+  return (
+    <div
+      className="stack-phone"
+      style={{
+        display: "grid",
+        gridTemplateColumns: "110px 1fr 96px",
+        gap: 14,
+        alignItems: "start",
+        padding: "12px 0",
+        borderTop: first ? 0 : "1px dashed var(--rule-soft)",
+      }}
+    >
+      <div>
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 11.5,
+            color: quietHeld ? "var(--ink)" : due ? "var(--accent)" : "var(--ink)",
+          }}
+        >
+          {!mounted
+            ? "scheduled"
+            : quietHeld
+              ? `holds till ${fmtQuietClock(holdEnd!)}`
+              : due
+                ? "due now"
+                : `in ${formatDelta(deltaSec)}`}
+        </div>
+        <div
+          style={{
+            fontFamily: "var(--mono)",
+            fontSize: 10,
+            color: "var(--ink-soft)",
+            marginTop: 2,
+          }}
+        >
+          {mounted ? formatClock(row.targetAt) : " "}
+        </div>
+      </div>
+      <div style={{ minWidth: 0 }}>
+        <div
+          style={{
+            fontSize: 12,
+            color: "var(--ink-muted)",
+            marginBottom: 3,
+            fontFamily: "var(--mono)",
+          }}
+        >
+          {row.authorHandle ? `@${row.authorHandle}` : "lead"} ·{" "}
+          {row.charCount ?? "?"} chars
+        </div>
+        <div
+          style={{
+            fontSize: 13,
+            color: "var(--ink-2)",
+            lineHeight: 1.45,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}
+        >
+          {row.bodyPreview ?? <em style={{ color: "var(--ink-soft)" }}>no body</em>}
+        </div>
+      </div>
+      <span
+        className="tag"
