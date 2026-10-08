@@ -198,3 +198,203 @@ export async function SpendPanel({ orgId, orgSlug, rangeParam }: SpendPanelProps
               >
                 <span>1 {monthShort}</span>
                 <span>
+                  {daysRemaining} day{daysRemaining === 1 ? "" : "s"} remaining
+                </span>
+                <span>
+                  {totalDaysInMonth} {monthShort}
+                </span>
+              </div>
+            </>
+          ) : (
+            <div style={{ marginTop: 12, fontSize: 12.5, color: "var(--ink-muted)" }}>
+              LLM spend counting toward per-month caps, summed across {range.label.toLowerCase()}.
+              The cap is a monthly guardrail — switch to <strong>Month</strong> to see cap progress.
+            </div>
+          )}
+
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "baseline",
+              marginTop: 14,
+              paddingTop: 12,
+              borderTop: "1px dashed var(--rule-soft)",
+              fontSize: 12.5,
+              color: "var(--ink-muted)",
+            }}
+          >
+            <span>
+              Apify provider usage · <strong>not counted toward limit</strong>
+            </span>
+            <span style={{ fontFamily: "var(--mono)" }}>{apifyProviderAmount}</span>
+          </div>
+          <div style={{ marginTop: 6, fontSize: 11.5, color: "var(--ink-muted)" }}>
+            {formatFetchedAt(apifyProvider.fetchedAt)}
+            {isMonth ? " · Calendar month; token billing cycles may reset on a different day." : ""}
+          </div>
+          {apifyUnverifiedCents > 0 ? (
+            <div style={{ marginTop: 6, fontSize: 11.5, color: "var(--ink-muted)" }}>
+              {formatCents(apifyUnverifiedCents)} in unverified Apify run charges remains
+              visible but is not added to reported provider usage.
+            </div>
+          ) : null}
+        </div>
+
+        <div className="card">
+          <div className="card-h">
+            <h3>{range.granularity === "day" ? "Daily burn" : "Monthly burn"}</h3>
+            <span className="tag">
+              avg {formatCents(avgUnitLlm)}/{perUnit} LLM
+            </span>
+          </div>
+          <SpendTrendChart points={providerTrend} max={trendMax} rangeLabel={range.label} apifyAvailable={hasApifyProviderFetch} />
+          <div
+            style={{
+              display: "flex",
+              gap: 16,
+              marginTop: 10,
+              fontSize: 11,
+              color: "var(--ink-muted)",
+            }}
+          >
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 9, height: 9, borderRadius: 2, background: "var(--accent)" }} />
+              LLM · {formatCents(trendTotalLlm)}
+            </span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 9, height: 9, borderRadius: 2, background: "var(--ok)" }} />
+              Apify · {hasApifyProviderFetch ? formatCents(trendTotalApify) : "Not fetched"}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className={styles.breakdowns}>
+      {/* By worker — provider Apify is account-level, so worker attribution stays LLM-only. */}
+      <div className={`card ${styles.breakdownCard}`}>
+        <div className="card-h">
+          <h3>By worker</h3>
+          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+            <span
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 5,
+                fontSize: 11,
+                color: "var(--ink-muted)",
+              }}
+            >
+              <span style={{ width: 9, height: 9, borderRadius: 2, background: "var(--accent)" }} />{" "}
+              LLM
+            </span>
+          </div>
+        </div>
+
+        {workerRows.length === 0 ? (
+          <div style={{ padding: "20px 0 4px", color: "var(--ink-muted)", fontSize: 13 }}>
+            No LLM spend recorded {emptyNote}. Bars fill in as each worker logs model calls.
+          </div>
+        ) : (
+          workerRows.map((w, i) => {
+            const llmPct = (w.llmCents / maxWorkerCents) * 100;
+            return (
+              <div
+                key={w.worker}
+                className="stack-phone"
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 110px",
+                  gap: 16,
+                  alignItems: "center",
+                  padding: "14px 0",
+                  borderTop: i === 0 ? 0 : "1px dashed var(--rule-soft)",
+                }}
+              >
+                <div>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      flexWrap: "wrap",
+                      gap: 8,
+                    }}
+                  >
+                    <span style={{ fontWeight: 500 }}>{w.label}</span>
+                  </div>
+                  <div className="bar-track" style={{ marginTop: 8, display: "flex" }}>
+                    <div
+                      className="bar-fill acc"
+                      style={{
+                        position: "relative",
+                        width: `${Math.max(llmPct, w.llmCents > 0 ? 1.5 : 0)}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+                <div style={{ textAlign: "right", fontFamily: "var(--mono)", fontSize: 13 }}>
+                  {formatCents(w.total)}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* Buckets — LLM pools that count toward the cap */}
+      <div className="card">
+        <div className="card-h">
+          <h3>Buckets · counts toward cap</h3>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <span className="tag">
+              {llmBuckets.length} pool{llmBuckets.length === 1 ? "" : "s"}
+            </span>
+            <button type="button" className="btn btn-sm btn-ghost" disabled>
+              Adjust caps →
+            </button>
+          </div>
+        </div>
+
+        {isEmpty ? (
+          <div style={{ padding: "20px 0 4px", color: "var(--ink-muted)", fontSize: 13 }}>
+            No spend recorded {emptyNote}. Buckets fill in as your agents log LLM calls.
+          </div>
+        ) : llmBuckets.length === 0 ? (
+          <div style={{ padding: "20px 0 4px", color: "var(--ink-muted)", fontSize: 13 }}>
+            No LLM spend {emptyNote} — only Apify provider usage, which doesn&apos;t count toward
+            your cap (see {formatCents(apifyCents)} below).
+          </div>
+        ) : (
+          llmBuckets.map((b, i) => {
+            const widthPct = (b.cents / maxBucketCents) * 100;
+            const pctOfTotal = totalCents === 0 ? 0 : (b.cents / totalCents) * 100;
+            const tone =
+              b.cents >= maxBucketCents * 0.85
+                ? "acc"
+                : b.cents >= maxBucketCents * 0.45
+                  ? "ok"
+                  : "";
+            return (
+              <div
+                key={b.id}
+                className="stack-phone"
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 110px 90px",
+                  gap: 16,
+                  alignItems: "center",
+                  padding: "14px 0",
+                  borderTop: i === 0 ? 0 : "1px dashed var(--rule-soft)",
+                }}
+              >
+                <div>
+                  <div style={{ fontWeight: 500 }}>{b.label}</div>
+                  <div className="bar-track" style={{ marginTop: 8 }}>
+                    <div
+                      className={`bar-fill${tone ? ` ${tone}` : ""}`}
+                      style={{ width: `${Math.max(widthPct, 1.5)}%` }}
+                    />
+                  </div>
+                </div>
+                <div style={{ textAlign: "right", fontFamily: "var(--mono)", fontSize: 13 }}>
+                  {formatCents(b.cents)}
