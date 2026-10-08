@@ -398,3 +398,103 @@ describe.skipIf(!url)("X publishing storage boundary (dedicated PostgreSQL)", ()
     expect(
       (await sql`select status from noelle.content_schedule_slots where id=${d.slotId}`)[0]?.status,
     ).toBe("publishing");
+    expect(
+      (await sql<{ used: number }[]>`select used from noelle.x_api_write_budget`)[0]?.used,
+    ).toBe(3);
+  });
+
+  it("derives a valid legacy manual slot idea while honoring its explicit scheduling authority", async () => {
+    const d = await seed();
+    await sql`update noelle.content_schedule_slots set idea_id=null,window_source='manual' where id=${d.slotId}`;
+    await sql`update noelle.post_drafts set status='draft',quality_passed=null,quality_score=null where id=${d.draftId}`;
+    const p = publisher();
+    expect((await p.tick())[0]?.status).toBe("published");
+    expect(
+      (await sql`select idea_id from noelle.content_schedule_slots where id=${d.slotId}`)[0]
+        ?.idea_id,
+    ).toBe(d.ideaId);
+  });
+
+  it("preserves explicit manual scheduling of a reviewed draft despite an earlier failed verifier", async () => {
+    const d = await seed();
+    await sql`update noelle.content_schedule_slots set window_source='manual' where id=${d.slotId}`;
+    await sql`update noelle.post_drafts set quality_passed=false where id=${d.draftId}`;
+    expect((await publisher().tick())[0]?.status).toBe("published");
+  });
+
+  it("rejects a contradictory nonnull slot idea instead of replacing the operator binding", async () => {
+    const d = await seed();
+    const other = await seed();
+    await sql`update noelle.content_schedule_slots set idea_id=${other.ideaId} where id=${d.slotId}`;
+    await sql`update noelle.content_schedule_slots set status='skipped' where id=${other.slotId}`;
+    const p = publisher();
+    expect(await p.tick()).toEqual([]);
+    expect(p.posts).toHaveLength(0);
+    expect(
+      (await sql`select idea_id from noelle.content_schedule_slots where id=${d.slotId}`)[0]
+        ?.idea_id,
+    ).toBe(other.ideaId);
+  });
+
+  it.each(["detached", "rebound", "deleted", "failed"])(
+    "cancels cached media after it is committed %s during upload",
+    async (change) => {
+      const d = await seed();
+      await image(d.draftId);
+      const other = change === "rebound" ? await seed() : null;
+      if (other)
+        await sql`update noelle.content_schedule_slots set status='skipped' where id=${other.slotId}`;
+      const p = publisher({
+        beforeUpload: async () => {
+          if (change === "detached")
+            await sql`update noelle.content_media set draft_id=null,idea_id=null where draft_id=${d.draftId}`;
+          if (change === "rebound")
+            await sql`update noelle.content_media set draft_id=${other!.draftId},idea_id=${other!.ideaId} where draft_id=${d.draftId}`;
+          if (change === "deleted")
+            await sql`delete from noelle.content_media where draft_id=${d.draftId}`;
+          if (change === "failed")
+            await sql`update noelle.content_media set status='failed' where draft_id=${d.draftId}`;
+        },
+      });
+      expect((await p.tick())[0]?.status).toBe("cancelled");
+      expect(p.posts).toHaveLength(0);
+      expect(
+        (await sql<{ used: number }[]>`select used from noelle.x_api_write_budget`)[0]?.used,
+      ).toBe(0);
+      expect(
+        (await sql`select status from noelle.content_schedule_slots where id=${d.slotId}`)[0]
+          ?.status,
+      ).toBe("ready");
+    },
+  );
+
+  it("holds the selected media binding through the actual post and receipt transaction", async () => {
+    const d = await seed();
+    await image(d.draftId);
+    const p = publisher({
+      beforePost: async () => {
+        await expect(
+          sql.begin(async (tx) => {
+            await tx`set local lock_timeout='100ms'`;
+            await tx`update noelle.content_media set draft_id=null where draft_id=${d.draftId}`;
+          }),
+        ).rejects.toMatchObject({ code: "55P03" });
+      },
+    });
+    expect((await p.tick())[0]?.status).toBe("published");
+    await sql`update noelle.content_media set draft_id=null where draft_id=${d.draftId}`;
+    expect((await sql`select draft_id from noelle.content_media`)[0]?.draft_id).toBeNull();
+  });
+
+  it("retains the canonical idea-shared selection even when an asset is also assigned to a sibling draft", async () => {
+    const d = await seed();
+    const [sibling] =
+      await sql`insert into noelle.post_drafts(org_id,agent_instance_id,idea_id,platform,body)
+      values (${org},${instance},${d.ideaId},'x','Sibling original') returning id`;
+    await image(sibling!.id);
+    await sql`update noelle.content_media set idea_id=${d.ideaId} where draft_id=${sibling!.id}`;
+    const p = publisher();
+    expect((await p.tick())[0]?.status).toBe("published");
+    expect(p.uploads()).toBe(1);
+  });
+});
