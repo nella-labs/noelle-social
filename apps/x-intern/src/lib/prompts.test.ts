@@ -398,3 +398,203 @@ describe("renderPersonProfile", () => {
     expect(out).not.toContain("How they write");
     expect(out).not.toContain("How to engage");
   });
+
+  it("renders all four fields when present", () => {
+    const out = renderPersonProfile({
+      summary: "s",
+      topics: ["t1"],
+      tone: "dry",
+      engagementNotes: "be concrete",
+    });
+    expect(out).toContain("Who they are: s");
+    expect(out).toContain("Topics they post about: t1");
+    expect(out).toContain("How they write: dry");
+    expect(out).toContain("How to engage them so it lands: be concrete");
+  });
+});
+
+describe("renderPatternRulesBlock", () => {
+  it("returns empty for no rules / blank instructions", async () => {
+    const { renderPatternRulesBlock } = await import("./prompts.js");
+    expect(renderPatternRulesBlock([])).toBe("");
+    expect(renderPatternRulesBlock([{ instruction: "  " }])).toBe("");
+  });
+
+  it("renders one bullet per rule with the break-these-patterns header", async () => {
+    const { renderPatternRulesBlock } = await import("./prompts.js");
+    const out = renderPatternRulesBlock([
+      { instruction: "stop opening with a question" },
+      { instruction: "vary the closer" },
+    ]);
+    expect(out).toContain("BREAK THESE REPEATED PATTERNS");
+    expect(out).toContain("- stop opening with a question");
+    expect(out).toContain("- vary the closer");
+    expect(out).toContain("habits, not hard bans");
+  });
+
+  it("appends the positive 'instead' mirror only when the rule has a suggestion", async () => {
+    const { renderPatternRulesBlock } = await import("./prompts.js");
+    const out = renderPatternRulesBlock([
+      { instruction: "stop echoing a raw detail as a fragment", suggestion: "open with your actual take or a question" },
+      { instruction: "vary the closer" },
+    ]);
+    expect(out).toContain("- stop echoing a raw detail as a fragment → instead: open with your actual take or a question");
+    // The suggestion-less rule stays a plain bullet.
+    expect(out).toContain("- vary the closer");
+    expect(out).not.toContain("vary the closer → instead:");
+  });
+
+  it("does not tell X replies to add periods for an automatic pattern alert", async () => {
+    const { renderPatternRulesBlock } = await import("./prompts.js");
+    const periodRule = {
+      instruction: "Do not routinely leave declarative replies hanging without terminal punctuation.",
+      suggestion: "Use a period when the thought is complete.",
+    };
+    const out = renderPatternRulesBlock([
+      { ...periodRule, source: "auto" },
+      { instruction: "Stop echoing a raw detail as a fragment", source: "auto" },
+    ]);
+    expect(out).toContain("Stop echoing a raw detail as a fragment");
+    expect(out).not.toContain("without terminal punctuation");
+    expect(out).not.toContain("Use a period");
+    expect(renderPatternRulesBlock([{ ...periodRule, source: "auto" }])).toBe("");
+    expect(renderPatternRulesBlock([{ ...periodRule, source: "manual" }])).toContain("Use a period");
+  });
+});
+
+describe("buildDrafterSystem + patternRules", () => {
+  it("stays byte-identical to SYSTEM_X_BASE when patternRules is empty/undefined", () => {
+    expect(buildDrafterSystem(null, null, null, null, null, undefined, [])).toBe(SYSTEM_X_BASE);
+    expect(buildDrafterSystem()).toBe(SYSTEM_X_BASE);
+  });
+
+  it("appends the pattern block LAST when rules are present", () => {
+    const out = buildDrafterSystem("mission", null, null, null, null, undefined, [
+      { instruction: "stop opening with a question" },
+    ]);
+    expect(out).toContain("BREAK THESE REPEATED PATTERNS");
+    expect(out.indexOf("OPERATOR MISSION")).toBeLessThan(out.indexOf("BREAK THESE REPEATED PATTERNS"));
+    // The block is the final section (freshest instruction before writing).
+    expect(out.trimEnd().endsWith("Keep every voice and NEVER-DO rule above intact.")).toBe(true);
+  });
+});
+
+describe("self-stat ban (the '24 followers' regression)", () => {
+  // 2026-07-24: Vega drafted "24 followers over here and i still show up like
+  // the room is full" when the operator had ~100. The number existed nowhere in
+  // Noelle. Both prompt variants must carry the ban outright, independently of
+  // whether an own-account facts block was wired in.
+  it("is present in BOTH drafter prompt variants", () => {
+    for (const prompt of [SYSTEM_X_BASE]) {
+      expect(prompt).toContain("Inventing a number about YOURSELF");
+      expect(prompt).toContain("Follower count");
+      expect(prompt).toContain("24 followers over here");
+    }
+  });
+
+  it("does not turn a missing count into an unsupported qualitative self-claim", () => {
+    expect(SYSTEM_X_BASE).not.toContain("barely anyone follows me");
+    expect(SYSTEM_X_BASE).toContain("Do not replace a missing count with an unsupported qualitative claim");
+  });
+});
+
+describe("buildDrafterSystem + ownAccount", () => {
+  const NOW = new Date("2026-07-26T18:00:00.000Z");
+  const FRESH = {
+    handle: "example_operator",
+    followers: 103,
+    following: 210,
+    posts: 412,
+    capturedAt: "2026-07-26T12:00:00.000Z",
+    source: "x_api" as const,
+  };
+
+  it("stays byte-identical to SYSTEM_X_BASE when no facts argument is passed", () => {
+    expect(buildDrafterSystem(null, null, null, null, null, undefined, [], null)).toBe(SYSTEM_X_BASE);
+    expect(buildDrafterSystem()).toBe(SYSTEM_X_BASE);
+  });
+
+  it("injects the real follower count when the snapshot is fresh", () => {
+    const out = buildDrafterSystem(null, null, null, null, null, undefined, null, {
+      snapshot: FRESH,
+      now: NOW,
+    });
+    expect(out).toContain("YOUR OWN ACCOUNT");
+    expect(out).toContain("103 followers");
+    expect(out).toContain("@example_operator");
+  });
+
+  it("renders the block even with NO snapshot, so the gap is stated not filled", () => {
+    const out = buildDrafterSystem(null, null, null, null, null, undefined, null, {
+      snapshot: null,
+      now: NOW,
+    });
+    expect(out).toContain("YOUR OWN ACCOUNT");
+    expect(out).toContain("Treat every count as unknown");
+  });
+
+  it("suppresses a stale count rather than passing off an old number as current", () => {
+    // The literal frozen snapshot: 68 followers, captured 2026-07-11.
+    const out = buildDrafterSystem(null, null, null, null, null, undefined, null, {
+      snapshot: { ...FRESH, followers: 68, capturedAt: "2026-07-11T16:02:53.773Z" },
+      now: NOW,
+    });
+    expect(out).not.toContain("68 followers");
+    expect(out).toContain("no longer accurate");
+  });
+
+  it("places the facts ABOVE the pattern-breaker block (facts first, style last)", () => {
+    const out = buildDrafterSystem("mission", null, null, null, null, undefined, [
+      { instruction: "stop opening with a question" },
+    ], { snapshot: FRESH, now: NOW });
+    expect(out.indexOf("YOUR OWN ACCOUNT")).toBeLessThan(out.indexOf("BREAK THESE REPEATED PATTERNS"));
+  });
+});
+
+// Same ban as Lyra's, from the same shared constant: the two interns were
+// running one skeleton, so they get one ban.
+describe("house-skeleton ban placement (Vega)", () => {
+  for (const [name, prompt] of [
+    ["SYSTEM_X_BASE", SYSTEM_X_BASE],
+    ["SYSTEM_X_BASE", SYSTEM_X_BASE],
+  ] as const) {
+    it(`${name} bans grading their detail`, () => {
+      expect(prompt).toContain("NEVER GRADE THEIR DETAIL");
+      expect(prompt).toContain("is the one/part/bit/line/detail");
+      // The no-dots rule rides the same reply surfaces.
+      expect(prompt).toContain("NO FULL STOPS");
+    });
+  }
+});
+
+it("honors a policy-only never config instead of the legacy product prompt", () => {
+  expect(buildDrafterSystem(null, null, parseBrandConfig({ pitch_policy: "never" }))).toContain("PITCH POLICY: never");
+});
+
+
+describe("renderOperatorFacts", () => {
+  it("shares configured factual copy with the writer while excluding drafting directives", () => {
+    const brand = parseBrandConfig({
+      persona: { name: "Ari", bio: "Builds Oriole" },
+      product: { name: "Oriole", description: "Maps Atlas", url: "https://oriole.example", install: "oriole inspect", surfaces: ["https://docs.oriole.example"], fits_when: ["dependency drift"] },
+      qa: [{ q: "What does it map?", a: "Atlas manifests" }],
+      pitch_policy: "always",
+      reply_style: { voice_notes: "Style-only Vega", never_do: ["Style-only prose"] },
+      dm_style: { greeting: "DM-only greeting", notes: "DM-only instructions" },
+    });
+    const facts = renderOperatorFacts(brand).join("\n");
+    const writer = renderBrandBlock(brand);
+    for (const value of ["Ari", "Builds Oriole", "Oriole", "Maps Atlas", "https://oriole.example", "oriole inspect", "https://docs.oriole.example", "dependency drift", "Atlas manifests"]) {
+      expect(facts).toContain(value);
+      expect(writer).toContain(value);
+    }
+    for (const directive of ["Style-only", "DM-only", "PITCH POLICY", "own line when pitching", "do NOT pitch"]) {
+      expect(facts).not.toContain(directive);
+    }
+  });
+
+  it("has no default operator or product facts without configured brand context", () => {
+    expect(renderOperatorFacts(parseBrandConfig({}))).toEqual([]);
+    expect(buildDrafterSystem()).not.toContain("OPERATOR BRAND (set by the operator");
+    expect(buildDrafterSystem()).toContain("do not pitch without a verified product brief");
+  });
