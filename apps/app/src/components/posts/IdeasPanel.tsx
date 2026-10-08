@@ -198,3 +198,85 @@ function TextIdeasBoard({
       ) : (
         <IdeasGrid>
           {visible.map((idea) => (
+            <IdeaCard
+              key={idea.id}
+              idea={idea}
+              busy={pending && busyId === idea.id}
+              onDraft={idea.platform === "linkedin" || idea.platform === "x" ? () => generate(idea.id) : undefined}
+              onDismiss={() => dismiss(idea.id)}
+            />
+          ))}
+        </IdeasGrid>
+      )}
+    </div>
+  );
+}
+
+// ─── Idea card ───────────────────────────────────────────────────────────
+function IdeaCard({ idea, busy, onDraft, onDismiss }: { idea: PostIdeaRow; busy: boolean; onDraft?: () => void; onDismiss: () => void }) {
+  const lane = LANE_BY_ID[idea.platform] ?? LANE_BY_ID.x;
+  const [fanned, setFanned] = useState(false);
+  // Real fan-out targets: the platforms this idea drafts into (default X + LinkedIn).
+  const targets = (idea.target_platforms?.length ? idea.target_platforms : [idea.platform]).filter(Boolean);
+
+  return (
+    <article className={styles.ideaCard}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+        <span style={{ fontFamily: "var(--mono)", fontSize: 9, letterSpacing: "0.06em", textTransform: "uppercase", color: lane.color,
+                       padding: "2px 7px", borderRadius: 999, background: `color-mix(in oklch, ${lane.color} 12%, var(--paper))`,
+                       boxShadow: `0 0 0 0.5px color-mix(in oklch, ${lane.color} 35%, var(--rule))` }}>
+          {lane.label}
+        </span>
+        {idea.pillar && <span className="tag" style={{ height: 18 }}>{idea.pillar}</span>}
+        {idea.angle && <span className="tag" style={{ height: 18 }}>{idea.angle}</span>}
+      </div>
+
+      <h3 className={styles.ideaHook}>{idea.hook}</h3>
+
+      {idea.thesis && (
+        <div style={{ marginTop: 10, fontSize: 11.5, color: "var(--ink-muted)", lineHeight: 1.45, display: "flex", gap: 6 }}>
+          <span style={{ color: "var(--accent)", flexShrink: 0 }}>◆</span>
+          <span>{idea.thesis}</span>
+        </div>
+      )}
+
+      <InspirationRefs refs={idea.inspiration_refs} />
+
+      <div className={styles.ideaCardActions}>
+        {onDraft ? (
+          <button className="btn btn-sm btn-primary" style={{ flex: 1 }} onClick={onDraft} disabled={busy}>
+            {busy ? "Drafting…" : "Draft →"}
+          </button>
+        ) : (
+          <span style={{ flex: 1, fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--ink-soft)", alignSelf: "center" }}>
+            arrives via skills bridge
+          </span>
+        )}
+        <button className="btn btn-sm" onClick={() => setFanned((f) => !f)}>⤢ Fan-out</button>
+        <button className="btn btn-sm btn-ghost" onClick={onDismiss} disabled={busy}>Dismiss</button>
+      </div>
+
+      {fanned && (
+        <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px dashed var(--rule)" }}>
+          <div className="eyebrow" style={{ marginBottom: 8 }}>One idea → many surfaces</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {targets.map((p) => {
+              const fp = LANE_BY_ID[p] ?? lane;
+              return (
+                <div key={p} style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", borderRadius: 8,
+                                      background: "var(--paper-2)", boxShadow: "0 0 0 0.5px var(--rule)" }}>
+                  {fp.role && <Avatar role={fp.role} size={20} accent={fp.color} />}
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 500 }}>{platLabel(p)} draft</div>
+                    <div style={{ fontFamily: "var(--mono)", fontSize: 9.5, color: "var(--ink-muted)" }}>{fp.agent} · in your voice</div>
+                  </div>
+                  <span style={{ marginLeft: "auto", color: "var(--accent)", fontSize: 14 }}>+</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </article>
+  );
+}
