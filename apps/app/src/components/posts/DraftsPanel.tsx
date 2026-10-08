@@ -398,3 +398,203 @@ function Editor({
               <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={7}
                         placeholder="Write the body. Concrete > abstract." style={{ ...inputStyle, resize: "vertical", lineHeight: 1.6 }} />
             </Field>
+          </>
+        )}
+
+        {/* What this post drew from — watchlist people, the source post, vault. */}
+        {draft.inspiration_refs?.length ? <InspirationRefs refs={draft.inspiration_refs} /> : null}
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <Field label="CTA"><input value={cta} onChange={(e) => setCta(e.target.value)} placeholder="Link in bio · DMs open…" style={inputStyle} /></Field>
+          <Field label="Category">
+            <select value={category} onChange={(e) => setCategory(e.target.value as Category | "")} style={{ ...inputStyle, height: 36, cursor: "pointer" }}>
+              <option value="">—</option>
+              {CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </Field>
+        </div>
+
+        <Field label="Schedule" hint="moves the X + LinkedIn set together">
+          <ScheduleChips today={today} value={draft.suggested_day ?? null} onChange={schedule} disabled={pending} />
+        </Field>
+
+        <Field label="Media" hint="attach an image / video">
+          <MediaField orgSlug={orgSlug} draftId={draft.id} platform={draft.platform} media={media} onChanged={onMediaChanged} />
+        </Field>
+
+        <Field label="Notes" hint="private — guides the drafter">
+          <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Angle, audience, do/don't…" rows={2}
+                    style={{ ...inputStyle, resize: "vertical", fontStyle: "italic" }} />
+        </Field>
+
+        {(msg || copyError) && <span role="status" style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--danger)" }}>{msg || copyError}</span>}
+
+        {/* actions */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, paddingTop: 4, borderTop: "1px dashed var(--rule)", flexWrap: "wrap" }}>
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button className="btn btn-sm" onClick={saveDraft} disabled={pending}>Save draft</button>
+            {isPosted ? (
+              <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--accent)", alignSelf: "center" }}>posted ✓</span>
+            ) : isReady ? (
+              <>
+                <button className="btn btn-sm" onClick={copy} disabled={pending}>{copiedKey ? "Copied ✓" : "Copy post"}</button>
+                <button className="btn btn-sm btn-primary" onClick={markPosted} disabled={pending}>Mark posted</button>
+              </>
+            ) : (
+              <button className="btn btn-sm btn-accent" onClick={markReady} disabled={pending}>{pending ? "Saving…" : "Mark ready"}</button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Schedule chips (today → +6) ─────────────────────────────────────────
+function addDaysYmd(ymd: string, i: number): string {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + i);
+  return d.toISOString().slice(0, 10);
+}
+function ScheduleChips({ today, value, onChange, disabled }: { today: string; value: string | null; onChange: (d: string | null) => void; disabled?: boolean }) {
+  const days = Array.from({ length: 7 }, (_, i) => {
+    const date = addDaysYmd(today, i);
+    const d = new Date(`${date}T00:00:00Z`);
+    return { i, date, dow: d.toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" }), num: d.getUTCDate() };
+  });
+  return (
+    <div style={{ display: "flex", gap: 4 }}>
+      <button onClick={() => onChange(null)} disabled={disabled} title="Unscheduled" style={chipBtn(value == null, "var(--ink-soft)")}>—</button>
+      {days.map((d) => (
+        <button key={d.i} onClick={() => onChange(d.date)} disabled={disabled} title={`${d.dow} ${d.num}`} style={chipBtn(value === d.date, "var(--accent)")}>
+          <span style={{ fontSize: 8, opacity: 0.7, display: "block", lineHeight: 1 }}>{d.i === 0 ? "Tod" : d.dow.slice(0, 2)}</span>
+          <span style={{ fontSize: 11, lineHeight: 1.2 }}>{d.num}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+function chipBtn(active: boolean, color: string): CSSProperties {
+  return {
+    flex: 1, minWidth: 0, height: 38, border: 0, borderRadius: 7, cursor: "pointer",
+    background: active ? color : "var(--paper-2)", color: active ? "#fff" : "var(--ink-muted)",
+    boxShadow: active ? "none" : "0 0 0 0.5px var(--rule)",
+    fontFamily: "var(--mono)", display: "grid", placeItems: "center", padding: 0,
+  };
+}
+
+// ─── Media attach (per-draft) ────────────────────────────────────────────
+const MAX_MEDIA_BYTES = 11 * 1024 * 1024;
+async function fileToBase64(file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  return btoa(binary);
+}
+function MediaField({ orgSlug, draftId, platform, media, onChanged }: {
+  orgSlug: string; draftId: string; platform: string; media: ContentMediaRow[]; onChanged: () => void;
+}) {
+  const [pending, start] = useTransition();
+  const [msg, setMsg] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const { copiedKey, copy } = useCopy();
+
+  function onPick(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setMsg(null);
+    if (file.size > MAX_MEDIA_BYTES) { setMsg("That file is too large (max ~11MB)."); if (inputRef.current) inputRef.current.value = ""; return; }
+    const kind = file.type.startsWith("video") ? "video" : file.type.startsWith("image") ? "image" : "other";
+    start(async () => {
+      try {
+        const dataBase64 = await fileToBase64(file);
+        const res = await uploadMedia({ orgSlug, kind, mimeType: file.type || "application/octet-stream", dataBase64, filename: file.name, draftId });
+        if (!res.ok) setMsg(`Couldn't upload: ${res.error.message}`); else onChanged();
+      } catch { setMsg("Couldn't read that file."); }
+      if (inputRef.current) inputRef.current.value = "";
+    });
+  }
+  function remove(id: string) {
+    setMsg(null);
+    start(async () => { const res = await deleteMedia({ orgSlug, id }); if (!res.ok) setMsg(`Couldn't remove: ${res.error.message}`); else onChanged(); });
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-start" }}>
+        {media.map((m) => {
+          const copied = copiedKey === m.id;
+          return (
+            <div key={m.id} style={{ width: 64, display: "flex", flexDirection: "column", gap: 4 }}>
+              <div style={{ position: "relative", width: 64, height: 64, borderRadius: 8, overflow: "hidden", boxShadow: "0 0 0 0.5px var(--rule)", background: "var(--paper-2)" }}>
+                {m.kind === "video" && m.url ? (
+                  <video src={m.url} style={{ width: "100%", height: "100%", objectFit: "cover" }} muted />
+                ) : m.url ? (
+                  <div role="img" aria-label={m.caption ?? "attached media"}
+                       style={{ width: "100%", height: "100%", backgroundImage: `url(${JSON.stringify(m.url)})`, backgroundSize: "cover", backgroundPosition: "center" }} />
+                ) : (
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 8, color: "var(--ink-soft)", display: "grid", placeItems: "center", height: "100%" }}>no preview</span>
+                )}
+                <button onClick={() => remove(m.id)} disabled={pending} aria-label="Remove media"
+                        style={{ position: "absolute", top: 2, right: 2, width: 18, height: 18, borderRadius: "50%", border: 0, cursor: "pointer",
+                                 background: "rgba(20,16,8,.7)", color: "#fff", fontSize: 11, lineHeight: 1, display: "grid", placeItems: "center" }}>✕</button>
+              </div>
+              <button type="button" onClick={() => copy(mediaCopyPath(m.url), m.id)} disabled={!m.url}
+                      title={m.url ? "Copy the path to this file" : "No path yet"}
+                      style={{ width: 64, height: 18, border: 0, borderRadius: 5, cursor: m.url ? "pointer" : "default", padding: 0,
+                               background: copied ? "var(--ok)" : "var(--paper-2)", color: copied ? "#fff" : "var(--ink-muted)",
+                               boxShadow: copied ? "none" : "0 0 0 0.5px var(--rule)", fontFamily: "var(--mono)", fontSize: 9, letterSpacing: "0.02em",
+                               transition: "background .15s, color .15s" }}>
+                {copied ? "✓ copied" : "Copy path"}
+              </button>
+            </div>
+          );
+        })}
+        <label className="btn btn-sm" style={{ cursor: "pointer" }}>
+          {pending ? "…" : media.length ? "+ Add" : "+ Image / video"}
+          <input ref={inputRef} type="file" accept="image/*,video/*" onChange={onPick} disabled={pending} hidden />
+        </label>
+      </div>
+      {media.length === 0 && (
+        <div style={{ fontSize: 10.5, color: "var(--ink-soft)", marginTop: 6 }}>
+          Attach an image{platform === "linkedin" ? " or the video for this post" : ""}. Draft-only — you post by hand.
+        </div>
+      )}
+      {msg && <span style={{ fontFamily: "var(--mono)", fontSize: 10.5, color: "var(--danger)", display: "block", marginTop: 6 }}>{msg}</span>}
+    </div>
+  );
+}
+
+// ─── Live preview ────────────────────────────────────────────────────────
+function ph(t: string, fallback: string) { return t && t.trim() ? t : fallback; }
+
+function Preview({ draft, userName, userHandle }: { draft: PostDraftRow; userName: string; userHandle: string }) {
+  const hookRaw = draft.draft_hook ?? "";
+  const full = draft.final_body ?? draft.body;
+  const body = stripLeadingHook(full, hookRaw); // full post minus its leading hook line
+  const didStrip = body !== full;
+  const cta = draft.cta ?? "";
+  // LinkedIn: bold hook line then the rest. Reddit: hook is the post TITLE, body
+  // below it. X: no separate hook field — show the full post (hook is line 1).
+  if (draft.platform === "linkedin")
+    return <LinkedInPreview userName={userName} hook={didStrip ? hookRaw : ""} content={body} cta={cta} />;
+  if (draft.platform === "reddit")
+    return <RedditPreview userHandle={userHandle} hook={hookRaw} content={didStrip ? body : full} cta={cta} />;
+  return <XPreview userName={userName} userHandle={userHandle} content={full} cta={cta} />;
+}
+
+function XPreview({ userName, userHandle, content, cta }: { userName: string; userHandle: string; content: string; cta: string }) {
+  const body = [content, cta].filter((s) => s && s.trim()).join("\n\n");
+  return (
+    <div className="card" style={{ padding: 16 }}>
+      <div style={{ display: "flex", gap: 10 }}>
+        <Avatar role="you" size={40} accent="var(--paper)" />
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+            <span style={{ fontWeight: 700, fontSize: 14 }}>{userName}</span>
+            <span style={{ color: "var(--ink-muted)", fontFamily: "var(--mono)", fontSize: 12 }}>{userHandle}</span>
+          </div>
+          <div style={{ marginTop: 6, fontSize: 14.5, lineHeight: 1.5, color: body ? "var(--ink)" : "var(--ink-soft)", whiteSpace: "pre-wrap", fontStyle: body ? "normal" : "italic" }}>
+            {ph(body, "Your post renders here.")}
+          </div>
