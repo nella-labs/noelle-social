@@ -198,3 +198,79 @@ const EnvSchema = z.object({
   NOELLE_KNOWLEDGE_DIRS: z.string().optional(),
   // How many knowledge chunks to retrieve in the second pass.
   NOELLE_DRAFTER_KNOWLEDGE_TOPK: z.coerce.number().int().min(0).default(4),
+  // Run the post-draft verifier + regenerate loop on Nova's SCRIPTS (voice /
+  // grounding / relevance / format). Off → scripts written unverified (legacy).
+  NOELLE_DRAFTER_VERIFY: boolFlag,
+  // Max regenerate attempts on a failed verdict before keeping the best try.
+  NOELLE_DRAFTER_VERIFY_RETRIES: z.coerce.number().int().min(0).max(3).default(2),
+  // Voice floor (0-1). A script whose voice score is below this fails the verdict
+  // (marked 'below bar' in the trace) and regenerates. 0 disables it. Default 0.65.
+  NOELLE_DRAFTER_VOICE_FLOOR: z.coerce.number().min(0).max(1).default(0.65),
+  // Voice variety: per lead, randomly assign a "register" and inject it into the
+  // comment-drafting prompt so comments vary in length + energy across the feed
+  // (see lib/register.ts). Default OFF → byte-identical drafts. Mirrors x-intern.
+  NOELLE_DRAFTER_VARIETY: boolFlag,
+  // Per-author memory: how many of the replies Orion already sent/queued to a
+  // post's author to inject into the comment prompt ("do not repeat these").
+  // 0 disables it. Default 3.
+  REDDIT_DRAFTER_SENT_TOPK: z.coerce.number().int().min(0).default(3),
+  // Global phrasing memory: how many of Orion's most recent replies across the
+  // WHOLE feed (all authors) to inject as an avoid-list. 0 disables it. Default 10.
+  REDDIT_DRAFTER_RECENT_PHRASINGS_TOPK: z.coerce.number().int().min(0).default(10),
+  // Vision caption fallback. When no BYO org `gemini-api-key` is configured (the
+  // self-host case), caption post images via Vertex Gemini using the worker's
+  // attached service account / ADC instead. Default ON; set 0 to force text-only.
+  NOELLE_VERTEX_ENABLED: boolFlag.default("1"),
+  // Vertex region for the ADC vision caption (and any Vertex engine fallback).
+  VERTEX_LOCATION: z.string().default("us-central1"),
+
+  // ── Phase 2: teardown (W2) + distiller (W3) ──
+  TEARDOWN_POLL_MS: z.coerce.number().int().positive().default(60_000),
+  TEARDOWN_BATCH: z.coerce.number().int().positive().default(8),
+  TEARDOWN_DAILY_CAP: z.coerce.number().int().positive().default(200),
+  // faster-whisper model size for transcription (base/small/medium). Unset → base.
+  WHISPER_MODEL: z.string().optional(),
+  DISTILLER_POLL_MS: z.coerce.number().int().positive().default(300_000),
+  DISTILLER_EMBED_BATCH: z.coerce.number().int().positive().default(50),
+  // W3b Skiller — how often it re-emits SKILL.md files from the Brand Guides.
+  // Cheap (pure FS writes), so it can trail the distiller loosely. Default 10 min.
+  SKILLER_POLL_MS: z.coerce.number().int().positive().default(600_000),
+  // ── Phase 3: ideator (W4 Muse) + scripter (W4 Scribe) ──
+  IDEATOR_POLL_MS: z.coerce.number().int().positive().default(30_000),
+  SCRIPTER_POLL_MS: z.coerce.number().int().positive().default(30_000),
+  SCRIPTER_BATCH: z.coerce.number().int().positive().default(4),
+  // ── Phase 6: briefer (W6 media intern) — recording briefs for approved drafts ──
+  // Flag-gated so the worker is DORMANT until enabled (merging is safe). Off →
+  // the briefer entrypoint logs and exits without touching the DB.
+  NOELLE_BRIEFER: boolFlag,
+  BRIEFER_POLL_MS: z.coerce.number().int().positive().default(30_000),
+  BRIEFER_BATCH: z.coerce.number().int().positive().default(4),
+  // Voyage key for clip embeddings (the dense retrieval layer). Unset → embedding
+  // skipped (dormant, like the account-feeder dense path until a key is set).
+  VOYAGE_API_KEY: z.string().optional(),
+
+  // ── Personal brand state (all default OFF → dormant until opted in). When on,
+  //    the distiller regenerates <vault>/<first voice dir>/personal-brand-state.md
+  //    (account profile + self metrics + brand-doc snippets) after each account
+  //    distillation, and the scripter PREFERS that artifact ahead of BM25 anchors.
+  //    Fully fail-open: a missing vault/file leaves live behavior byte-identical. ──
+  NOELLE_PERSONAL_BRAND_STATE: boolFlag,
+  // Override the artifact path. Default: <NOELLE_VAULT_DIR>/<first NOELLE_VOICE_DIRS
+  // entry>/personal-brand-state.md (vault root only when no voice dirs are set).
+  // Must live under a scanned dir, or the KB won't index it for retrieval.
+  NOELLE_PERSONAL_BRAND_STATE_PATH: z.string().optional(),
+});
+
+export type Env = z.infer<typeof EnvSchema>;
+
+let cached: Env | undefined;
+
+export function loadEnv(): Env {
+  if (cached) return cached;
+  cached = EnvSchema.parse(process.env);
+  return cached;
+}
+
+export function resetEnvForTests() {
+  cached = undefined;
+}
