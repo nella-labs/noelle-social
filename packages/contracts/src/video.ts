@@ -398,3 +398,203 @@ export const OnTheDayNoteSchema = z.object({
 });
 export type OnTheDayNote = z.infer<typeof OnTheDayNoteSchema>;
 
+/** Props/setting split into what MUST be in frame and what must NOT (the
+ *  founder-journey positioning rule: keep off-brand signals out of shot). */
+export const RecordingPropsSchema = z.object({
+  inFrame: z.array(z.string()).default([]),
+  mustNotBeInFrame: z.array(z.string()).default([]),
+});
+export type RecordingProps = z.infer<typeof RecordingPropsSchema>;
+
+/**
+ * The briefer's structured output (→ noelle.video_recording_briefs.brief). Keeps
+ * the Paperclip media-intern's full section set: hook check, shot list, b-roll,
+ * cam angles, props/setting, runtime target, and on-the-day notes.
+ */
+export const RecordingBriefOutputSchema = z.object({
+  /** Working title for the recording session (usually the draft's hook, tightened). */
+  title: z.string(),
+  /** Target runtime in SECONDS. */
+  runtimeTarget: z.number().nonnegative(),
+  /** Does the hook land in the first ~3s? A one-line go/no-go check for the operator. */
+  hookCheck: z.string(),
+  /** Ordered, timed shot list. */
+  shotList: z.array(RecordingShotSchema).default([]),
+  /** Supplementary b-roll to grab. */
+  bRoll: z.array(z.string()).default([]),
+  /** Camera angles / framing to use. */
+  camAngles: z.array(z.string()).default([]),
+  /** Props + setting: what belongs in frame, what must be kept out. */
+  props: RecordingPropsSchema.default({ inFrame: [], mustNotBeInFrame: [] }),
+  /** Reminders for filming day; flagged items roll up into forge_followups. */
+  onTheDayNotes: z.array(OnTheDayNoteSchema).default([]),
+});
+export type RecordingBriefOutput = z.infer<typeof RecordingBriefOutputSchema>;
+
+// --- Phase 4: asset generation (W5, "assist + overlays") -------------------
+// Typed Remotion overlay specs — the render target for video_drafts.graph_specs.
+// A discriminated union so the Build panel + the Forge/Remotion renderer know
+// exactly which vertical (1080x1920) composition + params to use. The scripter
+// emits the looser VideoGraphSpec; `remotionAssetFromGraphSpec` coerces it.
+export const BarChartSpecSchema = z.object({
+  kind: z.literal("bar_chart"),
+  title: z.string().optional(),
+  points: z.array(z.object({ label: z.string(), value: z.number() })).min(1),
+  brandColor: z.string().optional(),
+  durationFrames: z.number().int().positive().default(180),
+});
+export const LineChartSpecSchema = z.object({
+  kind: z.literal("line_chart"),
+  title: z.string().optional(),
+  series: z.array(z.object({ x: z.union([z.string(), z.number()]), y: z.number() })).min(2),
+  brandColor: z.string().optional(),
+  durationFrames: z.number().int().positive().default(180),
+});
+export const KineticCaptionSpecSchema = z.object({
+  kind: z.literal("kinetic_caption"),
+  lines: z.array(z.string()).min(1),
+  brandColor: z.string().optional(),
+  durationFrames: z.number().int().positive().default(120),
+});
+export const LowerThirdSpecSchema = z.object({
+  kind: z.literal("lower_third"),
+  title: z.string(),
+  subtitle: z.string().optional(),
+  brandColor: z.string().optional(),
+  durationFrames: z.number().int().positive().default(120),
+});
+export const RemotionAssetSpecSchema = z.discriminatedUnion("kind", [
+  BarChartSpecSchema,
+  LineChartSpecSchema,
+  KineticCaptionSpecSchema,
+  LowerThirdSpecSchema,
+]);
+export type RemotionAssetSpec = z.infer<typeof RemotionAssetSpecSchema>;
+
+export const ImageGenSpecSchema = z.object({
+  prompt: z.string().min(1),
+  aspect: z.enum(["9:16", "1:1", "16:9"]).default("9:16"),
+  style: z.string().optional(),
+});
+export type ImageGenSpec = z.infer<typeof ImageGenSpecSchema>;
+
+// A rendered/generated asset persisted on video_drafts.assets (mig 0070).
+export const VideoDraftAssetSchema = z.object({
+  kind: z.enum(["overlay", "image"]),
+  url: z.string(), // mp4/png URL or a data: URL
+  label: z.string().optional(),
+  specKind: z.string().optional(), // the RemotionAssetSpec.kind it came from
+  createdAt: z.string(),
+});
+export type VideoDraftAsset = z.infer<typeof VideoDraftAssetSchema>;
+
+/**
+ * Coerce the scripter's loose VideoGraphSpec into a typed RemotionAssetSpec for
+ * rendering. Maps the loose `kind` + best-effort reads `data`. Returns null when
+ * the spec can't be rendered (the Build panel just shows it as a suggestion).
+ */
+export function remotionAssetFromGraphSpec(spec: unknown): RemotionAssetSpec | null {
+  if (!spec || typeof spec !== "object") return null;
+  const g = spec as { kind?: string; title?: string; data?: unknown; note?: string };
+  const title = typeof g.title === "string" ? g.title : undefined;
+  const dataArr = Array.isArray(g.data) ? (g.data as unknown[]) : [];
+  const num = (v: unknown): number | null => {
+    const n = typeof v === "string" ? Number(v) : v;
+    return typeof n === "number" && Number.isFinite(n) ? n : null;
+  };
+  if (g.kind === "bar" || g.kind === "line" || g.kind === "time_series") {
+    const points = dataArr
+      .map((d) => {
+        const o = (d ?? {}) as Record<string, unknown>;
+        const value = num(o.value ?? o.y ?? o.count);
+        const label = String(o.label ?? o.x ?? o.name ?? "");
+        return value !== null && label ? { label, value } : null;
+      })
+      .filter((p): p is { label: string; value: number } => p !== null);
+    if (points.length === 0) return null;
+    if (g.kind === "bar") return { kind: "bar_chart", title, points, durationFrames: 180 };
+    return { kind: "line_chart", title, series: points.map((p) => ({ x: p.label, y: p.value })), durationFrames: 180 };
+  }
+  if (g.kind === "kinetic_text") {
+    // `title` carries the on-screen words; `note` is the animation direction, so
+    // it must NOT become a caption line. Split a multi-line title into lines.
+    const lines = (title ?? "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    return lines.length ? { kind: "kinetic_caption", lines, durationFrames: 120 } : null;
+  }
+  if (g.kind === "lower_third" && title) {
+    return { kind: "lower_third", title, subtitle: typeof g.note === "string" ? g.note : undefined, durationFrames: 120 };
+  }
+  return null;
+}
+
+/**
+ * A script edit Nova (the video refiner) proposes when the operator asks it to
+ * change the draft on screen. Same propose-then-confirm contract as the
+ * targeting/vault blocks: the chat LLM emits a fenced ```noelle-script-edit
+ * block of this JSON, the route extracts + validates it, and it only touches the
+ * draft when the operator clicks Apply — which loads the new lines into the
+ * studio editor (marked dirty) for review before Save. The LLM never writes.
+ */
+export const ScriptEditProposalSchema = z.object({
+  /** Per-beat voice-line replacements, keyed by the beat's 0-based storyboard index. */
+  beats: z
+    .array(
+      z.object({
+        index: z.number().int().min(0).max(50),
+        line: z.string().min(1).max(2000),
+      }),
+    )
+    .max(50)
+    .optional(),
+  /** A full-script replacement (when the operator asked for a whole-pass rewrite). */
+  fullScript: z.string().min(1).max(20_000).optional(),
+  /** One-line human summary of the change, shown on the Apply card. */
+  summary: z.string().min(1).max(300),
+});
+export type ScriptEditProposal = z.infer<typeof ScriptEditProposalSchema>;
+
+// ---------------------------------------------------------------------------
+// Harvest run summary — the inspectable, live record of one Scout harvest run,
+// written incrementally into noelle.worker_runs.summary as the tick works
+// through each lane. Powers the harvest console: per-lane pulled→kept counts,
+// *why* clips were dropped, hard errors, live phase/progress, and cancellation.
+// Every lane the worker touches appends/updates one entry so the operator can
+// watch a run fill in (~3s polling) and tell a too-strict filter (kept:0,
+// dropped.belowMinViews:30) apart from a bad pull (pulled:0, error set).
+// ---------------------------------------------------------------------------
+/** Why clips fell out of a lane before upsert. All counts, never PII. */
+export const HarvestDropReasonsSchema = z
+  .object({
+    /** Niche lane: below nicheTrending.minViews floor. */
+    belowMinViews: z.number().int().min(0).default(0),
+    /** Not selected by any creator lane (top-by-views/engagement/outperformer). */
+    notSelected: z.number().int().min(0).default(0),
+    /** Objective grader judged off-objective (only when grading ran). */
+    offObjective: z.number().int().min(0).default(0),
+  })
+  .strict();
+export type HarvestDropReasons = z.infer<typeof HarvestDropReasonsSchema>;
+
+export const HarvestLaneKindSchema = z.enum(["creator", "niche"]);
+
+/** One creator or niche lane's outcome within a run. */
+export const HarvestLaneResultSchema = z
+  .object({
+    kind: HarvestLaneKindSchema,
+    /** "@handle" for creators, the query for niches. */
+    label: z.string().max(200),
+    /** Raw clips the actor returned for this lane. */
+    pulled: z.number().int().min(0).default(0),
+    /** Clips that passed the W1 filters (before objective grading). */
+    selected: z.number().int().min(0).default(0),
+    /** Clips actually upserted (after grading, if any). */
+    kept: z.number().int().min(0).default(0),
+    dropped: HarvestDropReasonsSchema.default({}),
+    /** True when the objective grader ran on this lane. */
+    graded: z.boolean().default(false),
+    /** Set when this lane's pull failed (apify abort/quota/timeout). */
+    error: z.string().max(500).optional(),
+  })
+  .strict();
+export type HarvestLaneResult = z.infer<typeof HarvestLaneResultSchema>;
+
