@@ -198,3 +198,203 @@ two platforms do not mean quite the same thing by "6 hours" and cannot be made
 to — LinkedIn does not publish a precise timestamp anywhere on the card.
 
 **An unreadable age is treated as out-of-window.** We cannot prove it is recent,
+and only provably-recent things get answered.
+
+### Saying which zero it was
+
+Five different things produce "nothing to do", and they used to render
+identically. This string is what the panel shows and what lands in
+`noelle.{x,linkedin}_activity.reason`, so it is the first thing anybody
+debugging "the agent answered nothing" reads — a line that blames the recency window
+for a seen-ring zero sends them straight at the wrong code.
+
+| what happened | what it says |
+|---|---|
+| page rendered nothing | *(no detail — the caller says "selectors may have drifted")* |
+| cards read, none are replies to us | *(no detail — the caller says "read N cards, none are new replies to you")* |
+| candidates exist, all older than 12h | `4 replies, none within 12h (4 older, 0 undated)` |
+| candidates exist, all already answered | `3 replies within 12h, all already handled` |
+| candidates exist, none has a readable age | `no readable timestamp on any of 5 replies — markup may have changed` |
+
+**LinkedIn counts CARDS separately from replies.** Its `harvestNotifications`
+returns only reply-type cards, so `harvested === 0` used to be the ordinary
+"nobody replied to me in this window" state — most sweeps — while the panel
+rendered it as *"page rendered NO notification cards — selectors may have
+drifted"*. A healthy install cried wolf every 10-20 minutes, which degrades the
+one alarm that should mean something when LinkedIn really does drift. The
+content script now reports `cards` (every notification card) alongside `items`
+(the replies), and the sweep reports the former. X never had this problem: its
+harvest returns every cell, so zero genuinely is a markup break.
+
+Three rules make those honest. The buckets are computed over the **candidates**
+(cells that really are somebody replying to us), not over everything harvested —
+the notifications page is mostly likes, follows and our own tweets. The candidate total is DERIVED from the buckets rather than passed in
+alongside them, so the self-contradicting line that started all this
+("3 replies, none within Nh (0 older, 0 undated)") is now unrepresentable. And
+the two `undefined` rows matter as much as the strings: returning a detail there would
+make the caller's own branches dead code, and one of them is the silent-page
+signal added when a non-responding content script was being reported as an empty
+inbox.
+
+The fourth row is the **steady state** — an answered reply sits on the page for
+hours and every sweep re-reads it — so getting that one wrong would print a
+false line every ten minutes forever.
+
+Verified against the real captured page (`tests/fixtures/notifications-page.html`,
+6 cards): 2 reply cards, ages **2h** and **1d** — the 2h one is answered, the
+1d one is not. Under the old rule both were.
+
+**The tradeoff worth knowing:** age-dropped items are never marked seen, so
+nothing is lost *while the sweep is running*. But any coverage gap longer than
+12h — Chrome closed for a long weekend, Mac asleep, run stopped — makes those
+replies permanently unanswerable. Nine hours was chosen to cover the ordinary
+overnight gap; a longer outage still drops whatever aged out during it. That is
+intended (a reply answered a day late reads worse than no reply), but it is a
+deliberate call, not an accident.
+
+### Comment-level threading (Lyra answers UNDER their comment)
+
+This was the known limitation, and it was worse than a limitation: a
+conversation reply posted at post level is not a reply, it is a SECOND
+top-level comment from the operator on a thread he already commented on. Five
+reached LinkedIn before it was caught.
+
+It works now, and the chain is:
+
+| step | where |
+|---|---|
+| the sweep captures THEIR comment urn as the lead's `external_id` | `content/notifications.ts` (`commentIdFrom` prefers `replyUrn`, not our own `commentUrn`) |
+| api-vm serves it as `target.comment_urn` + `comment_author_name` | `routes/actuator.ts` (`isNotificationLead`) |
+| the actuator finds that comment and opens ITS reply box | `content/comment-threading.ts` |
+| the dedup exemption is granted ONLY to items carrying a target | `dedupeAlreadyCommented(built, urns, threaded)` |
+
+**The interlock.** Being exempt from "do not comment twice on this post" is
+legitimate only when we are not commenting on the post at all. So the exemption
+is keyed on `target.comment_urn` being present — and the actuator refuses to
+post without one. An item that cannot thread keeps the dedup and is dropped,
+exactly as it was while threading did not exist. There is no path where a
+conversation reply becomes a top-level comment.
+
+**Three independent guards on the actuation**, because the cost of being wrong
+is a public reply to the wrong human under the operator's name:
+
+1. the comment is located by an id anchored on `,<id>)` — `…192` cannot match `…1920`;
+2. the composer must BELONG to that comment (no other comment between them),
+   because "the first box below the anchor" is another comment's box when the
+   target's never opened;
+3. the submit must read **"Reply"** (the post composer's reads "Comment"), and
+   when the author name is known the box's pre-filled mention chip must name
+   them.
+
+Every failure is transient — the draft is retried on a later slot rather than
+being published in the wrong place.
+
+The drafter also gets the thread now (`renderConversationBlock`, shared from
+`packages/runtime` so it cannot drift between the two interns again). Without it
+Lyra had no idea it was mid-conversation and wrote opening remarks into
+two-person exchanges.
+
+## Triage — not everything gets a reply
+
+Answering every inbound reply was the wrong default. Most of it is "thanks!" or
+an emoji, and answering that is noise that burns write budget and reads exactly
+like a bot working through a queue. A few are the opposite: a real opportunity
+where an agent answering is actively the wrong outcome.
+
+So every notification lead is triaged **before any retrieval or LLM spend**
+(`packages/runtime/src/notificationTriage.ts`, pure + unit-tested):
+
+| Verdict | What happens |
+|---|---|
+| **reply** | Drafted as normal — it earned an answer. |
+| **pin** | **Pushover to the operator, and nothing is drafted.** |
+| **ignore** | Lead closed quietly, `skip_reason: triage:ignore:<why>`. |
+
+**Pin** fires on anything that reads like an opportunity: investment,
+acquisition, a job or contract, an intro, speaking/podcast, partnership, sales
+or pricing, an accelerator or grant, a meeting request, or "I sent you a DM".
+Deliberately broad and it beats every other rule — a short "thanks! can we hop
+on a call?" is both a pleasantry *and* the single most important thing to
+escalate, so opportunity wins. It also beats the turn cap: an opportunity is
+never dropped for arriving late in a thread.
+
+Crucially a pin drafts **nothing**. There is no half-written reply left in the
+inbox tempting a one-click send on something that needs a human. The push says
+so in as many words: *"(no reply drafted — this one is yours)"*.
+
+**Ignore** covers closing pleasantries, emoji-only, anything under 25 characters
+that isn't a question, and conversations that have already had their turns.
+`prior_turns` is stamped on the lead at ingest (the same count the turn cap
+uses), so a long back-and-forth tapers off instead of running flat to the cap.
+
+Pushover goes through each intern's existing per-org notifier, which returns
+`no_channel` without throwing when no keys are configured — so an org with no
+Pushover setup simply gets no push, never a failed lead.
+
+## The commitment guard — agents never promise anything in your name
+
+A separate, unconditional rule that applies to **every** draft from **every**
+intern, not just notifications.
+
+The failure it prevents is silent and expensive: a public reply that says "yes,
+let's do a call Thursday" or "I'll send you the deck" creates a real obligation
+the operator never agreed to, under their own name, in front of an audience. By
+the time they see it the other person is already expecting it.
+
+Two layers, because a prompt rule alone leaks:
+
+1. **`NO_COMMITMENTS_RULE`** is woven into all three interns' system prompts
+   (10 prompt variants across Vega, Lyra and Orion). It names every banned
+   category and says what to do instead: acknowledge warmly, leave the decision
+   open, never invent a yes *or* a no.
+2. **`makesCommitment()`** (`packages/runtime/src/commitmentGuard.ts`) checks
+   every draft before it can be queued. It catches promised future actions,
+   scheduling, acceptance, promised resources, speaking for the operator, and
+   deadlines-with-a-promise-verb.
+
+Deliberately **not** folded into the reply-diversity gate: that gate is opt-in
+and skipped entirely when there are no priors, and a safety rule that only runs
+when an unrelated feature flag happens to be on is not a safety rule.
+
+The guard is narrow on purpose — it is not a politeness filter. "I'll be
+honest", "I'll never understand this", "agreed", "they got the green light" all
+stay clean, because if ordinary warm replies trip it the drafter starves and
+every conversation dies, which is the exact failure this whole feature exists to
+fix. The test suite locks both directions.
+
+A committing DM is dropped on its own so it can't take otherwise-good replies
+with it. If every reply variant commits, the lead is skipped with a greppable
+`commitment:<kind>("<match>")` reason rather than queued.
+
+**Orion (Reddit) matters most here**: a Reddit reply that reaches the approvals
+queue is treated as approved and auto-sent — Skip is the only veto — so there is
+no human between a committing draft and a public promise.
+
+## `POST /api/actuator/inbound-reply`
+
+Actuator bearer + `instanceId`, same tenancy check as every other actuator
+route. Each item becomes one `noelle.leads` row:
+
+| Column | Value | Why |
+|---|---|---|
+| `external_id` | their reply's id (X: tweet id; LinkedIn: the `replyUrn` comment id) | UNIQUE ⇒ the idempotency key. Re-sweeping is a no-op reported as `duplicate`. On LinkedIn it must be **their reply**, not the `commentUrn` (which is *our* comment) — otherwise every person replying to one comment of ours collides on one id and only the first is ever answered. |
+| `status` | `'classified'` | Skips the classifier. Someone talking *to us* is relevant by construction. |
+| `priority` | `true` | Bypasses the drafter's classifier-quality and vault-relevance gates. Without it, a conversation reply that doesn't match the vault is silently dropped — the exact failure this feature fixes. |
+| `payload.source` | `'notification'` | The marker the drafter and the dedup exemption key off. |
+| `payload.conversation` | root + our last turn | Feeds the CONVERSATION prompt block. |
+
+`priority = true` routes these through `claim_watchlist_leads_for_drafting`,
+which claims one lead per author and skips authors who already have a pending
+reply approval — one live conversation turn per person, for free.
+
+### One batch, one parse
+
+The server validates a sweep's items as a single `InboundReplyInSchema.parse`,
+so **one malformed item 400s the whole batch** and loses every other item with
+it. The extension therefore clamps at the source rather than relying on luck:
+
+- scraped text is clamped to 4000 chars (X Premium long-form posts reach
+  ~25,000 and do appear in replies),
+- LinkedIn requires a derivable activity urn instead of falling back to the raw
+  href — a real notification link carries `commentUrn`/`dashCommentUrn` tracking
+  params and runs past 270 chars, over the 200-char `external_id` limit, and its
