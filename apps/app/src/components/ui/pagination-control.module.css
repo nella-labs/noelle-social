@@ -1,0 +1,5 @@
+.control { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px; padding: 18px 24px; border-top: 1px solid var(--rule); background: var(--paper); }
+.control:first-child { border-top: 0; border-bottom: 1px solid var(--rule); }
+.range, .page { color: var(--ink-muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.buttons { display: flex; align-items: center; gap: 12px; }
+@media (max-width: 640px) { .control { padding: 18px; } .buttons { flex: 1 1 100%; justify-content: space-between; gap: 8px; } }

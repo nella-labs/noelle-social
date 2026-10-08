@@ -198,3 +198,9 @@ export async function sendTransactional(args: SendTransactionalArgs): Promise<vo
       template_id: args.templateId ?? 0,
       data: { body: args.body, subject: args.subject },
       headers: [],
+      from_email:
+        args.fromEmail ?? process.env.LISTMONK_FROM_EMAIL ?? "Noelle <news@mail.trynoelle.com>",
+      content_type: args.contentType ?? "html",
+    }),
+  });
+}
