@@ -1398,3 +1398,203 @@ export async function getOrgSpendTrendRange(
           ),
           buckets as (
             select generate_series(
+              date_trunc('month', (select start_at from bounds)),
+              date_trunc('month', now()),
+              interval '1 month'
+            ) as b
+          )
+          select
+            to_char(b.b, 'YYYY-MM') as day,
+            coalesce(sum(l.cents) filter (where l.engine <> 'apify'), 0)::bigint as llm_cents,
+            coalesce(sum(l.cents) filter (where l.engine = 'apify'), 0)::bigint  as apify_cents
+          from buckets b
+          left join noelle.llm_calls l
+            on l.org_id = ${orgId}
+           and date_trunc('month', l.started_at) = b.b
+          group by b.b
+          order by b.b asc
+        `
+      : await readSql<Array<{ day: string; llm_cents: string | number; apify_cents: string | number }>>`
+          with buckets as (
+            select generate_series(${startIso}::date, current_date, interval '1 day')::date as b
+          )
+          select
+            b.b::text as day,
+            coalesce(sum(l.cents) filter (where l.engine <> 'apify'), 0)::bigint as llm_cents,
+            coalesce(sum(l.cents) filter (where l.engine = 'apify'), 0)::bigint  as apify_cents
+          from buckets b
+          left join noelle.llm_calls l
+            on l.org_id = ${orgId}
+           and l.started_at::date = b.b
+          group by b.b
+          order by b.b asc
+        `;
+  return rows.map((r) => ({
+    day: r.day,
+    llmCents: Number(r.llm_cents ?? 0),
+    apifyCents: Number(r.apify_cents ?? 0),
+  }));
+}
+
+export interface OrgSpendBySource {
+  /** All LLM engines (vertex / bedrock / claude / openai). */
+  ai: number;
+  /** Apify data-fetch actors (engine='apify'). */
+  apify: number;
+}
+
+/**
+ * This month's spend split by SOURCE — AI (all LLM engines) vs Apify (LinkedIn
+ * data fetch). Reads raw noelle.llm_calls because it carries the `engine` column;
+ * the monthly rollup (org_spend_month) is keyed by bucket only, so it can't drive
+ * this split. Tenancy guard before the query. `cents` is summed as bigint and
+ * coerced (postgres.js returns bigint as a string).
+ */
+export async function getOrgSpendBySourceMonth(orgId: string): Promise<OrgSpendBySource> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<Array<{ source: string; cents: string | number }>>`
+    select
+      case when engine = 'apify' then 'apify' else 'ai' end as source,
+      coalesce(sum(cents), 0)::bigint as cents
+    from noelle.llm_calls
+    where org_id = ${orgId}
+      and started_at >= date_trunc('month', now())
+    group by 1
+  `;
+  const out: OrgSpendBySource = { ai: 0, apify: 0 };
+  for (const r of rows) {
+    const cents = Number(r.cents ?? 0);
+    if (r.source === "apify") out.apify += cents;
+    else out.ai += cents;
+  }
+  return out;
+}
+
+export interface ApifyConnection {
+  id: string;
+  /** Masked display label (never the raw token). */
+  label: string;
+  createdAt: string;
+  /**
+   * When this token last hit its monthly usage cap (null = healthy). The worker
+   * sets it on a 403 and rotates to the next token; clears it on the next success.
+   */
+  exhaustedAt: string | null;
+  /**
+   * Server-computed: 'invalid' = Apify rejected the token (401 — wrong/dead /
+   * banned account, replace it); 'exhausted' = hit its cap and still inside its
+   * retry/billing cooldown; 'live' = healthy, or its retry date has passed.
+   */
+  status: "live" | "exhausted" | "invalid";
+  /** Short retry/billing date (e.g. "Jul 13") shown while exhausted; else null. */
+  retryLabel: string | null;
+  /**
+   * true = IN USE (the agents rotate through it); false = SPARE (parked — visible +
+   * testable here but no worker touches it until the operator promotes it).
+   */
+  inUse: boolean;
+}
+
+/**
+ * All of the org's ACTIVE Apify tokens (masked), in fallback order — non-exhausted
+ * first, then exhausted oldest-first (mirrors the worker's resolver). The operator
+ * stacks several so discovery rotates to the next when one hits its monthly cap.
+ */
+export async function listApifyConnections(orgId: string): Promise<ApifyConnection[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<
+    Array<{
+      id: string;
+      label: string;
+      created_at: string;
+      exhausted_at: string | null;
+      status: "live" | "exhausted" | "invalid";
+      retry_label: string | null;
+      in_use: boolean;
+    }>
+  >`
+    select id, label, created_at::text as created_at, exhausted_at::text as exhausted_at,
+           case when invalid_at is not null then 'invalid'
+                when exhausted_at is not null and (retry_at is null or retry_at > now())
+                then 'exhausted' else 'live' end as status,
+           to_char(retry_at, 'Mon DD') as retry_label,
+           in_use
+    from noelle.connections
+    where org_id = ${orgId} and kind = 'apify' and active
+    order by in_use desc,
+             (invalid_at is null and (exhausted_at is null or retry_at <= now())) desc,
+             invalid_at asc nulls first, exhausted_at asc nulls first, created_at asc
+  `;
+  return rows.map((r) => ({
+    id: r.id,
+    label: r.label,
+    createdAt: r.created_at,
+    exhaustedAt: r.exhausted_at,
+    status: r.status,
+    retryLabel: r.retry_label,
+    inUse: r.in_use,
+  }));
+}
+
+const loadApifySpendData = cache(async (orgId: string) => {
+  const userId = await getRequiredUserId();
+  await assertMember(orgId, userId);
+  return readApifySpendData(sql, orgId);
+});
+
+/** Last successful provider balances survive invalidation and token removal. */
+export async function getApifySpendByToken(orgId: string): Promise<ApifyTokenSpend[]> {
+  await assertMember(orgId, await getRequiredUserId());
+  const { snapshots, ledger } = await loadApifySpendData(orgId);
+  return apifyTokenSpend(snapshots, ledger);
+}
+
+/** Calendar-range expenses use Apify's daily readings, counted once per account. */
+export async function getApifyProviderSpend(orgId: string, startIso: string | null) {
+  await assertMember(orgId, await getRequiredUserId());
+  const { snapshots, ledger } = await loadApifySpendData(orgId);
+  return summarizeApifyProviderSpend(snapshots, ledger, startIso);
+}
+
+/**
+ * Add a single Apify token to the org's pool. It lands as SPARE (`in_use = false`) —
+ * parked until the operator promotes it — so a freshly-pasted token never enters the
+ * agents' rotation by surprise. Does NOT deactivate the existing tokens (stacking is
+ * the point). Re-pasting a token already in the pool just re-arms its exhausted/
+ * invalid flags and keeps its current bucket. Masked label for display; the raw
+ * token lives only in `secret`. (Bulk paste uses {@link addApifyConnectionsBulk}.)
+ */
+export async function addApifyConnection(orgId: string, token: string): Promise<void> {
+  await addApifyConnectionsBulk(orgId, [token]);
+}
+
+/** Shortest plausible Apify token — anything below this is treated as a typo/blank. */
+const MIN_APIFY_TOKEN_LEN = 12;
+
+/**
+ * Parse a free-form paste into a clean list of candidate Apify tokens. Splits on any
+ * whitespace, newline, or comma (so the operator can paste one-per-line, a CSV, or a
+ * space-separated blob), trims each, drops blanks and anything shorter than
+ * {@link MIN_APIFY_TOKEN_LEN}, and de-dupes (preserving first-seen order). Pure — no
+ * DB, no I/O — so it's unit-testable on its own. `rejected` is the count of non-blank
+ * fragments dropped for being too short, surfaced to the UI as "skipped".
+ */
+export function parseApifyTokens(raw: string): { tokens: string[]; rejected: number } {
+  const fragments = raw
+    .split(/[\s,]+/)
+    .map((f) => f.trim())
+    .filter((f) => f.length > 0);
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+  let rejected = 0;
+  for (const f of fragments) {
+    if (f.length < MIN_APIFY_TOKEN_LEN) {
+      rejected++;
+      continue;
+    }
+    if (seen.has(f)) continue;
+    seen.add(f);
