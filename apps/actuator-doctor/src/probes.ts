@@ -398,3 +398,203 @@ export async function probeStuckQueue(env: Env, sql: Sql, at: string): Promise<P
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// send_failures — 'skip' activity spike in the trailing window.
+// ---------------------------------------------------------------------------
+
+export async function probeSendFailures(env: Env, sql: Sql, at: string): Promise<ProbeResult[]> {
+  // COLUMN DRIFT: x_activity/linkedin_activity use `org_id`; reddit_activity uses
+  // `organization_id`. We count skips GLOBALLY (no org filter) so the drift is
+  // inert. Three explicit queries so a table identifier is never interpolated.
+  const win = env.NOELLE_DOCTOR_SEND_FAIL_WINDOW_MIN;
+  const counts = new Map<DoctorTarget, number | null>();
+
+  async function tally(target: DoctorTarget, q: Promise<Array<{ c: number }>>): Promise<void> {
+    try {
+      const rows = await q;
+      counts.set(target, Number(rows[0]?.c ?? 0));
+    } catch {
+      counts.set(target, null);
+    }
+  }
+
+  await Promise.all([
+    tally(
+      "x-actuator",
+      sql<Array<{ c: number }>>`select count(*)::int as c from noelle.x_activity
+        where type = 'skip' and created_at > now() - make_interval(mins => ${win})`,
+    ),
+    tally(
+      "linkedin-actuator",
+      sql<Array<{ c: number }>>`select count(*)::int as c from noelle.linkedin_activity
+        where type = 'skip' and created_at > now() - make_interval(mins => ${win})`,
+    ),
+    tally(
+      "reddit-intern",
+      sql<Array<{ c: number }>>`select count(*)::int as c from noelle.reddit_activity
+        where type = 'skip' and created_at > now() - make_interval(mins => ${win})`,
+    ),
+  ]);
+
+  const out: ProbeResult[] = [];
+  for (const target of LANE_TARGETS) {
+    const c = counts.get(target) ?? null;
+    if (c === null) {
+      out.push(mk(target, "send_failures", true, undefined, { note: "db-error" }, at)); // fail-open
+      continue;
+    }
+    const ok = c <= env.NOELLE_DOCTOR_SEND_FAIL_MAX;
+    out.push(
+      mk(target, "send_failures", ok, ok ? undefined : "send-failures-spike", {
+        skips: c,
+        window_min: win,
+      }, at),
+    );
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// db_reachable — the data plane itself.
+// ---------------------------------------------------------------------------
+
+// Without this probe a Postgres outage goes SILENTLY UNDETECTED: readArmState
+// fail-safes to "all lanes disarmed" (so arm-awareness masks every real lane
+// heartbeat/queue/skip fault), and probeStuckQueue / probeSendFailures fail
+// OPEN — so buildReport would report healthy:true while the product's data plane
+// is down. This probe is the break-the-silence signal: a `select 1` that fails
+// faults the api-vm target (infra, never arm-downgraded), which the
+// `db-unreachable` seed signature turns into a page.
+export async function probeDbReachable(env: Env, sql: Sql, at: string): Promise<ProbeResult[]> {
+  try {
+    await sql`select 1`;
+    return [mk("api-vm", "db_reachable", true, undefined, {}, at)];
+  } catch (e) {
+    return [
+      mk("api-vm", "db_reachable", false, "db-unreachable", { error: String(e).slice(0, 120) }, at),
+    ];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Arm state + arm-aware downgrade.
+// ---------------------------------------------------------------------------
+
+export interface ArmInfo {
+  armed: boolean; // reply_send_enabled true on any instance of the lane's role
+  autoSend: boolean; // auto_send_enabled (LinkedIn scheduling flag) — context only
+  instanceIds: string[];
+}
+
+export type ArmState = Record<DoctorTarget, ArmInfo>;
+
+function emptyArm(): ArmInfo {
+  return { armed: false, autoSend: false, instanceIds: [] };
+}
+
+// reply_send_enabled is the fail-closed master send switch (schema 0081). A DB
+// read failure => every lane treated DISARMED, so we never remediate a lane whose
+// arm state we couldn't confirm.
+export async function readArmState(sql: Sql): Promise<ArmState> {
+  const arm: ArmState = {
+    "x-actuator": emptyArm(),
+    "linkedin-actuator": emptyArm(),
+    "reddit-intern": emptyArm(),
+    bridge: emptyArm(),
+    // Infra is always "expected up" — there is no operator switch that disarms it.
+    "api-vm": { armed: true, autoSend: false, instanceIds: [] },
+  };
+  try {
+    const rows = await sql<
+      Array<{
+        id: string;
+        role: string;
+        reply_send_enabled: boolean;
+        auto_send_enabled: boolean;
+      }>
+    >`
+      select id, role, reply_send_enabled, auto_send_enabled
+      from noelle.agent_instances
+      where role in ('x_intern', 'linkedin_intern', 'reddit_intern')
+    `;
+    for (const r of rows) {
+      const t = ROLE_TO_TARGET[r.role];
+      if (!t) continue;
+      arm[t].instanceIds.push(r.id);
+      if (r.reply_send_enabled) arm[t].armed = true;
+      if (r.auto_send_enabled) arm[t].autoSend = true;
+    }
+  } catch {
+    // fail-safe: leave all lanes disarmed
+  }
+  // The bridge's ext-disconnect is only urgent while SOME lane that actually
+  // drives a Chrome extension is armed. reddit-intern now drives one too (it is
+  // in BROWSER_LANE_TARGETS), so an armed reddit lane arms the bridge.
+  arm.bridge.armed = BROWSER_LANE_TARGETS.some((t) => arm[t].armed);
+  return arm;
+}
+
+// Due BROWSER work per lane: pending approvals whose auto_send_target_at has
+// passed AND that a Chrome actuator (not an API worker) will drain. This is the
+// "does a closed Chrome matter RIGHT NOW" signal behind the idle gate in
+// applyArmAwareness. Unlike probeStuckQueue there is no overdue-minutes offset —
+// the moment browser work is waiting, connectivity faults are page-worthy again.
+//
+// Per-lane pipeline reality (see apps/api-vm/src/routes/actuator.ts):
+// - x_intern: a STAMPED approval is owned by the API-autosend pipeline (the
+//   noelle-send worker posts via the official X API — no Chrome), and the
+//   browser feed excludes it ("autosend-owned"). The X browser reply queue is
+//   the UNSTAMPED rows, drained only when the operator runs the extension, so
+//   it is never time-due. Hence x_intern contributes NOTHING here: a closed
+//   Chrome never pages for X connectivity. Stalled X autosend still pages via
+//   stuck_queue / send_failures, which are never idle-gated.
+// - linkedin_intern / reddit_intern: their actionable feeds serve ALL pending
+//   rows, stamped included — the browser is the only sender — so a stamped row
+//   past its target genuinely needs Chrome.
+//
+// Returns null on a DB error: null disables the gate downstream, so a flaky
+// approvals read fails toward the old page-while-armed behavior (a watchdog
+// must not let a query blip suppress its own pages).
+export type PendingDue = Partial<Record<DoctorTarget, number>>;
+
+export async function readBrowserDue(sql: Sql): Promise<PendingDue | null> {
+  const due: PendingDue = {};
+  try {
+    const rows = await sql<Array<{ role: string; depth: number }>>`
+      select ai.role, count(*)::int as depth
+      from noelle.approvals a
+      join noelle.agent_instances ai on ai.id = a.agent_instance_id
+      where a.status = 'pending'
+        and a.auto_send_target_at is not null
+        and a.auto_send_target_at <= now()
+        and ai.role in ('linkedin_intern', 'reddit_intern')
+      group by ai.role
+    `;
+    for (const r of rows) {
+      const t = ROLE_TO_TARGET[r.role];
+      if (t) due[t] = Number(r.depth);
+    }
+  } catch {
+    return null; // fail toward paging, never toward silence
+  }
+  return due;
+}
+
+function downgrade(p: ProbeResult, reason: string, armed = false): ProbeResult {
+  return {
+    ...p,
+    ok: true,
+    metrics: { ...p.metrics, armed, downgraded_reason: reason },
+  };
+}
+
+// PURE. Is `nowMs` inside the local operating window [start, end)? Supports a
+// wrapping window (start > end, e.g. 22->6). start=0 end=24 => always in-window.
+export function isInOperatingWindow(nowMs: number, startHour: number, endHour: number): boolean {
+  if (startHour === endHour) return startHour === 0; // 0/0 degenerate => never; keep simple
+  const h = new Date(nowMs).getHours();
+  return startHour < endHour ? h >= startHour && h < endHour : h >= startHour || h < endHour;
+}
+
+export interface ArmAwareCtx {
