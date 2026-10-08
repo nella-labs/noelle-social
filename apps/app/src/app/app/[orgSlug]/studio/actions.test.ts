@@ -198,3 +198,70 @@ describe.skipIf(!nativeUrl)("Studio ready script preservation (native PostgreSQL
     state.nativeSql = db;
   });
   beforeEach(async () => {
+    await db!`truncate noelle.organizations cascade`;
+    await db!`insert into noelle.organizations(id,slug,name)
+      values ('11111111-1111-4111-8111-111111111111','workspace','Studio')`;
+    await db!`insert into noelle.agent_instances(id,org_id,role)
+      values ('22222222-2222-4222-8222-222222222222','11111111-1111-4111-8111-111111111111','video_intern')`;
+    await db!`insert into noelle.video_ideas(id,org_id,agent_instance_id,hook)
+      values ('44444444-4444-4444-8444-444444444444','11111111-1111-4111-8111-111111111111',
+        '22222222-2222-4222-8222-222222222222','Studio idea')`;
+    await db!`insert into noelle.video_drafts(id,org_id,agent_instance_id,idea_id,script)
+      values (${common.draftId},'11111111-1111-4111-8111-111111111111',
+        '22222222-2222-4222-8222-222222222222','44444444-4444-4444-8444-444444444444','Original script')`;
+  });
+  afterAll(async () => {
+    state.nativeSql = null;
+    await db?.end();
+    const url = new URL(nativeUrl!);
+    url.pathname = "/postgres";
+    const observer = postgres(url.toString(), { max: 1, connect_timeout: 2, onnotice: () => {} });
+    try {
+      expect(
+        Number(
+          (
+            await observer`select count(*) as count from pg_stat_activity
+        where datname = 'noelle_studio_ready_test'`
+          )[0]?.count,
+        ),
+      ).toBe(0);
+    } finally {
+      await observer.end();
+    }
+  });
+  async function stored() {
+    return (
+      await db!`select final_script, status from noelle.video_drafts where id = ${common.draftId}`
+    )[0];
+  }
+  test("Save then Ready without another edit preserves the saved script", async () => {
+    expect(await saveVideoDraftScript({ ...common, script: "Saved operator script" })).toEqual({
+      ok: true,
+    });
+    expect((await stored())?.final_script).toBe("Saved operator script");
+    expect(await markVideoDraftReady(common)).toEqual({ ok: true });
+    expect(await stored()).toMatchObject({
+      final_script: "Saved operator script",
+      status: "ready",
+    });
+  });
+  test("Ready without an edit retains an original null script", async () => {
+    expect(await markVideoDraftReady(common)).toEqual({ ok: true });
+    expect(await stored()).toMatchObject({ final_script: null, status: "ready" });
+  });
+  for (const editedScript of ["", "Replacement script"]) {
+    test(`Ready accepts an explicit ${editedScript ? "replacement" : "empty"} script`, async () => {
+      await saveVideoDraftScript({ ...common, script: "Earlier saved script" });
+      expect(await markVideoDraftReady({ ...common, editedScript })).toEqual({ ok: true });
+      expect(await stored()).toMatchObject({ final_script: editedScript, status: "ready" });
+    });
+  }
+  test("Ready refuses a scoped zero-row write without invalidation", async () => {
+    state.revalidate.mockClear();
+    expect(
+      await markVideoDraftReady({ ...common, draftId: "66666666-6666-4666-8666-666666666666" }),
+    ).toEqual({ ok: false, error: "not_found" });
+    expect(state.revalidate).not.toHaveBeenCalled();
+    expect(await stored()).toMatchObject({ final_script: null, status: "draft" });
+  });
+});
