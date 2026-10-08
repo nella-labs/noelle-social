@@ -2998,3 +2998,168 @@ describe("writer and verifier factual evidence parity", () => {
     expect(evidence).toContain(fact);
     expect(evidence).toContain("Builds Oriole");
     expect(evidence).toContain("Atlas manifests");
+    expect(evidence).not.toContain("Style-only Vega");
+    expect(result.outbound.drafts[0].verifierMeta).toMatchObject({ pass: true, judgeOk: true, scores: { grounding: 0.9 } });
+  });
+
+  it("supplies observed thread facts when the current message omits their names", async () => {
+    const result = await run({ thread: true });
+    const evidence = result.judge.mock.calls[0]![1].split("DRAFTS TO GRADE")[0]!;
+    expect(result.runner.draft.mock.calls[0]![0].prompt).toContain(fact);
+    expect(evidence).toContain("Does Oriole map Atlas?");
+    expect(evidence).toContain(fact);
+    expect(result.outbound.drafts[0].verifierMeta).toMatchObject({ pass: true, judgeOk: true, scores: { grounding: 0.9 } });
+  });
+
+  it("keeps request and objective directives in the writer rather than factual evidence", async () => {
+    const result = await run({ brand, directives: true });
+    const evidence = result.judge.mock.calls[0]![1].split("DRAFTS TO GRADE")[0]!;
+    expect(result.runner.draft.mock.calls[0]![0].system).toContain("Objective-only Lyra");
+    expect(result.runner.draft.mock.calls[0]![0].prompt).toContain("Request-only Vega");
+    expect(evidence).not.toContain("Objective-only Lyra");
+    expect(evidence).not.toContain("Request-only Vega");
+    expect(result.outbound.drafts[0].verifierMeta.pass).toBe(true);
+  });
+
+  it("uses the same factual context for repair and exact final sibling reviews", async () => {
+    const result = await run({ brand, thread: true, retries: 1, siblings: true });
+    expect(result.runner.draft).toHaveBeenCalledTimes(2);
+    expect(result.judge.mock.calls.length).toBeGreaterThanOrEqual(4);
+    const evidence = result.judge.mock.calls.map((call) => call[1].split("DRAFTS TO GRADE")[0]!);
+    expect(new Set(evidence).size).toBe(1);
+    expect(evidence[0]).toContain(fact);
+    for (const row of result.outbound.drafts) expect(row.verifierMeta).toMatchObject({ pass: true, judgeOk: true });
+  });
+
+  it("saves the same supplied facts and thread for every retained exact reply", async () => {
+    const result = await run({ brand, thread: true, retries: 1, siblings: true, directives: true });
+    for (const row of result.outbound.drafts) {
+      expect(row.reviewContext).toMatchObject({ version: 1, platform: "x", postText: "How do you inspect dependency graphs?",
+        operatorFacts: expect.arrayContaining([expect.stringContaining(fact)]), knowledgeAnchors: [],
+        conversation: { root_post_text: "Does Oriole map Atlas?", our_reply_text: fact } });
+      expect(JSON.stringify(row.reviewContext)).not.toMatch(/Style-only Vega|Request-only Vega|Objective-only Lyra/);
+    }
+    expect(result.runner.draft).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports excessive factual evidence before semantic review or outbound", async () => {
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify({
+      drafts: [{ angle: "technical", body: "The graph makes dependencies visible" }],
+    }), engine: "fixture", model: "fixture" }) };
+    const postOutbound = vi.fn();
+    const markStatus = vi.fn();
+    const judge = vi.fn().mockResolvedValue(JSON.stringify({ voice: 0.9, grounding: 0.9, relevance: 0.9, reasons: [] }));
+    await runDrafterTick({
+      log: log as never, instance: { id: "i", org_id: "o" },
+      claimedLeads: [{ id: "L", external_id: "123", status: "drafting", priority: true,
+        author_handle: "author", author_id: "uid", tier: null, classifier_label: null, classifier_score: null,
+        payload: { text: "How do you inspect dependency graphs?", url: "https://x.com/author/status/123" } }],
+      runner: runner as never,
+      kb: { search: vi.fn(async (_query: string, _limit: number, options?: { filterDirs?: string[] }) => [{
+        snippet: options?.filterDirs?.includes("product") ? "k".repeat(8_001) : "Plain spoken",
+        score: 8, filePath: "voice.md", startLine: 1, endLine: 1,
+      }]) } as never,
+      postOutbound, markStatus, patternRules: [], knowledgeDirs: ["product"],
+      verify: { enabled: true, retries: 0, makeCalls: () => [judge] },
+    });
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(judge).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ leadId: "L", status: "errored" }));
+  });
+
+  it("retains the same evidence in actual Jev initial, repair and final reviews", async () => {
+    const states: Array<Record<string, unknown>> = [];
+    const send = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const request = JSON.parse(init!.body as string) as {
+        state: string; questions: Record<string, unknown>;
+      };
+      states.push(JSON.parse(request.state) as Record<string, unknown>);
+      const answers = Object.fromEntries(Object.keys(request.questions).map((name) => [name, {
+        type: "noul", noul: name === "voice" && states.length === 1 ? 0.3 : 0.9,
+      }]));
+      return Response.json({ answers });
+    });
+    vi.stubEnv("TYPESAFE_API_KEY", "inert-evidence-fixture");
+    try {
+      const result = await run({ brand, thread: true, retries: 1, siblings: true });
+      expect(result.runner.draft).toHaveBeenCalledTimes(2);
+      expect(states.length).toBeGreaterThanOrEqual(4);
+      expect(result.judge).not.toHaveBeenCalled();
+      const evidence = states.map((state) => JSON.stringify({
+        operatorFacts: state.operatorFacts, conversation: state.conversation,
+      }));
+      expect(new Set(evidence).size).toBe(1);
+      expect(evidence[0]).toContain(fact);
+      expect(evidence[0]).not.toContain("Style-only Vega");
+      for (const row of result.outbound.drafts) {
+        expect(row.verifierMeta).toMatchObject({ pass: true, judgeOk: true, judgeProvider: "jev" });
+      }
+    } finally {
+      send.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("gives writer and reviewer no private product facts when brand configuration is empty", async () => {
+    const result = await run({});
+    const evidence = result.judge.mock.calls[0]![1].split("DRAFTS TO GRADE")[0]!;
+    expect(result.runner.draft.mock.calls[0]![0].system).not.toContain("OPERATOR BRAND (set by the operator");
+    expect(evidence).not.toContain("OPERATOR FACTS (supplied identity and product facts");
+    expect(result.outbound.drafts[0].verifierMeta.pass).toBe(false);
+  });
+});
+
+describe("actual Jev reply task-fit handoff", () => {
+  it.each([
+    { body: "so real", repair: false, pass: true },
+    { body: "so real", repair: true, pass: true },
+    { body: "crypto changes everything", repair: false, pass: false },
+  ])("reviews the X reaction and its exact final body (repair=$repair, pass=$pass)", async ({ body, repair, pass }) => {
+    const questions: string[] = [];
+    const send = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const request = JSON.parse(init!.body as string) as { questions: Record<string, { instructions: string }> };
+      const policy = request.questions.relevance!.instructions;
+      questions.push(policy);
+      const fits = pass && policy.includes("a tiny standalone reaction") && !(repair && questions.length === 1);
+      return Response.json({ answers: Object.fromEntries(Object.keys(request.questions).map((name) => [name, {
+        type: "noul", noul: name === "relevance" && !fits ? 0.2 : 0.93,
+      }])) });
+    });
+    const runner = { draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({ drafts: [{ angle: "technical", body }] }), engine: "fixture", model: "fixture",
+    }) };
+    const fallback = vi.fn().mockResolvedValue(JSON.stringify({ voice: 0.93, grounding: 0.93, relevance: 0.93, reasons: [] }));
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    vi.stubEnv("TYPESAFE_API_KEY", "inert-task-fit-fixture");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    try {
+      await runDrafterTick({
+        log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never,
+        instance: { id: "i", org_id: "o" },
+        claimedLeads: [{
+          id: "L", external_id: "123", status: "drafting", priority: true,
+          author_handle: "author", author_id: "uid", tier: null, classifier_label: null, classifier_score: null,
+          payload: { text: "Spent the afternoon untangling a Rust lifetime error. Some days the compiler wins", url: "https://x.com/author/status/123" },
+        }],
+        runner: runner as never,
+        kb: { search: async () => [{ snippet: "brief lowercase warm reactions", score: 8, filePath: "voice.md", startLine: 1, endLine: 1 }] } as never,
+        postOutbound, markStatus: vi.fn(), patternRules: [],
+        verify: { enabled: true, retries: repair ? 1 : 0, makeCalls: () => [fallback] },
+      });
+      expect(postOutbound).toHaveBeenCalledOnce();
+      const final = postOutbound.mock.calls[0]![0].drafts[0];
+      expect(final.body).toBe(body);
+      expect(final.verifierMeta).toMatchObject({ pass, judgeOk: true, judgeProvider: "jev" });
+      expect(fallback).not.toHaveBeenCalled();
+      expect(questions.length).toBeGreaterThan(0);
+      if (repair) {
+        expect(runner.draft).toHaveBeenCalledTimes(2);
+        expect(runner.draft.mock.calls[1]![0].prompt).toMatch(/reaction.*fits.*moment.*energy/i);
+        expect(questions.length).toBeGreaterThanOrEqual(2);
+      }
+    } finally {
+      send.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+});
