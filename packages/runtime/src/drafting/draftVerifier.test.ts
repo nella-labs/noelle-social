@@ -998,3 +998,203 @@ describe("scoreFormat — anti-ai significance markers (constraint 14)", () => {
 });
 
 describe("scoreFormat — anti-ai reader-mode constructions", () => {
+  const CASES: Array<[string, RegExp]> = [
+    ["the migration stands as the proof here", /copula dodge/],
+    ["the cache layer boasts a 40ms p99", /copula dodge/],
+    ["it functions as a write-through cache", /copula dodge/],
+    ["they cut CI by half, underscoring the value of caching", /participial tail/],
+    ["studies show incremental builds are faster", /vague authority/],
+    ["experts say the resolver is the bottleneck", /vague authority/],
+    ["we cut CI in half. here's the kicker, it was one flag", /false suspense/],
+    ["shipping that resolver was a pivotal moment for us", /grandiosity/],
+    ["agentic coding is a real paradigm shift", /grandiosity/],
+  ];
+  for (const [body, want] of CASES) {
+    it(`hard-zeroes: "${body.slice(0, 34)}…"`, () => {
+      const f = strict(body);
+      expect(f.score).toBe(0);
+      expect(f.reasons.join(" ")).toMatch(want);
+    });
+    it(`is inert without strictVoice: "${body.slice(0, 34)}…"`, () => {
+      expect(loose(body).score).toBe(1);
+    });
+  }
+});
+
+describe("scoreFormat — anti-ai tier-1 wordbank", () => {
+  const HITS = [
+    "leveraging the existing index would be faster",
+    "worth a delve into how cargo resolves this",
+    "that's a seamless way to handle the cache",
+    "this was the pivotal call for your architecture",
+    "a real testament to how you scoped it",
+    "it's important to note the resolver runs twice",
+    "furthermore, the cold start dominates",
+  ];
+  for (const body of HITS) {
+    it(`hard-zeroes tier-1 vocab: "${body.slice(0, 34)}…"`, () => {
+      const f = strict(body);
+      expect(f.score).toBe(0);
+      expect(f.reasons.join(" ")).toMatch(/tier-1 AI vocabulary/);
+    });
+  }
+
+  // The words deliberately LEFT OUT of the deterministic list because they have a
+  // real technical sense in Demooperator's world. If someone adds them to WORDBANK_TIER1
+  // later, these fail loudly and the tradeoff gets re-decided on purpose.
+  const ALLOWED = [
+    "a robust parser would catch that before the resolver does",
+    "the npm ecosystem handles this with peer deps, so it works out",
+    "you can navigate to the config and flip it, that's all it took",
+    "the trajectory of the build times is what i'd watch here",
+  ];
+  for (const body of ALLOWED) {
+    it(`allows a legitimate technical use: "${body.slice(0, 34)}…"`, () => {
+      expect(strict(body).score).toBe(1);
+    });
+  }
+});
+
+describe("scoreFormat — anti-ai sweep does not regress clean drafts", () => {
+  it("passes a clean specific LinkedIn reply under strictVoice", () => {
+    const f = strict("rust build times are brutal, what worked for me was sccache plus a warm target dir");
+    expect(f.score).toBe(1);
+    expect(f.reasons).toHaveLength(0);
+  });
+  it("still flags 'honestly' as a soft penalty (no longer a hard zero)", () => {
+    const f = strict("honestly the resolver is the bottleneck");
+    expect(f.score).toBeCloseTo(0.7);
+    expect(f.reasons.join(" ").toLowerCase()).toContain("honestly");
+  });
+});
+
+// ---- fixes found by sweeping 1646 real historical Lyra drafts --------------
+describe("scoreFormat — anti-ai sweep, corpus-driven corrections", () => {
+  it("allows 'which is exactly why <cause>' (a causal connective, not a marker)", () => {
+    const f = strict("i shipped a whole feature off a model agreeing with me, which is exactly why a second reviewer matters");
+    expect(f.score).toBe(1);
+  });
+  it("still catches the noun form 'which is exactly the problem'", () => {
+    expect(strict("it retries on a 500, which is exactly the problem").score).toBe(0);
+  });
+
+  it("catches inflected vague authority ('experts noted', 'the data showed')", () => {
+    expect(strict("experts noted the resolver runs twice").score).toBe(0);
+    expect(strict("the data showed cold starts dominate").score).toBe(0);
+    expect(strict("analysts pointed to the cache layer").score).toBe(0);
+  });
+
+  it("exempts double-quoted spans — quoting slop to mock it is the GOOD version", () => {
+    // Verbatim shape of a real draft that this change would otherwise hard-zero.
+    const f = strict('"experts pointed to, experts noted, experts underscored" is a consultation that produced verbs');
+    expect(f.score).toBe(1);
+  });
+  it("still catches the same words used in the writer's own voice", () => {
+    expect(strict("experts pointed to the cache layer as the culprit").score).toBe(0);
+  });
+  it("does not let quote-stripping fuse neighbouring words into a false hit", () => {
+    // "here's the" + "thing is" must not become "here's the thing is" after strip.
+    expect(strict('here\'s the "cache" thing i keep hitting').score).toBe(1);
+  });
+});
+
+// ---- false positives found by adversarial review of the live corpus --------
+// Every string below is a REALISTIC Demooperator-voice draft (several are verbatim from
+// noelle.drafts / noelle.post_drafts, including one published post) that an
+// earlier revision of these rules hard-zeroed. They are pinned so no future
+// widening can silently re-break them.
+describe("scoreFormat — anti-ai sweep must not fire on real operator voice", () => {
+  const MUST_PASS: Array<[string, string]> = [
+    // 'leverage' as the founder-sense NOUN. 3/3 real-corpus uses, one published.
+    ["leverage-as-noun", "so do the visible work and build with people, that's the leverage, the name tags are not"],
+    ["leverage-as-noun 2", "when you're 17 with no name, no network, no leverage, volume is the strategy"],
+    // 'serving as' — the most common legitimate phrase on LinkedIn role posts.
+    ["serving as (role post)", "congrats manu, serving as head of eng at a 40 person startup is no joke"],
+    // 'functions' as a plural noun in code talk.
+    ["functions as (plural noun)", "we index nested functions as separate scopes, otherwise the symbol graph is useless"],
+    // 'underscore' the character / the library.
+    ["underscore (character)", "rust wants snake_case so half our symbols are just underscores and it wrecks tokenization"],
+    // OWNED, sourced data — naming your source is the fix the rule asks for.
+    ["owned data", "our benchmark data shows a 3x speedup on the 400k loc repo, happy to share the numbers"],
+    // Present progressive, not a participial tail.
+    ["progressive not tail", "the counter is reflecting the old value, classic stale closure"],
+    // Ordinary adjective / ordinary English.
+    ["elevated (adjective)", "we saw elevated p99 latency for an hour after the deploy"],
+    ["next generation (plain)", "spending saturdays mentoring the next generation of devs in medellin"],
+    ["realm (keycloak)", "the keycloak realm was misconfigured, that's why the token audience was wrong"],
+    // Present-tense opinion frame — both live instances were sent by the operator.
+    ["what gets me is", "what gets me is how fast the 'difficult' label shows up when the honest fix costs real work"],
+    // Causal connective, not a significance marker.
+    ["which is exactly why", "nobody reviewed it, which is exactly why the regression shipped"],
+  ];
+  for (const [name, body] of MUST_PASS) {
+    it(`passes: ${name}`, () => {
+      const f = strict(body);
+      expect(f.reasons.join(" ")).toBe("");
+      expect(f.score).toBe(1);
+    });
+  }
+
+  // The narrowings must not have disarmed the actual tells.
+  const MUST_STILL_FAIL: Array<[string, string]> = [
+    ["leveraged", "they leveraged the cache layer hard"],
+    ["leveraging", "leveraging what you already built is the move"],
+    ["stands as", "that config stands as the single source of truth"],
+    ["underscore as verb", "which underscores the importance of a warm cache"],
+    ["unsourced data", "the data shows most teams never hit that path"],
+    ["real participial tail", "they cut CI in half, underscoring the value of caching"],
+    ["elevate as verb", "it elevates the whole developer experience"],
+    ["what got me was (past)", "what got me was how long the cold start took"],
+  ];
+  for (const [name, body] of MUST_STILL_FAIL) {
+    it(`still catches: ${name}`, () => {
+      expect(strict(body).score).toBe(0);
+    });
+  }
+});
+
+describe("scoreFormat — anti-ai sweep, quoting and reason hygiene", () => {
+  it("NO single-quote form is exempt — neither straight nor curly", () => {
+    // Both collide with the apostrophe (curly ‘ is what autocorrect produces for
+    // a word-leading apostrophe: "the ‘90s"), and both produced a silent 1.00.
+    // A quoted tell now costs a regenerate; a silently-hidden tell cost a draft.
+    expect(strict("everyone kept saying \u2018here\u2019s the thing\u2019 until it meant nothing").score).toBe(0);
+    expect(strict("everyone kept saying 'here's the thing' until it meant nothing").score).toBe(0);
+  });
+  it("does not treat an apostrophe as an opening quote", () => {
+    // "it's" / "don't" / "founders'" must never open a span and blank the body.
+    const f = strict("it's the founders' call, don't let that sink in get lost");
+    expect(f.score).toBe(0); // 'let that sink in' must still be caught
+  });
+  it("catches un-contracted variants (the fix prompt nudges the drafter at them)", () => {
+    for (const b of [
+      "and that is the point",
+      "here is the thing, nobody reads the docs",
+      "that is what kills me about the whole setup",
+      "that's the whole point of the retry budget",
+    ]) {
+      expect(strict(b).score).toBe(0);
+    }
+  });
+  it("caps reasons so duplicates can't crowd the approval card", () => {
+    // "stands as a testament" alone trips copula dodge + 2 wordbank entries.
+    const f = strict("the migration stands as a testament to a pivotal transformative paradigm");
+    expect(f.score).toBe(0);
+    const antiAi = f.reasons.filter((r) => /significance-marking|AI construction|tier-1 AI vocab/.test(r));
+    expect(antiAi.length).toBeLessThanOrEqual(3);
+  });
+});
+
+// Proper-noun and everyday-adjective collisions, caught by sweeping the corpus
+// after the first round of widening. Pinned so these words can't be re-added to
+// the hard-zero list without a deliberate decision.
+describe("scoreFormat — anti-ai wordbank excludes everyday/proper-noun adjectives", () => {
+  const MUST_PASS = [
+    // "Profound Documents" is a PRODUCT NAME; the case-insensitive match hit it.
+    "LETS GOOO, shipping Benchmarking, Skills, Profound Documents, AND Agent Assistant in a few weeks is wild, congrats James!!",
+    "the relentless-questions thing is such a green flag",
+    "tireless work from that whole team, genuinely",
+    "congrats on getting into endeavor, that network is genuinely useful in bogota",
+    "the beacon endpoint was 404ing all morning",
+  ];
+  for (const body of MUST_PASS) {
