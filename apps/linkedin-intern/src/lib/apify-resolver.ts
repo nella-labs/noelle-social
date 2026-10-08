@@ -198,3 +198,53 @@ export function createApifyResolver(deps: ResolverDeps): (orgId: string) => Prom
  * shards the watchlist people + keyword queries across these handles and fetches
  * them in parallel — N tokens = ~N× the search throughput, with each person/
  * keyword assigned to exactly one handle so no two tokens hit the same target.
+ *
+ * Each handle still tracks its own token's exhaustion (401→invalid, 402/403→
+ * exhausted) so a spent token drops out next tick. Falls back to a 1-element
+ * pool (env/SM token) after a successful empty active, in-use pool read, as in the
+ * single-client path. Returns [] when nothing is
+ * available anywhere (caller skips the fetch).
+ */
+export function createApifyPoolResolver(
+  deps: ResolverDeps,
+): (orgId: string) => Promise<ApifyHandle[]> {
+  const buildClient = (token: string): ApifyLinkedInClient =>
+    createApifyLinkedInClient({
+      token,
+      ...(deps.profilePostsActorId ? { profilePostsActorId: deps.profilePostsActorId } : {}),
+    });
+
+  // One single-token rotating client (so exhaustion/invalid tracking still fires)
+  // per token. A 1-candidate "rotating" client never actually rotates.
+  const handleFor = (cand: RotatingTokenCandidate, totalCount: number, orgId: string): ApifyHandle => ({
+    client: createRotatingApifyClient({
+      candidates: [cand],
+      totalCount,
+      buildClient,
+      onTokenFatal: (id, status, token) => {
+        void handleTokenFatal(deps, id, status, token, orgId);
+      },
+      onRecovered: (id) => void clearApifyTokenExhausted(deps.sql, id).catch(() => {}),
+      log: deps.log,
+    }),
+    credentialId: cand.credentialId,
+  });
+
+  return async (orgId: string): Promise<ApifyHandle[]> => {
+    const dbTokens = await readTokenPool(deps, orgId);
+
+    if (dbTokens.length === 0) {
+      const envToken = await deps.secrets.get(deps.apifyTokenSecretId).catch(() => null);
+      if (!envToken) {
+        deps.log.warn({ orgId }, "no apify token (no active connection + no env fallback); skipping apify fetch");
+        return [];
+      }
+      return [handleFor({ credentialId: null, token: envToken, wasExhausted: false }, 1, orgId)];
+    }
+
+    const available = dbTokens.filter((t) => t.available);
+    return available.map((t) =>
+      handleFor({ credentialId: t.credentialId, token: t.token, wasExhausted: t.wasExhausted }, dbTokens.length, orgId),
+    );
+  };
+}

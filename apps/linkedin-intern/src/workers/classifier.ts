@@ -198,3 +198,153 @@ async function main() {
           return;
         }
 
+        // Backpressure gate: classifier output ultimately feeds the drafter,
+        // which feeds the approval inbox. If approvals are already at the
+        // (effective) cap, classifying more leads just deepens the future
+        // pile-up. Skip before doing any classification work.
+        const cap = effectiveDraftsCap(inst);
+        if (cap != null) {
+          const pending = await countPendingApprovalsForInstance(sql, inst.id);
+          if (pending >= cap) {
+            log.info(
+              { org_id: inst.org_id, pending, cap },
+              "classifier paused: pending approvals at cap",
+            );
+            await run.finish({ status: "ok", rowsProcessed: 0 });
+            return;
+          }
+        }
+
+        // Browser observations use Jev alone and live outside the legacy
+        // classifier claim. A missing Gateway key or Jev outage leaves each
+        // observation queued; delay retries so a 24/7 actor cannot hot-loop it.
+        let observedProcessed = 0;
+        if (Date.now() >= (jevRetryAfter.get(inst.id) ?? 0)) {
+          const strictClassifier = createClassifier({
+            backend: meteredBackend,
+            objective: inst.objective ?? null,
+            qThreshold: inst.classifier_threshold ?? env.LINKEDIN_Q_THRESHOLD,
+          });
+          // Claim one at a time: if Jev goes down, no other row is stranded in
+          // observed_classifying while we stop the batch.
+          for (let i = 0; i < env.CLASSIFIER_BATCH; i++) {
+            const [lead] = await claimObservedLeadsForClassification(sql, {
+              agentInstanceId: inst.id,
+              batch: 1,
+            });
+            if (!lead) break;
+            const result = await classifyOneLead({
+              sql, classifier: strictClassifier, notifier, inst, lead, log, bus,
+            });
+            if (result === "jev_unavailable") {
+              jevRetryAfter.set(inst.id, Date.now() + 60_000);
+              break;
+            }
+            observedProcessed++;
+          }
+        }
+
+        // Billing path. If the org brought its own Gemini key, classify through
+        // Google AI Studio with that key so usage bills *their* account.
+        // Otherwise use the Noelle-billed backend. NOT_FOUND is the common case
+        // (Noelle-billed) and is expected, not an error.
+        let backend: EngineBackend = meteredBackend;
+        let byo = false;
+        try {
+          const byoKey = await secrets.getForOrg(inst.org_id, "gemini-api-key");
+          backend = createGeminiKeyBackend({ apiKey: byoKey });
+          byo = true;
+        } catch (err) {
+          if (!(err instanceof SecretAccessError) || !/NOT_FOUND/.test(err.message)) throw err;
+        }
+
+        // Budget gate + spend recording apply ONLY to the Noelle-billed path.
+        // A BYO-key org pays Google directly. Skip the tick when the
+        // org/instance is at its cap on the `classifier` bucket.
+        // claude-cli (flat-rate, cents=0) is exempt inside the gate.
+        if (!byo) {
+          const blocked = await classifierBudgetBlock(budgetAdapters, {
+            orgId: inst.org_id,
+            instanceId: inst.id,
+            engine: recordEngine,
+          });
+          if (blocked) {
+            log.info(
+              {
+                org_id: inst.org_id,
+                layer: blocked.layer,
+                spent_cents: blocked.spentCents,
+                cap_cents: blocked.capCents,
+              },
+              "classifier paused: budget cap reached",
+            );
+            await run.finish({ status: "ok", rowsProcessed: observedProcessed });
+            return;
+          }
+        }
+
+        // Resolve the model for the active backend:
+        //   - Bedrock (self-host): fixed Claude handle.
+        //   - Gemini (BYO key, or Vertex default): honour the per-worker override;
+        //     non-Gemini picks fall back to Gemini Flash + log.
+        let classifierModel: string | undefined;
+        if (!byo && billedEngine === "bedrock") {
+          classifierModel = bedrockModel ?? undefined;
+        } else {
+          const { model, fellBack } = resolveClassifierModel(inst.model_overrides);
+          classifierModel = model ?? undefined;
+          if (fellBack) {
+            log.info(
+              { org_id: inst.org_id },
+              "classifier override targets a non-Gemini engine; falling back to default Gemini Flash",
+            );
+          }
+        }
+        const classifier = createClassifier({
+          backend,
+          ...(classifierModel ? { model: classifierModel } : {}),
+          objective: inst.objective ?? null,
+          // Per-instance override (Config page) wins over the env default, so the
+          // operator can loosen/tighten the filter without a redeploy.
+          qThreshold: inst.classifier_threshold ?? env.LINKEDIN_Q_THRESHOLD,
+          // Relationship scout flags high-leverage authors + pre-drafts an intro
+          // DM in the SAME classifier call. On unless NOELLE_VIP_SCOUT is
+          // explicitly disabled — additive + fail-open (no field → vip=null).
+          vipScout: VIP_SCOUT_ENABLED,
+        });
+
+        const claimed = await claimLeadsForClassification(sql, {
+          orgId: inst.org_id,
+          agentInstanceId: inst.id,
+          batch: env.CLASSIFIER_BATCH,
+        });
+        let n = observedProcessed;
+        for (const lead of claimed) {
+          await classifyOneLead({
+            sql,
+            classifier,
+            notifier,
+            inst,
+            lead,
+            log,
+            bus,
+            // Opus DM drafter (claude -p → Bedrock) for scout-flagged VIPs.
+            ...(vipDmRunner ? { runner: vipDmRunner } : {}),
+          });
+          n++;
+        }
+        await run.finish({ status: "ok", rowsProcessed: n });
+      } catch (err) {
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+    sleep: wake.sleep,
+  });
+}
+
+main().catch((err) => {
+  console.error("classifier fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
