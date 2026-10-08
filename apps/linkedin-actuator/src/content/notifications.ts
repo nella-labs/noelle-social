@@ -398,3 +398,167 @@ export function ageMinutesFromText(text: string | null | undefined): number | nu
 }
 
 /**
+ * How old the card says it is, in minutes.
+ *
+ * LIVE-TUNE: the real element is `.nt-card__time-ago`. Per this file's rule
+ * that nothing depends on a single class name, the fallback is structural —
+ * the one element in the card whose ENTIRE text is an age token — so a class
+ * rename degrades instead of silently zeroing every card's age.
+ */
+export function cardAgeMinutes(card: Element): number | null {
+  const fromDirect = ageMinutesFromText(card.querySelector(".nt-card__time-ago")?.textContent);
+  if (fromDirect !== null) return fromDirect;
+
+  // Two defenses, because a "safe" degradation that invents a FRESH age is
+  // worse than no fallback at all:
+  //  - skip the human-written subtrees, so a reply reading "5 min" is not read
+  //    as the card's age;
+  //  - take the LAST match rather than the first. On a real card the timestamp
+  //    renders after the comment body, so document order is the tiebreak that
+  //    survives the body-class ALSO having drifted.
+  let last: number | null = null;
+  for (const el of Array.from(card.querySelectorAll("time, span, p, div"))) {
+    if (el.closest(HUMAN_TEXT_SEL)) continue;
+    const text = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+    if (!text || text.length > 12) continue;
+    const age = ageMinutesFromText(text);
+    if (age !== null) last = age;
+  }
+  return last;
+}
+
+/**
+ * Is this card inside the window? An age we could not read is OUT — we cannot
+ * prove it is recent, and only provably-recent things get answered.
+ */
+export function withinAgeWindow(
+  ageMinutes: number | null | undefined,
+  maxAgeMinutes: number,
+): boolean {
+  return typeof ageMinutes === "number" && ageMinutes <= maxAgeMinutes;
+}
+
+/**
+ * How the harvested cards fall against the window, for the sweep's telemetry.
+ *
+ * `undated` is the operationally important one: if LinkedIn renames its
+ * time-ago markup this jumps to "all of them", the actor answers nothing, and
+ * the sweep line says exactly that instead of reporting a quiet empty inbox.
+ */
+export function ageBuckets(
+  items: readonly HarvestedNotification[],
+  maxAgeMinutes: number,
+): { recent: number; stale: number; undated: number } {
+  let recent = 0;
+  let stale = 0;
+  let undated = 0;
+  for (const item of items) {
+    if (typeof item.age_minutes !== "number") undated++;
+    else if (item.age_minutes <= maxAgeMinutes) recent++;
+    else stale++;
+  }
+  return { recent, stale, undated };
+}
+
+/**
+ * How many notification cards the page rendered AT ALL — replies or not.
+ *
+ * `harvestNotifications` returns only reply-type cards, so its count cannot
+ * answer "did the page render?". Conflating the two made a healthy quiet inbox
+ * (nobody replied to us in this window — most sweeps) report itself as
+ * "page rendered NO notification cards — selectors may have drifted", which is
+ * the alarm the Actuator Doctor and the operator are supposed to be able to
+ * trust when LinkedIn genuinely drifts. Zero replies is ordinary; zero cards is
+ * a markup break, and they need separate numbers.
+ */
+export function countNotificationCards(root: ParentNode): number {
+  return cardsIn(root).length;
+}
+
+/**
+ * Every notification card that is somebody replying to us, as harvest records.
+ * Cards missing a post link, a profile link, or a readable comment snippet are
+ * dropped: a lead with no text is one the drafter would skip anyway, and the
+ * next sweep re-sees the card for free.
+ */
+export function harvestNotifications(root: ParentNode): HarvestedNotification[] {
+  const out: HarvestedNotification[] = [];
+  const seen = new Set<string>();
+  for (const card of cardsIn(root)) {
+    const link =
+      card.querySelector("a.nt-card__headline") ?? card.querySelector(NOTIFICATION_LINK_SEL);
+    const href = link?.getAttribute("href") ?? null;
+    const headline = cardHeadline(card);
+
+    // LinkedIn's own type wins; the headline's prose is the fallback for cards
+    // that carry no highlightedUpdateType.
+    const type = notificationTypeFrom(href);
+    const isReply = type ? isReplyType(type) : isReplyHeadline(headline);
+    if (!isReply) continue;
+
+    const urn = activityUrnFrom(href);
+    if (!urn) continue;
+    // The commenter's profile link lives in the card's LEFT RAIL
+    // (data-view-name="notification-card-image"), percent-encoded
+    // ("/in/malena%2Dmir%2Dgarcia").
+    const publicId = publicIdFrom(
+      card.querySelector("a[data-view-name='notification-card-image']")?.getAttribute("href") ??
+        card.querySelector("a[href*='/in/']")?.getAttribute("href"),
+    );
+    if (!publicId) continue;
+
+    const text = cardSnippet(card, headline);
+    if (!text) continue;
+    // Page furniture is not a person. See isUiChrome.
+    if (isUiChrome(text)) continue;
+
+    // THEIR comment id when the link exposes one — it distinguishes two people
+    // replying to the same comment of ours, which (post, person) cannot.
+    const commentId = commentIdFrom(href);
+    const externalId = commentId ? `urn:li:comment:${commentId}` : `${urn}:${publicId}`;
+    if (seen.has(externalId)) continue; // the list re-renders cards as you scroll
+    seen.add(externalId);
+
+    out.push({
+      external_id: externalId,
+      public_id: publicId,
+      // The display name is the headline's leading <strong> on every real card;
+      // fall back to the prose before the verb, then to the profile id.
+      name:
+        (card.querySelector(".nt-card__headline strong")?.textContent ?? "").trim() ||
+        headline.split(/\s+(commented|replied|mentioned)\b/i)[0]?.trim() ||
+        publicId,
+      text,
+      // Canonical post permalink rather than the notification's tracking link:
+      // it is the URL shape the actuator's comment path already handles, and it
+      // is stable across renders.
+      url: `https://www.linkedin.com/feed/update/${urn}/`,
+      activity_urn: urn,
+      post_context: cardPostContext(card),
+      age_minutes: cardAgeMinutes(card),
+    });
+  }
+  return out;
+}
+
+/**
+ * The replies worth enqueueing: posted inside the recency window, not already
+ * seen this install, bounded per sweep. Unlike X there is no "is this aimed at
+ * me" test to make — the headline match already said "your post" / "your
+ * comment".
+ */
+export function selectRepliesToMe(
+  items: HarvestedNotification[],
+  opts: { seen: readonly string[]; max: number; maxAgeMinutes?: number },
+): HarvestedNotification[] {
+  const maxAgeMinutes = opts.maxAgeMinutes ?? MAX_AGE_MINUTES;
+  const seen = new Set(opts.seen);
+  const out: HarvestedNotification[] = [];
+  for (const item of items) {
+    if (out.length >= opts.max) break;
+    if (!withinAgeWindow(item.age_minutes, maxAgeMinutes)) continue;
+    if (seen.has(item.external_id)) continue;
+    out.push(item);
+  }
+  return out;
+}
