@@ -398,3 +398,203 @@ export function findSeeMore(tweet: Element): HTMLElement | null {
 
   // Fallback: exact text match on link/button-shaped elements inside the tweet.
   for (const el of Array.from(tweet.querySelectorAll<HTMLElement>("a, button, [role='link'], [role='button']"))) {
+    if (/^show more$/i.test((el.textContent ?? "").trim())) return el;
+  }
+  return null;
+}
+
+/**
+ * The trimmed tweet body text. LIVE-TUNE: [data-testid='tweetText']; a quote
+ * tweet nests a second tweetText, and the outer tweet's own text comes first in
+ * DOM order. Fallback: body blocks carry a lang attribute — take the longest.
+ */
+export function tweetText(tweet: Element): string {
+  const primary = tweet.querySelector<HTMLElement>("[data-testid='tweetText']");
+  if (primary) return (primary.textContent ?? "").trim();
+
+  let longest = "";
+  for (const el of Array.from(tweet.querySelectorAll<HTMLElement>("div[lang]"))) {
+    const t = (el.textContent ?? "").trim();
+    if (t.length > longest.length) longest = t;
+  }
+  return longest;
+}
+
+/** Word count of the tweet body text. */
+export function wordCount(tweet: Element): number {
+  return tweetText(tweet).split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * True if the tweet contains photo/video media. LIVE-TUNE: pbs.twimg.com media
+ * images carry "/media/" in src (avatars are "/profile_images/" and never match).
+ */
+export function hasMedia(tweet: Element): boolean {
+  return (
+    tweet.querySelector(
+      "[data-testid='tweetPhoto'], [data-testid='videoPlayer'], video, img[src*='media']"
+    ) !== null
+  );
+}
+
+/** True if the tweet body is collapsed (a "Show more" expander is present). */
+export function isTruncated(tweet: Element): boolean {
+  return findSeeMore(tweet) !== null;
+}
+
+/**
+ * The author's @handle WITHOUT the leading "@", or null. LIVE-TUNE:
+ * [data-testid='User-Name'] holds "Display Name @handle · time"; the handle is
+ * the first span whose text starts with "@". Falls back to the permalink path
+ * ("/{handle}/status/{id}").
+ */
+export function tweetAuthorHandle(tweet: Element): string | null {
+  const nameBlock = tweet.querySelector("[data-testid='User-Name']");
+  if (nameBlock) {
+    for (const span of Array.from(nameBlock.querySelectorAll("span"))) {
+      const t = (span.textContent ?? "").trim();
+      if (t.startsWith("@") && t.length > 1) return t.slice(1);
+    }
+  }
+  const href = permalink(tweet) ?? "";
+  return /^\/([A-Za-z0-9_]{1,15})\/status\/\d+/.exec(href)?.[1] ?? null;
+}
+
+/**
+ * All page text OUTSIDE tweet bodies, whitespace-normalized. The restriction
+ * probe below matches exact platform phrases against this, so a live tweet
+ * merely QUOTING those phrases can never false-positive — X renders its
+ * notices in standalone cells, never inside article[data-testid='tweet'].
+ * Clone-and-prune keeps "all text not inside a tweet" simple; it runs once per
+ * permalink navigation (not per tick), so the copy is cheap.
+ */
+function textOutsideTweets(root: ParentNode): string {
+  const el = root instanceof Element ? root : (root as Document).body ?? null;
+  if (!el) return "";
+  const clone = el.cloneNode(true) as Element;
+  for (const t of Array.from(clone.querySelectorAll("article[data-testid='tweet']"))) t.remove();
+  return (clone.textContent ?? "").replace(/\s+/g, " ");
+}
+
+/**
+ * True when the focal post restricts who can reply and this account isn't
+ * eligible — X renders a "Who can reply?" notice ("People @author mentioned can
+ * reply", "Only accounts @author follows can reply", …) and keeps the focal
+ * tweet's reply icon but DISABLES it, so no composer ever mounts. Permanent for
+ * this account: the actuator DROPS the draft (and marks it skipped server-side)
+ * instead of hunting for a composer that will never exist and retrying
+ * box-not-found forever. BOTH signals are gated on the reply composer
+ * ([data-testid='tweetTextarea_0']) being ABSENT: a mounted composer means
+ * this account CAN reply, no matter what banner text is on the page — X shows
+ * the "Who can reply?" notice to ELIGIBLE repliers too (accounts the author
+ * mentioned/follows), and a positive here feeds a DURABLE markSkipped.
+ *  (1) LIVE-TUNE: the focal tweet's button[data-testid='reply'] is
+ *      disabled/aria-disabled — the disabled attribute only renders on
+ *      restricted-reply tweets, so a page that is merely slow to hydrate (no
+ *      disabled icon yet) can't trip it.
+ *  (2) The restriction phrasing, probed OUTSIDE tweet bodies (quote-proof —
+ *      the focal tweet still renders on restricted pages, so a body quoting
+ *      the phrases must not trip the probe).
+ */
+export function isReplyRestricted(root: ParentNode): boolean {
+  const el = root instanceof Element ? root : (root as Document).body ?? null;
+  if (!el) return false;
+  // Composer mounted => this account can reply. Nothing below may override it.
+  if (el.querySelector("[data-testid='tweetTextarea_0']") !== null) return false;
+  const focal = el.querySelector("article[data-testid='tweet']");
+  const btn = focal?.querySelector("button[data-testid='reply']") ?? null;
+  if (btn && (btn.hasAttribute("disabled") || btn.getAttribute("aria-disabled") === "true")) return true;
+  const text = textOutsideTweets(el);
+  return [
+    /who can reply\?/i,
+    /(?:people|accounts) @?\w+ (?:follows or )?mentioned can reply/i,
+    /only .{0,60}? can reply/i,
+    /replies (?:are |have been )?(?:limited|restricted)/i,
+  ].some((re) => re.test(text));
+}
+
+/**
+ * True when x.com is challenging or locking the session. A REAL challenge
+ * REDIRECTS the page to /account/access (the lock interstitial route) or loads
+ * an actual captcha-vendor iframe (arkose/funcaptcha — X's verification
+ * vendor) — those are the signals that are both reliable and false-positive-
+ * free. The old text probe ("suspicious", "verify your identity", …) and the
+ * generic iframe[src*='captcha'] scan matched innocent tweets and ad iframes
+ * and HALTED valid runs (ports #406/#407) — on a lights-out account one stray
+ * tweet cost days of autonomy (a challenge halt arms the multi-day auto-start
+ * cooldown). Nothing but structural evidence trips this now.
+ */
+export function findChallenge(root: ParentNode): boolean {
+  if (typeof location !== "undefined" && location.pathname.startsWith("/account/access")) return true;
+  return root.querySelector("iframe[src*='arkoselabs' i], iframe[src*='funcaptcha' i]") !== null;
+}
+
+export interface SubmitSearchDiag {
+  /** a reply composer box was found at all */
+  box: boolean;
+  /** buttons that are submit-WORDED, FOLLOW the box, and aren't a reply-icon
+   * toggle / per-tweet affordance / DM-drawer button — the exact pool the
+   * anchored pass draws from. */
+  wf: number;
+  /** of `wf`, how many are enabled */
+  en: number;
+  /** of the enabled ones, how many have a non-zero layout rect (a click could
+   * actually land) — `en>0, vis=0` means the submit exists and is enabled but
+   * has no box yet (the locator's zero-rect skip fires). */
+  vis: number;
+  /** any button whose aria/text is a submit word anywhere on the page,
+   * including the action-bar icons — a floor on "does a 'Reply'-ish button
+   * even exist on this surface". */
+  all: number;
+  /** the most informative candidate + WHY it was rejected, as
+   * `<label>_<dis|zr|pre|tog|itm|msg|nobox|ok>`. */
+  top: string;
+  /** compact dump of the buttons in/around the composer (the 6-hop climb region
+   * plus any worded button), each as
+   * `<label>_<pos><type>_<disabled><zerorect><worded>_g<group>` —
+   *   pos:  f=follows box, p=precedes, n=no box
+   *   type: s=submit, b=button, x=other/none
+   *   group: t=reply-icon toggle, i=inside a tweet article, m=DM drawer, n=none
+   * This shows the REAL submit's shape even when it's unworded or mis-ordered —
+   * the thing the counts alone can't reveal. Space-separated so it survives the
+   * reason sanitizer. */
+  region: string;
+  /** the composer editor + real submit, to answer WHY the submit stays disabled
+   * with text present:
+   *   bx=<tag>.<cls>  the box findReplyBox typed into
+   *   al=<aria>       its aria-label (X stamps "Post text" on the editor)
+   *   pm=<0/1>        is it inside a known editor root (tweetTextarea/DraftJS)?
+   *   len=<n>         box.textContent length (did our text land here?)
+   *   nce=<n>         how many contenteditables on the page (wrong-box risk)
+   *   sub=<cls>       the resolved submit button's classes
+   *   ad=<v>          its aria-disabled
+   *   dis=<v>         its .disabled property
+   * If pm=1,len>0 but dis=true, the editor has our text in the DOM but not its
+   * model. If pm=0 or nce>1, we may be typing into the wrong node. */
+  dom: string;
+}
+
+/**
+ * Why did findReplySubmitInfo return null? `submit-not-found` collapses three
+ * very different failures — no worded submit exists, one exists but stays
+ * disabled the whole poll, one is enabled but has no layout box (the zero-rect
+ * skip) — into a single reason. This re-walks the same predicates and counts
+ * each bucket so a failure row in noelle.x_activity says WHICH, without a live
+ * DevTools session (unavailable during a run — chrome.debugger holds the tab).
+ * `isZeroRect` is injected: the content script measures real rects, tests stub
+ * it. Read-only, no side effects. (Ported from the LinkedIn actuator, #444.)
+ */
+export function diagnoseReplySubmit(
+  root: ParentNode,
+  isZeroRect: (el: HTMLElement) => boolean,
+): SubmitSearchDiag {
+  const box = findReplyBox(root);
+  const buttons = Array.from(root.querySelectorAll<HTMLElement>("button, [role='button']"));
+  const worded = buttons.filter(submitWordy);
+  const follows = (el: HTMLElement) =>
+    !!box && (box.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  const inTweet = (el: HTMLElement) => el.closest("article[data-testid='tweet']") !== null;
+  const wf = worded.filter(
+    (el) => follows(el) && !replyToggleLike(el) && !inTweet(el) && el.closest(DM_SEL) === null,
+  );
+  const en = wf.filter((el) => !submitDisabled(el));
