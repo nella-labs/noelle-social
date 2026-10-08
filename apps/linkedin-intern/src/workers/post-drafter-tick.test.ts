@@ -398,3 +398,186 @@ describe("runPostDrafterTick", () => {
           generationRequestId: "11111111-1111-1111-1111-111111111111",
           generationReviewRequired: true,
         },
+      ],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [judge],
+      verifyRetries: 1,
+      sink,
+      release: vi.fn(),
+    });
+
+    expect(judge.mock.calls[0]![0]).toContain("draft original social posts");
+    expect(judge.mock.calls[0]![1]).toContain("POST PREMISE / REQUESTED IDEA:");
+    expect(judge.mock.calls[0]![1]).toContain("[post]");
+    expect(runner.draft.mock.calls[1]![0]!.prompt).toContain("previous original post");
+    expect(sink.mock.calls[0]![0]!.body).toBe("better post");
+  });
+
+  it("marks only the final planned MCP post variant as generation complete", async () => {
+    const requestId = "11111111-1111-1111-1111-111111111111";
+    const runner = {
+      draft: vi
+        .fn()
+        .mockResolvedValue({ text: JSON.stringify({ body: "post" }), engine: "b", model: "m" }),
+    };
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d" });
+
+    await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [
+        {
+          ...idea,
+          targetPlatforms: ["linkedin", "x"],
+          generationRequestId: requestId,
+          generationReviewRequired: true,
+        },
+      ],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
+      sink,
+      release: vi.fn(),
+    });
+
+    expect(sink).toHaveBeenCalledTimes(4);
+    expect(sink.mock.calls.map((c) => c[0]!.generationComplete)).toEqual([
+      false,
+      false,
+      false,
+      true,
+    ]);
+  });
+
+  it("releases a partially failed MCP batch for retry without claiming completion", async () => {
+    const runner = {
+      draft: vi
+        .fn()
+        .mockResolvedValue({ text: JSON.stringify({ body: "post" }), engine: "b", model: "m" }),
+    };
+    const sink = vi
+      .fn()
+      .mockResolvedValueOnce({ draft_id: "x1" })
+      .mockRejectedValueOnce(new Error("sink unavailable"))
+      .mockResolvedValueOnce({ draft_id: "x3" });
+    const release = vi.fn().mockResolvedValue(undefined);
+    const clearPending = vi.fn().mockResolvedValue(undefined);
+    await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [
+        {
+          ...idea,
+          targetPlatforms: ["x"],
+          generationRequestId: "11111111-1111-1111-1111-111111111111",
+        },
+      ],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls: () => [],
+      verifyRetries: 0,
+      sink,
+      release,
+      clearPending,
+    });
+    expect(sink).toHaveBeenCalledTimes(3);
+    expect(sink.mock.calls.every((call) => call[0].generationComplete === false)).toBe(true);
+    expect(release).toHaveBeenCalledWith(idea.id);
+    expect(clearPending).not.toHaveBeenCalled();
+  });
+
+  it("forces the existing verifier and stamps request id for MCP generation requests", async () => {
+    const requestId = "11111111-1111-1111-1111-111111111111";
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({ body: "I hire juniors. They compound fast." }),
+        engine: "b",
+        model: "m",
+      }),
+    };
+    const passJudge = vi.fn().mockResolvedValue(
+      JSON.stringify({
+        voice: 0.9,
+        grounding: 0.9,
+        relevance: 0.9,
+        reasons: ["specific"],
+      }),
+    );
+    const makeVerifierCalls = vi.fn((opts?: { force?: boolean }) =>
+      opts?.force ? [passJudge] : [],
+    );
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d1" });
+
+    const n = await runPostDrafterTick({
+      log,
+      instance,
+      ideas: [
+        {
+          ...idea,
+          generationRequestId: requestId,
+          generationReviewRequired: true,
+        },
+      ],
+      gather: async () => ctx,
+      runner,
+      makeVerifierCalls,
+      verifyRetries: 2,
+      sink,
+      release: vi.fn(),
+    });
+
+    expect(n).toBe(1);
+    expect(makeVerifierCalls).toHaveBeenCalledWith({ force: true });
+    expect(passJudge).toHaveBeenCalled();
+    expect(sink.mock.calls[0]![0]).toMatchObject({
+      generationRequestId: requestId,
+      qualityPassed: true,
+    });
+  });
+});
+
+describe("actual Jev original-post task-fit handoff", () => {
+  it.each(["linkedin", "x", "reddit"] as const)("grades the %s premise through initial and repair review", async (platform) => {
+    const questions: string[] = [];
+    const send = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const request = JSON.parse(init!.body as string) as {
+        state: string; questions: Record<string, { instructions: string }>;
+      };
+      expect(JSON.parse(request.state).drafts[0].kind).toBe("post");
+      const policy = request.questions.relevance!.instructions;
+      questions.push(policy);
+      const fits = questions.length > 1 && policy.includes("requested premise");
+      return Response.json({ answers: Object.fromEntries(Object.keys(request.questions).map((name) => [name, {
+        type: "noul", noul: name === "relevance" && !fits ? 0.2 : 0.93,
+      }])) });
+    });
+    const runner = { draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({ body: "Small fixes compound\nOne repaired build per day keeps the change reviewable" }),
+      engine: "fixture", model: "fixture",
+    }) };
+    const fallback = vi.fn().mockResolvedValue(JSON.stringify({ voice: 0.93, grounding: 0.93, relevance: 0.93, reasons: [] }));
+    const sink = vi.fn().mockResolvedValue({ draft_id: "d" });
+    vi.stubEnv("TYPESAFE_API_KEY", "inert-task-fit-fixture");
+    vi.stubEnv("AI_GATEWAY_API_KEY", "");
+    try {
+      const count = await runPostDrafterTick({
+        log, instance, ideas: [{ ...idea, targetPlatforms: [platform], pendingPlatforms: [platform] }],
+        gather: async () => ({ ...ctx, hook: "Small fixes compound", thesis: "One repaired build per day keeps the change reviewable" }),
+        runner, makeVerifierCalls: () => [fallback], verifyRetries: 1, sink, release: vi.fn(),
+      });
+      expect(count).toBe(1);
+      expect(sink).toHaveBeenCalledOnce();
+      expect(sink.mock.calls[0]![0]).toMatchObject({ qualityPassed: true, verifierMeta: { pass: true, judgeProvider: "jev", attempts: 1 } });
+      expect(runner.draft).toHaveBeenCalledTimes(2);
+      expect(runner.draft.mock.calls[1]![0].prompt).toContain("requested premise");
+      expect(fallback).not.toHaveBeenCalled();
+      expect(questions).toHaveLength(2);
+      expect(new Set(questions).size).toBe(1);
+    } finally {
+      send.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+});
