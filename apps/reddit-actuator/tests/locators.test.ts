@@ -198,3 +198,203 @@ const NEW_SCOPED_COMPOSER = `
     <button type="submit" slot="submit-button" id="post-submit">Comment</button>
   </comment-composer-host>
   <shreddit-comment thingid="t1_c1" author="alice" score="5">
+    <div slot="comment">a</div>
+    <shreddit-comment-action-row><button>Reply</button></shreddit-comment-action-row>
+    <comment-composer-host>
+      <div contenteditable="true" name="body" role="textbox" id="comment-box"></div>
+      <button type="submit" slot="submit-button" id="comment-submit">Comment</button>
+    </comment-composer-host>
+  </shreddit-comment>`;
+
+describe("locateReplyBox — new-Reddit comment scoping (FIX 2)", () => {
+  it("returns the COMMENT composer (non-zero) over the collapsed 0×0 post box", () => {
+    const root = mount(NEW_SCOPED_COMPOSER);
+    stubRect(root.querySelector("#comment-box")!, { x: 10, y: 400, width: 320, height: 90 });
+    // post box stays collapsed (jsdom 0×0)
+    const res = locateReplyBox(root, "www.reddit.com", "c1");
+    expect(res.ok).toBe(true);
+    expect(res.rect).toEqual({ x: 10, y: 400, width: 320, height: 90 });
+  });
+  it("scopes by comment even when the post composer is ALSO expanded (non-zero)", () => {
+    const root = mount(NEW_SCOPED_COMPOSER);
+    stubRect(root.querySelector("#post-box")!, { x: 0, y: 0, width: 300, height: 80 }); // post composer expanded too
+    stubRect(root.querySelector("#comment-box")!, { x: 10, y: 400, width: 320, height: 90 });
+    const res = locateReplyBox(root, "www.reddit.com", "c1");
+    expect(res.ok).toBe(true);
+    expect(res.rect).toEqual({ x: 10, y: 400, width: 320, height: 90 }); // the COMMENT box, not the post box
+  });
+  it("without a commentId (POST target) uses the page-level composer", () => {
+    const root = mount(NEW_SCOPED_COMPOSER);
+    stubRect(root.querySelector("#post-box")!, { x: 0, y: 0, width: 300, height: 80 });
+    const res = locateReplyBox(root, "www.reddit.com");
+    expect(res.ok).toBe(true);
+    expect(res.rect).toEqual({ x: 0, y: 0, width: 300, height: 80 }); // the post box
+  });
+});
+
+describe("verifyReplyCleared — post-submit confirmation (FIX 4)", () => {
+  it("a still-present, non-empty editable → cleared:false (NOT posted)", () => {
+    const root = mount(`<div contenteditable="true" name="body" role="textbox">my unsent reply text</div>`);
+    expect(verifyReplyCleared(root, "www.reddit.com").cleared).toBe(false);
+  });
+  it("an emptied editable → cleared:true (posted)", () => {
+    const root = mount(`<div contenteditable="true" name="body" role="textbox"></div>`);
+    expect(verifyReplyCleared(root, "www.reddit.com").cleared).toBe(true);
+  });
+  it("an unmounted composer remains inconclusive", () => {
+    const root = mount(`<div>no composer here</div>`);
+    expect(verifyReplyCleared(root, "www.reddit.com")).toEqual({ cleared: false, present: false, empty: null });
+  });
+  it("scopes to the target comment's composer (post box empty, comment box still holds text)", () => {
+    const root = mount(`
+      <comment-composer-host><div contenteditable="true" name="body" role="textbox"></div></comment-composer-host>
+      <shreddit-comment thingid="t1_c1"><comment-composer-host>
+        <div contenteditable="true" name="body" role="textbox">still typing under the comment</div>
+      </comment-composer-host></shreddit-comment>`);
+    expect(verifyReplyCleared(root, "www.reddit.com", "c1").cleared).toBe(false);
+  });
+});
+
+describe("locateAmbientComments", () => {
+  it("locates a thread to open (read-only decoy)", () => {
+    const root = mount(`<div class="thing link" data-url="u"><a class="comments" href="/r/x/comments/1/">42 comments</a></div>`);
+    const res = locateAmbientComments(root, rng, "old.reddit.com");
+    expect(res.ok).toBe(true);
+  });
+  it("reports skipReason when nothing is openable", () => {
+    const res = locateAmbientComments(mount(`<div></div>`), rng, "old.reddit.com");
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("no-thread-to-open");
+  });
+});
+
+describe("locateUpvote (idle-upvote; UPVOTE-ONLY)", () => {
+  it("new Reddit: locates a feed post's upvote button (open shadow root) + observed post_id/subreddit", () => {
+    document.body.innerHTML = "";
+    const post = document.createElement("shreddit-post");
+    post.setAttribute("id", "t3_abc123");
+    post.setAttribute("permalink", "/r/SaaS/comments/abc123/x/");
+    post.attachShadow({ mode: "open" }).innerHTML =
+      `<button data-action-bar-action="upvote" aria-pressed="false"></button>`;
+    document.body.appendChild(post);
+    const res = locateUpvote(document.body, rng, "www.reddit.com");
+    expect(res.ok).toBe(true);
+    expect(res.observed).toMatchObject({ flavor: "new", post_id: "abc123", subreddit: "SaaS" });
+  });
+  it("old Reddit: locates the un-modded up arrow with observed subreddit", () => {
+    const root = mount(`<div class="thing link" data-permalink="/r/webdev/comments/1/x/"><div class="arrow up"></div></div>`);
+    const res = locateUpvote(root, rng, "old.reddit.com");
+    expect(res.ok).toBe(true);
+    expect(res.observed).toMatchObject({ flavor: "old", subreddit: "webdev" });
+  });
+  it("ok:false when every post is already upvoted — diagnostics say withBtn>0 (ports #410)", () => {
+    const root = mount(`<div class="thing link"><div class="arrow up upmod"></div></div>`);
+    const res = locateUpvote(root, rng, "old.reddit.com");
+    expect(res.ok).toBe(false);
+    // posts=1 with an (upmod-pressed) button present ⇒ "all already upvoted", not drift.
+    expect(res.skipReason).toBe("no-upvotable-post(posts=1,withBtn=1,btns=1,path=/,flavor=old)");
+  });
+  it("ok:false when no post is present — diagnostics say posts=0 (ports #410)", () => {
+    const res = locateUpvote(mount(`<div>empty</div>`), rng, "www.reddit.com");
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("no-upvotable-post(posts=0,withBtn=0,btns=0,path=/,flavor=new)");
+  });
+  it("diagnostics count shadow-root upvote buttons on new Reddit (already-pressed post)", () => {
+    document.body.innerHTML = "";
+    const post = document.createElement("shreddit-post");
+    post.attachShadow({ mode: "open" }).innerHTML =
+      `<button data-action-bar-action="upvote" aria-pressed="true"></button>`;
+    document.body.appendChild(post);
+    const res = locateUpvote(document.body, rng, "www.reddit.com");
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("no-upvotable-post(posts=1,withBtn=1,btns=1,path=/,flavor=new)");
+  });
+  it("surfaces wordCount + hasMedia so the background can read-dwell before upvoting (read-before-like wiring)", () => {
+    const root = mount(`<div class="thing link" data-permalink="/r/webdev/comments/1/x/">
+      <div class="arrow up"></div>
+      <div class="usertext-body"><div class="md">one two three four five six</div></div>
+    </div>`);
+    const res = locateUpvote(root, rng, "old.reddit.com");
+    expect(res.ok).toBe(true);
+    expect(res.observed).toMatchObject({ wordCount: 6, hasMedia: false });
+  });
+  it("reports hasMedia:true for a post with a thumbnail (dwell hint)", () => {
+    const root = mount(`<div class="thing link" data-permalink="/r/pics/comments/2/x/" data-url="https://i.redd.it/x.jpg">
+      <div class="arrow up"></div>
+      <a class="thumbnail" href="https://i.redd.it/x.jpg"></a>
+    </div>`);
+    const res = locateUpvote(root, rng, "old.reddit.com");
+    expect(res.ok).toBe(true);
+    expect(res.observed).toMatchObject({ hasMedia: true });
+  });
+  it("read-before-upvote: the located payload drives a positive human dwell (decideStop → readingDwellMs | glanceMs)", () => {
+    const root = mount(`<div class="thing link" data-permalink="/r/webdev/comments/3/x/">
+      <div class="arrow up"></div>
+      <div class="usertext-body"><div class="md">${"word ".repeat(120)}</div></div>
+    </div>`);
+    const loc = locateUpvote(root, makeRng(1), "old.reddit.com");
+    const wc = loc.observed!.wordCount as number;
+    const media = loc.observed!.hasMedia as boolean;
+    expect(wc).toBe(120);
+    // The exact calls doUpvote now makes before landing the click.
+    const dwellRng = makeRng(7);
+    const stop = decideStop(dwellRng, wc, { hasMedia: media });
+    const dwell = stop ? readingDwellMs(dwellRng, wc, { hasMedia: media }, 240) : glanceMs(dwellRng);
+    expect(dwell).toBeGreaterThan(0);
+  });
+});
+
+describe("locateSave (idle post-save; DEFAULT-OFF; SAVE-ONLY)", () => {
+  it("new Reddit: returns the overflow opener with observed.needsMenu=true + post_id/subreddit", () => {
+    document.body.innerHTML = "";
+    const post = document.createElement("shreddit-post");
+    post.setAttribute("id", "t3_abc123");
+    post.setAttribute("permalink", "/r/SaaS/comments/abc123/x/");
+    post.attachShadow({ mode: "open" }).innerHTML =
+      `<button data-action-bar-action="overflow" aria-label="more options">…</button>`;
+    document.body.appendChild(post);
+    const res = locateSave(document.body, rng, "www.reddit.com");
+    expect(res.ok).toBe(true);
+    expect(res.observed).toMatchObject({ flavor: "new", needsMenu: true, post_id: "abc123", subreddit: "SaaS" });
+  });
+  it("old Reddit: returns the direct save link with observed.needsMenu=false (one-click save)", () => {
+    const root = mount(`<div class="thing link" data-permalink="/r/webdev/comments/1/x/"><form class="save-button"><a href="#">save</a></form></div>`);
+    const res = locateSave(root, rng, "old.reddit.com");
+    expect(res.ok).toBe(true);
+    expect(res.observed).toMatchObject({ flavor: "old", needsMenu: false, subreddit: "webdev" });
+  });
+  it("ok:false with a self-diagnosing reason when nothing is saveable (caller falls back to upvote)", () => {
+    const root = mount(`<div class="thing link saved"><form class="save-button"><a href="#">save</a></form></div>`);
+    const res = locateSave(root, rng, "old.reddit.com");
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toContain("no-saveable-post");
+  });
+});
+
+describe("locateSaveInMenu (open overflow menu, two-step new Reddit)", () => {
+  it("locates the Save item without scrolling (menu stays open)", () => {
+    const root = mount(`<div role="menu"><div role="menuitem">Share</div><div role="menuitem">Save</div></div>`);
+    const res = locateSaveInMenu(root, "www.reddit.com");
+    expect(res.ok).toBe(true);
+    expect(res.rect).toBeTruthy();
+  });
+  it("ok:false when the menu isn't open / the Save item drifted (background Escape-dismisses + falls back)", () => {
+    const res = locateSaveInMenu(mount(`<div>no menu</div>`), "www.reddit.com");
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("save-item-not-found");
+  });
+  it("old Reddit has no menu step (one-click save)", () => {
+    const res = locateSaveInMenu(mount(`<div class="thing link"></div>`), "old.reddit.com");
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("save-menu-old-reddit");
+  });
+});
+
+describe("detectChallenge (locator wrapper)", () => {
+  it("passes through the selector's ChallengeResult", () => {
+    const root = mount(`<div class="ratelimit">You're doing that too much. Try again in 5 minutes.</div>`);
+    expect(detectChallenge(root)).toEqual({ challenge: true, kind: "throttle" });
+  });
+});
+
+describe("locateDirtyReplyBox", () => {
