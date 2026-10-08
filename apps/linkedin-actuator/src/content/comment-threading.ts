@@ -198,3 +198,203 @@ function findReplyEditor(
   opts: { afterCommentId: string },
 ): { editor: HTMLElement; box: HTMLElement } | { skipReason: string } {
   const anchorId = commentIdOf(opts?.afterCommentId ?? "");
+  if (!anchorId) return { skipReason: "reply-composer:bad-target-id" };
+  const anchor = locateCommentByUrn(root, anchorId);
+  if (!anchor) return { skipReason: "reply-composer:comment-not-found" };
+
+  // Every tier, not the first that matches globally: if one composer on the
+  // page still uses the old key and the TARGET's has drifted to the newer
+  // shape, short-circuiting on tier 1 would hide the target's box and hand back
+  // the unrelated one.
+  const boxes: HTMLElement[] = [];
+  const seen = new Set<HTMLElement>();
+  for (const sel of COMPOSER_SEL) {
+    for (const el of Array.from(root.querySelectorAll<HTMLElement>(sel))) {
+      if (!seen.has(el)) { seen.add(el); boxes.push(el); }
+    }
+  }
+  if (boxes.length === 0) return { skipReason: "reply-composer:none-open" };
+
+  const after = boxes.filter(
+    (b) => anchor.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).sort((a, b) => a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+  if (after.length === 0) return { skipReason: "reply-composer:none-after-comment" };
+  const containers = Object.values(COMMENT_CONTAINERS).join(", ");
+  const ownerId = (element: Element): string | null => {
+    const owner = element.closest(containers);
+    return owner ? containerCommentId(owner) : null;
+  };
+  // An explicitly owned composer can follow a nested child's open editor.
+  // Adjacent boxes have no comment ancestor and need the boundary check below.
+  const owned = after.find((box) => ownerId(box) === anchorId);
+  const pick = owned ?? after.find((box) => ownerId(box) === null);
+  if (!pick) return { skipReason: "reply-composer:not-this-comments-box" };
+
+  // BELONGING, not merely order. "First composer below the comment" is not the
+  // same as "this comment's composer": if the target's box never opened (a
+  // missed click, a render race, a box left open by an earlier run) the next
+  // comment's box is also below the anchor and would be used to answer the
+  // wrong human, in public, under the operator's name. The label check cannot
+  // catch that — EVERY reply box submits with "Reply". So: refuse if another
+  // comment container sits between the anchor and the box we picked.
+  const between = Array.from(root.querySelectorAll<HTMLElement>(containers)).filter(
+    (c) =>
+      c !== anchor &&
+      !c.contains(anchor) &&
+      containerCommentId(c) !== anchorId &&
+      anchor.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING &&
+      c.compareDocumentPosition(pick) & Node.DOCUMENT_POSITION_FOLLOWING,
+  );
+  if (!owned && between.length > 0) return { skipReason: "reply-composer:not-this-comments-box" };
+
+  const editor = Array.from(pick.querySelectorAll<HTMLElement>(EDITOR_SEL)).find(
+    (element) => ownerId(element) === anchorId || ownerId(element) === null,
+  );
+  if (!editor) return { skipReason: "reply-composer:no-editor" };
+  return { editor, box: pick };
+}
+
+/** The reply composer's editable, as a clickable/typable target. */
+export function locateReplyComposer(root: ParentNode, opts: { afterCommentId: string }): LocateResult {
+  const found = findReplyEditor(root, opts);
+  return "editor" in found ? hit(found.editor, "reply-composer") : miss(found.skipReason);
+}
+
+/**
+ * The composer's submit button — and the SAFETY CHECK.
+ *
+ * A reply box's submit reads "Reply"; the post-level composer's reads
+ * "Comment". Requiring the word "Reply" is therefore not cosmetic: it is what
+ * makes it impossible to type a conversation answer and publish it as a new
+ * top-level comment, which is the exact failure this whole module exists to
+ * prevent. If the button says anything else we refuse rather than guess.
+ */
+export function locateReplySubmit(
+  root: ParentNode,
+  opts: { afterCommentId: string; expectMention?: string },
+): LocateResult {
+  const found = findReplyEditor(root, opts);
+  if (!("editor" in found)) return miss(found.skipReason);
+
+  // Second, INDEPENDENT proof of identity when the caller knows who it is
+  // answering. LinkedIn pre-fills a reply box with a mention chip naming that
+  // person, so this catches a mis-targeted box that document order alone would
+  // have accepted. Cheap, and the cost of being wrong is a public reply to the
+  // wrong human.
+  if (opts.expectMention) {
+    const chip = mentionText(found.editor);
+    const want = opts.expectMention.replace(/\s+/g, " ").trim().toLowerCase();
+    if (!chip || !want || chip.toLowerCase().split(" ")[0] !== want.split(" ")[0]) {
+      return miss("reply-submit:wrong-person", { chip, expected: opts.expectMention });
+    }
+  }
+
+  // Walk up from the editor until we meet the container holding the submit.
+  let scope: Element | null = found.editor;
+  for (let i = 0; i < 8 && scope; i++) {
+    const section = scope.querySelector<HTMLElement>('[id*="commentButtonSection"], [componentkey*="commentButtonSection"]');
+    if (section) {
+      // Skip disabled buttons the way selectors.ts does: the 2026 submit is
+      // disabled until typing registers, and clicking it is a silent no-op that
+      // would otherwise be reported as a successful send.
+      const btn = Array.from(section.querySelectorAll<HTMLElement>("button")).find(
+        (b) =>
+          /^reply$/i.test((b.textContent ?? "").replace(/\s+/g, " ").trim()) &&
+          !(b as HTMLButtonElement).disabled &&
+          b.getAttribute("aria-disabled") !== "true",
+      );
+      if (btn) return hit(btn, "reply-submit");
+      const wrong = Array.from(section.querySelectorAll<HTMLElement>("button"))
+        .map((b) => (b.textContent ?? "").replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+      return miss("reply-submit:not-a-reply-box", { labels: wrong });
+    }
+    scope = scope.parentElement;
+  }
+  return miss("reply-submit:no-button-section");
+}
+
+/**
+ * Is this composer really threaded under the person we mean to answer?
+ *
+ * LinkedIn pre-fills a reply box with a non-editable mention chip naming that
+ * person. Reading it back is a cheap, independent confirmation that the click
+ * landed on the right comment — worth having, because the cost of being wrong
+ * is a public reply addressed to the wrong human.
+ */
+function mentionText(editor: HTMLElement): string | null {
+  const chip = editor.querySelector<HTMLElement>('[data-type="mention"]');
+  const text = (chip?.textContent ?? "").replace(/\s+/g, " ").trim();
+  return text || null;
+}
+
+export function replyComposerMention(root: ParentNode, opts: { afterCommentId: string }): string | null {
+  const found = findReplyEditor(root, opts);
+  if (!("editor" in found)) return null;
+  return mentionText(found.editor);
+}
+
+/** Read this target's body without treating its persistent mention as text. */
+export function readReplyComposer(root: ParentNode, opts: { afterCommentId: string }): LocateResult {
+  const found = findReplyEditor(root, opts);
+  if (!("editor" in found)) {
+    // The anchor was resolved before these two absence results. Missing targets
+    // or foreign/partially mounted editors remain unknown, not a sent receipt.
+    if (["reply-composer:none-open", "reply-composer:none-after-comment"].includes(found.skipReason)) {
+      return { ok: true, observed: { present: false, empty: true, text: "" } };
+    }
+    return miss(found.skipReason);
+  }
+  const copy = found.editor.cloneNode(true) as HTMLElement;
+  copy.querySelectorAll('[data-type="mention"]').forEach((mention) => mention.remove());
+  const text = normalizeEditorText(copy.textContent ?? "");
+  return { ok: true, observed: { present: true, empty: text.length === 0, text } };
+}
+
+/**
+ * The "See N more comments" / "Load more comments" control.
+ *
+ * THIS is why the first threaded runs all failed with
+ * `thread-comment-reply:comment-not-found`. LinkedIn renders only a handful of
+ * comments on a post and hides the rest behind this button — so the comment we
+ * were sent to answer was simply not in the DOM, no matter how correct the
+ * locator was. The actuator has to expand the thread the way a person does.
+ *
+ * Real markup (tests/fixtures/post-comments-2026.html):
+ *   <div id="…-replaceableLoadMoreComments">
+ *     <div role="button" …><p>See 33 more comments</p></div>
+ */
+const MORE_COMMENTS = /^(see|show|load)\s+(\d+\s+)?(more\s+)?(previous\s+)?comments?$/i;
+
+export function locateLoadMoreComments(root: ParentNode): LocateResult {
+  const scopes: Element[] = [
+    ...Array.from(root.querySelectorAll('[id*="replaceableLoadMoreComments"]')),
+    ...Array.from(root.querySelectorAll('[componentkey*="LoadMoreComments"]')),
+    ...Array.from(root.querySelectorAll('[class*="load-more-container"]')),
+  ];
+  // Class-agnostic fallback: any clickable whose whole label is the phrase.
+  const clickables: Element[] = scopes.length
+    ? scopes.flatMap((sc) => Array.from(sc.querySelectorAll('[role="button"], button')))
+    : Array.from(root.querySelectorAll('[role="button"], button'));
+
+  const btn =
+    clickables.find((el) =>
+      MORE_COMMENTS.test((el.textContent ?? "").replace(/\s+/g, " ").trim()),
+    ) ??
+    // Legacy ember labels it on the button, not in the text.
+    (root.querySelector<HTMLElement>(
+      'button[aria-label="Load more comments"], button[class*="load-more-comments-button"]',
+    ) ?? undefined);
+  if (!btn) return miss("load-more-comments:not-found");
+  return hit(btn, "load-more-comments");
+}
+
+/**
+ * The post permalink that DEEP-LINKS to one comment.
+ *
+ * LinkedIn scrolls to and expands the thread around `commentUrn`, which is how
+ * a human arrives from a notification. Navigating here instead of to the bare
+ * post is the difference between the comment being on screen and being behind
+ * "See 33 more comments".
+ *
+ * The param needs the TUPLE form — `urn:li:comment:(<post>,<id>)` — while the
