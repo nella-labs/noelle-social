@@ -2598,3 +2598,203 @@ describe("runDrafterTick voice variety (NOELLE_DRAFTER_VARIETY)", () => {
       postOutbound,
       markStatus: vi.fn().mockResolvedValue(undefined),
       // r=0.75 is above TONE_FIRST_SHAPE_SHARE → the REGISTER half of the
+      // tone-first split. Within the celebration register set 0.75 lands on
+      // SLANG, so the assertion is on the block rather than on HYPE's wording.
+      variety: { enabled: true, rng: () => 0.75, genzMarkerRate: 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("ASSIGNED REGISTER FOR THIS REPLY");
+    expect(prompt).not.toContain("THIS REPLY'S ASSIGNED SHAPE");
+  });
+
+  it("injects NOTHING when variety is OFF (byte-identical to today)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      variety: { enabled: false, rng: () => 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("ASSIGNED REGISTER");
+  });
+
+  it("injects NOTHING when the variety arg is omitted entirely", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("ASSIGNED REGISTER");
+  });
+});
+
+// ── Faithful form-variant rotation ───────────────────────────────────────────
+// When a faithful voice is pinned AND variety is on, each reply gets ONE of the
+// 10 SHAPE variants (rendered inside the faithful STYLE block) and the register
+// + opening-move blocks are suppressed — one shape instruction per prompt. A
+// fresh injected rotation isolates each test from the module-level singleton.
+describe("runDrafterTick — faithful form-variant rotation", () => {
+  const faithfulStyle = (over: Record<string, unknown> = {}) => ({
+    enabled: true,
+    loadPool: vi
+      .fn()
+      .mockResolvedValue([
+        { external_id: "s1", body: "one sharp line", like_count: 500, comment_count: 40, account_handle: "kaia", posted_at: null },
+      ]),
+    loadUltraProfiles: vi.fn().mockResolvedValue([]),
+    config: { maxStyleExemplars: 2, varietyTemperature: 0 },
+    rng: () => 0.5,
+    faithful: true,
+    faithfulVoices: ["kaia"],
+    ...over,
+  });
+
+  it.each(["substantial", "light"] as const)("browser-observed %s excludes shapes that force a bare question or unsupported history", async (kind) => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const next = vi.fn().mockReturnValue({ id: "ONE_SHORT", weight: 0.1, directive: "One short sentence." });
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: kind, tier: "T3", payload: { ...leadPayload, source: "extension_observed" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      variety: { enabled: true, rng: () => 0.1, formVariantRotation: { next } },
+    });
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next.mock.calls[0]![1]).toEqual(expect.arrayContaining(["SELF_STORY", "AGREE_EXTEND", "MICRO", "QUESTION_ONLY"]));
+  });
+
+  it("assigns a SHAPE inside the faithful STYLE block and suppresses register + opening move", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      style: faithfulStyle() as never,
+      variety: { enabled: true, rng: () => 0, formVariantRotation: createFormVariantRotation() },
+    });
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(system).toContain("THIS REPLY'S ASSIGNED SHAPE controls length and beat structure only");
+    expect(system).toContain("writer evidence wins");
+    // The fixed hook-then-line recipe is replaced by the assigned shape.
+    expect(system).not.toContain("OPEN with a short, punchy reaction (roughly 3 to 8 words)");
+    // One shape instruction per prompt: register + opening move are suppressed.
+    // (The register/opening-move blocks are injected into the USER prompt; the
+    // base SYSTEM prompt's "(when present)" explainer quotes the header, so
+    // only the user-prompt side is meaningful to assert on.)
+    expect(prompt).not.toContain("ASSIGNED REGISTER FOR THIS REPLY");
+    expect(prompt).not.toContain("OPENING MOVE FOR THIS REPLY");
+  });
+
+  it("consecutive replies never share a shape (rotation excludes the previous variant)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ id: "L1", tier: "T2", classifier_label: "substantial" }),
+        lead({ id: "L2", tier: "T2", classifier_label: "substantial", external_id: "7000000000000000002" }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      style: faithfulStyle() as never,
+      // rng pinned to 0 → without the exclusion both leads would get the SAME
+      // first variant; the rotation must force the second lead onto another one.
+      variety: { enabled: true, rng: () => 0, formVariantRotation: createFormVariantRotation() },
+    });
+    expect(runner.draft).toHaveBeenCalledTimes(2);
+    const shapeLine = (system: string) =>
+      system.split("\n").find((l) => l.includes("THIS REPLY'S ASSIGNED SHAPE controls length and beat structure only"))!;
+    const s1 = shapeLine(runner.draft.mock.calls[0]![0].system as string);
+    const s2 = shapeLine(runner.draft.mock.calls[1]![0].system as string);
+    expect(s1).toBeTruthy();
+    expect(s2).toBeTruthy();
+    expect(s2).not.toBe(s1);
+  });
+
+  it("non-faithful style: shape renders standalone in the prompt, never inline in the system", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_label: "substantial" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      style: faithfulStyle({ faithful: false, faithfulVoices: [] }) as never,
+      variety: { enabled: true, rng: () => 0, formVariantRotation: createFormVariantRotation() },
+    });
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    // No PINNED voice, so the shape cannot render inside the faithful style
+    // block — it renders as its own block in the user prompt instead. What must
+    // never happen is the lead getting NO form directive at all.
+    expect(system).not.toContain("THIS REPLY'S ASSIGNED SHAPE controls length and beat structure only");
+    expect(prompt).toContain("THIS REPLY'S ASSIGNED SHAPE (follow it exactly");
+    expect(prompt).not.toContain("ASSIGNED REGISTER FOR THIS REPLY");
+  });
+
+  it("light path gets the assigned shape too", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "claude-sonnet-4-6" }),
+    };
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: "T3" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      style: faithfulStyle() as never,
+      variety: { enabled: true, rng: () => 0, formVariantRotation: createFormVariantRotation() },
+    });
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(system).toContain("THIS REPLY'S ASSIGNED SHAPE controls length and beat structure only");
+    expect(prompt).not.toContain("ASSIGNED REGISTER FOR THIS REPLY");
+  });
+
+  it("light path never assigns QUESTION_ONLY (lane exclusion)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "claude-sonnet-4-6" }),
+    };
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: "T3" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      style: faithfulStyle() as never,
+      // 0.40 maps to QUESTION_ONLY on the FULL pool (cumulative .34-.44); with
+      // the light-lane exclusion active it must land on another shape.
+      variety: { enabled: true, rng: () => 0.4, formVariantRotation: createFormVariantRotation() },
+    });
+    const system = runner.draft.mock.calls[0]![0].system as string;
