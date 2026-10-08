@@ -198,3 +198,203 @@ files with real values.)
 ## 8. GCP VM for Listmonk
 
 **Architecture summary (this doc) — operational details and exact commands
+live in `infra/listmonk/README.md` (next to the compose/Caddy files).**
+
+The Listmonk stack runs on a dedicated GCP VM, separate from `noelle-vm-0`
+(the agents VM) so a blocklist DB issue or campaign-time CPU spike can't take
+down agent workers.
+
+| Field | Value |
+|---|---|
+| GCP project | `noelle-agents` |
+| VM name | `noelle-listmonk` |
+| Zone | `us-central1-a` |
+| Machine | `e2-small`, Debian 12, 20GB disk, OS Login |
+| Public URL | `https://listmonk.trynoelle.com` |
+| Reverse proxy | Caddy (auto-TLS via Let's Encrypt) |
+| Postgres | `postgres:16`, data in `/opt/listmonk/pgdata` |
+| Listmonk version | Pinned in `infra/listmonk/docker-compose.yml` |
+| Firewall | `allow-listmonk-https` (tcp:80,tcp:443 on tag `https-server`) |
+| Postgres password | GCP Secret Manager: `listmonk-postgres-password` |
+
+Caddy provisions a Let's Encrypt cert automatically. With the Cloudflare A
+record from §3.4 proxied through Cloudflare, set Cloudflare SSL mode to
+**Full (strict)** — Caddy serves the real cert on origin, Cloudflare presents
+its edge cert to browsers.
+
+**For deploy / upgrade / rotation / logs**, see `infra/listmonk/README.md`.
+The `docker-compose.yml` and `Caddyfile` in `infra/listmonk/` are the
+single source of truth for what's running on the VM.
+
+---
+
+## 9. Configure Listmonk
+
+Open `https://listmonk.trynoelle.com` and run the first-time setup wizard.
+
+### 9.0 Users (admin + dashboard API)
+
+Listmonk v6 needs two users in the `users` table — one for UI login and
+one for the Noelle dashboard's HTTP Basic API calls. Both reference a
+`Super Admin` role with wildcard `{*}` permissions.
+
+Provisioned 2026-05-20 (use these; don't recreate):
+
+| User | type | Purpose | Secret name in GCP |
+|---|---|---|---|
+| `admin` | `user` (UI session login) | https://listmonk.trynoelle.com admin UI | `listmonk-admin-password` |
+| `noelle-dashboard` | `api` (HTTP Basic for `/api/*`) | dashboard's `lib/listmonk.ts` reads | `listmonk-dashboard-api-token` |
+
+Vercel envs `LISTMONK_USER` / `LISTMONK_PASSWORD` resolve to the API
+user + token (not the UI admin). If you ever wipe the Listmonk Postgres
+volume, you'll need to re-create both rows — Listmonk v6's first-run
+setup endpoint at `/admin/setup` isn't reachable, so seed via SQL:
+
+```bash
+# UI admin user — password is bcrypt-hashed
+HASH=$(htpasswd -nbBC10 admin '<plaintext>' | cut -d: -f2 | sed 's/^\$2y\$/\$2a\$/')
+docker compose exec -T postgres psql -U listmonk -d listmonk <<SQL
+  INSERT INTO roles (type, permissions, name)
+    VALUES ('user'::role_type, ARRAY['*']::text[], 'Super Admin');
+  INSERT INTO users (username, password_login, password, email, name,
+                     type, user_role_id, status)
+    VALUES ('admin', TRUE, '$HASH', 'you@example.com', 'You',
+            'user'::user_type,
+            (SELECT id FROM roles WHERE name='Super Admin' LIMIT 1),
+            'enabled'::user_status);
+SQL
+
+# API user — token stored as plaintext (Listmonk does plaintext compare)
+TOKEN=$(openssl rand -hex 24)
+docker compose exec -T postgres psql -U listmonk -d listmonk <<SQL
+  INSERT INTO users (username, password_login, password, email, name,
+                     type, user_role_id, status)
+    VALUES ('noelle-dashboard', FALSE, '$TOKEN',
+            'dashboard@trynoelle.com', 'Noelle Dashboard',
+            'api'::user_type,
+            (SELECT id FROM roles WHERE name='Super Admin' LIMIT 1),
+            'enabled'::user_status);
+SQL
+
+# After inserting, restart the listmonk container — it caches users in
+# memory and won't see the new row until reboot.
+docker compose restart listmonk
+```
+
+### 9.1 SMTP → SES
+
+Listmonk admin → Settings → SMTP:
+
+| Field | Value |
+|---|---|
+| Host | `email-smtp.us-east-1.amazonaws.com` |
+| Port | `587` |
+| Auth protocol | LOGIN |
+| Username | from `gcloud secrets versions access` on `listmonk-ses-smtp-user` |
+| Password | from `gcloud secrets versions access` on `listmonk-ses-smtp-pass` |
+| TLS | STARTTLS |
+| HELO hostname | `listmonk.trynoelle.com` |
+| Max connections | 10 (sandbox), 50+ after production approval |
+| Max retries | 2 |
+
+Send the built-in test mail to yourself to confirm.
+
+### 9.2 Default settings
+
+- **From email**: `Noelle <news@mail.trynoelle.com>`
+- **Root URL**: `https://listmonk.trynoelle.com`
+- **Notification emails**: send admin alerts to a real human inbox
+- **Enable double opt-in**: ON (this is non-negotiable for the SES reapply)
+
+### 9.3 Templates
+
+- Upload `supabase/templates/announcement.html` as the default campaign template.
+- The placeholder syntax in that file is already Listmonk-compatible
+  (Sprig/Go templates). `{{ UnsubscribeURL }}` and `{{ MessageURL }}` are
+  Listmonk built-ins.
+
+### 9.4 SES bounce webhook handler
+
+Listmonk's built-in SES bounce parser was added in v4. Settings → Bounces:
+
+- Enable bounce processing: ON
+- SES notifications: ON
+- Webhook URL: `/webhooks/ses` (under the same Listmonk host)
+- Auto-blocklist after: 2 hard bounces, 1 complaint
+
+The SNS subscription from §6 will auto-confirm the first time SNS POSTs the
+confirmation token to this URL.
+
+### 9.5 List structure
+
+Two lists, both **opt-in**:
+
+1. `Noelle product updates` — single-opt-in is OK for users who signed up
+   inside the product (we have proof in our DB). Use double-opt-in for any
+   list captured from the marketing site.
+2. `Noelle launch waitlist` — double-opt-in, public signup form.
+
+---
+
+## 9.6 Dashboard integration (`/admin/email`)
+
+The Noelle dashboard's admin area has an **Email** tab (URL still
+`/admin/broadcasts`, label renamed in §AdminTabs) that's the operational
+pane for everything in this doc — so an admin never has to bounce between
+this Markdown, the AWS console, and Listmonk's admin UI to know if mail
+is healthy.
+
+It renders three sections, top-to-bottom:
+
+1. **Mail infrastructure** — two side-by-side status cards:
+   - **Amazon SES** — region, daily quota, max send rate, sent in last
+     24h, account health (sandbox vs production, sending enabled). Pulled
+     live from `ses:GetAccount` via `apps/app/src/lib/ses.ts`. Read-only
+     IAM creds (`AWS_SES_ACCESS_KEY_ID` / `AWS_SES_SECRET_ACCESS_KEY`)
+     live in Vercel project env — do **not** reuse the Listmonk SMTP IAM
+     user (its policy is send-only and lacks `GetAccount`).
+   - **Listmonk** — version, subscriber / list / campaign / lifetime-
+     messages-sent counts. Pulled live from `/api/config` and
+     `/api/dashboard/counts` via `apps/app/src/lib/listmonk.ts`.
+2. **Recent campaigns** — the last 8 Listmonk campaigns with status,
+   sent/total, age, and a deep-link to the Listmonk admin row.
+3. **Send a broadcast** — the existing composer (test send or campaign).
+
+Each section degrades independently — if Listmonk is down, the SES card
+still renders and vice versa. Missing credentials show a hint card with
+the exact env var names to set, never an exception.
+
+**Provisioned (2026-05-20)** — already live in production. Don't re-run
+unless rotating:
+
+| Where | Value |
+|---|---|
+| AWS IAM user | `noelle-ses-readonly` (account `151963020654`) |
+| AWS inline policy | `SesReadOnly` — allows `ses:GetAccount`, `ses:GetSendQuota`, `ses:GetSendStatistics`, `sesv2:GetAccount`, `sesv2:GetSendQuota` |
+| AWS access key id | mirrored to GCP Secret Manager `noelle-ses-readonly-access-key-id` |
+| AWS secret access key | mirrored to GCP Secret Manager `noelle-ses-readonly-secret-access-key` |
+| Vercel project | `noelle-app` (team `nella-labs`), set for production + preview + development |
+
+To re-provision from scratch:
+
+```bash
+# Create a read-only IAM user
+aws iam create-user --user-name noelle-ses-readonly
+aws iam put-user-policy --user-name noelle-ses-readonly \
+  --policy-name SesReadOnly --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": [
+        "ses:GetAccount", "ses:GetSendQuota", "ses:GetSendStatistics",
+        "sesv2:GetAccount", "sesv2:GetSendQuota"
+      ],
+      "Resource": "*"
+    }]
+  }'
+aws iam create-access-key --user-name noelle-ses-readonly
+# → mirror to GCP Secret Manager and Vercel env (AWS_SES_ACCESS_KEY_ID /
+#   AWS_SES_SECRET_ACCESS_KEY, all three target environments).
+```
+
+If creds are absent the SES card shows a placeholder + a deep-link to the
