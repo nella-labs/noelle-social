@@ -1398,3 +1398,25 @@ describe("person-first lane (candidate retention + polling)", () => {
       rateBucket: { tryTake: () => true },
       discoveredHandles: ["dup"],
     });
+    expect(userTweets).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores candidates entirely on a watchlist-only (paused) tick", async () => {
+    // Paused means the operator turned the keyword lane off; speculative
+    // candidate polling would spend their Apify budget on people they never chose.
+    const userTweets = vi.fn().mockResolvedValue(res([]));
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      watchlist: { handles: [], keywords: [] },
+      watchlistPeople: [{ handle: "watched", addedAt: "2020-01-01T00:00:00.000Z" }],
+      xClient: { userTweets, searchTimeline: vi.fn().mockResolvedValue(res([])) } as never,
+      upsertLead: vi.fn().mockResolvedValue({ id: "L", inserted: true }),
+      rateBucket: { tryTake: () => true },
+      watchlistOnly: true,
+      discoveredHandles: ["candidate"],
+    });
+    const polled = userTweets.mock.calls.map((c) => (c[0] as { handle: string }).handle);
+    expect(polled).toEqual(["watched"]);
+  });
+});
