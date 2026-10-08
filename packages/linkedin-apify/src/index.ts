@@ -198,3 +198,203 @@ export interface ApifyLinkedInClient {
     maxItems?: number;
     /** "Short" (cheap, basic data) | "Full" (opens each profile). Default "Short". */
     mode?: "Short" | "Full";
+  }): Promise<CandidateProfile[]>;
+}
+
+// One image entry from the actor's postImages array (and the same {url,...}
+// shape reused by article.image / postVideo thumbnails). All fields optional.
+interface ApifyImage {
+  url?: string;
+  width?: unknown;
+  height?: unknown;
+  expiresAt?: unknown;
+}
+
+// Apify item shape (subset we read) — fields are best-effort/optional. The media
+// fields mirror HarvestAPI's post schema (profile-posts + post-search): postImages
+// is an array of {url,...}; postVideo carries a thumbnailUrl; article nests an
+// image object; a document carousel exposes coverPages[].imageUrls (string URLs).
+// We read all of them defensively and coalesce to LinkedInPost.images.
+interface ApifyPostItem {
+  id?: string;
+  linkedinUrl?: string;
+  content?: string;
+  author?: {
+    name?: string;
+    publicIdentifier?: string;
+    /** Company pages leave publicIdentifier null but carry the slug here. */
+    universalName?: string;
+    /** "member" (person) | "company" — the keyword lane skips company pages. */
+    type?: string;
+    linkedinUrl?: string;
+    info?: string;
+  };
+  postedAt?: { timestamp?: number; date?: string; postedAgoText?: string };
+  engagement?: { likes?: unknown; comments?: unknown; shares?: unknown };
+  postImages?: ApifyImage[];
+  postVideo?: { thumbnailUrl?: string; videoUrl?: string };
+  article?: { image?: ApifyImage };
+  document?: { coverPages?: Array<{ imageUrls?: unknown }> };
+}
+
+// Apify profile item shape (subset we read) from the profile-search actor. All
+// fields best-effort/optional; field names vary by mode so we read defensively.
+// profile-search "Short" mode shape (verified against a live run): no
+// publicIdentifier/headline — instead firstName/lastName, a `summary` (the
+// about/bio text), and `currentPositions[].title` (the real role line, e.g.
+// "Founder & CEO"). `id` is the member id (urn:li:fsd_profile: stripped) and
+// `linkedinUrl` is /in/<that id>. We coalesce a headline from the position
+// titles (primary signal) then the summary, so the ICP gate has text to match.
+interface ApifyProfileItem {
+  id?: string;
+  publicIdentifier?: string;
+  username?: string;
+  linkedinUrl?: string;
+  name?: string;
+  firstName?: string;
+  lastName?: string;
+  headline?: string;
+  occupation?: string;
+  summary?: string;
+  currentPositions?: Array<{ title?: string; position?: string; companyName?: string }>;
+}
+
+// Apify comment item shape (subset we read) from the post-comments actor.
+interface ApifyCommentItem {
+  id?: string;
+  linkedinUrl?: string;
+  commentary?: string;
+  createdAt?: string | number;
+  numComments?: unknown;
+  reactionTypeCounts?: Array<{ type?: string; count?: unknown }>;
+  actor?: { name?: string; position?: string; linkedinUrl?: string };
+}
+
+// Apify item shape (subset we read) from the profile-comments actor
+// (harvestapi/linkedin-profile-comments). DIFFERENT field layout from the
+// post-comments actor: counts live under a nested `engagement` object
+// (engagement.likes / engagement.comments / engagement.reactions[]) instead of
+// the flat numComments + reactionTypeCounts. `actor` is the target profile (the
+// author of the comment); `post` is the parent post the comment was left on. All
+// fields best-effort/optional — read defensively.
+interface ApifyAuthoredCommentItem {
+  id?: string;
+  linkedinUrl?: string;
+  commentary?: string;
+  createdAt?: string | number;
+  createdAtTimestamp?: number;
+  engagement?: {
+    likes?: unknown;
+    comments?: unknown;
+    reactions?: Array<{ type?: string; count?: unknown }>;
+  };
+  actor?: { name?: string; position?: string; linkedinUrl?: string };
+  post?: unknown;
+}
+
+function reactionTotal(counts: Array<{ count?: unknown }> | undefined): number | null {
+  if (!Array.isArray(counts)) return null;
+  let total = 0;
+  for (const item of counts) {
+    const count = readSourceCount(item?.count);
+    if (count === null || !Number.isSafeInteger(total + count)) return null;
+    total += count;
+  }
+  return total;
+}
+
+function publicIdToUrl(publicId: string): string {
+  return `https://www.linkedin.com/in/${publicId.replace(/^@/, "").trim()}`;
+}
+
+/**
+ * Map a valid ISO lower bound to the configured coarse `postedLimit` hints
+ * ("24h" | "week" | "month"). Precise filtering still happens client-side.
+ * Bounds older than 31 days omit the hint. Unset/invalid dates omit it too.
+ */
+function sinceToPostedLimit(sinceISO?: string): "24h" | "week" | "month" | undefined {
+  const timestamp = readSourceTimestamp(sinceISO);
+  if (timestamp === null) return undefined;
+  const since = Date.parse(timestamp);
+  const ageMs = Date.now() - since;
+  if (ageMs <= 0) return "24h";
+  const DAY = 86_400_000;
+  if (ageMs <= DAY) return "24h";
+  if (ageMs <= 7 * DAY) return "week";
+  if (ageMs <= 31 * DAY) return "month";
+  return undefined;
+}
+
+function asHttpUrl(v: unknown): string | null {
+  return typeof v === "string" && /^https?:\/\//i.test(v.trim()) ? v.trim() : null;
+}
+
+/**
+ * Pull every post-media image URL off the raw actor item, coalesced + deduped.
+ * Reads the several HarvestAPI media fields (postImages, the postVideo thumbnail,
+ * an article preview image, a document carousel's coverPages[].imageUrls). Pure
+ * and fail-open: anything malformed (non-array, missing url, non-string) is
+ * silently skipped, so a downstream vision step gets only real http(s) URLs.
+ */
+function extractImages(item: ApifyPostItem): string[] {
+  const out: string[] = [];
+  const push = (v: unknown) => {
+    const u = asHttpUrl(v);
+    if (u && !out.includes(u)) out.push(u);
+  };
+  if (Array.isArray(item.postImages)) for (const img of item.postImages) push(img?.url);
+  push(item.postVideo?.thumbnailUrl);
+  push(item.article?.image?.url);
+  if (Array.isArray(item.document?.coverPages)) {
+    for (const page of item.document!.coverPages) {
+      if (Array.isArray(page?.imageUrls)) for (const u of page.imageUrls) push(u);
+    }
+  }
+  return out;
+}
+
+export function normalizePost(item: ApifyPostItem): LinkedInPost | null {
+  const rawId = String(item.id ?? "");
+  const text = (item.content ?? "").trim();
+  const digits = rawId.match(/(\d{6,})/);
+  const id = digits ? digits[1]! : rawId;
+  if (!id || !text) return null;
+  const postedAt = readSourceEpochTimestamp(item.postedAt?.timestamp, "milliseconds")
+    ?? readSourceTimestamp(item.postedAt?.date);
+  const eng = item.engagement ?? {};
+  const a = item.author ?? {};
+  const images = extractImages(item);
+  return {
+    id,
+    urn: rawId.startsWith("urn:") ? rawId : `urn:li:activity:${id}`,
+    text,
+    url: item.linkedinUrl ?? "",
+    postedAt,
+    reactions: readSourceCount(eng.likes),
+    comments: readSourceCount(eng.comments),
+    // Omit the key on a text-only post; never emit an empty array.
+    ...(images.length > 0 ? { images } : {}),
+    author: {
+      name: a.name ?? null,
+      // Person posts populate publicIdentifier; company pages leave it null but
+      // carry the slug in universalName (confirmed against a live post-search run).
+      // publicIdentifier is sometimes an opaque member URN (ACwAA…) — recover the
+      // real vanity slug from the author/post URL so the person stays profilable.
+      publicId: resolveVanitySlug({
+        publicId: a.publicIdentifier ?? a.universalName ?? null,
+        profileUrl: a.linkedinUrl ?? null,
+        postUrl: item.linkedinUrl ?? null,
+      }),
+      url: a.linkedinUrl ?? null,
+      headline: a.info ?? null,
+      type: a.type ?? null,
+    },
+  };
+}
+
+/** Slug out of a linkedin.com/in/<slug> URL, or null. */
+function slugFromUrl(url: string | undefined): string | null {
+  if (typeof url !== "string") return null;
+  const m = url.match(/linkedin\.com\/in\/([^/?#]+)/i);
+  return m ? decodeURIComponent(m[1]!) : null;
+}
