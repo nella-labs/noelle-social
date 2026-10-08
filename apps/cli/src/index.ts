@@ -998,3 +998,203 @@ async function runDeployNative(
     ui.err(
       `[deploy] locked by pid ${h.pid} (stage ${h.stage}); wait for the current deploy to finish.`,
     );
+    return 1;
+  }
+
+  // Failure pager: fires NOELLE_ALERT_CMD (if set) so a broken tick pages the
+  // operator instead of failing silently in the launchd log. Fail-open; warn
+  // when an alert was configured but did not send.
+  const alert = async (msg: string): Promise<void> => {
+    if ((await sendDeployAlert(home.envFile, msg)) === "failed") {
+      ui.warn("[deploy] NOELLE_ALERT_CMD is configured but the alert did not send.");
+    }
+  };
+  let sha: string | null = null;
+  // Fold a failure into the backoff state; page only on a sha's FIRST failure.
+  const failDeploy = async (reason: string): Promise<void> => {
+    // The emergency pager (p2 siren, retry-until-ack) and the backoff state
+    // exist for the UNATTENDED auto-update lane (`noelle sync`), where a failed
+    // tick would otherwise vanish into the launchd log. A manual `noelle deploy`
+    // — a worktree-built CLI, a hand run, or a `--force` rollback — is ATTENDED:
+    // the operator sees the failure inline and the non-zero exit, so it must not
+    // wake them with a siren or pollute the auto lane's per-sha backoff state.
+    if (!opts.auto) return;
+    if (!sha) {
+      await alert(`noelle deploy failed: ${reason}`);
+      return;
+    }
+    const next = recordDeployFailure(config.autoUpdate.lastFailure, sha);
+    config.autoUpdate.lastFailure = next.state;
+    saveConfig(config);
+    if (next.alert) {
+      await alert(`noelle deploy ${sha.slice(0, 8)}: ${reason}`);
+    } else {
+      ui.info(
+        `[deploy] failure ${next.state.attempts}/${DEPLOY_MAX_ATTEMPTS} for ${sha.slice(0, 8)}; already paged.`,
+      );
+    }
+  };
+  // Stamp + advance + clear the failure state. Only VERIFIED deploys (or
+  // deliberate no-restart cases) go through here, so `noelle deploy status`
+  // never calls a failed deploy shipped.
+  const markDeployed = (deployedSha: string): void => {
+    writeDeployStamp(
+      repoRoot,
+      deployStampPayload(deployedSha, hostname(), new Date().toISOString()),
+    );
+    config.autoUpdate.lastBuiltSha = deployedSha;
+    config.autoUpdate.lastFailure = null;
+    saveConfig(config);
+  };
+
+  try {
+    // Self-heal the operator JWT on every tick, BEFORE the HEAD early-exit —
+    // the token ages out on a wall clock, not on commits. The 10-min cadence
+    // means a 7-day re-mint window can't be slept through while the box runs.
+    if (!existsSync(home.stackDownMarker) && await reloadOperatorSession({ envFile: home.envFile, config, repoRoot, ecosystem: home.ecosystem })) {
+      ui.ok("[deploy] operator session refreshed");
+    }
+
+    // Pull origin only on the AUTO tick. `noelle deploy` (with or without
+    // --force) means "deploy this working tree exactly as it is", which is
+    // what makes a rollback stick: reset --hard <good-sha> + deploy --force
+    // must not pull the bad origin sha right back.
+    if (opts.auto && !force) {
+      const branch = config.autoUpdate.branch;
+      const ff = await nativeFetchAndFastForward(repoRoot, branch);
+      if (ff.action === "fast-forwarded") {
+        ui.ok(`[deploy] ${branch} fast-forwarded to origin (${ff.detail})`);
+      } else if (ff.action !== "up-to-date") {
+        ui.info(`[deploy] origin pull skipped (${ff.action}: ${ff.detail}); deploying local HEAD`);
+      }
+    }
+
+    sha = await localHeadSha(repoRoot);
+
+    // Self-heal BEFORE the unchanged-HEAD early exit: a crashed stack (reboot,
+    // wedged Postgres, dead pm2 daemon) must come back without an operator,
+    // and a crash never changes HEAD — this used to leave the stack down all
+    // day while every tick reported "nothing to rebuild". A stack stopped on
+    // purpose (`noelle down` writes the marker) is left alone. The bring-up is
+    // the same `noelle up` the login autostart runs, which includes native
+    // Postgres stale-lock recovery; failures page once per sha via the
+    // deploy pager, and every later tick retries.
+    if (opts.auto && !force) {
+      const secrets = loadOrCreateSecrets(home);
+      const postgresOk = await waitForPostgres(adminUrlFor(config, secrets), 3_000).then(
+        () => true,
+        () => false,
+      );
+      const [apiOk, appOk] = await Promise.all([
+        probeHttp(`http://127.0.0.1:${config.ports.apiVm}/health`),
+        probeHttp(`http://127.0.0.1:${config.ports.app}/`),
+      ]);
+      const decision = selfHealDecision({
+        postgresOk,
+        apiOk,
+        appOk,
+        markedDown: existsSync(home.stackDownMarker),
+      });
+      if (decision.heal) {
+        updateStage("self-heal");
+        ui.warn(`[deploy] stack is down (${decision.detail}) — running the full bring-up`);
+        const upCode = await cmdUp({ _: ["up"], flags: {} });
+        if (upCode !== 0) {
+          await failDeploy(`self-heal bring-up failed (down: ${decision.detail})`);
+          return 1;
+        }
+        ui.ok("[deploy] self-heal: stack restored");
+      } else if (decision.detail) {
+        ui.info(`[deploy] ${decision.detail}`);
+      }
+    }
+
+    // Bound repeated migration failures with the same deploy failure policy.
+    if (opts.auto && !force && shouldHoldDeploy(config.autoUpdate.lastFailure, sha)) {
+      ui.warn(
+        `[deploy] ${sha.slice(0, 8)} already failed ${config.autoUpdate.lastFailure!.attempts}x; holding until a new sha lands (noelle deploy --force to retry now).`,
+      );
+      return 0;
+    }
+
+    updateStage("migrate");
+    ui.step("[deploy] applying pending schema migrations");
+    await applyMigrations({
+      adminUrl: adminUrlFor(config, loadOrCreateSecrets(home)),
+      schemaDir: schemaDir(repoRoot),
+      log: (message) => ui.plain(message),
+    });
+
+    // Auto tick: skip when HEAD is unchanged. Manual/force: always build the
+    // working tree as-is (uncommitted edits included) so a hand-run picks them up.
+    if (opts.auto && !force && sha === config.autoUpdate.lastBuiltSha) {
+      ui.info(`[deploy] local HEAD unchanged (${sha.slice(0, 8)}) — nothing to rebuild.`);
+      return 0;
+    }
+
+    // Docs-only merges advance the stamp without a build or restart: the
+    // running build already corresponds to this sha's runtime code.
+    if (opts.auto && !force && config.autoUpdate.lastBuiltSha) {
+      const prev = config.autoUpdate.lastBuiltSha;
+      const known = await run("git", ["-C", repoRoot, "cat-file", "-e", `${prev}^{commit}`], {
+        allowFailure: true,
+      });
+      if (known.code === 0) {
+        const diff = await run("git", ["-C", repoRoot, "diff", "--name-only", `${prev}..${sha}`], {
+          allowFailure: true,
+        });
+        const files = diff.stdout
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean);
+        if (diff.code === 0 && isDocsOnlyDiff(files)) {
+          markDeployed(sha);
+          ui.ok(
+            `[deploy] docs-only change → ${sha.slice(0, 8)} stamped; no build or restart needed.`,
+          );
+          return 0;
+        }
+      }
+    }
+
+    updateStage("build");
+    // Install before building: a merged PR that added a workspace package or
+    // dependency has no node_modules here yet (see pnpmInstallArgs) — first
+    // hit by PR #472 (packages/worker-runtime → "Cannot find module 'pino'").
+    // No-op when nothing changed. A thrown failure lands in the outer catch:
+    // pages once per sha, lastBuiltSha stays put, next tick retries.
+    ui.step("[deploy] installing workspace deps");
+    await run("pnpm", pnpmInstallArgs(), { cwd: repoRoot, inherit: true });
+    ui.step("[deploy] building the local checkout (dashboard + workers + api + mcp)");
+    // Exclude the browser extensions (apps/*-actuator, `wxt build`): they are
+    // built separately into dist-unpacked and loaded in Chrome — NOT server
+    // artifacts. A missing/cleared wxt node_modules in the deploy checkout must
+    // never break a prod deploy (it silently did, wedging the workers stale).
+    await run("pnpm", ["-r", "--filter=!@noelle/x-actuator", "--filter=!@noelle/linkedin-actuator", "--filter=!@noelle/reddit-actuator", "--filter=!@noelle/chrome-bridge-ext", "build"], { cwd: repoRoot, inherit: true });
+
+    // The LinkedIn actuator IS a deploy artifact now: its build refreshes
+    // dist-unpacked (the Chrome load path) and the build stamp that drives the
+    // extension's self-reload. Build it separately and NON-FATALLY: a wedged
+    // wxt toolchain still never blocks the server fleet — the extension just
+    // stays on its previous build (self-reload sees no new stamp) until fixed.
+    try {
+      await run("pnpm", ["--filter", "@noelle/linkedin-actuator", "build"], { cwd: repoRoot, inherit: true });
+    } catch (e) {
+      ui.warn(
+        `[deploy] linkedin-actuator build failed; extension stays on its previous build: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    // Same deal for the X and Reddit actuators: refresh their dist-unpacked +
+    // build stamp on every deploy, warn-only on failure.
+    try {
+      await run("pnpm", ["--filter", "@noelle/x-actuator", "build"], { cwd: repoRoot, inherit: true });
+    } catch (e) {
+      ui.warn(
+        `[deploy] x-actuator build failed; extension stays on its previous build: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    try {
+      await run("pnpm", ["--filter", "@noelle/reddit-actuator", "build"], { cwd: repoRoot, inherit: true });
+    } catch (e) {
+      ui.warn(
+        `[deploy] reddit-actuator build failed; extension stays on its previous build: ${e instanceof Error ? e.message : String(e)}`,
