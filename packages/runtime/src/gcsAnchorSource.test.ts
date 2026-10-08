@@ -198,3 +198,98 @@ describe("gcsAnchorSource (NellaClient over GCS)", () => {
       "", // line 4
       "# Voice", // line 5
       "Intro paragraph.", // line 6
+      "", // line 7
+      "## Good textures", // line 8
+      "Concrete numbers and timestamps.", // line 9
+      "", // line 10
+      "## Banned energy", // line 11
+      "Corporate hype and excited-to-announce.", // line 12
+    ].join("\n");
+    const client = createGcsNellaClient({
+      bucket: "noelle-vaults",
+      storage: reader({ "demooperator/voice.md": body }),
+    });
+    const hits = await client.searchContext({
+      workspace: "mars-demooperator",
+      query: "concrete timestamps",
+    });
+    expect(hits.length).toBeGreaterThan(0);
+    const goodTextures = hits.find((h) => h.snippet.includes("Concrete"));
+    expect(goodTextures).toBeDefined();
+    // The "Good textures" section spans roughly lines 8–9 in the source.
+    expect(goodTextures?.startLine).toBeGreaterThanOrEqual(8);
+    expect(goodTextures?.endLine).toBeLessThanOrEqual(10);
+    expect(goodTextures?.startLine).not.toBe(1);
+  });
+
+  it("ranks the relevant chunk above other chunks in the same file", async () => {
+    const body = [
+      "# Voice",
+      "Intro.",
+      "",
+      "## Good textures",
+      "Concrete numbers, real timestamps, specific tools.",
+      "",
+      "## Banned energy",
+      "Corporate SaaS hype.",
+    ].join("\n");
+    const client = createGcsNellaClient({
+      bucket: "noelle-vaults",
+      storage: reader({ "demooperator/voice.md": body }),
+    });
+    const hits = await client.searchContext({
+      workspace: "mars-demooperator",
+      query: "hype corporate",
+    });
+    expect(hits[0]?.snippet.toLowerCase()).toContain("hype");
+  });
+
+  it("returns highlights as matched terms (not the snippet)", async () => {
+    const client = createGcsNellaClient({
+      bucket: "noelle-vaults",
+      storage: reader({
+        "demooperator/x.md": "# Title\n\n## Section\nShipping daily is the only way.",
+      }),
+    });
+    const [hit] = await client.searchContext({
+      workspace: "mars-demooperator",
+      query: "shipping",
+    });
+    expect(hit?.highlights.length).toBeGreaterThan(0);
+    // Highlights should contain a stem/token, not the full snippet text.
+    expect(hit?.highlights[0]?.length ?? 999).toBeLessThan(40);
+    // And the matched term should be related to the query.
+    expect(hit?.highlights.some((h) => h.toLowerCase().startsWith("ship"))).toBe(true);
+  });
+
+  it("yields multiple chunks from a single file when sections match", async () => {
+    const body = [
+      "# Voice",
+      "",
+      "## Good textures",
+      "Concrete numbers.",
+      "",
+      "## Bad textures",
+      "Concrete vibes.",
+      "",
+      "## Other",
+      "Unrelated content here.",
+    ].join("\n");
+    const client = createGcsNellaClient({
+      bucket: "noelle-vaults",
+      storage: reader({ "demooperator/voice.md": body }),
+    });
+    const hits = await client.searchContext({
+      workspace: "mars-demooperator",
+      query: "concrete",
+      topK: 5,
+    });
+    // Both "Good textures" and "Bad textures" contain "concrete" — two
+    // chunks from the same file should both appear.
+    const sameFile = hits.filter((h) => h.filePath === "voice.md");
+    expect(sameFile.length).toBeGreaterThanOrEqual(2);
+    const lineRanges = sameFile.map((h) => `${h.startLine}-${h.endLine}`);
+    // Different chunks → different line ranges.
+    expect(new Set(lineRanges).size).toBe(sameFile.length);
+  });
+});
