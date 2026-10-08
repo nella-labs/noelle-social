@@ -2,6 +2,7 @@ name: ci
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main, codex/public-release]
   # Manual trigger lets us re-run CI on demand (useful after merging a flake
@@ -27,7 +28,7 @@ jobs:
     name: ci
     runs-on: ubuntu-latest
     # Don't burn runner minutes on PRs that are still drafts (work-in-progress).
-    # Pushes to main and manual dispatches always run.
+    # Pushes and manual dispatches always run.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     # Safety cap: a hung step can't run away and burn hours of Linux minutes.
     timeout-minutes: 20
@@ -61,22 +62,15 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
-      # Hard gate: typecheck + lint + build + test in one turbo invocation so build
-      # outputs are computed once and reused (typecheck/test both dependsOn ^build).
-      # test is a REAL gate — a failing test fails the PR; workspaces without tests
-      # pass because every test script uses `vitest run --passWithNoTests` (matches
-      # the post-#96 strict gate; do not reintroduce continue-on-error / `|| true`).
-      #   - On PRs: `--affected` validates only packages touched by the diff (and
-      #     their dependents), compared against the PR's base commit.
-      #   - On main / dispatch: full validation, no `--affected`.
-      # `pnpm lint:sst` is the repo-wide single-source-of-truth check — NOT a turbo
-      # task — so it always runs regardless of `--affected`.
-      - name: Typecheck + lint + build + test
+      # Share task admission, repository guards and self-tests with the local gate.
+      - name: Validate
+        shell: bash
         env:
-          TURBO_SCM_BASE: ${{ github.event.pull_request.base.sha }}
+          CI_EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            AFFECTED="--affected"
+          if [ "$CI_EVENT_NAME" = "pull_request" ]; then
+            bash scripts/ci-local.sh --affected --base "$PR_BASE_SHA" --skip-install
+          else
+            bash scripts/ci-local.sh --full --skip-install
           fi
-          pnpm exec turbo run typecheck lint build test $AFFECTED
-          pnpm lint:sst
