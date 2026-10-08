@@ -798,3 +798,203 @@ describe("buildActionableReddit", () => {
     const out = buildActionableReddit([redditBase]);
     expect(out.replies).toHaveLength(1);
     expect(out.replies[0]).toMatchObject({
+      kind: "reply",
+      body: "great point, here's my take",
+      target: {
+        type: "post",
+        url: "https://www.reddit.com/r/SaaS/comments/abc123/some_title/",
+        post_id: "abc123",
+        subreddit: "SaaS",
+        author: "founder_jane",
+      },
+    });
+    // A post target never carries a comment_id.
+    expect(out.replies[0]!.target).not.toHaveProperty("comment_id");
+  });
+
+  it("maps a reply_target.kind='comment' row to a COMMENT target (permalink + t1 id + comment author)", () => {
+    const row: RedditJoinedRow = {
+      ...redditBase,
+      draft_payload: {
+        kind: "reply",
+        body: "replying under the top comment",
+        reply_target: {
+          kind: "comment",
+          commentId: "t1_def456", // t1_ prefix stripped in output
+          permalink: "/r/SaaS/comments/abc123/some_title/def456/", // relative → absolutized
+          author: "u/topcommenter", // u/ prefix stripped in output
+        },
+      },
+    };
+    const out = buildActionableReddit([row]);
+    expect(out.replies).toHaveLength(1);
+    expect(out.replies[0]!.target).toEqual({
+      type: "comment",
+      url: "https://www.reddit.com/r/SaaS/comments/abc123/some_title/def456/",
+      post_id: "abc123",
+      comment_id: "def456",
+      subreddit: "SaaS",
+      author: "topcommenter",
+    });
+  });
+
+  it("drops a reply whose body carries an external (non-reddit) link, guard on", () => {
+    const spy = vi.fn();
+    const row: RedditJoinedRow = { ...redditBase, draft_payload: { kind: "reply", body: "see https://example.com/x" } };
+    const out = buildActionableReddit([row], spy, { blockExternalLinks: true });
+    expect(out.replies).toHaveLength(0);
+    expect(spy).toHaveBeenCalledWith("external-link", expect.anything());
+  });
+
+  it("allows a reddit-internal link with the guard on", () => {
+    const row: RedditJoinedRow = { ...redditBase, draft_payload: { kind: "reply", body: "see https://www.reddit.com/r/SaaS/x" } };
+    expect(buildActionableReddit([row], undefined, { blockExternalLinks: true }).replies).toHaveLength(1);
+  });
+
+  it("drops an empty body", () => {
+    const out = buildActionableReddit([{ ...redditBase, draft_payload: { kind: "reply", body: "   " } }]);
+    expect(out.replies).toHaveLength(0);
+  });
+
+  it("prefers edited_body over body", () => {
+    const out = buildActionableReddit([{ ...redditBase, draft_payload: { kind: "reply", body: "raw", edited_body: "edited" } }]);
+    expect(out.replies[0]!.body).toBe("edited");
+  });
+
+  it("omits a non-reply kind (Reddit is reply-only)", () => {
+    const spy = vi.fn();
+    const out = buildActionableReddit([{ ...redditBase, draft_payload: { kind: "dm", body: "hi" } }], spy);
+    expect(out.replies).toHaveLength(0);
+    expect(spy).toHaveBeenCalledWith("unsupported-kind", expect.anything());
+  });
+
+  it("omits a post-target row whose comments permalink can't be resolved", () => {
+    const spy = vi.fn();
+    const row: RedditJoinedRow = { ...redditBase, lead_payload: { subreddit: "SaaS", author_handle: "founder_jane" } };
+    const out = buildActionableReddit([row], spy);
+    expect(out.replies).toHaveLength(0);
+    expect(spy).toHaveBeenCalledWith("no-post-url", expect.anything());
+  });
+
+  it("FAILS CLOSED: a comment target missing its comment id is dropped", () => {
+    const spy = vi.fn();
+    const row: RedditJoinedRow = {
+      ...redditBase,
+      draft_payload: { kind: "reply", body: "x", reply_target: { kind: "comment", permalink: "/r/SaaS/comments/abc/c/" } },
+    };
+    const out = buildActionableReddit([row], spy);
+    expect(out.replies).toHaveLength(0);
+    expect(spy).toHaveBeenCalledWith("no-comment-id", expect.anything());
+  });
+
+  it("FAILS CLOSED: a comment target missing its permalink is dropped", () => {
+    const spy = vi.fn();
+    const row: RedditJoinedRow = {
+      ...redditBase,
+      draft_payload: { kind: "reply", body: "x", reply_target: { kind: "comment", commentId: "def456" } },
+    };
+    const out = buildActionableReddit([row], spy);
+    expect(out.replies).toHaveLength(0);
+    expect(spy).toHaveBeenCalledWith("no-comment-permalink", expect.anything());
+  });
+
+  it("strips a leading t3_ from external_id for post_id, and falls back to payload.original_post_id", () => {
+    expect(buildActionableReddit([{ ...redditBase, external_id: "t3_abc123" }]).replies[0]!.target.post_id).toBe("abc123");
+    const noExt: RedditJoinedRow = {
+      ...redditBase,
+      external_id: null,
+      lead_payload: { ...redditBase.lead_payload, original_post_id: "zzz999",
+        url: "https://www.reddit.com/r/SaaS/comments/zzz999/title/" },
+    };
+    expect(buildActionableReddit([noExt]).replies[0]!.target.post_id).toBe("zzz999");
+  });
+
+  it("produces a schema-valid response (the target discriminated union parses)", () => {
+    const commentRow: RedditJoinedRow = {
+      ...redditBase,
+      draft_payload: { kind: "reply", body: "y", reply_target: { kind: "comment", commentId: "def456", permalink: "/r/SaaS/comments/abc123/title/def456/" } },
+    };
+    expect(() => ActionableRedditResponseSchema.parse(buildActionableReddit([redditBase, commentRow]))).not.toThrow();
+  });
+});
+
+describe("dedupeAlreadyRepliedReddit (persistent dedup-by-thread, ports #420)", () => {
+  it("drops a reply whose thread was already replied to", () => {
+    const built = buildActionableReddit([redditBase]); // target.post_id = "abc123"
+    expect(built.replies).toHaveLength(1);
+    const out = dedupeAlreadyRepliedReddit(built, new Set(["abc123"]));
+    expect(out.replies).toHaveLength(0);
+  });
+
+  it("keeps a reply whose thread is NOT in the replied set", () => {
+    const built = buildActionableReddit([redditBase]);
+    const out = dedupeAlreadyRepliedReddit(built, new Set(["zzz999"]));
+    expect(out.replies).toHaveLength(1);
+  });
+
+  it("empty replied set is an identity passthrough", () => {
+    const built = buildActionableReddit([redditBase]);
+    const out = dedupeAlreadyRepliedReddit(built, new Set());
+    expect(out.replies).toHaveLength(1);
+  });
+
+  it("a COMMENT-target reply in an already-replied thread is dropped too (per-THREAD grain)", () => {
+    const row: RedditJoinedRow = {
+      ...redditBase,
+      draft_payload: {
+        kind: "reply",
+        body: "replying under the top comment",
+        reply_target: { kind: "comment", commentId: "def456", permalink: "/r/SaaS/comments/abc123/x/def456/" },
+      },
+    };
+    const built = buildActionableReddit([row]);
+    expect(built.replies[0]!.target.post_id).toBe("abc123"); // the PARENT post's id
+    const out = dedupeAlreadyRepliedReddit(built, new Set(["abc123"]));
+    expect(out.replies).toHaveLength(0);
+  });
+
+  it("derives an absent legacy post_id from its known permalink for persistent dedup", () => {
+    const row: RedditJoinedRow = { ...redditBase, external_id: null };
+    const built = buildActionableReddit([row]);
+    expect(built.replies[0]!.target.post_id).toBe("abc123");
+    const out = dedupeAlreadyRepliedReddit(built, new Set(["abc123"]));
+    expect(out.replies).toHaveLength(0);
+  });
+
+  it("drops only the already-replied thread, keeps a fresh one in the same batch", () => {
+    const fresh: RedditJoinedRow = {
+      ...redditBase,
+      approval_id: "44444444-4444-4444-4444-444444444444",
+      lead_id: "55555555-5555-5555-5555-555555555555",
+      external_id: "zzz999",
+      lead_payload: { ...redditBase.lead_payload, url: "https://www.reddit.com/r/SaaS/comments/zzz999/other/" },
+    };
+    const built = buildActionableReddit([redditBase, fresh]);
+    expect(built.replies).toHaveLength(2);
+    const out = dedupeAlreadyRepliedReddit(built, new Set(["abc123"]));
+    expect(out.replies).toHaveLength(1);
+    expect(out.replies[0]!.target.post_id).toBe("zzz999");
+  });
+});
+
+describe("bodyHasExternalRedditLink", () => {
+  it("flags a non-reddit link", () => {
+    expect(bodyHasExternalRedditLink("check https://example.com/thing")).toBe(true);
+    expect(bodyHasExternalRedditLink("read https://blog.substack.com/p/x")).toBe(true);
+  });
+  it("allows reddit.com / redd.it links", () => {
+    expect(bodyHasExternalRedditLink("see https://www.reddit.com/r/x")).toBe(false);
+    expect(bodyHasExternalRedditLink("old https://old.reddit.com/r/x")).toBe(false);
+    expect(bodyHasExternalRedditLink("img https://i.redd.it/abc.png")).toBe(false);
+    expect(bodyHasExternalRedditLink("short https://redd.it/abc")).toBe(false);
+  });
+  it("is false for a plain no-link reply", () => {
+    expect(bodyHasExternalRedditLink("just a normal reply, no links here")).toBe(false);
+  });
+});
+
+describe("resolveRedditDailyWriteCap (daily write-cap fail-safe, FIX 5)", () => {
+  it("a non-numeric env value falls back to 8 (never NaN → never fail-open)", () => {
+    expect(resolveRedditDailyWriteCap("eight")).toBe(8);
+  });
+  it("an unset env value falls back to 8", () => {
