@@ -998,3 +998,32 @@ describe("the codex pot has a ceiling of its own", () => {
         budget: withCodexSpend(50_000), recorder: noopSpendRecorder },
     ).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(BudgetExceededError);
+  });
+
+  it("honours NOELLE_CODEX_CAP_CENTS", async () => {
+    const prev = process.env.NOELLE_CODEX_CAP_CENTS;
+    process.env.NOELLE_CODEX_CAP_CENTS = "1000";
+    try {
+      const err = await callAgentModel(
+        { ...baseArgs, routing },
+        { engines: { "claude-cli": stubBackend("x"), "codex-cli": stubBackend("codex") },
+          budget: withCodexSpend(2_000), recorder: noopSpendRecorder },
+      ).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(BudgetExceededError);
+    } finally {
+      if (prev === undefined) delete process.env.NOELLE_CODEX_CAP_CENTS;
+      else process.env.NOELLE_CODEX_CAP_CENTS = prev;
+    }
+  });
+
+  it("still fails over when the adapter cannot report per-engine spend", async () => {
+    // Fail-OPEN on a monitoring gap: refusing to fail over here would mean
+    // going dark to protect a budget nobody is actually measuring.
+    const res = await callAgentModel(
+      { ...baseArgs, routing },
+      { engines: { "claude-cli": stubBackend("x"), "codex-cli": stubBackend("codex-text") },
+        budget: overCap, recorder: noopSpendRecorder },
+    );
+    expect(res.text).toBe("codex-text");
+  });
+});
