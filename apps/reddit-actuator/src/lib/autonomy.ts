@@ -198,3 +198,117 @@ export interface StalledRunInput {
  * a fresh drain. This fills the gap shouldAutoDrain leaves: its runActive gate
  * skips whenever a run is live, so a run that is "running" but making no progress
  * (a frozen tick loop, a tab that wandered off, a wall of comment-failed skips)
+ * would otherwise pin the actor with approvals piling up and never recover.
+ *
+ * Fires ONLY on a provably stalled run — drafts loaded AND comment slots overdue
+ * AND no successful post for stallThresholdMs, past warm-up — never on a run that
+ * is merely idle-waiting for supply (nothing loaded) or correctly paced between
+ * actions (nothing overdue). It reuses every auto-drain gate and CRUCIALLY shares
+ * the re-arm cooldown (lastAutoDrainMs / minGapMinutes) with shouldAutoDrain: at
+ * most one drain start — auto OR recovery — per re-arm window per lane, the
+ * load-bearing bound on a false-positive spam. The caller must ALSO run
+ * passesAutoStartSafety (health + post-challenge cooldown) and must never arm
+ * sending on this path. Fail-closed on clock skew.
+ */
+export function shouldRecoverStalledRun(i: StalledRunInput): boolean {
+  if (!i.autonomous || !i.autoDrain) return false;
+  if (!i.runActive) return false;                           // only a live run can be wedged
+  if (i.loadedDrafts <= 0) return false;                    // nothing loaded → supply-gated idle, not stuck
+  if (i.dueCommentSlots <= 0) return false;                 // nothing overdue → correctly paced, not stuck
+  if (i.msSinceStart <= i.warmupSuppressMs) return false;   // still warming up → not stalled
+  if (i.msSinceProgress < i.stallThresholdMs) return false; // posted recently → healthy
+  if (i.stopDay != null && i.stopDay === i.todayKey) return false; // operator STOP wins for the day
+  if (!withinOperatingHours(i.localHour, i.startHour, i.endHour)) return false;
+  if (i.lastAutoDrainMs != null) {
+    const gapMs = i.nowMs - i.lastAutoDrainMs;
+    if (Number.isNaN(gapMs) || gapMs < 0) return false;     // skew/garbage stamp → fail-closed
+    if (gapMs < i.minGapMinutes * 60_000) return false;     // SHARED re-arm cooldown
+  }
+  return true;
+}
+
+// ── Two-tick stall confirmation ──────────────────────────────────────────────
+
+/** A persisted stall observation: the run + its progress marker when first seen stalled. */
+export interface StallProbe {
+  sid: string;       // RunState.sessionId the observation belongs to
+  progressMs: number; // lastProgressMs ?? startMs at first observation
+}
+
+export interface StallConfirmInput {
+  /** shouldRecoverStalledRun's verdict this tick. */
+  stalledNow: boolean;
+  /** Current run's sessionId. */
+  sessionId: string;
+  /** Current progress marker (lastProgressMs ?? startMs). */
+  progressMs: number;
+  /** The persisted prior observation, or null if none. */
+  probe: StallProbe | null;
+}
+
+export type StallConfirmResult = "recover" | "observe" | "clear";
+
+/**
+ * Two-tick confirmation guard on top of shouldRecoverStalledRun. A single
+ * snapshot can't distinguish a HEALTHY run momentarily past the no-progress
+ * threshold (a scheduled run's legitimately large inter-comment gap, or the
+ * ~15-60s window while a post is mid-flight and the slot still reads overdue)
+ * from a genuinely wedged one. So recovery requires the run to look stalled on
+ * TWO consecutive autonomy ticks with the SAME progress marker: a healthy run
+ * posts within ~60s, so by the next tick (~5 min later) its progressMs has
+ * advanced and it never confirms; a real wedge makes no progress and confirms.
+ *   - "clear"   → not stalled now; drop any probe.
+ *   - "recover" → stalled now AND the probe is this run with unchanged progress → act.
+ *   - "observe" → first stalled sighting (or progress advanced since) → record + wait.
+ */
+export function confirmStall(i: StallConfirmInput): StallConfirmResult {
+  if (!i.stalledNow) return "clear";
+  if (i.probe && i.probe.sid === i.sessionId && i.probe.progressMs === i.progressMs) return "recover";
+  return "observe";
+}
+
+// ── Self-reload on new build ─────────────────────────────────────────────────
+
+export interface SelfReloadInput {
+  /** A run is in progress — never yank the code out from under it. */
+  runActive: boolean;
+  /**
+   * The live run is safe to interrupt AND will come back on its own: it has
+   * nothing loaded to send (both pools empty, so no work is lost) and autonomy is
+   * armed to restart it. Without this, persistent drains — which never end by
+   * design — would pin `runActive` true forever and the extension could NEVER
+   * self-update onto a new build. Undefined ⇒ false (old fail-safe behaviour).
+   */
+  runResumable?: boolean;
+  /** Stamp compiled into this bundle, or null if the define is missing. */
+  embeddedStamp: string | null;
+  /** Stamp api-vm read from the on-disk build, or null (missing/unreadable). */
+  servedStamp: string | null;
+  /** Last stamp a reload was already attempted for (persisted). */
+  lastAttemptedStamp: string | null;
+}
+
+/**
+ * True when the extension should chrome.runtime.reload() to pick up a newer
+ * on-disk build. Fail-closed on unknowns (either stamp null → no reload), and
+ * one attempt per served stamp: if the reload didn't change the embedded stamp
+ * (a stale disk copy that hasn't synced yet), it must not loop every alarm tick.
+ */
+export function shouldSelfReload(i: SelfReloadInput): boolean {
+  // A busy run is never interrupted. A run that is merely PERSISTENT-and-idle is,
+  // because a persistent drain never ends: leaving the old guard would mean the
+  // extension stays on a stale build for as long as the drain is running.
+  if (i.runActive && !i.runResumable) return false;
+  if (i.embeddedStamp == null || i.servedStamp == null) return false;
+  if (i.servedStamp === i.embeddedStamp) return false; // already running the on-disk build
+  if (i.servedStamp === i.lastAttemptedStamp) return false; // one attempt per stamp
+  return true;
+}
+
+/** Operator-local YYYY-MM-DD key, used to gate one auto-start per day. */
+export function localDayKey(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
