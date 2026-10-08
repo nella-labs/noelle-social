@@ -398,3 +398,49 @@ function renderExtractorPrompt(source: FeederSource, corpus: CorpusItem[]): stri
  * failure. Matched by ApifyXError.status and by name (AllApifyTokensExhaustedError
  * is thrown from the rotating client and isn't importable here without a cycle, so
  * match by name) — both mean the operator hit their cost gate.
+ */
+export function isApifyQuotaError(err: unknown): boolean {
+  if (err instanceof ApifyXError && (err.status === 402 || err.status === 429 || err.status === 403)) {
+    return true;
+  }
+  const name = (err as { name?: string } | null)?.name;
+  return name === "AllApifyTokensExhaustedError";
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function oneLine(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Parse the model's text into a JSON object. Gemini, called without a forced JSON
+ * mime-type, sometimes wraps the object in a ```json fence or surrounds it with
+ * prose, so strip fences and fall back to the first `{...}` span before giving up.
+ * Returns null when nothing parses.
+ */
+function extractJson(text: string): unknown {
+  const trimmed = text.trim();
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  for (const candidate of [unfenced, sliceBraces(unfenced)]) {
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
+}
+
+function sliceBraces(s: string): string | null {
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  return s.slice(start, end + 1);
+}
