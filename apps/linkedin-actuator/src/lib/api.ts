@@ -198,3 +198,64 @@ export class ActuatorApi {
   }
 
   // Server-side actuator health gate for lights-out auto-start. `this.ok` throws
+  // on non-2xx; network errors reject — the caller wraps in `.catch(() => null)`
+  // so any failure collapses to null → fail-closed (skip auto-start).
+  async health(): Promise<{ status: "ok" | "warn" | "halt" }> {
+    const url = `${this.config.apiBaseUrl}/api/actuator/health`;
+    const res = await this.ok(await this.fetchImpl(url, { headers: this.headers() }));
+    return (await res.json()) as { status: "ok" | "warn" | "halt" };
+  }
+
+  // Ingest replies-to-us harvested from the notifications page. This is the ONLY
+  // write the notifications sweep makes, and it writes to noelle — never to
+  // LinkedIn. Each item becomes a lead the drafter picks up; the comment itself
+  // still flows out through the normal approval -> actionable-linkedin ->
+  // actuate path, so nothing here can post. Throws on non-2xx (the caller
+  // downgrades it to a panel line and retries on the next sweep).
+  async postInboundReplies(body: InboundReplyIn): Promise<InboundReplyResponse> {
+    const url = `${this.config.apiBaseUrl}/api/actuator/inbound-reply`;
+    const res = await this.ok(
+      await this.fetchImpl(url, { method: "POST", headers: this.headers(), body: JSON.stringify(body) }),
+    );
+    return InboundReplyResponseSchema.parse(await res.json());
+  }
+
+  async logActivity(sessionId: string, events: LinkedInActivityEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    const url = `${this.config.apiBaseUrl}/api/linkedin-activity`;
+    await this.ok(await this.fetchImpl(url, { method: "POST", headers: this.headers(), body: JSON.stringify({ session_id: sessionId, events }) }));
+  }
+
+  // Long-poll the operator's REMOTE start/stop intent for this actuator (0089).
+  // Holds server-side up to ~25s, returning immediately once the desired state
+  // advances past `sinceMs` (the commandAt this extension last saw). A client
+  // abort at 33s guards a wedged connection so the intent loop can re-poll; the
+  // in-flight fetch also keeps the MV3 service worker alive. `this.ok` throws on
+  // non-2xx and the fetch rejects on abort/network error — the caller wraps in
+  // `.catch(() => null)` and backs off, so a down api-vm never wedges the loop.
+  async fetchIntent(sinceMs: number): Promise<ActuatorIntentResponse> {
+    const url = `${this.config.apiBaseUrl}/api/actuator/intent?instanceId=${encodeURIComponent(this.config.instanceId)}&since=${sinceMs}&waitMs=25000`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 33_000);
+    try {
+      const res = await this.ok(await this.fetchImpl(url, { headers: this.headers(), signal: ctrl.signal }));
+      return ActuatorIntentResponseSchema.parse(await res.json());
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Report the extension's ACTUAL run state for the dashboard's live status +
+  // liveness. `setDesired` is passed ONLY on an explicit local panel action
+  // (Full-automatic / STOP) to publish the operator's new intent so the local
+  // panel and the remote switch never disagree. Best-effort at the call site.
+  async ackIntent(runState: "running" | "idle", setDesired?: "running" | "stopped"): Promise<void> {
+    const url = `${this.config.apiBaseUrl}/api/actuator/intent-ack`;
+    const body: { instanceId: string; runState: "running" | "idle"; setDesired?: "running" | "stopped" } = {
+      instanceId: this.config.instanceId,
+      runState,
+    };
+    if (setDesired) body.setDesired = setDesired;
+    await this.ok(await this.fetchImpl(url, { method: "POST", headers: this.headers(), body: JSON.stringify(body) }));
+  }
+}
