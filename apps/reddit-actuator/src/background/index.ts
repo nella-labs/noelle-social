@@ -1798,3 +1798,184 @@ async function checkSelfReload(): Promise<void> {
 // running vs idle without any per-transition wiring. `force` bypasses the 60s
 // throttle for the 5-min autonomy alarm. Never touches the send path.
 async function pulseBridge(force: boolean): Promise<void> {
+  const cfg = await getConfig().catch(() => null);
+  if (!cfg) return;
+  const s = await loadState().catch(() => null);
+  const state = s?.status === "running" ? "running" : "idle";
+  await bridgePulse(cfg, state, { session_id: s?.sessionId }, force);
+}
+
+// ── Remote start/stop of the actuator (the "hands" master switch, 0089) ──────
+// The operator's intent lives on agent_instances.actuator_desired_state; the
+// extension long-polls it (GET /api/actuator/intent) and reconciles its run
+// lifecycle to match, in near-real-time. See docs/actuator-remote-control.md.
+//
+// REMOTE_STATE_KEY mirrors the applied intent locally so the autonomy gate honors
+// it synchronously and it survives SW death; 'stopped' hard-gates all autonomy,
+// 'running' keeps a drain live (Reddit has no Full-auto standing intent — the
+// durable REMOTE_STATE_KEY itself is the persistence), absent = no remote override.
+const REMOTE_STATE_KEY = "actuator.remoteState";
+// The commandAt (epoch-ms) of the last remote intent this extension applied (kept
+// for observability/debug; the live loop tracks `since` in memory and forces a
+// fresh reconcile on cold start).
+const LAST_COMMAND_AT_KEY = "actuator.remoteCommandAt";
+
+// The gate the autonomy path consults. Fail-OPEN on a storage error (return
+// false): the real stop enforcement is the STOP stamps applyRemoteIntent writes
+// at stop time (which don't depend on this read), so a transient storage blip
+// must not halt a normally-running actuator.
+async function remoteStopped(): Promise<boolean> {
+  try {
+    const s = await chrome.storage.local.get(REMOTE_STATE_KEY);
+    return s[REMOTE_STATE_KEY] === "stopped";
+  } catch {
+    return false;
+  }
+}
+
+// Reconcile the LIVE run to the operator's remote intent. Idempotent — safe to
+// call on every long-poll return and after any SW restart. The GATE
+// (REMOTE_STATE_KEY) is level-triggered; the STOP *action* (endRun) is
+// EDGE-triggered — it fires only on the transition INTO 'stopped', so a re-apply
+// never kills a one-shot manual Run the operator started afterward.
+//   'stopped' → stamp today's STOP (so a lights-out `autonomous` config can't
+//               relaunch it, matching a local STOP) and end any live run.
+//   'running' → ensure a drain is live. Reddit auto-sends approved replies, so
+//               this is a full operator-initiated start (equivalent to the local
+//               Run button), NOT arming anything new. The reconcile re-runs every
+//               long-poll return + is re-armed by the 30s alarm, so a drain that
+//               dies is restarted here within ~25-30s while intent stays 'running'.
+//   null      → no remote override: clear the mirror; local autonomy governs.
+async function applyRemoteIntent(desired: "running" | "stopped" | null): Promise<void> {
+  const cfg = await getConfig();
+  if (!cfg) return;
+  const prevStore = await chrome.storage.local.get(REMOTE_STATE_KEY).catch(() => ({}));
+  const prev = (prevStore as Record<string, unknown>)[REMOTE_STATE_KEY];
+
+  if (desired === "stopped") {
+    await chrome.storage.local.set({ [REMOTE_STATE_KEY]: "stopped" });
+    await chrome.storage.local.set({
+      [AUTO_START_DAY_KEY]: localDayKey(new Date()),
+      [STOP_DAY_KEY]: localDayKey(new Date()),
+    });
+    if (prev !== "stopped") {
+      const s = await loadState().catch(() => null);
+      if (s?.status === "running") await endRun("stopped").catch(() => {});
+    }
+  } else if (desired === "running") {
+    await chrome.storage.local.set({ [REMOTE_STATE_KEY]: "running" });
+    await chrome.storage.local.remove(STOP_DAY_KEY); // a remote start clears a prior same-day STOP
+    const s = await loadState().catch(() => null);
+    if (s?.status !== "running") {
+      await startDrain({ manual: true }).catch((e) =>
+        console.warn("[intent] reddit drain start failed:", e instanceof Error ? e.message : e),
+      );
+    }
+  } else {
+    await chrome.storage.local.remove(REMOTE_STATE_KEY);
+  }
+
+  // Ack the actuator's ACTUAL run state so the dashboard shows reality, not just
+  // intent. Best-effort — a telemetry failure must never break the loop.
+  const after = await loadState().catch(() => null);
+  const runState: "running" | "idle" = after?.status === "running" ? "running" : "idle";
+  await new ActuatorApi(cfg).ackIntent(runState).catch(() => {});
+}
+
+// Singleton guard for the intent loop (in-memory; resets on SW death, so
+// ensureIntentLoop re-arms it after any restart — driven by onStartup and the 30s
+// tick alarm). At most one loop runs per service-worker lifetime.
+let intentLoopRunning = false;
+function ensureIntentLoop(): void {
+  if (intentLoopRunning) return;
+  intentLoopRunning = true;
+  void runIntentLoop().finally(() => {
+    intentLoopRunning = false;
+  });
+}
+
+// The near-real-time remote control channel. A cold start forces `since=0` so the
+// FIRST poll returns the current standing intent immediately and reconciles (in
+// case a SW death/self-reload wiped the run); thereafter `since` tracks the last
+// applied commandAt so the poll blocks until a genuine change. Fail-open: a null
+// (down api-vm / parse error) backs off ~4s and retries; the 30s alarm re-arms
+// this loop if the SW was killed during that gap. The in-flight long-poll keeps
+// the MV3 service worker alive between reconciles.
+async function runIntentLoop(): Promise<void> {
+  let since = 0; // cold-start: force an immediate reconcile of the current intent
+  for (;;) {
+    const cfg = await getConfig().catch(() => null);
+    if (!cfg?.instanceId || !cfg.apiBaseUrl || !cfg.token) {
+      await plainSleep(15_000);
+      continue;
+    }
+    const intent = await new ActuatorApi(cfg).fetchIntent(since).catch(() => null);
+    if (!intent) {
+      await plainSleep(4000);
+      continue;
+    }
+    since = intent.commandAt ?? since;
+    await chrome.storage.local.set({ [LAST_COMMAND_AT_KEY]: since }).catch(() => {});
+    await applyRemoteIntent(intent.desired).catch((e) =>
+      console.warn("[intent] apply failed:", e instanceof Error ? e.message : e),
+    );
+  }
+}
+
+// Publish a LOCAL panel action's intent to the server so the phone/dashboard and
+// the local panel never disagree, and mirror it locally so the gate honors it
+// immediately (before the loop reads it back). On Reddit the only local
+// master-switch action is STOP (there is no Full-automatic button).
+async function publishLocalIntent(desired: "running" | "stopped"): Promise<void> {
+  const cfg = await getConfig().catch(() => null);
+  if (!cfg) return;
+  await chrome.storage.local.set({ [REMOTE_STATE_KEY]: desired }).catch(() => {});
+  const s = await loadState().catch(() => null);
+  const runState: "running" | "idle" = s?.status === "running" ? "running" : "idle";
+  await new ActuatorApi(cfg).ackIntent(runState, desired).catch(() => {});
+}
+
+chrome.runtime.onStartup.addListener(() => { void ensureAutonomyAlarm(); void ensureIntentLoop(); void checkAutonomy(); });
+chrome.runtime.onInstalled.addListener(() => { void ensureAutonomyAlarm(); void ensureIntentLoop(); });
+
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === ALARM) { void ensureIntentLoop(); void tick(); void pulseBridge(false); }
+  else if (a.name === AUTONOMY_ALARM) { void ensureIntentLoop(); void checkAutonomy(); void checkSelfReload(); void pulseBridge(true); }
+});
+chrome.runtime.onMessage.addListener((msg: { cmd: string; params?: never }, _s, reply) => {
+  (async () => {
+    try {
+      // The manual flag routes the enable-send arm INSIDE startRun/startDrain,
+      // after the epoch bump and through the withSendSwitch serial queue — never
+      // arm here, ahead of the bump, where a concurrently-ending run's disable
+      // could land after it and silently empty the new run's queue.
+      if (msg.cmd === "startRun") { await startRun(msg.params!, { manual: true }); reply({ ok: true }); }
+      else if (msg.cmd === "startDrain") { await startDrain({ manual: true }); reply({ ok: true }); }
+      else if (msg.cmd === "stopRun") {
+        await endRun("stopped");
+        // If autonomy is on, a manual STOP must also block today's auto-restart —
+        // otherwise the 5-min autonomy alarm would silently re-launch the run the
+        // operator just stopped. Stamp today so checkAutonomy treats it as done.
+        const cfg = await getConfig();
+        if (cfg?.autonomous) {
+          // Silence BOTH autonomy paths for the day: the daily auto-start via its
+          // once-per-day key, and auto-drain via the STOP-day key it reads.
+          await chrome.storage.local.set({
+            [AUTO_START_DAY_KEY]: localDayKey(new Date()),
+            [STOP_DAY_KEY]: localDayKey(new Date()),
+          });
+        }
+        void publishLocalIntent("stopped"); // durable remote STOP so the phone agrees + it stays down
+        reply({ ok: true });
+      }
+      else if (msg.cmd === "getState") { reply({ ok: true, state: await loadState() }); }
+      else if (msg.cmd === "tick") { await tick(); reply({ ok: true }); } // content-script-driven loop (reliable, unlike SW timers)
+      else reply({ ok: false, error: "unknown command" });
+    } catch (e) {
+      // Surface the real reason to the panel — DevTools can't be open during a
+      // run (it blocks chrome.debugger), so the panel log is the only window in.
+      reply({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  })();
+  return true;
+});
