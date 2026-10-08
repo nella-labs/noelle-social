@@ -1,0 +1,26 @@
+{
+  "name": "@noelle/x-actuator",
+  "version": "0.0.1-alpha.0",
+  "private": true,
+  "type": "module",
+  "description": "Vega's hands — MV3 browser extension that actuates approved X replies from your own tab.",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build && node -e \"const fs=require('node:fs');fs.rmSync('dist-unpacked.new',{recursive:true,force:true});fs.cpSync('.output/chrome-mv3','dist-unpacked.new',{recursive:true});fs.rmSync('dist-unpacked.old',{recursive:true,force:true});if(fs.existsSync('dist-unpacked'))fs.renameSync('dist-unpacked','dist-unpacked.old');fs.renameSync('dist-unpacked.new','dist-unpacked');fs.rmSync('dist-unpacked.old',{recursive:true,force:true})\"",
+    "zip": "wxt zip",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@noelle/actuator-cdp": "workspace:*",
+    "@noelle/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.270",
+    "@types/node": "^25.9.1",
+    "jsdom": "^25.0.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6",
+    "wxt": "^0.19.0"
+  }
+}
