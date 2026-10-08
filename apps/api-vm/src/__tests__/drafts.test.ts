@@ -198,3 +198,203 @@ function makeFakeSql(opts: {
 // Stub XClient: returns a canned tweet by default; the per-test setup can
 // swap in an error-throwing variant to exercise the failure branches.
 // ---------------------------------------------------------------------------
+
+interface XClientStubOpts {
+  reply?: (text: string, replyTo: string) => Promise<{ id: string; url: string }>;
+  /** When set, every createTweet call throws this error. */
+  throws?: Error;
+}
+
+function makeXClientStub(opts: XClientStubOpts = {}): XClient {
+  const fail = opts.throws;
+  return {
+    async verifyCredentials() {
+      return { screen_name: "stub", id_str: "stub" };
+    },
+    async userTweets() { return []; },
+    async searchTimeline() { return []; },
+    async createTweet({ inReplyToId, text }) {
+      if (fail) throw fail;
+      if (opts.reply) return opts.reply(text, inReplyToId);
+      return {
+        id: "tweet-fake",
+        url: `https://x.com/stub/status/tweet-fake`,
+      };
+    },
+    async likeTweet() {
+      return true;
+    },
+  };
+}
+
+// Stub SecretsClient: every getForOrg call returns canned strings.
+function makeSecretsStub(opts: {
+  notFound?: boolean;
+} = {}): SecretsClient {
+  return {
+    async get(name) {
+      return `secret-${name}`;
+    },
+    async getForOrg(_orgId, fragment) {
+      if (opts.notFound) {
+        throw new SecretAccessError(`NOT_FOUND reading ${fragment}`);
+      }
+      return `${fragment}-value`;
+    },
+    async warm() { /* noop */ },
+    bust() { /* noop */ },
+  };
+}
+
+async function buildApp(setup: {
+  sql: ReturnType<typeof makeFakeSql>;
+  xClient?: XClient;
+  secrets?: SecretsClient;
+}) {
+  const { drafts, __setSendDepsForTests, __resetSendDepsForTests } =
+    await import("../routes/drafts.js");
+  __resetSendDepsForTests();
+  __setSendDepsForTests({
+    secrets: setup.secrets ?? makeSecretsStub(),
+    xClientFactory: () => setup.xClient ?? makeXClientStub(),
+  });
+  const app = new Hono<{ Variables: { auth: AuthContext } }>();
+  app.use("*", async (c, next) => {
+    c.set("auth", {
+      userId: "user-1",
+      raw: { sub: "user-1" } as never,
+    });
+    await next();
+  });
+  app.route("/", drafts);
+  __setDbClientForTests(setup.sql);
+  return app;
+}
+
+beforeEach(() => {
+  vi.restoreAllMocks();
+  resetDbClientForTests();
+});
+
+describe("POST /api/drafts/:id/send", () => {
+  it("posts to X synchronously and returns sent_url + sibling_skipped", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-A",
+        org_id: "org-1",
+        draft_id: "draft-A",
+        lead_id: "lead-1",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: "1234567890",
+      },
+      siblingIds: ["appr-B", "appr-C"],
+    });
+    const xClient = makeXClientStub({
+      reply: async () => ({
+        id: "9876543210",
+        url: "https://x.com/me/status/9876543210",
+      }),
+    });
+    const app = await buildApp({ sql: fakeSql, xClient });
+
+    const res = await app.request("/api/drafts/appr-A/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hello world", edited: false }),
+    });
+
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      approval_id: string;
+      status: string;
+      sibling_skipped: number;
+      sent_external_id: string;
+      sent_url: string;
+    };
+    expect(json.approval_id).toBe("appr-A");
+    expect(json.status).toBe("sent");
+    expect(json.sibling_skipped).toBe(2);
+    expect(json.sent_external_id).toBe("9876543210");
+    expect(json.sent_url).toBe("https://x.com/me/status/9876543210");
+
+    const hasSiblingFlip = (fakeSql as unknown as { __calls: SqlCall[] }).__calls.some(
+      (c) => /sibling-angle-sent/.test(c.text),
+    );
+    expect(hasSiblingFlip).toBe(true);
+    const hasSentExternalIdWrite = (fakeSql as unknown as { __calls: SqlCall[] }).__calls.some(
+      (c) => /update noelle\.drafts/i.test(c.text) && /sent_external_id/i.test(c.text),
+    );
+    expect(hasSentExternalIdWrite).toBe(true);
+  });
+
+  it("marks a DM 'sent' WITHOUT posting to X or skipping reply siblings", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-dm",
+        org_id: "org-1",
+        draft_id: "draft-dm",
+        lead_id: "lead-1",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: "1234567890",
+        draft_kind: "dm",
+      },
+      // Present on purpose: a DM send must NOT skip these reply siblings.
+      siblingIds: ["appr-B", "appr-C"],
+    });
+    let tweeted = false;
+    const xClient = makeXClientStub({
+      reply: async () => {
+        tweeted = true;
+        return { id: "should-not-happen", url: "https://x.com/x/status/0" };
+      },
+    });
+    const app = await buildApp({ sql: fakeSql, xClient });
+
+    const res = await app.request("/api/drafts/appr-dm/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hellooo\n\nsaw your post", edited: false }),
+    });
+
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      status: string;
+      sent_url?: string;
+      sent_external_id?: string;
+    };
+    expect(json.status).toBe("sent");
+    // The X reply API was never touched.
+    expect(tweeted).toBe(false);
+    // A DM carries no posted-tweet fields.
+    expect(json.sent_url).toBeUndefined();
+    expect(json.sent_external_id).toBeUndefined();
+    // And it never ran the reply sibling-skip.
+    const calls = (fakeSql as unknown as { __calls: SqlCall[] }).__calls;
+    expect(calls.some((c) => /sibling-angle-sent/.test(c.text))).toBe(false);
+    expect(calls.some((c) => /sent_external_id/i.test(c.text))).toBe(false);
+  });
+
+  it("returns 503 x_auth_failed when X cookies are stale", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-A",
+        org_id: "org-1",
+        draft_id: "draft-A",
+        lead_id: "lead-1",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: "1234567890",
+      },
+      siblingIds: [],
+    });
+    const xClient = makeXClientStub({ throws: new XAuthError() });
+    const app = await buildApp({ sql: fakeSql, xClient });
+
+    const res = await app.request("/api/drafts/appr-A/send", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "hi", edited: false }),
+    });
+    expect(res.status).toBe(503);
