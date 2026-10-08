@@ -198,3 +198,203 @@ function InboxRow({
   selected,
   onToggle,
   canSelect,
+  mobile = false,
+}: {
+  row: PendingApprovalRow;
+  orgSlug: string;
+  filterQuery: string;
+  selected: boolean;
+  onToggle: () => void;
+  canSelect: boolean;
+  mobile?: boolean;
+}) {
+  const router = useRouter();
+  const [busy, startRow] = React.useTransition();
+  const isSkipped = row.approval.status === "skipped";
+  const onSkip = () =>
+    startRow(async () => {
+      await skipDraft({ orgSlug, approvalId: row.approval.id });
+      router.refresh();
+    });
+  const onUnskip = () =>
+    startRow(async () => {
+      await unskipDraft({ orgSlug, approvalId: row.approval.id });
+      router.refresh();
+    });
+
+  const lp = leadPayload(row.lead);
+  const dp = draftPayload(row.draft);
+  const kind = dp.kind ?? "reply";
+  const readinessBadge = row.approval.status === "pending" && kind === "reply"
+    ? <ReplyReadinessBadge ready={isXReplyReady(row)} />
+    : null;
+  const handle = lp.author_handle ? `@${lp.author_handle}` : "—";
+  const followers = lp.author_followers;
+  const followerLabel =
+    followers != null && followers > 0
+      ? `${(followers / 1000).toFixed(1)}k`
+      : null;
+  const tier = row.lead?.tier ?? lp.tier ?? null;
+  const score = row.lead?.classifier_score ?? null;
+  const scoreLabel = score != null ? Math.round(score * 100) : null;
+  const scoreColor =
+    score == null
+      ? "var(--ink-muted)"
+      : score >= 0.75
+        ? "var(--accent)"
+        : score >= 0.5
+          ? "var(--ink-2)"
+          : "var(--ink-muted)";
+  const preview =
+    lp.post_text ??
+    dp.body ??
+    dp.angles?.empathetic?.body ??
+    dp.angles?.technical?.body ??
+    dp.angles?.contrarian?.body ??
+    "(no source post synced)";
+  const pushed = row.approval.created_at ? timeAgo(row.approval.created_at) : "—";
+  const alreadyScheduled = !!row.approval.auto_send_target_at;
+  const selectTitle = kind === "dm"
+    ? "Manual DM — review and mark sent; auto-send is off"
+    : alreadyScheduled
+      ? "Already queued for auto-send"
+      : "Select for auto-send";
+
+  // For a sent row, the live X permalink to Vega's reply (the post with the
+  // reply in it). Rendered as a sibling anchor floated over the right edge so
+  // it isn't nested inside the row's child Links (invalid HTML).
+  const replyUrl =
+    row.approval.status === "sent"
+      ? sentReplyUrl({ sentUrl: dp.sent_url, authorHandle: lp.author_handle })
+      : null;
+
+  const detailHref = `/app/${orgSlug}/approvals/${row.approval.id}${filterQuery}`;
+
+  // ─── Phone: one card per lead (checkbox + handle/score head, clamped
+  // preview body, meta footer). The desktop "on X" overlay is inlined into
+  // the footer here instead of being absolutely positioned. ───────────────
+  if (mobile) {
+    return (
+      <div className={`row-card ${styles.mobileRow}`} style={{ gap: 8 }}>
+        <div className="row-card-head" style={{ alignItems: "flex-start" }}>
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggle}
+            disabled={!canSelect}
+            title={selectTitle}
+            aria-label={`Select ${handle}`}
+            style={{ width: 18, height: 18, marginTop: 2, flexShrink: 0, cursor: canSelect ? "pointer" : "default" }}
+          />
+          <Link
+            href={detailHref}
+            className="inbox-handle"
+            style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 6, whiteSpace: "normal", textDecoration: "none", color: "inherit" }}
+          >
+            {handle}
+            {kind === "dm" ? (
+              <span className="tag tag-acc" style={{ height: 18, fontSize: 10, letterSpacing: "0.06em" }}>
+                DM
+              </span>
+            ) : null}
+          </Link>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+            <span className={tier === "T1" ? "tag tag-acc" : "tag"} style={{ height: 20 }}>
+              {tier ?? "—"}
+            </span>
+            <span style={{ fontFamily: "var(--mono)", fontSize: 12, color: scoreColor }}>
+              {scoreLabel != null ? scoreLabel : "—"}
+            </span>
+          </div>
+        </div>
+        <Link
+          href={detailHref}
+          className="inbox-preview"
+          style={{ textDecoration: "none", color: "var(--ink-muted)" }}
+        >
+          &ldquo;{preview}&rdquo;
+        </Link>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexWrap: "wrap",
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "var(--ink-soft)",
+          }}
+        >
+          <span>{pushed}</span>
+          {alreadyScheduled ? <AutoSendChip targetAt={row.approval.auto_send_target_at!} /> : null}
+          {readinessBadge}
+          {followerLabel ? <span>· {followerLabel}</span> : null}
+          {replyUrl ? (
+            <a
+              href={replyUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="tag tag-acc"
+              style={{ height: 18, fontSize: 10, textDecoration: "none", marginLeft: "auto" }}
+            >
+              on X ↗
+            </a>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
+  const inboxRow = (
+    <div
+      className={`${styles.row} ${styles.scored}`}
+      data-selected={selected || undefined}
+    >
+      <input
+        type="checkbox"
+        checked={selected}
+        onChange={onToggle}
+        disabled={!canSelect}
+        title={selectTitle}
+            aria-label={`Select ${handle}`}
+        style={{ width: 16, height: 16, cursor: canSelect ? "pointer" : "default" }}
+      />
+      <Link
+        href={`/app/${orgSlug}/approvals/${row.approval.id}${filterQuery}`}
+        style={{ textDecoration: "none", color: "inherit", display: "block" }}
+      >
+        <div
+          className="inbox-handle"
+          style={{ display: "flex", alignItems: "center", gap: 6 }}
+        >
+          {handle}
+          {kind === "dm" ? (
+            <span
+              className="tag tag-acc"
+              style={{ height: 18, fontSize: 10, letterSpacing: "0.06em" }}
+              title="Cold-outreach DM — copy and send on X yourself"
+            >
+              DM
+            </span>
+          ) : null}
+        </div>
+        <div style={{ fontSize: 11, color: "var(--ink-muted)", marginTop: 2 }}>
+          {tier ? (
+            <>
+              <span
+                className="inbox-tier"
+                style={{ color: tier === "T1" ? "var(--accent)" : "var(--ink-muted)" }}
+              >
+                {tier}
+              </span>
+              {followerLabel ? <span> · {followerLabel}</span> : null}
+            </>
+          ) : followerLabel ? (
+            <span className="inbox-tier">{followerLabel}</span>
+          ) : (
+            <span className="inbox-tier">—</span>
+          )}
+        </div>
+          {alreadyScheduled ? (
+          <div style={{ marginTop: 4 }}>
+            <AutoSendChip targetAt={row.approval.auto_send_target_at!} />
