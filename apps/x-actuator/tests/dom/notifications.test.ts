@@ -398,3 +398,108 @@ describe("the All tab: notification cards are not replies", () => {
     });
     expect(picked).toHaveLength(1);
     expect(picked[0]!.text).not.toMatch(/buzz is the one/);
+  });
+
+  it("the notification cards really are present in the fixture (guards the guard)", () => {
+    document.body.innerHTML = fx();
+    expect(document.querySelectorAll('article[data-testid="notification"]').length).toBe(2);
+    expect(document.querySelectorAll('article[data-testid="tweet"]').length).toBe(1);
+  });
+});
+
+// Recency is independent of deduplication: a fresh installation has no seen
+// entries but must still reject stale notifications.
+describe("the 12h recency window", () => {
+  const NOW = Date.parse("2026-07-26T12:00:00.000Z");
+  const at = (iso: string | null) => ({
+    tweet_id: "1",
+    handle: "alice",
+    text: "a real question for you?",
+    url: "https://x.com/alice/status/1",
+    posted_at: iso,
+    replying_to: ["demooperator"],
+  });
+  const pick = (iso: string | null) =>
+    selectRepliesToMe([at(iso)], { selfHandle: "demooperator", seen: [], max: 5, nowMs: NOW });
+
+  it("is twelve hours", () => {
+    expect(MAX_AGE_MINUTES).toBe(720);
+  });
+
+  it("keeps a reply from five minutes ago", () => {
+    expect(pick("2026-07-26T11:55:00.000Z")).toHaveLength(1);
+  });
+
+  it("keeps a reply from exactly twelve hours ago (the boundary is inclusive)", () => {
+    expect(pick("2026-07-26T00:00:00.000Z")).toHaveLength(1);
+  });
+
+  it("drops a reply from twelve hours and a minute ago", () => {
+    expect(pick("2026-07-25T23:59:00.000Z")).toEqual([]);
+  });
+
+  it("keeps an overnight reply the next morning — the reason for 9h over 6h", () => {
+    // Posted 1am, sweep runs at 9am: 8h old. Under a 6h window this had aged
+    // out while nobody was watching.
+    const nine = Date.parse("2026-07-26T09:00:00.000Z");
+    const oneAm = "2026-07-26T01:00:00.000Z";
+    expect(
+      selectRepliesToMe([at(oneAm)], { selfHandle: "demooperator", seen: [], max: 5, nowMs: nine }),
+    ).toHaveLength(1);
+  });
+
+  it("drops a two-day-old reply that the seen-ring has never seen", () => {
+    // The exact case the window exists for: unseen, therefore "new" by the old
+    // rule, but answering it is necro-engagement.
+    expect(pick("2026-07-24T12:00:00.000Z")).toEqual([]);
+  });
+
+  it("drops a reply whose timestamp cannot be read", () => {
+    // We cannot prove it is recent, so it does not get answered. It stays out
+    // of the seen-ring too, so nothing is permanently lost.
+    expect(pick(null)).toEqual([]);
+    expect(pick("not a date")).toEqual([]);
+  });
+
+  it("keeps a cell timestamped slightly in the future (clock skew)", () => {
+    expect(pick("2026-07-26T12:00:30.000Z")).toHaveLength(1);
+  });
+
+  it("applies the window on top of the other gates, not instead of them", () => {
+    const fresh = { ...at("2026-07-26T11:59:00.000Z"), replying_to: [] };
+    expect(selectRepliesToMe([fresh], { selfHandle: "demooperator", seen: [], max: 5, nowMs: NOW })).toEqual([]);
+  });
+});
+
+describe("ageBuckets — the sweep's markup-break signal", () => {
+  const NOW = Date.parse("2026-07-26T12:00:00.000Z");
+  const mk = (posted_at: string | null) => ({
+    tweet_id: "1", handle: "a", text: "t", url: "u", posted_at, replying_to: ["demooperator"],
+  });
+
+  it("counts recent, stale and undated separately", () => {
+    const buckets = ageBuckets(
+      [
+        mk("2026-07-26T11:00:00.000Z"), // 1h
+        mk("2026-07-26T04:00:00.000Z"), // 8h — inside 9h, was outside 6h
+        mk("2026-07-24T12:00:00.000Z"), // 2d
+        mk(null),
+      ],
+      { nowMs: NOW, maxAgeMinutes: MAX_AGE_MINUTES },
+    );
+    expect(buckets).toEqual({ recent: 2, stale: 1, undated: 1 });
+  });
+
+  it("reports all-undated, which is what a <time> markup change looks like", () => {
+    // This is the number that turns a silent "0 replies" into a diagnosis.
+    const buckets = ageBuckets([mk(null), mk(null)], { nowMs: NOW, maxAgeMinutes: MAX_AGE_MINUTES });
+    expect(buckets.undated).toBe(2);
+    expect(buckets.recent).toBe(0);
+  });
+
+  it("is empty-safe", () => {
+    expect(ageBuckets([], { nowMs: NOW, maxAgeMinutes: MAX_AGE_MINUTES })).toEqual({
+      recent: 0, stale: 0, undated: 0,
+    });
+  });
+});
