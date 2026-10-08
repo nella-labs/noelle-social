@@ -198,3 +198,100 @@ describe.skipIf(!url)("durable budget admission (native PostgreSQL)", () => {
       await expect(recorder().record(row)).rejects.toMatchObject({ category: "deadline" });
       expect(performance.now() - started).toBeLessThan(700);
     } finally { clearTimeout(safety); await unlock(); }
+    await delay(100);
+    expect((await sql`select count(*)::int as n from noelle.llm_calls`)[0]?.n).toBe(0);
+    expect((await sql`select settled_at from noelle.llm_budget_reservations where id=${id}`)[0]?.settled_at).toBeNull();
+    await recorder().record(row);
+    expect((await sql`select count(*)::int as n from noelle.llm_calls`)[0]?.n).toBe(1);
+  });
+  it("bounds admission lock wait and creates no reservation after rejection", async () => {
+    let release!: () => void, acquired!: () => void;
+    const ready = new Promise<void>((r) => { acquired = r; });
+    const held = new Promise<void>((r) => { release = r; });
+    const tx = sql.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended('llm-budget:' || ${org}::uuid::text,0))`;
+      acquired(); await held;
+    });
+    await ready; const safety = setTimeout(release, 1500);
+    try {
+      const started = performance.now();
+      await expect(adapters(other, 1000).reserveAttempt!(attempt())).rejects.toMatchObject({ category: "deadline" });
+      expect(performance.now() - started).toBeLessThan(1300);
+    } finally { clearTimeout(safety); release(); await tx; }
+    await delay(100);
+    expect((await sql`select count(*)::int as n from noelle.llm_budget_reservations`)[0]?.n).toBe(0);
+    await reserve(attempt(), other);
+    expect((await other`select 1 as healthy`)[0]?.healthy).toBe(1);
+  });
+  const refused = (id: string, overrides: Partial<SpendRow> = {}) => receipt(id, {
+    status: "error", costBasis: "not_dispatched", inputTokens: 0, outputTokens: 0, cents: 0, latencyMs: null, ...overrides,
+  });
+  it("atomically settles an identical confirmed refusal once without a charge", async () => {
+    const id = await reserve(); const row = refused(id);
+    await Promise.all([recorder().record(row), recorder(other).record(row)]);
+    expect((await sql`select count(*)::int as n,sum(cents)::int as cents from noelle.llm_calls`)[0]).toEqual({ n: 1, cents: 0 });
+    expect((await sql`select settled_at from noelle.llm_budget_reservations where id=${id}`)[0]?.settled_at).not.toBeNull();
+    await reserve();
+  });
+  it("acknowledges refusal after admission without dispatching a provider", async () => {
+    let providers = 0, hooks = 0;
+    const options = { engine: "bedrock" as const, context: { ...attempt(), agentRole: "x_intern" as const }, budget: { adapters: adapters(), estimateCents: () => 8 },
+      recorder: recorder(), beforeDispatch: async () => {
+        hooks++; expect((await sql`select count(*)::int as n from noelle.llm_budget_reservations`)[0]?.n).toBe(1);
+        return "not_dispatched" as const;
+      } };
+    const backend = createBudgetedBackend({ call: async () => { providers++; return { text: "forbidden", usage: { input_tokens: 1, output_tokens: 1 } }; } }, options);
+    await expect(backend.call({ system: "system", prompt: "prompt", model: attempt().model })).rejects.toMatchObject({ name: "ModelNotDispatchedError" });
+    expect([providers, hooks]).toEqual([0, 1]);
+    expect((await sql`select status,cost_basis,input_tokens,output_tokens,cents,latency_ms from noelle.llm_calls`)[0])
+      .toEqual({ status: "error", cost_basis: "not_dispatched", input_tokens: 0, output_tokens: 0, cents: 0, latency_ms: null });
+    expect((await sql`select settled_at from noelle.llm_budget_reservations`)[0]?.settled_at).not.toBeNull();
+  });
+  it.each(["thrown", "nominal", "invalid"])("retains an unknown acknowledgement hold with no provider (%s)", async (kind) => {
+    let providers = 0, hooks = 0;
+    const error = kind === "nominal" ? new ModelNotDispatchedError() : new Error("acknowledgement unavailable");
+    const backend = createBudgetedBackend({ call: async () => { providers++; return { text: "forbidden", usage: { input_tokens: 1, output_tokens: 1 } }; } }, {
+      engine: "bedrock", context: { ...attempt(), agentRole: "x_intern" }, budget: { adapters: adapters(), estimateCents: () => 8 },
+      recorder: recorder(), beforeDispatch: async () => { hooks++; if (kind === "invalid") return undefined as never; throw error; },
+    });
+    const pending = backend.call({ system: "system", prompt: "prompt", model: attempt().model });
+    if (kind === "invalid") await expect(pending).rejects.toThrow("Invalid model dispatch acknowledgement");
+    else await expect(pending).rejects.toBe(error);
+    expect([providers, hooks]).toEqual([0, 1]);
+    expect((await sql`select status,cost_basis,input_tokens,output_tokens,cents,latency_ms from noelle.llm_calls`)[0])
+      .toEqual({ status: "error", cost_basis: "unknown", input_tokens: 0, output_tokens: 0, cents: 0, latency_ms: null });
+    expect((await sql`select settled_at from noelle.llm_budget_reservations`)[0]?.settled_at).toBeNull();
+    await expect(reserve()).rejects.toMatchObject({ spentCents: 8 });
+  });
+  it.each([
+    { status: "ok" as const }, { status: "timeout" as const }, { inputTokens: 1 },
+    { outputTokens: 1 }, { cents: 1 }, { latencyMs: 0 },
+  ])("rejects inconsistent not-dispatched accounting and rolls back (%j)", async (overrides) => {
+    const id = await reserve();
+    await expect(recorder().record(refused(id, overrides))).rejects.toMatchObject({ category: "database" });
+    expect((await sql`select count(*)::int as n from noelle.llm_calls where attempt_id=${id}`)[0]?.n).toBe(0);
+    expect((await sql`select settled_at from noelle.llm_budget_reservations where id=${id}`)[0]?.settled_at).toBeNull();
+  });
+  it.each([
+    "orgId", "instanceId", "agentRole", "worker", "engine", "model", "bucket",
+  ] as const)("rejects a confirmed refusal with a mismatched %s", async (key) => {
+    const id = await reserve();
+    const foreign = { orgId: foreignOrg, instanceId: foreignInstance, agentRole: "linkedin_intern", worker: "briefer",
+      engine: "vertex", model: "gemini-2-5-flash", bucket: "ideation" };
+    await expect(recorder().record({ ...refused(id), [key]: foreign[key] } as SpendRow)).rejects.toMatchObject({ category: "database" });
+    expect((await sql`select count(*)::int as n from noelle.llm_calls`)[0]?.n).toBe(0);
+    expect((await sql`select settled_at from noelle.llm_budget_reservations where id=${id}`)[0]?.settled_at).toBeNull();
+  });
+  it("rolls back receipt insertion when confirmed refusal settlement fails", async () => {
+    const id = await reserve();
+    await sql.unsafe(`create function noelle.reject_settlement() returns trigger language plpgsql as $$ begin raise exception 'blocked' using errcode='23514'; end $$;
+      create trigger reject_settlement before update of settled_at on noelle.llm_budget_reservations for each row execute function noelle.reject_settlement()`);
+    try {
+      await expect(recorder().record(refused(id))).rejects.toMatchObject({ category: "database" });
+    } finally {
+      await sql.unsafe("drop trigger reject_settlement on noelle.llm_budget_reservations; drop function noelle.reject_settlement()");
+    }
+    expect((await sql`select count(*)::int as n from noelle.llm_calls where attempt_id=${id}`)[0]?.n).toBe(0);
+    expect((await sql`select settled_at from noelle.llm_budget_reservations where id=${id}`)[0]?.settled_at).toBeNull();
+  });
+});

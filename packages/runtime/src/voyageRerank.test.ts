@@ -198,3 +198,100 @@ describe("voyageRerank — topK", () => {
     const out = await voyageRerank("q", ["a", "b", "c", "d"], { topK: 2 });
     expect(body.top_k).toBe(2);
     expect(out).toHaveLength(2);
+    expect(out.map((r) => r.index)).toEqual([3, 1]);
+  });
+
+  it("respects topK on the fail-open path (truncates identity ranking)", async () => {
+    // No key → identity, but still truncated to topK.
+    vi.stubGlobal("fetch", vi.fn());
+    const out = await voyageRerank("q", ["a", "b", "c", "d", "e"], { topK: 2 });
+    expect(out.map((r) => r.index)).toEqual([0, 1]);
+  });
+});
+
+describe("voyageRerank — edge cases", () => {
+  it("returns [] for an empty document list without calling fetch", async () => {
+    process.env["VOYAGE_API_KEY"] = "k";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const out = await voyageRerank("q", []);
+    expect(out).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts an explicit apiKey opt (overrides env)", async () => {
+    let auth = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        auth = (init?.headers as Record<string, string>)["Authorization"] ?? "";
+        return rerankResponse([{ index: 0, relevance_score: 1 }]);
+      }),
+    );
+
+    await voyageRerank("q", ["x"], { apiKey: "explicit-key" });
+    expect(auth).toBe("Bearer explicit-key");
+  });
+});
+
+describe("rankStyleExemplars", () => {
+  type Exemplar = { id: string; text: string };
+
+  it("reorders candidate objects best-first on the success path", async () => {
+    process.env["VOYAGE_API_KEY"] = "k";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        rerankResponse([
+          { index: 2, relevance_score: 0.99 },
+          { index: 0, relevance_score: 0.5 },
+          { index: 1, relevance_score: 0.1 },
+        ]),
+      ),
+    );
+
+    const candidates: Exemplar[] = [
+      { id: "one", text: "alpha" },
+      { id: "two", text: "beta" },
+      { id: "three", text: "gamma" },
+    ];
+    const out = await rankStyleExemplars("q", candidates, (c) => c.text);
+    expect(out.map((c) => c.id)).toEqual(["three", "one", "two"]);
+  });
+
+  it("falls back to original order when rerank fails open (no key)", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+    const candidates: Exemplar[] = [
+      { id: "one", text: "alpha" },
+      { id: "two", text: "beta" },
+    ];
+    const out = await rankStyleExemplars("q", candidates, (c) => c.text);
+    expect(out.map((c) => c.id)).toEqual(["one", "two"]);
+  });
+
+  it("returns [] for no candidates", async () => {
+    const out = await rankStyleExemplars("q", [] as Exemplar[], (c) => c.text);
+    expect(out).toEqual([]);
+  });
+
+  it("respects topK", async () => {
+    process.env["VOYAGE_API_KEY"] = "k";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        rerankResponse([
+          { index: 1, relevance_score: 0.9 },
+          { index: 0, relevance_score: 0.8 },
+        ]),
+      ),
+    );
+    const candidates: Exemplar[] = [
+      { id: "one", text: "alpha" },
+      { id: "two", text: "beta" },
+      { id: "three", text: "gamma" },
+    ];
+    const out = await rankStyleExemplars("q", candidates, (c) => c.text, { topK: 2 });
+    expect(out.map((c) => c.id)).toEqual(["two", "one"]);
+  });
+});
