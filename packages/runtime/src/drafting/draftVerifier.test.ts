@@ -1598,3 +1598,33 @@ describe("Jev task-fit policy", () => {
     expect(relevance).toContain("every draft");
     expect(relevance).toMatch(/only.*(?:X public reply|public X reply)/i);
     expect(relevance).toMatch(/does not apply to DMs or reposts/i);
+    expect(verdict).toMatchObject({ pass: false, judgeOk: true, judgeProvider: "jev" });
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a mixed post/reply set as an original-post task", async () => {
+    let relevance = "";
+    await verifyDrafts([reply("so real"), { kind: "post", angle: null, body: "Small fixes compound" }], ctx, goodJudge, {
+      jevRun: async (request) => { relevance = request.questions.relevance!.instructions; return allClear(request); },
+    });
+    expect(relevance).not.toContain("Grade the post against the requested premise");
+    expect(relevance).toContain("every draft respond specifically to the source post");
+  });
+
+  it("repairs a rejected X reaction for actual fit without always requiring added detail", async () => {
+    const legacy = vi.fn(goodJudge);
+    const verdict = await verifyDrafts([reply("crypto changes everything")], ctx, legacy, {
+      jevRun: async () => ({ answers: {
+        voice: { type: "boolean", probability: 0.93 },
+        grounding: { type: "boolean", probability: 0.93 },
+        relevance: { type: "boolean", probability: 0.2 },
+      } }),
+    });
+    expect(verdict).toMatchObject({ pass: false, judgeOk: true, judgeProvider: "jev" });
+    expect(verdict.fix).toMatch(/reaction.*fits.*moment.*energy/i);
+    expect(verdict.fix).toMatch(/unrelated|generic praise/i);
+    expect(verdict.fix).toContain("Do not require unique nouns or an added explanation");
+    expect(verdict.fix).not.toContain("Respond to one concrete detail in the original post");
+    expect(legacy).not.toHaveBeenCalled();
+  });
+});
