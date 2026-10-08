@@ -198,3 +198,105 @@ describe("createBackendJsonFn", () => {
   it("reduces the provider deadline by time spent on admission", async () => {
     let clock = 0; vi.spyOn(performance, "now").mockImplementation(() => clock);
     const rows: SpendRow[] = []; const admit = vi.fn(async () => { clock = 5; return { attemptId: "a" }; });
+    const call = vi.fn<EngineBackend["call"]>(async () => ({ text: '{}', usage: { input_tokens: 0, output_tokens: 0 } }));
+    expect(await createBackendJsonFn({ call }, "claude-sonnet-4-6", { timeoutMs: 20, metering: metering(rows, admit) })("system", "prompt")).toEqual({});
+    expect(call.mock.calls[0]?.[0]).toMatchObject({ timeoutMs: 15 }); expect(rows).toHaveLength(1);
+  });
+  it("awaits an admitted receipt before returning an expired output outcome", async () => {
+    vi.useFakeTimers(); let release!: () => void; let recording = false; let settled = false;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const rows: SpendRow[] = []; const scope = metering(rows);
+    scope.recorder.record = async row => { recording = true; await blocked; rows.push(row); };
+    const call = vi.fn<EngineBackend["call"]>(async () => ({ text: '{}', usage: { input_tokens: 1, output_tokens: 1 } }));
+    const pending = createBackendJsonFn({ call }, "claude-sonnet-4-6", { timeoutMs: 10, metering: scope })("system", "prompt")
+      .then(value => { settled = true; return value; });
+    try {
+      await vi.advanceTimersByTimeAsync(20);
+      expect(recording).toBe(true); expect(settled).toBe(false);
+    } finally { release(); await pending; }
+    expect(await pending).toBeNull(); expect(call).toHaveBeenCalledOnce(); expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "ok", costBasis: "token_estimate", attemptId: "a" });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("createVertexJsonFn request compatibility", () => {
+  it("keeps key precedence, combined prompt and configured temperature", async () => {
+    let request: RequestInit | undefined; let url = "";
+    const auth = { getAccessToken: vi.fn(async () => "unused") };
+    const json = createVertexJsonFn({ project: "", apiKey: "fixture", authClient: auth, temperature: 0.37,
+      fetchImpl: async (input, init) => {
+        url = String(input); request = init;
+        return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: '```json\n{"saved":true}\n```' }] } }] }));
+      } });
+    expect(await json("system", "user")).toEqual({ saved: true });
+    expect(auth.getAccessToken).not.toHaveBeenCalled();
+    expect(url).toContain("/models/gemini-2.5-flash:generateContent?key=fixture");
+    expect(JSON.parse(String(request?.body))).toEqual({ contents: [{ role: "user", parts: [{ text: "system\n\nuser" }] }],
+      generationConfig: { responseMimeType: "application/json", temperature: 0.37 } });
+  });
+  it("keeps separate Vertex system instructions, model and default temperature", async () => {
+    let request: RequestInit | undefined; let url = "";
+    const json = createVertexJsonFn({ project: "project", location: "region", model: "saved-model",
+      authClient: { getAccessToken: async () => "saved-token" }, fetchImpl: async (input, init) => {
+        url = String(input); request = init;
+        return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Before {"saved":true} after' }] } }] }));
+      } });
+    expect(await json("system", "user")).toEqual({ saved: true });
+    expect(url).toContain("region-aiplatform.googleapis.com/v1/projects/project/locations/region/publishers/google/models/saved-model");
+    expect(new Headers(request?.headers).get("authorization")).toBe("Bearer saved-token");
+    expect(JSON.parse(String(request?.body))).toEqual({ systemInstruction: { parts: [{ text: "system" }] },
+      contents: [{ role: "user", parts: [{ text: "user" }] }], generationConfig: { responseMimeType: "application/json", temperature: 0.5 } });
+  });
+});
+
+describe("createScripter", () => {
+  it("passes structure guidance into Nova's script generation prompt", async () => {
+    let seenSystem = "";
+    const scripter = createScripter(async (system) => {
+      seenSystem = system;
+      return {
+        hook: "Ship the rough version",
+        structure: [{ tStart: 0, tEnd: 3, purpose: "hook", line: "Ship the rough version." }],
+        script: "Ship the rough version.",
+        transitions: [{ at: "0", type: "cut" }],
+        sounds: [{ name: "quiet beat", trending: false }],
+        graphSpecs: [],
+      };
+    });
+
+    await scripter.script({ hook: "ship", concept: "iterate", objective: null, profiles: [], exemplars: [] });
+
+    expect(seenSystem).toContain("Let the content earn its ending");
+    expect(seenSystem).toContain("Use specific names, numbers, references, feelings or anecdotes only when relevant and supported");
+  });
+});
+
+describe("createIdeator", () => {
+  it("passes structure guidance into Nova's idea generation prompt", async () => {
+    let seenSystem = "";
+    const ideator = createIdeator(async (system) => {
+      seenSystem = system;
+      return { ideas: [{ hook: "h", concept: "c", angle: "a", pillar: "p", inspirationClipIds: ["x"] }] };
+    });
+
+    await ideator.ideate({ objective: "grow", count: 1, profiles: [], clips: [] });
+
+    expect(seenSystem).toContain("Let the content earn its ending");
+    expect(seenSystem).toContain("With missing facts, omit the detail instead of inventing it");
+  });
+
+  it("validates and returns ideas from the injected json fn", async () => {
+    const ideator = createIdeator(async () => ({
+      ideas: [{ hook: "h", concept: "c", angle: "a", pillar: "p", inspirationClipIds: ["x"] }],
+    }));
+    const out = await ideator.ideate({ objective: "grow", count: 1, profiles: [], clips: [] });
+    expect(out?.ideas).toHaveLength(1);
+    expect(out?.ideas[0]?.hook).toBe("h");
+  });
+
+  it("returns null when the json fn yields null (fail-open)", async () => {
+    const ideator = createIdeator(async () => null);
+    await expect(ideator.ideate({ objective: null, count: 3, profiles: [], clips: [] })).resolves.toBeNull();
+  });
+});
