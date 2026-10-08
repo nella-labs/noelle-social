@@ -398,3 +398,99 @@ function InboxRow({
           {alreadyScheduled ? (
           <div style={{ marginTop: 4 }}>
             <AutoSendChip targetAt={row.approval.auto_send_target_at!} />
+          </div>
+          ) : null}
+          {readinessBadge}
+      </Link>
+      <Link
+        href={`/app/${orgSlug}/approvals/${row.approval.id}${filterQuery}`}
+        className="inbox-preview"
+        style={{ textDecoration: "none", color: "inherit" }}
+      >
+        &ldquo;{preview}&rdquo;
+      </Link>
+      <div className="inbox-time">{pushed}</div>
+      <div style={{ textAlign: "right" }}>
+        <span className={tier === "T1" ? "tag tag-acc" : "tag"} style={{ height: 20 }}>
+          {tier ?? "—"}
+        </span>
+      </div>
+      <div
+        style={{ textAlign: "right", fontFamily: "var(--mono)", fontSize: 12, color: scoreColor }}
+        title={score == null ? "No score yet" : `Classifier score · ${score.toFixed(3)}`}
+      >
+        {scoreLabel != null ? scoreLabel : "—"}
+      </div>
+      {isSkipped ? (
+        <button
+          type="button"
+          onClick={onUnskip}
+          disabled={busy}
+          title="Un-skip — return this lead to the pending queue"
+          className="inbox-rowbtn"
+          style={{
+            justifySelf: "center",
+            border: "none",
+            background: "transparent",
+            cursor: busy ? "default" : "pointer",
+            color: "var(--ink-muted)",
+            fontSize: 14,
+            lineHeight: 1,
+            padding: 4,
+          }}
+        >
+          ↩
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={onSkip}
+          disabled={busy}
+          title="Skip — remove this lead from the queue (reversible under Status → Skipped)"
+          className="inbox-rowbtn"
+          style={{
+            justifySelf: "center",
+            border: "none",
+            background: "transparent",
+            cursor: busy ? "default" : "pointer",
+            color: "var(--ink-muted)",
+            fontSize: 15,
+            lineHeight: 1,
+            padding: 4,
+          }}
+        >
+          ✕
+        </button>
+      )}
+    </div>
+  );
+
+  if (!replyUrl) return inboxRow;
+
+  return (
+    <div style={{ position: "relative" }}>
+      {inboxRow}
+      <a
+        href={replyUrl}
+        target="_blank"
+        rel="noreferrer"
+        className="tag tag-acc"
+        title="Open Vega's reply on X"
+        style={{
+          position: "absolute",
+          top: "50%",
+          right: 8,
+          transform: "translateY(-50%)",
+          zIndex: 2,
+          fontSize: 10,
+          height: 18,
+          textDecoration: "none",
+          background: "var(--paper)",
+          boxShadow: "0 0 0 4px var(--paper)",
+        }}
+      >
+        on X ↗
+      </a>
+    </div>
+  );
+}
