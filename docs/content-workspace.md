@@ -398,3 +398,5 @@ also requires repair, so storage cannot truncate a checked idea afterward.
 
 The shared gate lives in `packages/runtime/src/ideaQuality.ts`; prompt guidance
 lives in `packages/runtime/src/antiAiWriting.ts`. These checks catch known wording
+patterns. They do not certify factual accuracy or originality. Existing stored
+ideas and manually supplied ideas are not rewritten by this change.

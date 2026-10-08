@@ -198,3 +198,201 @@ than trusted from the model, and only a `substantial` lead carries one.
 
 The per-instance bar is `agent_instances.classifier_threshold` (mig 0042) and
 falls back to `X_Q_THRESHOLD`. That column has been wired for Lyra and Orion
+since #184/#230; Vega ignored it, so the dashboard's strictness control silently
+did nothing for the X intern.
+
+### Watchlist leads are classified, not bypassed
+
+A watchlist lead used to skip the classifier entirely with a forged `score=1`
+and `tier=T1`, so ~70% of drafted output was never graded. It is now classified
+like any other lead and merely **protected**: a `skip` verdict is clamped to
+`light` rather than dropped, because the person is the gate, not the post.
+
+Guards that keep that honest:
+
+- an **off-topic floor** — the rescue only fires at or above
+  `NOELLE_X_CLAMP_MIN_Q` (default 25), so a hand-picked person's off-topic or
+  promo post is still a skip;
+- a **null `q`** (a scoring outage) clears the floor;
+- the **AI-slop detector and the follower floor are exempted for a priority
+  lead**. Both grade STRANGERS, and the old bypass short-circuited them, so
+  removing it without this would have quietly made them terminal for watched
+  authors. Measured on the live data before the exemption landed: 56 of 2813
+  priority leads trip the slop detector and 11 would have been dropped — 10 of
+  which had actually been drafted and sent. Both verdicts are still recorded in
+  `classifierMeta` for auditing; they simply stop being fatal for someone the
+  operator chose.
+
+The only ways a priority lead is now dropped are the ones that applied before
+too: it is too old, it is non-English, or it is off-topic below the clamp floor.
+
+On X, `priority=true` already means "the author is in the watchlist people list
+and posted on/after the day they were added", so unlike LinkedIn there is no
+`payload.source` discriminator to apply: every X priority lead is hand-picked by
+construction. This costs one classifier call per watchlist lead that the bypass
+used to avoid.
+
+### The light lane
+
+`reply_kind='light'` routes to a SHORT warm reaction (a ship, a launch, a
+personal win) instead of a substantive take. It reuses the shape machinery
+rather than a second prompt: shapes that cannot carry a congrats are excluded,
+a be-warm-and-brief directive is added, and `allowCelebration` stops the
+verifier grading genuine warmth as forced cheer.
+
+### ICP author gate
+
+When `icp_config.headlineKeywords` is set, a non-priority author whose **bio**
+clearly does not match is dropped before the LLM call. Two differences from
+Lyra's headline gate, both platform-driven:
+
+- **priority leads are exempt** — the operator already chose them;
+- **a missing bio fails OPEN**, because the Apify actor does not reliably return
+  one. Failing closed (Lyra's behaviour, correct for Voyager profiles which
+  always carry a headline) would silently drop the entire keyword lane the first
+  time the actor changed its payload shape.
+
+### Discovery
+
+- The **engagement floor (`minFaves`) is keyword-lane only.** It is a heuristic
+  for trawling strangers; on the watch lane the person is already the gate, and
+  quality is now judged downstream on content.
+- The watch-lane fetch is narrowed to `max(window, added_at)`. Apify bills per
+  item and pre-`added_at` posts are discarded anyway.
+- `X_WATCHLIST_REPOLL_HOURS` now defaults to **2** (was 0, i.e. the gate shipped
+  inert and never fired). Vega has no dual-role targeting handles, so every
+  watch person was re-polled on every tick.
+- A dead Apify pool now **pages the operator**. Both discovery lanes re-throw
+  `AllApifyTokensExhaustedError` instead of swallowing it as a per-source
+  failure, which is what made the existing handler unreachable (#494: discovery
+  dead ~25h, symptom was an approvals queue draining to zero).
+- Goal-runs have a **stall guard**: a target the watchlist can never reach
+  auto-pauses after 2h of no new replies instead of polling Apify forever.
+
+### DMs ladder up
+
+The on-demand DM was a one-shot cold pitch every time. Note the SYSTEM prompt
+declares the DM "is where the actual pitch lives" and mandates the site + install
+lines, so a per-lead rung directive in the user prompt could not beat it — every
+rung below Invite now also appends a hard DM-pitch override to the system prompt,
+last, where it wins. It is now the next rung
+of four, chosen by how many DMs were already SENT to that person: Open → Deepen
+→ Bridge → Invite, and only the top rung may propose a call. Prior DMs to that
+person are injected so a later rung cannot reuse an earlier opener. Any DB error
+counts 0 sent, so an unknown person starts at rung 1 rather than being invited
+to a call on first contact.
+
+### Model escalation
+
+`useOpus = likes > X_OPUS_LIKES || (replies > X_OPUS_REPLIES && !comment_bait)`.
+Suppressing the replies trigger on an engagement-bait post is the load-bearing
+half: otherwise a "comment WORD below" giveaway reliably buys itself the
+expensive model on a reply count inflated with junk. Both thresholds at 0
+disables escalation.
+
+---
+
+## Person-first discovery (2026-07-26)
+
+Vega's lead model was entirely POST-first: the keyword lane found tweets, minted
+leads from the good ones, and threw the author away. Someone who clearly matched
+the ICP but whose current tweet was not reply-worthy left no trace and had to be
+rediscovered from scratch every time. Lyra has retained qualified people since
+#185; this is the X analogue.
+
+**It is not a literal port, because X has no people-search.** Lyra's Feeder A
+calls a LinkedIn profile-search actor; the X client exposes only `userTweets`,
+`searchTimeline` and `conversationReplies`. So candidates come from the authors
+already surfaced by the keyword lane, gated on their BIO.
+
+How it works:
+
+1. **Retain.** Any keyword-lane author whose bio matches `icp_config` is upserted
+   into `noelle.x_discovered_people` (mig 0090), idempotent on
+   (instance, handle), bumping `seen_count` on every re-sighting.
+2. **Poll.** On later ticks the least-recently-polled candidates join the SAME
+   source ring as the watchlist handles, so they inherit the tick budget, the
+   rate bucket, the cursor rotation and the re-poll machinery instead of running
+   in a parallel loop. Their posts become ordinary **non-priority** leads.
+
+Deliberate asymmetries, each for a reason:
+
+- **Retention fails CLOSED on an unknown bio**, while the classifier's ICP gate
+  fails OPEN. Opposite trades: dropping the whole keyword lane because the actor
+  stopped sending bios would be catastrophic, whereas filling a speculative
+  prospect list with unvetted handles just spends Apify budget polling strangers.
+- **Watchlist people are never retained** — the watchlist already holds them, and
+  a handle in both lists is polled once, not twice.
+- **The lane is off on a paused (watchlist-only) tick.** Paused means the
+  operator turned the keyword lane off; speculative polling would spend their
+  budget on people they never chose.
+- **A candidate is stamped as polled even when their fetch fails**, so a broken
+  timeline cools down instead of sitting at the front of the never-polled queue
+  and being retried every tick.
+- **It requires `icp_config`.** With no "right person" test there is nothing to
+  qualify on, and retaining every author would be an expensive way to poll
+  strangers. `readIcpGate` is shared with the classifier so "in-ICP" means one
+  thing in both places.
+
+This is distinct from watchlist auto-promotion, which is post-first and slow: it
+promotes an author into the always-reply watchlist only after N drafted replies.
+The person lane keeps *candidates*, gated on who they are, and polls them as
+ordinary leads.
+
+Knobs: `X_PERSON_LANE_ENABLED` (default on), `X_PERSON_POLL_PER_TICK` (3 — each
+costs one Apify run), `X_PERSON_POLL_COOLDOWN_HOURS` (12).
+
+### The follower feeder (person DISCOVERY)
+
+Retention above answers "keep the good people we already bumped into". The
+feeder answers "go find people we have never seen".
+
+Lyra does this with a LinkedIn profile-search actor. X has no keyword→user
+search actor that is trustworthy on a free Apify plan: the best feature fit is
+`apidojo/twitter-user-scraper`, but that is the same publisher this repo
+migrated OFF on 2026-06-23 for silently returning `{demo:true}` placeholders to
+FREE-plan tokens while still charging. Re-taking that trade for a load-bearing
+lane is not worth it.
+
+So Vega discovers people from **audiences** instead, via
+`kaitoeasyapi/premium-x-follower-scraper-following-data` — the same publisher as
+the tweet actor, which is the one proven to return real data on free tokens. It
+needs no login, no cookies and no proxy setup, and every record carries the bio
+the ICP gate qualifies on.
+
+Arguably a better signal than keyword search: a bio match finds people who
+*describe* themselves a certain way; the follower list of an account your ICP
+already reads *is* that audience.
+
+**Seeds** come from `icp_config.seedHandles` when set, else the operator's own
+watchlist (accounts they already chose). A cursor rotates through them so a long
+list is covered over successive runs instead of re-harvesting seed 0 forever.
+
+**Cost is the whole design constraint.** Unlike every other discovery knob this
+one spends per RUN, not per useful lead, and the actor floors its list at 200
+users. With the shipped defaults:
+
+| | |
+|---|---|
+| per run (200 users @ ~$0.15/1K) | **$0.03** |
+| per day (1 run) | **$0.03** |
+| per month | **$0.90** — 18% of one $5 free-tier token |
+| **if the throttle ever failed** (every 5-min tick) | **$8.64/day ≈ 52× a token/month** |
+
+That last row is why the throttle is built the way it is:
+
+- the stamp lives on the **bus**, not in process memory — the worker restarts on
+  every deploy tick, and an in-memory stamp would let each restart re-trigger a
+  paid run;
+- it is written **before** the run, so a crash mid-harvest cannot leave the
+  feeder eligible again on the very next tick;
+- an **unparseable stamp means skip**, not run, so a bus glitch costs nothing.
+
+It also ships **default OFF** (`X_FOLLOWER_FEEDER_ENABLED`) and requires
+`icp_config`, because with no "right person" test it would retain everyone it
+paid for. Knobs: `X_FOLLOWER_FEEDER_INTERVAL_HOURS` (24),
+`X_FOLLOWER_FEEDER_MAX_USERS` (200), `X_FOLLOWER_FEEDER_SEEDS_PER_RUN` (1).
+
+Spend is metered as actor `premium-x-follower-scraper` so this lane's cost shows
+next to the rest of discovery's, priced from Apify's own `usageTotalUsd` when the
+run reports it.
