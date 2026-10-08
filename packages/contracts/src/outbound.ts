@@ -198,3 +198,4 @@ export const OutboundCapReachedSchema = z.object({
   active: z.number().int().nonnegative(),
   cap: z.number().int().nonnegative(),
 });
+export type OutboundCapReached = z.infer<typeof OutboundCapReachedSchema>;
