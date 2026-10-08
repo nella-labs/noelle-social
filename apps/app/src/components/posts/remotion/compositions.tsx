@@ -198,3 +198,23 @@ export function DraftReel({ specs, hook }: { specs: RemotionAssetSpec[]; hook?: 
 
 /** Total frames a DraftReel runs for (hook caption + each visual). */
 export function draftReelDuration(specs: RemotionAssetSpec[], hook?: string): number {
+  const base = hook && hook.trim() ? 90 : 0;
+  return Math.max(1, base + specs.reduce((n, s) => n + s.durationFrames, 0));
+}
+
+/** Dispatch a RemotionAssetSpec to its composition. The single entry the Player mounts. */
+export function VisualComposition({ spec }: { spec: RemotionAssetSpec }) {
+  const accent = ("brandColor" in spec && spec.brandColor) || RUST;
+  switch (spec.kind) {
+    case "bar_chart":
+      return <BarChart spec={spec} accent={accent} />;
+    case "line_chart":
+      return <LineChart spec={spec} accent={accent} />;
+    case "kinetic_caption":
+      return <KineticCaption spec={spec} accent={accent} />;
+    case "lower_third":
+      return <LowerThird spec={spec} accent={accent} />;
+    default:
+      return <Frame>{null}</Frame>;
+  }
+}
