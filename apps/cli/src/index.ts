@@ -1998,3 +1998,203 @@ async function probeHttp(url: string): Promise<boolean> {
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
     return res.status < 500;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForHttp(url: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await probeHttp(url)) return true;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  return false;
+}
+
+// `noelle content push` — push generated ideas/drafts into the local noelle
+// api-vm over the HMAC bridge. The operator/skills side of the content
+// ingestion path (mirrors how the server workers write the same contract).
+async function cmdContent(args: Args): Promise<number> {
+  const sub = args._[1];
+  if (sub !== "push") {
+    ui.err(
+      `unknown content subcommand: ${sub ?? "(none)"} — try: noelle content push --kind ideas`,
+    );
+    return 1;
+  }
+
+  const kind = str(args.flags, "kind");
+  if (kind !== "ideas" && kind !== "draft") {
+    ui.err("--kind must be 'ideas' or 'draft'");
+    return 1;
+  }
+
+  const config = loadConfig() ?? defaultConfig();
+  const p = paths();
+  let fileEnv: Record<string, string> = {};
+  try {
+    fileEnv = readEnvFile(p.envFile);
+  } catch {
+    // No ~/.noelle/.env yet — fall back to the process env.
+  }
+  const env = { ...process.env, ...fileEnv };
+
+  const apiUrl =
+    str(args.flags, "api-url") ?? env.NOELLE_API_URL ?? `http://127.0.0.1:${config.ports.apiVm}`;
+  const hmacSecret = env.NOELLE_HMAC_SECRET;
+  if (!hmacSecret) {
+    ui.err("NOELLE_HMAC_SECRET is not set (looked in ~/.noelle/.env and the environment)");
+    return 1;
+  }
+
+  try {
+    const payload = await readPayload(str(args.flags, "file"));
+    const { result } = await pushContent({
+      kind,
+      payload,
+      platform: str(args.flags, "platform"),
+      deps: { apiUrl, hmacSecret },
+    });
+    ui.ok(`pushed ${kind} → ${apiUrl}`);
+    ui.plain(JSON.stringify(result));
+    return 0;
+  } catch (e) {
+    ui.err(`content push failed: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
+}
+
+function printHelp(): void {
+  ui.plain(`noelle ${VERSION} — self-hosted Noelle on your VM
+
+Usage: noelle <command> [flags]
+
+Commands:
+  init        Provision Postgres, apply schema, seed operator, write config
+  up          Start Postgres → api-vm → dashboard (workers if enabled)
+  down        Stop services (--purge also removes the Postgres container)
+  migrate     Re-apply schema + re-seed (idempotent)
+  status      Show service + process health (--json for machine output)
+  logs [svc]  Tail process logs
+  health      One-shot health probe (exit non-zero on failure)
+  tunnel      Open a Cloudflare quick tunnel to the dashboard
+  expose [--off] [--mode https|http] [--port <n>]   publish over Tailscale (phone access; --port for a non-443 listener)
+  autostart <install|uninstall|status> start the VM + Noelle on Mac login (LaunchAgent)
+  autoupdate <install|uninstall|status> [--branch <b>] [--interval <min>]  keep the VM tracking a branch
+  deploy [status|log] [--force] [--vm <name>]   manual deploy / drift + lock status / recent deploys
+  worktrees prune [--force]     remove agent worktrees fully merged to origin/main + clean
+  sync        internal: the locked deploy pipeline (run by the auto-update agent)
+  doctor [status|start|logs [n]]   bare: self-host preflight; sub: actuator-doctor watchdog
+  bridge <status|start|logs [n]>   Chrome Bridge control server (Claude's hands on Chrome)
+  vega <enable|disable|status>  X-intern lifecycle + spend cap
+  vega style <add|remove|pin|unpin|run|list>   Account Feeder — pick the voice of Vega's posts
+  lyra followup <profile>       connection follow-up: scrape a new connection's
+                                posts + comments → talking points, genuine
+                                questions, and a warm follow-up DM (draft-only)
+                                [--posts N] [--comments N] [--json]
+  brand <init|apply|show>       set questions + message styles (tailors replies + DMs)
+  rollup [--watch]              aggregate llm_calls → org_spend_month (fixes the budget figures)
+  content push --kind <ideas|draft> [--platform <linkedin|x|reddit>] [--file <path>]
+                                push generated ideas/drafts into noelle (HMAC; reads stdin if no --file)
+
+init flags:
+  --provider <anthropic|openai|codex|vertex|bedrock>   LLM provider (default anthropic)
+  --email <addr>   --name <display>   --org <slug>     operator identity
+  --vault-dir <dir>      local markdown vault for voice anchors (BM25, no GCP)
+  --voice-dirs <a,b,c>   scope drafter retrieval to these vault subdirs (curated
+                         voice base; default indexes the whole vault-dir)
+  --budget-cents <n>     X-intern LLM spend cap in cents (default 2500 = $25)
+  --workers              build + autostart discovery/classifier/drafter (send stays off)
+  --pg <docker|native>                                 Postgres mode (default: auto-detect)
+  --port-app <n>   --port-api <n>                      ports (default 3001 / 18791)
+  --workers                                            enable the X-intern worker pool
+
+Provider keys are read from the environment (e.g. ANTHROPIC_API_KEY) at init time.
+Everything generated lives under ~/.noelle (override with NOELLE_HOME).`);
+}
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+  const cmd = args._[0];
+  let code = 0;
+  switch (cmd) {
+    case "init":
+      code = await cmdInit(args);
+      break;
+    case "up":
+      code = await cmdUp(args);
+      break;
+    case "down":
+      code = await cmdDown(args);
+      break;
+    case "migrate":
+      code = await cmdMigrate();
+      break;
+    case "status":
+      code = await cmdStatus(args);
+      break;
+    case "logs":
+      code = await cmdLogs(args);
+      break;
+    case "health":
+      code = await cmdHealth();
+      break;
+    case "tunnel":
+      code = await cmdTunnel();
+      break;
+    case "expose":
+      code = await cmdExpose(args);
+      break;
+    case "autostart":
+      code = await cmdAutostart(args);
+      break;
+    case "autostart-run":
+      code = await cmdAutostartRun(args);
+      break;
+    case "autoupdate":
+      code = await cmdAutoupdate(args);
+      break;
+    case "sync":
+      code = await cmdSync(args);
+      break;
+    case "deploy":
+      code = await cmdDeploy(args);
+      break;
+    case "worktrees":
+      code = await cmdWorktrees(args);
+      break;
+    case "doctor":
+      code = await cmdDoctor(args);
+      break;
+    case "bridge":
+      code = await cmdBridge(args);
+      break;
+    case "vega":
+      code = await cmdVega(args);
+      break;
+    case "lyra":
+      code = await cmdLyra(args);
+      break;
+    case "brand":
+      code = await cmdBrand(args);
+      break;
+    case "rollup":
+      code = await cmdRollup(args);
+      break;
+    case "content":
+      code = await cmdContent(args);
+      break;
+    case undefined:
+    case "help":
+    case "--help":
+    case "-h":
+      printHelp();
+      break;
+    case "version":
+    case "--version":
+    case "-v":
+      ui.plain(VERSION);
+      break;
+    default:
+      ui.err(`unknown command: ${cmd}`);
