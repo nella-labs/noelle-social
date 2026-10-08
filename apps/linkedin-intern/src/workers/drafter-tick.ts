@@ -998,3 +998,203 @@ export async function runDrafterTick(args: RunDrafterTickArgs): Promise<number> 
       }
       // Reserve the light budget slot so the next lead in this pass sees the
       // right cap (mirrors how the original sequential loop worked).
+      if (!replyRequest) budgetLeft.light--;
+    } catch (err) {
+      if (err instanceof BudgetExceededError) {
+        log.warn(
+          { leadId: lead.id, layer: err.layer, spent_cents: err.spentCents, cap_cents: err.capCents },
+          "drafter blocked by budget cap; deferring lead, will retry",
+        );
+        budgetBlown = true;
+        await deferLeadToClassified({ sql, leadId: lead.id, replyKind: "light", reason: "budget" });
+        continue;
+      }
+      log.error({ leadId: lead.id, err: (err as Error).message }, "drafter tick failed for light lead during pre-compute");
+      await markStatus({ leadId: lead.id, status: "errored", meta: { error: (err as Error).message } });
+    }
+  }
+
+  // One line per kind per tick, instead of one per deferred lead (see cap gate).
+  for (const kind of ["substantial", "light"] as const) {
+    const ids = capDeferred[kind];
+    if (ids.length === 0) continue;
+    log.info(
+      {
+        replyKind: kind,
+        cap: kind === "light" ? lightCap : substantialCap,
+        deferred: ids.length,
+        leadIds: ids.slice(0, 20),
+      },
+      "daily draft cap reached for kind; leaving leads classified for a later day",
+    );
+  }
+
+  // ── Batched LIGHT path ────────────────────────────────────────────────────
+  // One call for all batchable light leads. Fail-open: any parse failure /
+  // count mismatch / id mismatch / model error → fall back to per-lead single
+  // calls so no lead is dropped or cross-wired.
+  if (batchableLights.length > 0) {
+    const batchIds = batchableLights.map((ctx) => ctx.lead.id);
+    log.info({ count: batchableLights.length, ids: batchIds }, "drafter: running batched light call");
+    let batchFellBack = false;
+    let batchResult: { replies: z.infer<typeof BatchedLightOutput>; engine: string; model: string } | null = null;
+    try {
+      // Build the batched inputs (one per lead with its own context).
+      // renderStyleBlock is sync (already imported at the top of this file).
+      const batchInputs: BatchedLightLeadInput[] = batchableLights.map((ctx) => ({
+        id: ctx.lead.id,
+        postText: ctx.postText,
+        authorName: ctx.payload.authorName ?? null,
+        publicId: ctx.payload.authorPublicId ?? ctx.lead.author_handle ?? null,
+        styleBlock: ctx.styleForLead ? renderStyleBlock(ctx.styleForLead, ctx.postRegister, ctx.faithful) : "",
+        anchors: ctx.anchors.map((a) => a.snippet),
+        knowledgeAnchors: ctx.knowledgeAnchors,
+        imageCaption: ctx.imageCaption,
+        commentDigest: ctx.commentDigest,
+        registerBlock: ctx.registerBlock,
+        // The per-lead SHAPE. Without this the batched lane was the one place a
+        // light reply still had no form directive at all, so batched drafts all
+        // came back at the suffix's default ~90-180 band.
+        shapeBlock: ctx.shapeBlock,
+        openingMoveBlock: ctx.openingMoveBlock,
+        genzBlock: ctx.genzBlock,
+        priorReplies: ctx.priorReplies,
+        recentPhrasings,
+      }));
+
+      // Use the base routing (never Opus — all batchable leads are non-Opus).
+      // The batched system prompt = the light drafter system + the batched-mode suffix.
+      const batchSystem =
+        buildLightDrafterSystem(instance.objective, null, brand, null) +
+        BATCHED_LIGHT_SYSTEM_SUFFIX;
+      const batchPrompt = renderBatchedLightUserPrompt(batchInputs);
+
+      const res = await runner.draft({
+        bucket: "drafter-codex",
+        routing: baseRouting,
+        orgId: instance.org_id,
+        instanceId: instance.id,
+        worker: "drafter" as const,
+        agentRole: "linkedin_intern" as const,
+        system: batchSystem,
+        prompt: batchPrompt,
+      });
+
+      // Parse: expect a JSON array. Try bracket-extraction on failure.
+      const parsed = parseBatchedLightOutput(res.text, batchableLights.length, batchIds, log);
+      if (!parsed) {
+        log.warn(
+          { count: batchableLights.length, raw: res.text.slice(0, 300) },
+          "batched light: parse failed — falling back to per-lead single calls",
+        );
+        batchFellBack = true;
+      } else {
+        batchResult = { replies: parsed, engine: res.engine, model: res.model };
+      }
+    } catch (err) {
+      if (err instanceof BudgetExceededError) {
+        log.warn(
+          { layer: err.layer, spent_cents: err.spentCents, cap_cents: err.capCents },
+          "batched light: blocked by budget cap; deferring the batch, will retry",
+        );
+        // The batch call is what proved the org cap is spent, so record it here:
+        // the fallback below then defers every batched lead without re-trying a
+        // call we already know throws. (Non-budget failures still fall back and
+        // retry per lead — that path is unchanged.)
+        budgetBlown = true;
+        batchFellBack = true;
+      } else {
+        log.warn(
+          { err: (err as Error).message },
+          "batched light: call threw — falling back to per-lead single calls",
+        );
+        batchFellBack = true;
+      }
+    }
+
+    if (batchResult) {
+      // Success: distribute results back to each lead.
+      const replyByLeadId = new Map(batchResult.replies.map((e) => [e.id, e.reply]));
+      for (const ctx of batchableLights) {
+        let posted = false;
+        try {
+          const body = replyByLeadId.get(ctx.lead.id);
+          if (!body) {
+            // id missing from output — treat as schema miss, error the lead.
+            log.error(
+              { leadId: ctx.lead.id },
+              "batched light: reply missing from batch output; marking errored",
+            );
+            await markStatus({ leadId: ctx.lead.id, status: "errored", meta: { error: "batch_id_missing" } });
+            continue;
+          }
+          // Apply the same reply policy against this member's own post.
+          const [policed] = applyReplyEmojiPolicy(
+            [
+              {
+                id: randomUUID(),
+                kind: "reply" as const,
+                angle: "empathetic" as const,
+                body,
+              },
+            ],
+            ctx.postText,
+          );
+          if (!policed) {
+            // Nothing sendable left. Skip THIS lead and keep going: an empty
+            // body must never take the rest of the batch down with it.
+            log.warn(
+              { leadId: ctx.lead.id },
+              "batched light: reply was emoji-only and cleaned to empty; skipping this lead",
+            );
+            await markStatus({ leadId: ctx.lead.id, status: "skipped", meta: { reason: "empty-after-emoji-policy" } });
+            continue;
+          }
+          if (makesCommitment(policed.body)) {
+            const reason = commitmentReason(detectCommitments(policed.body)) || "commitment-guard";
+            log.warn({ leadId: ctx.lead.id, reason }, "commitment guard dropped a batched light reply");
+            await markStatus({ leadId: ctx.lead.id, status: "skipped", meta: { skip_reason: reason } });
+            continue;
+          }
+          const replyRow = { ...policed, charCount: [...policed.body].length };
+          const batchedOutbound = buildOutbound({
+            lead: ctx.lead,
+            postText: ctx.postText,
+            payload: ctx.payload,
+            anchors: ctx.anchors,
+            drafts: [replyRow],
+            verifierMeta: null,
+            style: ctx.styleForLead,
+          });
+          if (!batchedOutbound) {
+            log.warn({ leadId: ctx.lead.id }, "batched light: outbound empty; skipping this lead");
+            await markStatus({ leadId: ctx.lead.id, status: "skipped", meta: { reason: "empty-after-emoji-policy" } });
+            continue;
+          }
+          await postOutbound(batchedOutbound);
+          posted = true;
+          processed++;
+          remaining.light--;
+          await markStatus({
+            leadId: ctx.lead.id,
+            status: "drafted",
+            meta: { engine: batchResult.engine, model: batchResult.model, reply_kind: "light", batched: true },
+          });
+          await bus?.emit({
+            topic: "draft.created",
+            worker: "drafter",
+            summary: "drafted light reply (batched)",
+            payload: { lead_id: ctx.lead.id, reply_kind: "light", tier: ctx.lead.tier ?? null, batched: true },
+            correlationId: ctx.lead.id,
+          });
+        } catch {
+          log.error({ leadId: ctx.lead.id, posted }, "batched light: member failed; retaining other results");
+          if (!posted) {
+            await markStatus({ leadId: ctx.lead.id, status: "errored", meta: { error: "batch_member_failed" } })
+              .catch(() => log.warn({ leadId: ctx.lead.id }, "batched light: failed member status unavailable"));
+          }
+        }
+      }
+    }
+
+    if (batchFellBack) {
