@@ -398,3 +398,185 @@ export async function listFeederSourceProfiles(
       from noelle.approvals a
       ${approvalMemoryJoins(fragmentSql)}
       where a.agent_instance_id = ${inst.id} and a.org_id = ${inst.org_id}
+    ), style_usage as (
+      select d.platform, b->>'handle' as handle, count(distinct d.id)::int as drafts_used,
+        avg(case when jsonb_typeof(b->'weight') = 'number' then (b->>'weight')::numeric end)::text as avg_weight
+      from scoped_styles d cross join lateral jsonb_array_elements(d.blend) b
+      where jsonb_typeof(b->'handle') = 'string'
+      group by d.platform, b->>'handle'
+    ), style_totals as (
+      select platform, count(*)::int as total_styled_drafts
+      from scoped_styles where jsonb_array_length(blend) > 0 group by platform
+    )
+    select
+      s.id as source_id, s.platform,
+      s.handle, s.display_name, s.enabled, s.last_pulled_at::text as last_pulled_at,
+      (
+        select count(*)::int from noelle.account_style_posts p
+        where p.agent_instance_id = s.agent_instance_id and p.org_id = s.org_id and p.platform = s.platform
+          and lower(p.account_handle) = lower(s.handle) and p.kind = 'post'
+      ) as post_count,
+      (
+        select count(*)::int from noelle.account_style_posts p
+        where p.agent_instance_id = s.agent_instance_id and p.org_id = s.org_id and p.platform = s.platform
+          and lower(p.account_handle) = lower(s.handle) and p.kind = 'comment'
+      ) as comment_count,
+      contact.person_id as contact_person_id,
+      coalesce(usage.drafts_used, 0) as drafts_used,
+      coalesce(totals.total_styled_drafts, 0) as total_styled_drafts,
+      usage.avg_weight,
+      up.voice_summary, up.tone, up.structure_notes,
+      up.hook_patterns, up.signature_phrases, up.top_topics,
+      up.posts_analyzed, up.model, up.generated_at::text as generated_at
+    from noelle.account_feeder_sources s
+    left join style_usage usage on usage.platform = s.platform and usage.handle = s.handle
+    left join style_totals totals on totals.platform = s.platform
+    left join noelle.account_ultra_profiles up
+      on up.agent_instance_id = s.agent_instance_id and up.platform = s.platform
+      and lower(up.account_handle) = lower(s.handle) and up.org_id = s.org_id
+    -- Resolve the contact this source maps to (suffix-normalized for LinkedIn) so
+    -- the Styles row can deep-link to the person's profile in Contacts.
+    left join lateral (
+      select psa.person_id from noelle.person_social_accounts psa
+      where psa.org_id = s.org_id and psa.platform = s.platform
+        and regexp_replace(lower(psa.handle), '-[0-9a-f]{6,}$', '')
+            = regexp_replace(lower(s.handle), '-[0-9a-f]{6,}$', '')
+      limit 1
+    ) contact on true
+    where s.agent_instance_id = ${inst.id} and s.org_id = ${inst.org_id}
+    order by s.created_at asc
+  `;
+  return rows.map((r) => {
+    const hasProfile = r.voice_summary != null || r.tone != null || (r.posts_analyzed ?? 0) > 0;
+    return {
+      sourceId: r.source_id,
+      platform: r.platform,
+      handle: r.handle,
+      displayName: r.display_name,
+      enabled: r.enabled,
+      lastPulledAt: r.last_pulled_at,
+      postCount: r.post_count,
+      commentCount: r.comment_count,
+      contactPersonId: r.contact_person_id,
+      draftsUsed: r.drafts_used,
+      totalStyledDrafts: r.total_styled_drafts,
+      avgWeight: r.avg_weight !== null && Number.isFinite(Number(r.avg_weight)) ? Number(r.avg_weight) : null,
+      profile: hasProfile
+        ? {
+            voiceSummary: r.voice_summary,
+            tone: r.tone,
+            structureNotes: r.structure_notes,
+            hookPatterns: asStringArray(r.hook_patterns),
+            signaturePhrases: asStringArray(r.signature_phrases),
+            topTopics: asStringArray(r.top_topics),
+            postsAnalyzed: r.posts_analyzed ?? 0,
+            model: r.model,
+            generatedAt: r.generated_at,
+          }
+        : null,
+    };
+  });
+}
+
+/** A sample pulled corpus item, for the Styles page "show the posts pulled" view. */
+export interface StyleSamplePost {
+  handle: string;
+  kind: "post" | "comment";
+  body: string;
+  likeCount: number | null;
+  commentCount: number | null;
+  postedAt: string | null;
+}
+
+/**
+ * Top-`perSource` highest-engagement corpus items per source for an instance —
+ * the actual pulled posts/comments, so the operator can see what the feeder
+ * learned from. Membership-guarded via getAgentInstance.
+ */
+export async function listStyleSamples(
+  instanceId: string,
+  perSource = 4,
+): Promise<StyleSamplePost[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+  const rows = await sql<
+    Array<{
+      account_handle: string;
+      kind: "post" | "comment";
+      body: string;
+      like_count: string | null;
+      comment_count: string | null;
+      posted_at: string | null;
+    }>
+  >`
+    select account_handle, kind, body, like_count::text, comment_count::text, posted_at::text as posted_at
+    from (
+      select p.account_handle, p.kind, p.body, p.like_count, p.comment_count, p.posted_at,
+        row_number() over (
+          partition by p.account_handle
+          order by ${corpusEngagementSql(fragmentSql)} desc nulls last,
+                   p.posted_at desc nulls last,p.id
+        ) as rn
+      from noelle.account_style_posts p
+      join noelle.agent_instances a on a.id=p.agent_instance_id and a.org_id=p.org_id
+      where p.agent_instance_id = ${inst.id} and p.org_id = ${inst.org_id} and p.body <> ''
+    ) r
+    where rn <= ${perSource}
+    order by account_handle, rn
+  `;
+  return rows.map((r) => ({
+    handle: r.account_handle,
+    kind: r.kind,
+    body: r.body,
+    likeCount: readSourceCount(r.like_count),
+    commentCount: readSourceCount(r.comment_count),
+    postedAt: readSourceTimestamp(r.posted_at),
+  }));
+}
+
+/**
+ * All style-source keys (`platform:handle`, lowercased) for an org — for the
+ * contacts LIST to badge which contacts are also Account-Feeder sources without
+ * a per-row query. LinkedIn handles are suffix-normalized (see
+ * normalizeLinkedinHandle) so the key matches a contact merged onto the clean
+ * vanity even when the source is stored under the raw `-<hex>` slug. The
+ * consumer (ContactsBrowser.isStyleSource) normalizes the contact handle the
+ * same way. Org-scoped (same trust model as the other contact reads).
+ */
+export async function listStyleSourceKeysForOrg(orgId: string): Promise<string[]> {
+  const rows = await sql<Array<{ key: string }>>`
+    select distinct (
+      platform || ':' ||
+      case when platform = 'linkedin'
+           then regexp_replace(lower(handle), '-[0-9a-f]{6,}$', '')
+           else lower(handle) end
+    ) as key
+    from noelle.account_feeder_sources
+    where org_id = ${orgId} and handle is not null
+  `;
+  return rows.map((r) => r.key);
+}
+
+/**
+ * Convenience for the agent detail page: source count + a "feeder is configured"
+ * flag (account_feeder_config present) in one membership-guarded round trip.
+ * The card always renders for the LinkedIn intern; the flag just tweaks copy.
+ */
+export const getFeederSummary = cache(async (
+  instanceId: string,
+): Promise<{ sourceCount: number; configured: boolean }> => {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return { sourceCount: 0, configured: false };
+  const [counts] = await sql<Array<{ n: number; configured: boolean }>>`
+    select
+      (
+        select count(*)::int from noelle.account_feeder_sources s
+        where s.agent_instance_id = ${inst.id} and s.org_id = ${inst.org_id}
+      ) as n,
+      (account_feeder_config is not null) as configured
+    from noelle.agent_instances
+    where id = ${inst.id} and org_id = ${inst.org_id}
+    limit 1
+  `;
+  return { sourceCount: counts?.n ?? 0, configured: counts?.configured ?? false };
+});
