@@ -198,3 +198,62 @@ test("close is idempotent and waits for active plus pending work", async () => {
   const { watcher } = start(write);
   emit("change");
   await vi.advanceTimersByTimeAsync(50);
+  emit("change");
+  const closed = watcher.close();
+  expect(watcher.close()).toBe(closed);
+  let settled = false;
+  void closed.then(() => {
+    settled = true;
+  });
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  expect(settled).toBe(false);
+  gate.release();
+  await closed;
+  expect(write).toHaveBeenCalledTimes(2);
+  expect(f.close).toHaveBeenCalledTimes(1);
+});
+test("capacity stops admission and drains accepted work before reporting failure", async () => {
+  const gate = deferred();
+  f.read.mockResolvedValue("body");
+  const write = vi.fn(async () => {
+    if (write.mock.calls.length === 1) await gate.promise;
+  });
+  const { watcher, onFailure, log } = start(write);
+  emit("change");
+  await vi.advanceTimersByTimeAsync(50);
+  for (let i = 0; i < 256; i++) emit("change", `${root}/${i}.md`);
+  emit("change", `${root}/0.md`);
+  emit("change", `${root}/overflow.md`);
+  emit("change", `${root}/rejected.md`);
+  expect(f.close).toHaveBeenCalledTimes(1);
+  expect(onFailure).not.toHaveBeenCalled();
+  expect(log).toHaveBeenCalledWith(expect.stringContaining("256 pending paths"));
+  gate.release();
+  await watcher.close();
+  expect(write).toHaveBeenCalledTimes(257);
+  expect(onFailure).toHaveBeenCalledTimes(1);
+});
+test("a Chokidar close failure still waits for accepted upload work", async () => {
+  const gate = deferred();
+  f.read.mockResolvedValue("body");
+  const { watcher } = start(
+    vi.fn(async () => {
+      await gate.promise;
+    }),
+  );
+  emit("change");
+  await vi.advanceTimersByTimeAsync(50);
+  f.close.mockRejectedValueOnce(Error("inert close failure"));
+  const closed = watcher.close(),
+    rejected = expect(closed).rejects.toThrow("inert close failure");
+  let settled = false;
+  void closed.catch(() => {
+    settled = true;
+  });
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  expect(settled).toBe(false);
+  gate.release();
+  await rejected;
+  // The same rejected close has already been observed; afterEach drains the other watchers.
+  watchers = [];
+});
