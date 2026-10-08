@@ -1,0 +1,23 @@
+[Unit]
+Description=Noelle X intern — profiler worker (instance %i)
+Documentation=file:///opt/noelle/docs/runbook.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=noelle-api
+Group=noelle-api
+WorkingDirectory=/opt/noelle/repo/apps/x-intern
+ExecStart=/opt/noelle/repo/apps/x-intern/run.sh profiler
+EnvironmentFile=/etc/noelle/db.env
+EnvironmentFile=/etc/noelle/worker.env
+Environment=WORKER_ID=%i
+Restart=on-failure
+RestartSec=15s
+MemoryMax=512M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
