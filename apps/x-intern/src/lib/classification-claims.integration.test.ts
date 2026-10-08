@@ -198,3 +198,58 @@ describe.skipIf(!url)("X classification claim admission release (native)", () =>
     const row = await claim();
     let unlock!: () => void;
     let locked!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    const acquired = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const writer = sql.begin(async (tx) => {
+      await tx`select id from noelle.agent_instances where id=${instance} for no key update`;
+      locked();
+      await gate;
+    });
+    await acquired;
+    const started = performance.now();
+    let settled = false;
+    const releasing = releaseOne(row).then(
+      (result) => {
+        settled = true;
+        return { result };
+      },
+      (error: unknown) => {
+        settled = true;
+        return { error };
+      },
+    );
+    try {
+      await vi.waitFor(
+        async () => {
+          const [waiting] = await sql`select count(*)::int as count from pg_stat_activity
+          where datname=current_database() and application_name='classifier-release-native'
+            and wait_event_type='Lock' and query like '%jsonb_to_recordset%'`;
+          expect(waiting?.count).toBe(1);
+        },
+        { timeout: 800, interval: 20 },
+      );
+      await vi.waitFor(() => expect(settled).toBe(true), { timeout: 3500, interval: 20 });
+      expect(await releasing).toMatchObject({
+        error: { name: "PgOperationError", category: "deadline" },
+      });
+      expect(performance.now() - started).toBeLessThan(3500);
+      expect((await stored(row.id)).status).toBe("classifying");
+      expect((await sql`select 1 as healthy`)[0]?.healthy).toBe(1);
+    } finally {
+      unlock();
+      await writer;
+    }
+    await releasing;
+    const [waiting] = await sql`select count(*)::int as count from pg_stat_activity
+      where datname=current_database() and application_name='classifier-release-native'
+        and wait_event_type='Lock' and query like '%jsonb_to_recordset%'`;
+    expect(waiting?.count).toBe(0);
+    expect((await stored(row.id)).status).toBe("classifying");
+    expect(await releaseOne(row)).toBe(1);
+    expect((await stored(row.id)).status).toBe("new");
+  });
+});
