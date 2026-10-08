@@ -398,3 +398,37 @@ async function main() {
             apifyExhaustedNotified = true;
             await notifier
               .notify({
+                orgId: inst.org_id,
+                title: "Lyra: Apify tokens exhausted",
+                message:
+                  `All ${err.tokenCount} Apify token${err.tokenCount === 1 ? "" : "s"} hit the ` +
+                  `monthly usage limit — Lyra can't fetch LinkedIn posts until you add a working ` +
+                  `token in Connections.`,
+              })
+              .catch(() => {});
+          }
+          return;
+        }
+        // Apify rate limits (429 too many runs) are transient — defer to the next
+        // tick rather than flapping the worker. (402/403 are token-fatal and get
+        // rotated inside the client, surfacing as AllApifyTokensExhaustedError.)
+        if (err instanceof ApifyError && (err.status === 429 || err.status === 402)) {
+          log.info(
+            { instance: inst.id, status: err.status },
+            "apify rate/usage limit; deferring to next tick",
+          );
+          await run.finish({ status: "ok", rowsProcessed: 0 });
+          return;
+        }
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+  });
+}
+
+main().catch((err) => {
+  console.error("discovery fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});

@@ -198,3 +198,104 @@ function safeJsonParse(s: string): unknown {
     return JSON.parse(stripped);
   } catch {
     /* fall through */
+  }
+  const a = s.indexOf("{");
+  const b = s.lastIndexOf("}");
+  if (a >= 0 && b > a) {
+    try {
+      return JSON.parse(s.slice(a, b + 1));
+    } catch {
+      /* fall through */
+    }
+  }
+  return null;
+}
+
+/**
+ * Build a connection brief through the shared runtime for a person the operator
+ * just connected with. Returns the brief, or null only when NO attempt
+ * produced a usable one (no grounding, budget cap, engine error, or unparseable
+ * output twice) so the caller degrades cleanly instead of shipping garbage.
+ *
+ * One regeneration: if the first draft's DM trips a phrase tell after the
+ * deterministic scrub, we retain that (serviceable) brief and ask once more,
+ * plainer — returning the cleaner DM if it comes, else the retained one. Every
+ * shipped line (DM + questions + points) is scrubbed of em-dashes + disallowed
+ * emoji, and a stray empty bullet is pruned rather than rejecting the brief.
+ */
+export async function buildConnectionBrief(args: {
+  runner: Pick<CodexRunner, "draft">;
+  routing?: ModelRouting;
+  orgId: string;
+  instanceId: string;
+  person: FollowupPerson;
+  posts: FollowupPost[];
+  /** The person's authored comments (how they engage). Optional grounding. */
+  authoredComments?: string[];
+  /** A prior Lyra profile summary for this person, when they're already watched. */
+  existingSummary?: string | null;
+  /** Per-person operator angle/objective, when set. */
+  objective?: string | null;
+}): Promise<ConnectionBrief | null> {
+  const comments = (args.authoredComments ?? []).filter((c) => c.trim().length > 0);
+  // Nothing to ground on → no brief. The worker surfaces a helpful message.
+  if (args.posts.length === 0 && comments.length === 0 && !args.existingSummary?.trim()) {
+    return null;
+  }
+
+  const base = renderFollowupPrompt({
+    person: args.person,
+    posts: args.posts,
+    comments,
+    existingSummary: args.existingSummary,
+    objective: args.objective,
+  });
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const prompt =
+      attempt === 0
+        ? base
+        : `${base}\n\nThe previous follow-up DM read like AI. Rewrite the whole brief plainer and more human: no em-dash, no "Curious:" / "Would love to hear" / "Let me know", no buzzwords — just real, curious, specific.`;
+
+    let text: string;
+    let model: string;
+    try {
+      const res = await args.runner.draft({
+        bucket: "drafter-codex",
+        routing: args.routing ?? FOLLOWUP_ROUTING,
+        orgId: args.orgId,
+        instanceId: args.instanceId,
+        worker: "followup",
+        agentRole: "linkedin_intern",
+        system: SYSTEM_FOLLOWUP,
+        prompt,
+      });
+      text = res.text;
+      model = res.model;
+    } catch {
+      return null; // a rejected DM cannot become usable when its rewrite fails
+    }
+
+    const parsed = FollowupOutput.safeParse(safeJsonParse(text));
+    if (!parsed.success) continue;
+
+    const dm = scrubFollowupDm(parsed.data.followup_dm);
+    if (!dm) continue;
+
+    const questions = cleanList(parsed.data.questions, 12);
+    if (questions.length === 0) continue; // the questions are the point; need >=1
+
+    const brief: ConnectionBrief = {
+      person: args.person,
+      commonGround: cleanList(parsed.data.common_ground, 8),
+      talkingPoints: cleanList(parsed.data.talking_points, 10),
+      questions,
+      followupDm: dm,
+      model,
+    };
+
+    const voice = scoreFormat({ kind: "dm", angle: null, body: dm }, undefined, true, true);
+    if (!looksAi(dm) && voice.score >= 0.7) return brief;
+  }
+  return null;
+}
