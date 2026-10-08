@@ -419,7 +419,7 @@
     "@noelle/process": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "^25.9.3",
+    "@types/node": "^26.6.4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.6"
   }
