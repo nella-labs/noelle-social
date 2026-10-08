@@ -198,3 +198,94 @@ describe("SpendPanel", () => {
     expect(text).toContain("unverified");
     expect(text).not.toContain("$5.00");
   });
+
+  it("charts provider Apify daily buckets and leaves worker totals LLM-only", async () => {
+    queryMocks.getApifyProviderSpend.mockResolvedValue({
+      cents: 250,
+      unverifiedCents: 0,
+      fetchedAt: "2026-09-17T12:00:00.000Z",
+      byDay: [{ day: "2026-09-01", cents: 250 }],
+    });
+
+    const doc = await renderNode(
+      createElement(SpendPanel, { orgId: "org_1", orgSlug: "operator", rangeParam: "month" }),
+    );
+    const text = doc.body.textContent ?? "";
+
+    expect(text).toContain("2026-09-01: 12.34 LLM · 2.50 Apify");
+    expect(text).not.toContain("2026-09-01: 12.34 LLM · 5.00 Apify");
+    expect(text).toContain("Drafter");
+    expect(text).not.toContain("Discovery");
+    expect(text).not.toContain("$12.34 LLM · $5.00 Apify");
+  });
+
+  it("charts provider-only Apify dates that have no local ledger row", async () => {
+    queryMocks.getOrgSpendTrendRange.mockResolvedValue([
+      { day: "2026-09-01", llmCents: 1234, apifyCents: 500 },
+    ]);
+    queryMocks.getApifyProviderSpend.mockResolvedValue({
+      cents: 400,
+      unverifiedCents: 0,
+      fetchedAt: "2026-09-17T12:00:00.000Z",
+      byDay: [{ day: "2026-09-02", cents: 400 }],
+    });
+
+    const doc = await renderNode(
+      createElement(SpendPanel, { orgId: "org_1", orgSlug: "operator", rangeParam: "month" }),
+    );
+    const text = doc.body.textContent ?? "";
+
+    expect(text).toContain("2026-09-01: 12.34 LLM · 0.00 Apify");
+    expect(text).toContain("2026-09-02: 0.00 LLM · 4.00 Apify");
+    expect(text).toContain("Apify · $4.00");
+    expect(text).not.toContain("2026-09-01: 12.34 LLM · 5.00 Apify");
+  });
+
+  it("does not show a fake zero-dollar provider amount before the first fetch", async () => {
+    queryMocks.getApifyProviderSpend.mockResolvedValue({
+      cents: 0,
+      unverifiedCents: 0,
+      fetchedAt: null,
+      byDay: [],
+    });
+
+    const doc = await renderNode(
+      createElement(SpendPanel, { orgId: "org_1", orgSlug: "operator", rangeParam: "month" }),
+    );
+    const text = doc.body.textContent ?? "";
+
+    expect(text).toContain("Not fetched");
+    expect(text).not.toContain("$0.00");
+  });
+
+  it("shows a genuine zero-dollar provider balance after a fetch", async () => {
+    queryMocks.getApifyProviderSpend.mockResolvedValue({
+      cents: 0,
+      unverifiedCents: 0,
+      fetchedAt: "2026-09-17T12:00:00.000Z",
+      byDay: [],
+    });
+
+    const doc = await renderNode(
+      createElement(SpendPanel, { orgId: "org_1", orgSlug: "operator", rangeParam: "month" }),
+    );
+    const text = doc.body.textContent ?? "";
+
+    expect(text).toContain("Apify provider usage");
+    expect(text).toContain("$0.00");
+    expect(text).toContain("Last fetched Sep 17, 12:00 PM UTC");
+  });
+});
+
+describe("legacy spend route", () => {
+  it("redirects to the merged spend tab and preserves range", async () => {
+    await expect(
+      SpendPage({
+        params: Promise.resolve({ orgSlug: "operator" }),
+        searchParams: Promise.resolve({ range: "year" }),
+      }),
+    ).rejects.toThrow("NEXT_REDIRECT");
+
+    expect(navMocks.redirect).toHaveBeenCalledWith("/app/operator/connections?tab=spend&range=year");
+  });
+});
