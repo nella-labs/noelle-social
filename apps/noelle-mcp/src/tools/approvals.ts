@@ -398,3 +398,161 @@ async function sendDraft(args: Record<string, unknown>, ctx: NoelleContext): Pro
   if ((row.platform ?? "x") !== "x") {
     throw new NoelleError(
       "noelle_send_draft only queues or sends X drafts. Use the platform review UI/manual send flow, then noelle_mark_sent if you need to record it.",
+    );
+  }
+
+  if (ctx.apiConfigured()) {
+    const body = providedBody ?? row.body ?? "";
+    const result = await ctx.apiFetch<Record<string, unknown>>(`/api/drafts/${approvalId}/send`, {
+      method: "POST",
+      body: JSON.stringify({ body, edited: provided }),
+    });
+    return text(
+      `Send request for draft \`${approvalId}\` was accepted by api-vm. Check approval/activity status for delivery confirmation.\n\n${mdFields(result)}`,
+    );
+  }
+
+  // The local actuator reads pending approvals, not the legacy API-send queue.
+  if (row.kind === "dm")
+    throw new NoelleError(
+      "DM sends require api-vm delegation or use noelle_mark_sent to record a manual send.",
+    );
+  if (!row.external_id || !row.draft_id)
+    throw new NoelleError(
+      `Approval ${approvalId} has no source tweet (external_id) to reply to — cannot auto-send.`,
+    );
+
+  await queueApprovedReply(ctx, {
+    orgId: org.orgId, approvalId, draftId: row.draft_id, leadId: row.lead_id,
+    ...(providedBody !== undefined ? { body: providedBody } : {}),
+  });
+
+  return text(
+    "Approved and queued for the local X browser actuator. Delivery is pending and still depends on the existing sender gates and connected actuator. No agent settings were changed.",
+  );
+}
+
+async function skipDraft(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("skip a draft");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const result = await skipApproval(
+    ctx.sql,
+    { orgId: org.orgId, approvalId: reqStr(args, "approvalId"), operatorId: ctx.operatorId() },
+    optStr(args, "reason") ?? null,
+  );
+  return text(`Skipped **${result.count}** approval(s).`);
+}
+
+async function parkDraft(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("park a draft");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const approvalId = reqStr(args, "approvalId");
+  await parkApprovalDm(ctx.sql, { orgId: org.orgId, approvalId, operatorId: ctx.operatorId() });
+  return text(`Parked approval \`${approvalId}\` (status=deferred).`);
+}
+
+async function unskipDraft(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("unskip a draft");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const result = await restoreSkippedApproval(ctx.sql, {
+    orgId: org.orgId,
+    approvalId: reqStr(args, "approvalId"),
+    operatorId: ctx.operatorId(),
+  });
+  return text(`Restored **${result.count}** approval(s) to pending.`);
+}
+
+async function editDraft(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("edit a draft");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const approvalId = reqStr(args, "approvalId");
+  await saveApprovalEdit(
+    ctx.sql,
+    { orgId: org.orgId, approvalId, operatorId: ctx.operatorId() },
+    reqStr(args, "body"),
+  );
+  return text(`Edited draft for approval \`${approvalId}\`.`);
+}
+
+async function markSent(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("mark a draft as sent");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const approvalId = reqStr(args, "approvalId");
+  const sentUrl = optStr(args, "tweetUrl") ?? null;
+  const match = sentUrl ? sentUrl.match(/(?:x|twitter)\.com\/[^/]+\/status\/(\d+)/i) : null;
+  const tweetId = match?.[1] ?? null;
+
+  const fetched = await ctx.sql<Array<{ draft_id: string | null; lead_id: string | null }>>`
+    select draft_id, lead_id from noelle.approvals where id = ${approvalId} and org_id = ${org.orgId}`;
+  const row = fetched[0];
+  if (!row) throw new NoelleError(`Approval ${approvalId} not found in ${org.name}.`);
+
+  await ctx.sql`
+    update noelle.drafts set sent_external_id = coalesce(${tweetId}, 'manual:' || id::text), posted_at = now(),
+      payload = coalesce(payload,'{}'::jsonb) || ${ctx.sql.json({ sent_via: "manual", ...(sentUrl ? { sent_url: sentUrl } : {}) })}
+    where id=${row.draft_id} and org_id=${org.orgId} and sent_external_id is null`;
+
+  await ctx.sql`
+    update noelle.approvals set status='sent', decided_at=now(), decided_by=${ctx.operatorId()}
+    where id=${approvalId} and org_id=${org.orgId}`;
+
+  await ctx.sql`
+    update noelle.approvals a set status='skipped', decided_at=now(), decided_by=${ctx.operatorId()}, skip_reason='sibling-angle-sent'
+    from noelle.drafts d
+    where d.id=a.draft_id and a.lead_id=${row.lead_id} and a.org_id=${org.orgId} and a.id<>${approvalId}
+      and a.status='pending' and coalesce(d.payload->>'kind','reply')<>'dm'`;
+
+  return text(
+    `Recorded manual send for approval \`${approvalId}\`${tweetId ? ` (tweet ${tweetId})` : ""}. Sibling reply angles skipped.`,
+  );
+}
+
+async function bulkSkip(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("bulk-skip drafts");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const approvalIds = optStrArray(args, "approvalIds");
+  if (!approvalIds || approvalIds.length === 0)
+    throw new NoelleError("approvalIds is required (1..200 approval ids).");
+  if (approvalIds.length > 200)
+    throw new NoelleError(`Too many approvalIds (${approvalIds.length}) — max 200.`);
+  const reason = optStr(args, "reason") ?? "bulk-skip";
+
+  const result = await bulkSkipApprovals(ctx.sql, {
+    orgId: org.orgId,
+    approvalIds,
+    operatorId: ctx.operatorId(),
+    reason,
+  });
+  return text(`Bulk-skipped **${result.approvals}** approval(s).`);
+}
+
+async function handle(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult | null> {
+  switch (name) {
+    case "noelle_list_approvals":
+      return guard(() => listApprovals(args, ctx));
+    case "noelle_get_approval":
+      return guard(() => getApproval(args, ctx));
+    case "noelle_send_draft":
+      return guard(() => sendDraft(args, ctx));
+    case "noelle_skip_draft":
+      return guard(() => skipDraft(args, ctx));
+    case "noelle_park_draft":
+      return guard(() => parkDraft(args, ctx));
+    case "noelle_unskip_draft":
+      return guard(() => unskipDraft(args, ctx));
+    case "noelle_edit_draft":
+      return guard(() => editDraft(args, ctx));
+    case "noelle_mark_sent":
+      return guard(() => markSent(args, ctx));
+    case "noelle_bulk_skip":
+      return guard(() => bulkSkip(args, ctx));
+    default:
+      return null;
+  }
+}
+
+export const approvalsModule: ToolModule = { tools, handle };
