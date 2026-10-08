@@ -398,3 +398,203 @@ export async function countPendingApprovalsForInstance(
     left join noelle.drafts d on d.id = a.draft_id
     where a.agent_instance_id = ${agentInstanceId}
       and a.status = 'pending'
+      and coalesce(d.payload->>'kind', 'reply') <> 'dm'
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
+/**
+ * Backpressure read 2/2 — how many leads are "in flight" (not yet
+ * resolved into a draft or skipped). Only discovery consults this; the
+ * cap exists to stop us from piling fresh leads on top of a backlog
+ * the classifier/drafter haven't drained yet.
+ *
+ * See: infra/cloudsql/schema/0013_lead_backlog_cap.sql,
+ *      apps/x-intern/src/workers/discovery.ts
+ */
+export async function countLeadBacklogForInstance(
+  sql: Sql,
+  agentInstanceId: string,
+): Promise<number> {
+  const rows = await sql<{ count: string }[]>`
+    select count(*)::text as count
+    from noelle.leads
+    where agent_instance_id = ${agentInstanceId}
+      and status in ('new', 'classifying', 'classified', 'drafting')
+  `;
+  return Number(rows[0]?.count ?? 0);
+}
+
+/**
+ * On-demand DM requests — claim leads the operator flagged for a one-off DM
+ * (payload.dm_requested = true, set by the dashboard "Generate DM" action).
+ * Atomically clears the flag as it claims (so each request generates once) and
+ * skips leads that already have a pending DM approval. Independent of the reply
+ * lanes + the auto-DM toggle: runs whenever the drafter ticks (active or
+ * paused), so the operator gets their DM regardless of pipeline state.
+ */
+export async function claimDmRequestLeads(
+  sql: Sql,
+  args: { agentInstanceId: string; cap: number },
+): Promise<LeadRow[]> {
+  const rows = await sql<LeadRow[]>`
+    update noelle.leads l
+    set payload = payload - 'dm_requested', updated_at = now()
+    where l.id in (
+      select c.id
+      from noelle.leads c
+      where c.agent_instance_id = ${args.agentInstanceId}
+        and c.payload->>'dm_requested' = 'true'
+        and not exists (
+          select 1 from noelle.approvals a
+          left join noelle.drafts d on d.id = a.draft_id
+          where a.lead_id = c.id
+            and a.status = 'pending'
+            and coalesce(d.payload->>'kind', 'reply') = 'dm'
+        )
+      order by c.updated_at desc
+      limit ${args.cap}
+      for update skip locked
+    )
+    returning l.id, l.external_id, l.payload, l.author_handle, l.author_id,
+              l.tier, l.classifier_label, l.classifier_score, l.status, l.priority
+  `;
+  return [...rows];
+}
+
+/**
+ * One-off reply requests — claim leads the operator explicitly asked to draft
+ * through MCP (payload.reply_requested = true). This is independent of reply
+ * lane state: the worker drains it even while paused/replies are off. The claim
+ * keeps payload.reply_requested true through drafting so stale-claim recovery can
+ * put an interrupted request back into the queue. markLeadStatus clears it only
+ * when the lead reaches a terminal status. A matching completed draft blocks
+ * duplicate generation for the same key.
+ */
+export async function claimReplyRequestLeads(
+  sql: Sql,
+  args: { agentInstanceId: string; cap: number },
+): Promise<LeadRow[]> {
+  const rows = await sql<LeadRow[]>`
+    update noelle.leads l
+    set status = 'drafting', updated_at = now()
+    where l.id in (
+      select c.id
+      from noelle.leads c
+      where c.agent_instance_id = ${args.agentInstanceId}
+        and c.status = 'classified'
+        and c.payload->>'reply_requested' = 'true'
+        and c.payload->'reply_request'->>'request_key' is not null
+        and not exists (
+          select 1 from noelle.approvals a
+          left join noelle.drafts d on d.id = a.draft_id
+          where a.lead_id = c.id
+            and coalesce(d.payload->>'kind', 'reply') <> 'dm'
+            and d.payload->>'reply_request_key' = c.payload->'reply_request'->>'request_key'
+        )
+      order by c.updated_at desc
+      limit ${args.cap}
+      for update skip locked
+    )
+    returning l.id, l.external_id, l.payload, l.author_handle, l.author_id,
+              l.tier, l.classifier_label, l.classifier_score, l.status, l.priority
+  `;
+  return [...rows];
+}
+
+export async function markLeadStatus(
+  sql: Sql,
+  args: {
+    leadId: string;
+    status: "drafted" | "errored" | "skipped" | "classified" | "observed";
+    meta?: Record<string, unknown>;
+  },
+): Promise<void> {
+  const terminalStatus = args.status === "drafted" || args.status === "errored" || args.status === "skipped";
+  const meta = sql.json((args.meta ?? {}) as JSONValue);
+  await sql`
+    update noelle.leads
+    set status = ${args.status},
+        payload = case
+          when ${terminalStatus} and payload ? 'reply_request'
+            then payload || ${meta}::jsonb || '{"reply_requested": false}'::jsonb
+          else payload || ${meta}::jsonb
+        end,
+        updated_at = now()
+    where id = ${args.leadId}
+  `;
+}
+
+/**
+ * A claim older than this is provably orphaned. Each worker kind runs as a
+ * single process per instance and drafts/classifies its whole batch well inside
+ * 45 minutes (the SKIP LOCKED in the claim RPCs is a concurrency safety net,
+ * not the topology), so a lead still mid-claim after this long has no living
+ * owner.
+ */
+const STALE_CLAIM_MINUTES = 45;
+
+/**
+ * Strands older than this exit as 'skipped' instead of retrying — a reply
+ * drafted two days after the post reads as necro-engagement, not conversation.
+ */
+const STALE_CLAIM_EXPIRE_HOURS = 48;
+
+/**
+ * Recover leads stranded mid-claim by a worker crash or restart. The claim RPCs
+ * flip status ('new'→'classifying', 'classified'→'drafting') and the worker
+ * later writes the terminal outcome — but a process death between the two
+ * leaves the lead invisible to every future claim (claims only pick the
+ * pre-claim status), so it is lost silently. Merge-driven deploys restart every
+ * worker, making this a steady leak (2026-07-19: 159 leads stranded at
+ * 'drafting'/'classifying' across the three interns).
+ *
+ * Fresh strands go back to `requeueStatus` for a retry; ones past the expiry
+ * horizon are marked 'skipped' with a payload.stale_claim marker so the
+ * dashboard can tell them apart from classifier skips. Runs at the top of every
+ * worker tick; the usual match is zero rows.
+ */
+export async function reapStaleClaims(
+  sql: Sql,
+  args: {
+    agentInstanceId: string;
+    /** The mid-claim status this worker owns. */
+    claimedStatus: "classifying" | "observed_classifying" | "drafting";
+    /** The pre-claim status a fresh strand is returned to. */
+    requeueStatus: "new" | "observed" | "classified";
+  },
+): Promise<{ requeued: number; expired: number }> {
+  if (args.claimedStatus === "observed_classifying") {
+    // A long Jev outage must not turn durable browser observations into skips.
+    const rows = await sql<{ id: string }[]>`
+      update noelle.leads
+      set status = 'observed', updated_at = now()
+      where agent_instance_id = ${args.agentInstanceId}
+        and status = 'observed_classifying'
+        and payload->>'source' = 'extension_observed'
+        and updated_at < now() - make_interval(mins => ${STALE_CLAIM_MINUTES})
+      returning id
+    `;
+    return { requeued: rows.length, expired: 0 };
+  }
+  const requeued = await sql<{ id: string }[]>`
+    update noelle.leads
+    set status = ${args.requeueStatus}, updated_at = now()
+    where agent_instance_id = ${args.agentInstanceId}
+      and status = ${args.claimedStatus}
+      and updated_at < now() - make_interval(mins => ${STALE_CLAIM_MINUTES})
+      and (
+        updated_at >= now() - make_interval(hours => ${STALE_CLAIM_EXPIRE_HOURS})
+        or payload->>'reply_requested' = 'true'
+      )
+    returning id
+  `;
+  const expired = await sql<{ id: string }[]>`
+    update noelle.leads
+    set status = 'skipped',
+        payload = payload || '{"stale_claim":"expired"}'::jsonb,
+        updated_at = now()
+    where agent_instance_id = ${args.agentInstanceId}
+      and status = ${args.claimedStatus}
+      and payload->>'reply_requested' is distinct from 'true'
+      and updated_at < now() - make_interval(hours => ${STALE_CLAIM_EXPIRE_HOURS})
