@@ -198,3 +198,203 @@ describe("runDiscoveryTick (linkedin / apify)", () => {
       instance: { id: "i", org_id: "o" } as never,
       watchlistPeople: [{ ...person, publicId: null }],
       postsSource: { profilePosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(profilePosts).not.toHaveBeenCalled();
+    expect(upsert).not.toHaveBeenCalled();
+    expect(inserted).toBe(0);
+  });
+
+  it("continues to the next person when one person's fetch throws", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const profilePosts = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("apify error"))
+      .mockResolvedValueOnce([post("9")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person, { ...person, id: "wp2", fsdProfileId: "XYZ", publicId: "two" }],
+      postsSource: { profilePosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "9" }));
+  });
+
+  it("does NOT fetch when already at the daily extract cap", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const profilePosts = vi.fn().mockResolvedValue([post("1")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      postsSource: { profilePosts },
+      discoveryLimit: 5,
+      dailyExtractCap: 80,
+      alreadyExtractedToday: 80,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(0);
+    expect(profilePosts).not.toHaveBeenCalled();
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("stops inserting mid-tick the moment the running total hits the daily extract cap", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    // 5 fresh posts available, but only 2 slots left today (cap 80, already 78).
+    const profilePosts = vi.fn().mockResolvedValue([post("1"), post("2"), post("3"), post("4"), post("5")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      postsSource: { profilePosts },
+      discoveryLimit: 5,
+      dailyExtractCap: 80,
+      alreadyExtractedToday: 78,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(2);
+    expect(upsert).toHaveBeenCalledTimes(2);
+  });
+
+  it("only counts genuinely-new inserts (re-seen posts don't burn cap budget)", async () => {
+    // First post is a re-seen no-op (inserted:false); second is new.
+    const upsert = vi
+      .fn()
+      .mockResolvedValueOnce({ id: "L1", inserted: false })
+      .mockResolvedValueOnce({ id: "L2", inserted: true });
+    const profilePosts = vi.fn().mockResolvedValue([post("1"), post("2")]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      postsSource: { profilePosts },
+      discoveryLimit: 5,
+      dailyExtractCap: 80,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("runDiscoveryTick — tailored run filters", () => {
+  it("drops posts below the minReactions floor", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const lo = { ...post("lo"), reactions: 3 };
+    const hi = { ...post("hi"), reactions: 40 };
+    const profilePosts = vi.fn().mockResolvedValue([lo, hi]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      postsSource: { profilePosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+      filters: { timeWindowHours: null, minReactions: 10, minComments: null },
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "hi" }));
+  });
+
+  it("drops posts below the minComments floor", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const lo = { ...post("lo"), comments: 0 };
+    const hi = { ...post("hi"), comments: 9 };
+    const profilePosts = vi.fn().mockResolvedValue([lo, hi]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      postsSource: { profilePosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+      filters: { timeWindowHours: null, minReactions: null, minComments: 5 },
+    });
+
+    expect(inserted).toBe(1);
+    expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ externalId: "hi" }));
+  });
+
+  it("treats missing engagement as 0 — a floor drops posts Apify returned with no counts", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const noCounts = { ...post("x"), reactions: null, comments: null };
+    const profilePosts = vi.fn().mockResolvedValue([noCounts]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      postsSource: { profilePosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+      filters: { timeWindowHours: null, minReactions: 1, minComments: null },
+    });
+
+    expect(inserted).toBe(0);
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it("a floor of 0 / null never filters (default behaviour preserved)", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const profilePosts = vi.fn().mockResolvedValue([{ ...post("a"), reactions: 0, comments: 0 }]);
+
+    const inserted = await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistPeople: [person],
+      postsSource: { profilePosts },
+      discoveryLimit: 5,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+      filters: { timeWindowHours: null, minReactions: 0, minComments: null },
+    });
+
+    expect(inserted).toBe(1);
+  });
+
+  it("narrows the Apify sinceISO to the window and drops posts older than it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-10T00:00:00.000Z"));
+    try {
+      const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+      const old = { ...post("old"), postedAt: "2026-06-08T00:00:00.000Z" }; // 48h ago
+      const fresh = { ...post("fresh"), postedAt: "2026-06-09T18:00:00.000Z" }; // 6h ago
+      const profilePosts = vi.fn().mockResolvedValue([old, fresh]);
+
+      const inserted = await runDiscoveryTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        watchlistPeople: [person], // added_at 2026-06-01 — older than the window
+        postsSource: { profilePosts },
+        discoveryLimit: 5,
+        dailyExtractCap: CAP,
