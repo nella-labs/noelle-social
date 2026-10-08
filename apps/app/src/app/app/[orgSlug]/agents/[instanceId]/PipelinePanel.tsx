@@ -198,3 +198,203 @@ export function PipelinePanel({
 
   return (
     <section
+      className="card"
+      style={{ opacity: active ? 1 : 0.92, position: "relative" }}
+    >
+      {/* Master header */}
+      <div className="card-h">
+        <h3>
+          Pipeline ·{" "}
+          <span style={{ color: active ? "var(--ok)" : "var(--ink-soft)", fontFamily: "var(--mono)", fontSize: 12 }}>
+            {active ? "ACTIVE" : "PAUSED"}
+          </span>
+        </h3>
+        <div style={{ display: "flex", gap: 6 }}>
+          <button
+            type="button"
+            className="btn btn-xs"
+            onClick={() => run("refresh", async () => ({ ok: true }))}
+            disabled={pending}
+            title="Refresh counts now"
+          >
+            ↻
+          </button>
+          {active ? (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={() => run("stop", () => stopAll({ orgSlug, instanceId }))}
+              disabled={pending}
+            >
+              {busy === "stop" ? "…" : "Stop all"}
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {/* Goal-run */}
+      <div
+        style={{
+          padding: 12,
+          borderRadius: 10,
+          background: "var(--paper-2)",
+          boxShadow: "0 0 0 0.5px var(--rule-soft)",
+          marginBottom: 14,
+        }}
+      >
+        {goalActive ? (
+          <>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 6 }}>
+              <div style={{ fontSize: 14, fontWeight: 500 }}>
+                {fmt(goal.produced)} / {fmt(goal.target ?? 0)} leads ready
+              </div>
+              <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--ink-soft)" }}>
+                started {rel(goal.startedAt, now)} ago
+              </div>
+            </div>
+            <div style={{ height: 8, borderRadius: 999, background: "var(--rule-soft)", overflow: "hidden" }}>
+              <div style={{ width: `${goalPct}%`, height: "100%", background: "var(--ok)", transition: "width .4s" }} />
+            </div>
+            <div style={{ fontSize: 11.5, color: "var(--ink-muted)", marginTop: 6 }}>
+              Auto-pauses at {fmt(goal.target ?? 0)}. {fmt(goal.ready)} currently waiting in the approval queue.
+            </div>
+          </>
+        ) : (
+          <>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 13.5 }}>Get me</span>
+              <input
+                type="number"
+                min={1}
+                max={500}
+                value={goalInput}
+                onChange={(e) => setGoalInput(Math.max(1, Math.min(500, Number(e.target.value) || 1)))}
+                className="input"
+                style={{ width: 64, textAlign: "center" }}
+              />
+              <span style={{ fontSize: 13.5 }}>{ui.goalNoun}</span>
+              <button
+                type="button"
+                className="btn btn-sm btn-primary grow-phone"
+                style={{ marginLeft: "auto" }}
+                onClick={() =>
+                  run("startGoal", () =>
+                    startAll({ orgSlug, instanceId, goalTarget: goalInput, runConfig: buildRunConfig() }),
+                  )
+                }
+                disabled={pending}
+              >
+                {busy === "startGoal" ? "…" : "▶ Start all"}
+              </button>
+            </div>
+            {dc != null ? (
+              <TailorRun
+                ui={ui}
+                open={tailorOpen}
+                onToggle={() => setTailorOpen((o) => !o)}
+                nums={nums}
+                setNum={setNum}
+                bools={bools}
+                setBool={setBool}
+                lang={lang}
+                setLang={setLang}
+              />
+            ) : null}
+          </>
+        )}
+      </div>
+
+      {/* Recurring scheduled run */}
+      <ScheduleBlock
+        orgSlug={orgSlug}
+        instanceId={instanceId}
+        saved={snapshot.schedule}
+        goalNoun={ui.goalNoun}
+        now={now}
+        busy={busy}
+        pending={pending}
+        run={run}
+      />
+
+      {relationshipDms ? (
+        <RelationshipDmsRow
+          orgSlug={orgSlug}
+          instanceId={instanceId}
+          platform={relationshipDms.platform}
+          enabled={relationshipDms.enabled}
+          approvalsHref={relationshipDms.approvalsHref}
+        />
+      ) : null}
+
+      {/* Funnel — one row per worker */}
+      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        {snapshot.workers.map((w) => (
+          <WorkerRow key={w.kind} w={w} now={now} active={active} showRun={active && sessionStarted}
+            busy={busy} pending={pending}
+            roleText={w.kind === "drafter" ? ui.drafterRole : ROLE[w.kind]}
+            onToggle={(enabled) =>
+              run(`toggle:${w.kind}`, () => setWorkerEnabled({ orgSlug, instanceId, worker: w.kind as "discovery" | "classifier" | "drafter" | "send" | "profiler" | "watchlist", enabled }))
+            }
+          />
+        ))}
+      </ul>
+
+      {!active ? (
+        <div style={{ marginTop: 10, fontSize: 12, color: "var(--ink-muted)" }}>
+          {ui.pausedNote}
+        </div>
+      ) : null}
+      {error ? (
+        <div style={{ marginTop: 8, fontSize: 11.5, color: "var(--warn)" }}>{error}</div>
+      ) : null}
+    </section>
+  );
+}
+
+function RelationshipDmsRow({
+  orgSlug,
+  instanceId,
+  platform,
+  enabled,
+  approvalsHref,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  platform: "linkedin" | "x";
+  enabled: boolean;
+  approvalsHref: string;
+}) {
+  const router = useRouter();
+  const [checked, setChecked] = useState(enabled);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const cap = RELATIONSHIP_DM_DAILY_CAPS[platform];
+
+  useEffect(() => {
+    setChecked(enabled);
+  }, [enabled]);
+
+  async function save(next: boolean) {
+    setChecked(next);
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await setRelationshipDmsEnabled({ orgSlug, instanceId, enabled: next });
+      if (!res.ok) {
+        setChecked(!next);
+        setError(res.error.message);
+        return;
+      }
+      router.refresh();
+    } catch (err) {
+      console.error("[relationship-dms] save failed:", err);
+      setChecked(!next);
+      setError("Could not save. Try again.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      style={{
