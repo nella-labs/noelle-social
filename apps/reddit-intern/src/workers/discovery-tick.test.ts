@@ -398,3 +398,86 @@ describe("watchlist repoll gate (per-subreddit cooldown)", () => {
     const gate = createRepollGate(2 * 3600_000, () => 0);
 
     await runDiscoveryTick({ ...baseArgs(subredditPosts, upsert), watchlistSubreddits: [sub], repollGate: gate });
+    await runDiscoveryTick({ ...baseArgs(subredditPosts, upsert), watchlistSubreddits: [sub], repollGate: gate });
+
+    expect(subredditPosts).toHaveBeenCalledTimes(1);
+  });
+
+  it("without a gate the old every-tick behaviour is unchanged", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi.fn().mockResolvedValue([post("1")]);
+
+    await runDiscoveryTick({ ...baseArgs(subredditPosts, upsert), watchlistSubreddits: [sub] });
+    await runDiscoveryTick({ ...baseArgs(subredditPosts, upsert), watchlistSubreddits: [sub] });
+
+    expect(subredditPosts).toHaveBeenCalledTimes(2);
+  });
+
+  it("cooldown 0 (the default) disables the gate entirely", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi.fn().mockResolvedValue([post("1")]);
+    const gate = createRepollGate(0, () => 0);
+
+    await runDiscoveryTick({ ...baseArgs(subredditPosts, upsert), watchlistSubreddits: [sub], repollGate: gate });
+    await runDiscoveryTick({ ...baseArgs(subredditPosts, upsert), watchlistSubreddits: [sub], repollGate: gate });
+
+    expect(subredditPosts).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("runDiscoveryTick — time window", () => {
+  it("narrows the Apify sinceISO to the window and drops posts older than it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-10T00:00:00.000Z"));
+    try {
+      const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+      const old = post("old", { createdAt: "2026-06-08T00:00:00.000Z" }); // 48h ago
+      const fresh = post("fresh", { createdAt: "2026-06-09T18:00:00.000Z" }); // 6h ago
+      const subredditPosts = vi.fn().mockResolvedValue([old, fresh]);
+
+      const inserted = await runDiscoveryTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        watchlistSubreddits: [sub], // added_at 2026-06-01 — older than the window
+        postsSource: { subredditPosts },
+        discoveryLimit: 15,
+        dailyExtractCap: CAP,
+        alreadyExtractedToday: 0,
+        upsertLead: upsert,
+        timeWindowHours: 12,
+      });
+
+      // sinceISO = later of (added_at, now − 12h) = the window bound.
+      expect(subredditPosts).toHaveBeenCalledWith(
+        expect.objectContaining({ sinceISO: "2026-06-09T12:00:00.000Z" }),
+      );
+      // The Apify client applies the precise floor; the upsert still inserts both
+      // because the mock returns both. Discovery doesn't re-filter by time (it
+      // trusts sinceISO), so both inserted here — the window's job is the fetch bound.
+      expect(inserted).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("without a window, sinceISO stays the subreddit's added_at", async () => {
+    const upsert = vi.fn().mockResolvedValue({ id: "L", inserted: true });
+    const subredditPosts = vi.fn().mockResolvedValue([]);
+
+    await runDiscoveryTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      watchlistSubreddits: [sub],
+      postsSource: { subredditPosts },
+      discoveryLimit: 15,
+      dailyExtractCap: CAP,
+      alreadyExtractedToday: 0,
+      upsertLead: upsert,
+      timeWindowHours: null,
+    });
+
+    expect(subredditPosts).toHaveBeenCalledWith(
+      expect.objectContaining({ sinceISO: "2026-06-01T00:00:00.000Z" }),
+    );
+  });
+});
