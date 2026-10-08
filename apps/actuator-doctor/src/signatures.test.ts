@@ -198,3 +198,14 @@ describe("matchSignatures clause operators", () => {
 describe("topMatchPerTarget", () => {
   it("keeps the highest-confidence signature per target", () => {
     const store = SignatureStoreSchema.parse({
+      version: 1,
+      updatedAt: "2026-07-17T00:00:00.000Z",
+      signatures: [
+        { id: "low", title: "l", description: "d", match: [{ target: "api-vm", check: "api_freshness", ok: false }], ladder: ["page_human"], confidence: 0.3 },
+        { id: "high", title: "h", description: "d", match: [{ target: "api-vm", check: "api_freshness", ok: false }], ladder: ["page_human"], confidence: 0.9 },
+      ],
+    });
+    const top = topMatchPerTarget(matchSignatures(store, [probe("api-vm", "api_freshness", false)]));
+    expect(top.get("api-vm")?.signature.id).toBe("high");
+  });
+});
