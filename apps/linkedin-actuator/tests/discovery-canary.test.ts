@@ -198,3 +198,59 @@ describe("browser discovery canary", () => {
     const send = vi.fn(async () => ({ ok: true, items: [{ fingerprint: "already-seen", text: "Full visible post" }] as VisiblePost[] }));
     const submit = vi.fn();
     const status = await runBrowserObservation({
+      tabId: 1, instanceId: "instance", seen: new Set(["instance:already-seen"]),
+      stopped: () => false, enabled: async () => true, now: () => 1000, wait, send, submit, onVisible,
+      report: async (_status: ObservationStatus) => {},
+    });
+    expect(status).toMatchObject({ result: "empty", observed: 0 });
+    expect(onVisible).toHaveBeenCalledWith([{ fingerprint: "already-seen", text: "Full visible post" }]);
+    expect(send).toHaveBeenCalledOnce();
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("reports an extraction failure without submitting posts", async () => {
+    const report = vi.fn(async (_status: ObservationStatus) => {});
+    const submit = vi.fn(async () => ({ accepted: 1, duplicates: 0, invalid: 0 }));
+    const status = await runBrowserObservation({
+      tabId: 1, instanceId: "instance", seen: new Set(), stopped: () => false, enabled: async () => true, now: () => 1000, wait,
+      send: async () => { throw new Error("content script unavailable"); }, submit, report,
+    });
+    expect(status).toMatchObject({ result: "failed", stage: "extract", error: "content script unavailable" });
+    expect(submit).not.toHaveBeenCalled();
+    expect(report).toHaveBeenCalledOnce();
+  });
+
+  it("reports submission failure and retries the same URN on the next read", async () => {
+    const seen = new Set<string>();
+    const report = vi.fn(async (_status: ObservationStatus) => {});
+    const send = async () => ({ ok: true, items: [post("urn:li:activity:1")] });
+    const submit = vi.fn().mockRejectedValueOnce(new Error("HTTP 503")).mockResolvedValue({ accepted: 1, duplicates: 0, invalid: 0 });
+    const args = { tabId: 1, instanceId: "instance", seen, stopped: () => false, enabled: async () => true, now: () => 1000, wait, send, submit, report };
+    expect(await runBrowserObservation(args)).toMatchObject({ result: "failed", stage: "submit", observed: 1, error: "HTTP 503" });
+    expect(seen.size).toBe(0);
+    expect(await runBrowserObservation(args)).toMatchObject({ result: "submitted", observed: 1, accepted: 1 });
+    expect(submit).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops before extraction or further batches", async () => {
+    const send = vi.fn(async () => ({ ok: true, items: [post("urn:li:activity:1")] }));
+    const report = vi.fn(async (_status: ObservationStatus) => {});
+    const submit = vi.fn(async () => ({ accepted: 1, duplicates: 0, invalid: 0 }));
+    expect(await runBrowserObservation({ tabId: 1, instanceId: "instance", seen: new Set(), stopped: () => true, enabled: async () => true, now: () => 1000, wait, send, submit, report })).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+    expect(report).not.toHaveBeenCalled();
+  });
+
+  it("does no extraction or submission while the canary is off", async () => {
+    const send = vi.fn(async () => ({ ok: true, items: [post("urn:li:activity:1")] }));
+    const submit = vi.fn(async () => ({ accepted: 1, duplicates: 0, invalid: 0 }));
+    const report = vi.fn(async (_status: ObservationStatus) => {});
+    expect(await runBrowserObservation({
+      tabId: 1, instanceId: "instance", seen: new Set(), stopped: () => false,
+      enabled: async () => false, now: () => 1000, wait, send, submit, report,
+    })).toBeNull();
+    expect(send).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expect(report).not.toHaveBeenCalled();
+  });
+});
