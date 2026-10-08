@@ -1798,3 +1798,203 @@ describe("runDrafterTick", () => {
             { angle: "empathetic", body: "e", char_count: 1 },
             { angle: "technical", body: "t", char_count: 1 },
             { angle: "contrarian", body: "c", char_count: 1 },
+          ],
+        }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "strong", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    // getWatchlistObjectives reads x_watchlist_people; the stored handle is
+    // lowercased/@-stripped, the lead's author_handle is the raw "@JDoe".
+    const sql = vi.fn().mockResolvedValue([
+      { handle: "jdoe", objective_kind: "amplify", objective_note: "boost them" },
+    ]);
+
+    await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "post text" }, author_handle: "@JDoe", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      sql: sql as never,
+    });
+
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    const system: string = runner.draft.mock.calls[0]![0].system;
+    expect(system).toContain("PER-PERSON OBJECTIVE");
+    expect(system).toContain("Champion and signal-boost"); // amplify directive
+    expect(system).toContain("boost them"); // operator note
+  });
+
+  it("leaves the system prompt unchanged when the lead's author has no objective", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "d", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "e", char_count: 1 },
+            { angle: "technical", body: "t", char_count: 1 },
+            { angle: "contrarian", body: "c", char_count: 1 },
+          ],
+        }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "strong", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const sql = vi.fn().mockResolvedValue([]); // no objectives for this instance
+
+    await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "post text" }, author_handle: "someone", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      sql: sql as never,
+    });
+
+    const system: string = runner.draft.mock.calls[0]![0].system;
+    expect(system).not.toContain("PER-PERSON OBJECTIVE");
+  });
+
+  it("drafts a priority (watchlist) lead even when anchors are below the relevance threshold", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "d", approval_id: "a" });
+    const draft = vi.fn().mockResolvedValue({
+      text: JSON.stringify({ drafts: [{ angle: "technical", body: "hi", char_count: 2 }] }),
+      engine: "codex",
+      model: "gpt-5",
+    });
+    const runner = { draft };
+    // All anchors well below the 1.5 threshold — a normal lead would be skipped.
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p1.md", snippet: "weak", score: 0.1, filePath: "p1.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o", auto_send_enabled: false } as never,
+      claimedLeads: [
+        { id: "Lpri", external_id: "xpri", payload: { text: "anything at all" }, author_handle: "u", author_id: null, status: "drafting", tier: "T1", classifier_label: "watchlist", classifier_score: 1, priority: true },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+
+    expect(n).toBe(1);
+    expect(draft).toHaveBeenCalledTimes(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ status: "drafted" }));
+  });
+
+  it.each(["2026-02-24T14:00:41.000Z", undefined, "", "2026-02-30T00:00:00Z"])(
+    "forwards measured source time or unknown for %j", async (realPostedAt) => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "d", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({ drafts: [{ angle: "technical", body: "hi", char_count: 2 }] }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const nella = {
+      search: vi.fn().mockResolvedValue([
+        { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+      ]),
+    };
+    const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" },
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "post text", url: "https://x.com/u/status/1", posted_at: realPostedAt }, author_handle: "u", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ],
+      runner: runner as never,
+      kb: nella as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+    });
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    expect(postOutbound.mock.calls[0]![0].postedAt).toBe(realPostedAt === "2026-02-24T14:00:41.000Z" ? realPostedAt : null);
+  });
+});
+
+describe("runDmRequestTick (on-demand DM)", () => {
+  const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+  const nella = {
+    search: vi.fn().mockResolvedValue([
+      { path: "p.md", snippet: "anchor", score: 3.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+    ]),
+  };
+  const callArgs = (runner: unknown, postOutbound: unknown, posted_at?: unknown) => ({
+    log,
+    instance: { id: "i", org_id: "o" } as never,
+    claimedLeads: [
+      { id: "L", external_id: "x1", payload: { text: "post text", url: "https://x.com/u/status/1", posted_at }, author_handle: "u", author_id: "uid", status: "drafted", tier: null, classifier_label: null, classifier_score: null, priority: false },
+    ] as never,
+    kb: nella as never,
+    runner: runner as never,
+    postOutbound: postOutbound as never,
+  });
+
+  it.each([undefined, "", "2026-02-30T00:00:00Z", "2026-10-01T12:34:56.000Z"])("queues only the DM and preserves measured or unknown source time: %s", async (postedAt) => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [{ angle: "empathetic", body: "e", char_count: 1 }],
+          dm: { body: "hey saw your post\n\nlet's chat", char_count: 28 },
+        }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
+    const n = await runDmRequestTick(callArgs(runner, postOutbound, postedAt));
+    expect(n).toBe(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.drafts).toHaveLength(1);
+    expect(body.drafts[0].kind).toBe("dm");
+    expect(body.drafts[0].body).toContain("saw your post");
+    expect(body.autoSend).toBeNull();
+    expect(body.postedAt).toBe(postedAt === "2026-10-01T12:34:56.000Z" ? postedAt : null);
+  });
+
+  it("queues nothing when the model returns no DM", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({ drafts: [{ angle: "empathetic", body: "e", char_count: 1 }] }),
+        engine: "codex",
+        model: "gpt-5",
+      }),
+    };
