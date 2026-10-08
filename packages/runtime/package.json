@@ -398,3 +398,29 @@
     }
   },
   "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json && cp -R src/vault-template dist/vault-template && cp src/googleCredentialsWorker.mjs dist/googleCredentialsWorker.mjs",
+    "lint": "echo \"lint placeholder\"",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@anthropic-ai/bedrock-sdk": "^0.29.0",
+    "@anthropic-ai/sdk": "^0.69.0",
+    "@google-cloud/storage": "^7.19.0",
+    "@noelle/contracts": "workspace:*",
+    "@noelle/secrets": "workspace:*",
+    "ai": "^7.0.107",
+    "google-auth-library": "^10.6.2",
+    "minisearch": "^7.1.2",
+    "openai": "^6.10.0",
+    "postgres": "^3.4.0",
+    "re2js": "2.8.6",
+    "zod": "^3.23.8",
+    "@noelle/process": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  }
+}
