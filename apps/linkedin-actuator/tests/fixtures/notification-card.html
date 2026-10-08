@@ -1,0 +1,92 @@
+<!-- REAL markup captured from a logged-in linkedin.com/notifications on
+     2026-07-26. Names, handles and body text are anonymized; SVG icon innards
+     and the settings-dropdown items are trimmed EXCEPT the one dropdown entry
+     that matters (its class contains "headline", which is why cardHeadline
+     cannot use a bare [class*='headline'] selector).
+
+     This single card disproved four assumptions:
+       1. the container attribute is data-view-name="notification-card-CONTAINER"
+       2. the headline class is nt-card__headline, NOT nt-card__text--headline
+       3. the post link is PERCENT-ENCODED and a ugcPost, not an activity —
+          /feed/update/urn%3Ali%3AugcPost%3A...  (so an /activity[-:](\d+)/
+          regex matches nothing, and every real card was being skipped)
+       4. the LONGEST text on a card is the ORIGINAL POST, not the comment —
+          taking the longest leaf made the drafter answer our own post
+
+     It also revealed a bonus: the href's commentUrn param carries a REAL
+     comment id, so a comment is addressable after all.
+
+     This card is an IMPRESSIONS notification, not a reply, so it must be
+     REJECTED by isReplyHeadline — it is the negative case. -->
+<div class="nt-card-list">
+  <article class="nt-card nt-card--unread nt-card--with-hover-states" aria-label="Unread notification." data-nt-card-index="8" data-view-name="notification-card-container">
+    <div class="nt-card__container">
+      <div class="nt-card__left-rail">
+        <figure class="nt-card__blue-dot-figure mt5" aria-hidden="true"></figure>
+        <div class="ivm-image-view-model">
+          <div class="ivm-view-attr__img-wrapper">
+            <svg role="none" aria-hidden="true" width="48" height="48" viewBox="0 0 48 48" data-test-icon="ui-chart"></svg>
+          </div>
+        </div>
+      </div>
+
+      <div class="display-flex flex-column flex-grow-1 mr2">
+        <a class="nt-card__headline nt-card__text--word-wrap t-black t-normal text-body-small" href="/feed/update/urn%3Ali%3AugcPost%3A7486054278927835136?commentUrn=urn%3Ali%3Acomment%3A%28ugcPost%3A7486054278927835136%2C7486091099183251456%29&amp;dashCommentUrn=urn%3Ali%3Afsd%5Fcomment%3A%287486091099183251456%2Curn%3Ali%3AugcPost%3A7486054278927835136%29" tabindex="0">
+          <p class="visually-hidden">
+            Unread notification.
+          </p>
+          <span class="nt-card__text--3-line">
+            <span>Your comment has gained<span class="white-space-pre"> </span><strong>371 impressions</strong>.</span>
+          </span>
+        </a>
+
+        <button aria-hidden="true" tabindex="-1" class="artdeco-card overflow-hidden mt2" role="link" type="button">
+          <div class="nt-card__text--word-wrap nt-card__text--2-line-large text-align-start m2 t-14 t-black">
+            a week to teach yourself advanced econometrics and python, on your own, as the only second-year in the room. that plus the grade and the hackathon win in one year is a ridiculous run, enjoy the exchange.
+          </div>
+          <hr class="m0">
+          <div class="nt-card-content__body--secondary display-flex">
+            <div class="full-width display-flex flex-column justify-center align-items-flex-start p2">
+              <div class="nt-card-content__body-text nt-card__text--word-wrap nt-card__text--2-line-large text-align-start t-14 t-black--light">
+                Happy to share that I finished first in my cohort this year! After my first year living abroad on exchange, I finished the second semester with a top average and a full merit scholarship. I am especially happy about this because I decided to take advanced courses where I was the only second-year student, for which I had to learn advanced econometrics and Python in one week on my own. It has also been a pretty intense year outside the classroom, and a huge thank you to everyone who was part of it. In a couple of weeks I will be heading abroad again for an exchange semester. Looking forward to this next chapter!
+              </div>
+            </div>
+          </div>
+        </button>
+
+        <section class="nt-social-counts t-12 t-black--light t-normal mt2">
+          <span class="nt-social-counts__count">1 reaction</span>
+          <span class="nt-social-counts__count">1 comment</span>
+        </section>
+      </div>
+
+      <div class="display-flex flex-column text-align-right align-self-flex-start">
+        <p class="nt-card__time-ago t-12 t-black--light t-normal">3h</p>
+        <div>
+          <div id="ember128" class="artdeco-dropdown">
+            <button aria-expanded="false" aria-label="Settings menu" class="artdeco-dropdown__trigger" type="button"></button>
+            <div tabindex="-1" aria-hidden="true" class="nt-card-settings-dropdown__content artdeco-dropdown__content">
+              <div class="artdeco-dropdown__content-inner">
+                <div class="nt-card-settings-dropdown-item pv2 ph4 full-width">
+                  <button class="nt-card-settings-dropdown-item__button" type="button">
+                    <div>
+                      <p class="nt-card-settings-dropdown-item__headline">Change notification preferences</p>
+                      <p class="nt-card-settings-dropdown-item__sub-headline"></p>
+                    </div>
+                  </button>
+                </div>
+                <div class="nt-card-settings-dropdown-item pv2 ph4 full-width">
+                  <button class="nt-card-settings-dropdown-item__button" type="button">
+                    <div>
+                      <p class="nt-card-settings-dropdown-item__headline">Delete notification</p>
+                    </div>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </article>
+</div>

@@ -1,0 +1,25 @@
+<!-- Reduced from the live September 2026 diagnostic: a roleless shadow outlet,
+     two visible cards, and three unrelated menus before the post-menu click.
+     The post menu is mounted outside the outlet after the click. -->
+<main>
+  <div role="listitem" id="qualified-card">
+    <button aria-label="Open control menu for post by Ada Lovelace" aria-expanded="false"></button>
+    <a href="/in/ada/">Ada Lovelace</a>
+    <span data-testid="expandable-text-box">An idea about software.
+      <a href="/posts/other-activity-1111111111111111111-XyZ">A cited post</a>
+    </span>
+    <button aria-label="Reaction button state: no reaction"></button>
+  </div>
+  <div role="listitem">
+    <button aria-label="Open control menu for post by Grace Hopper"></button>
+    <a href="/in/grace/">Grace Hopper</a>
+    <span data-testid="expandable-text-box">A separate idea.</span>
+    <button aria-label="Reaction button state: no reaction"></button>
+  </div>
+  <div id="interop-outlet"></div>
+  <div role="menu"><a href="/in/navigation-one/">Navigation</a></div>
+  <div role="menu"><a href="/feed/update/urn:li:activity:2222222222222222222/">Unrelated menu</a></div>
+  <div role="menu"><button>Save</button>
+    <a href="/feed/update/urn:li:activity:3333333333333333333/">Saved item</a>
+  </div>
+</main>
