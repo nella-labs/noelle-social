@@ -198,3 +198,84 @@ describe("scoped Copy link capture", () => {
     })).toBeUndefined();
     expect(h.clipboard.writeText).toBe(h.original);
   });
+
+  it("discards a provisional URL when a later poll sees another write or STOP", async () => {
+    const url = "https://lnkd.in/p/eQDXbx_h";
+    for (const exit of ["second-write", "stop"] as const) {
+      const h = harness();
+      const failures: unknown[] = [];
+      let waits = 0;
+      let stopped = false;
+      const identity = await captureCopyLinkIdentity({
+        evaluate: h.evaluate,
+        click: async () => {},
+        wait: async () => {
+          if (++waits === 1) await h.clipboard.writeText(url);
+          else if (waits === 2 && exit === "second-write") await h.clipboard.writeText("unrelated text");
+          else if (waits === 2) stopped = true;
+        },
+        stopped: () => stopped,
+        onFailure: (failure) => failures.push(failure),
+      });
+      expect(identity).toBeUndefined();
+      expect(failures).toEqual([exit === "stop" ? { stage: "stopped" } :
+        { stage: "read", writes: "many", method: "writeText" }]);
+      expect(h.clipboard.writeText).toBe(h.original);
+    }
+  });
+
+  it("keeps observing after an early valid URL so a late second write remains ambiguous", async () => {
+    const h = harness();
+    let waits = 0;
+    const failures: unknown[] = [];
+    const identity = await captureCopyLinkIdentity({
+      evaluate: h.evaluate,
+      click: async () => {},
+      wait: async () => {
+        if (++waits === 1) await h.clipboard.writeText("https://lnkd.in/p/eQDXbx_h");
+        if (waits === 4) await h.clipboard.writeText("another value");
+      },
+      stopped: () => false,
+      onFailure: (failure) => failures.push(failure),
+    });
+    expect(waits).toBe(4);
+    expect(identity).toBeUndefined();
+    expect(failures).toEqual([{ stage: "read", writes: "many", method: "writeText" }]);
+    expect(h.clipboard.writeText).toBe(h.original);
+  });
+
+  it("restores the method if the click fails or STOP arrives during the read", async () => {
+    for (const failingClick of [true, false]) {
+      const h = harness();
+      let stopped = false;
+      expect(await captureCopyLinkIdentity({
+        evaluate: h.evaluate,
+        click: async () => { if (failingClick) throw new Error("menu closed"); stopped = true; },
+        wait: async () => {}, stopped: () => stopped,
+      })).toBeUndefined();
+      expect(h.clipboard.writeText).toBe(h.original);
+    }
+  });
+
+  it("restores the method on the page timer if the cleanup CDP command fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness();
+      const evaluate = async (expression: string) => {
+        if (expression.includes("state.restore()")) throw new Error("CDP detached");
+        return h.evaluate(expression);
+      };
+      const failures: unknown[] = [];
+      expect(await captureCopyLinkIdentity({
+        evaluate,
+        click: () => h.clipboard.writeText("https://www.linkedin.com/feed/update/urn:li:activity:7506985844398911488/"),
+        wait: async () => {}, stopped: () => false,
+        onFailure: (failure) => failures.push(failure),
+      })).toBeUndefined();
+      expect(failures).toEqual([{ stage: "restore" }]);
+      expect(h.clipboard.writeText).not.toBe(h.original);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(h.clipboard.writeText).toBe(h.original);
+    } finally { vi.useRealTimers(); }
+  });
+});
