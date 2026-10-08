@@ -198,3 +198,55 @@ async function main() {
         //     non-Gemini picks fall back to Gemini Flash + log.
         let classifierModel: string | undefined;
         if (!byo && billedEngine === "bedrock") {
+          classifierModel = bedrockModel ?? undefined;
+        } else {
+          const { model, fellBack } = resolveClassifierModel(inst.model_overrides);
+          classifierModel = model ?? undefined;
+          if (fellBack) {
+            log.info(
+              { org_id: inst.org_id },
+              "classifier override targets a non-Gemini engine; falling back to default Gemini Flash",
+            );
+          }
+        }
+        const classifier = createClassifier({
+          backend,
+          ...(classifierModel ? { model: classifierModel } : {}),
+          objective: inst.objective ?? null,
+          // Per-instance override (Config page) wins over the env default, so the
+          // operator can loosen/tighten the filter without a redeploy.
+          qThreshold: inst.classifier_threshold ?? env.REDDIT_Q_THRESHOLD,
+        });
+
+        const claimed = await claimLeadsForClassification(sql, {
+          orgId: inst.org_id,
+          agentInstanceId: inst.id,
+          batch: env.CLASSIFIER_BATCH,
+        });
+        let n = 0;
+        for (const lead of claimed) {
+          await classifyOneLead({
+            sql,
+            classifier,
+            notifier,
+            inst,
+            lead,
+            log,
+            bus,
+          });
+          n++;
+        }
+        await run.finish({ status: "ok", rowsProcessed: n });
+      } catch (err) {
+        await run.finish({ status: "error", errorMessage: (err as Error).message });
+        throw err;
+      }
+    },
+    shouldStop,
+  });
+}
+
+main().catch((err) => {
+  console.error("classifier fatal:", err);
+  process.exit(EX_TEMPFAIL);
+});
