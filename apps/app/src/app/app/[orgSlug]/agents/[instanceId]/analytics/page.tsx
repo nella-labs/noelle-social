@@ -198,3 +198,12 @@ function HighlightCard({ title, tone, posts }: { title: string; tone: "ok" | "mu
         {posts.map((p) => (
           <a key={p.id} href={p.url} target="_blank" rel="noreferrer" style={{ display: "flex", gap: 8, alignItems: "center", color: "var(--ink)", textDecoration: "none" }}>
             <span style={{ fontFamily: "var(--mono)", fontSize: 12, color: tone === "ok" ? "var(--ok, #2e7d32)" : "var(--ink-muted)", flexShrink: 0, width: 56, textAlign: "right" }}>
+              {p.reachMultiple != null ? fmtReach(p.reachMultiple) : "—"}
+            </span>
+            <span style={{ fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.caption || "(no caption)"}</span>
+          </a>
+        ))}
+      </div>
+    </div>
+  );
+}
