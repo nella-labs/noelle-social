@@ -198,3 +198,62 @@ async function search(args: Record<string, unknown>, ctx: NoelleContext): Promis
   const per = limitOf(args, 20, 100);
   const orgId = org.orgId;
 
+  const [leads, persons, ideas, drafts, replies] = await Promise.all([
+    ctx.sql<Array<{ id: string; who: string | null; snip: string | null }>>`
+      select id, author_handle as who, payload->>'text' as snip from noelle.leads
+      where org_id = ${orgId} and (payload->>'text' ilike ${like} or author_handle ilike ${like})
+      order by created_at desc limit ${per}`,
+    ctx.sql<Array<{ id: string; who: string | null; snip: string | null }>>`
+      select id, display_name as who, notes as snip from noelle.persons
+      where org_id = ${orgId} and (display_name ilike ${like} or notes ilike ${like})
+      order by display_name asc limit ${per}`,
+    ctx.sql<Array<{ id: string; who: string | null; snip: string | null }>>`
+      select id, platform as who, coalesce(hook, thesis, angle) as snip from noelle.post_ideas
+      where org_id = ${orgId} and (hook ilike ${like} or thesis ilike ${like} or angle ilike ${like})
+      order by created_at desc limit ${per}`,
+    ctx.sql<Array<{ id: string; who: string | null; snip: string | null }>>`
+      select id, platform as who, coalesce(final_body, body) as snip from noelle.post_drafts
+      where org_id = ${orgId} and coalesce(final_body, body) ilike ${like}
+      order by created_at desc limit ${per}`,
+    ctx.sql<Array<{ id: string; who: string | null; snip: string | null }>>`
+      select d.id, l.author_handle as who, d.payload->>'body' as snip
+      from noelle.drafts d join noelle.leads l on l.id = d.lead_id
+      where d.org_id = ${orgId} and d.payload->>'body' ilike ${like}
+      order by d.synced_at desc nulls last limit ${per}`,
+  ]);
+
+  const sections: Array<[string, Array<{ id: string; who: string | null; snip: string | null }>]> = [
+    ["lead", leads],
+    ["person", persons],
+    ["post_idea", ideas],
+    ["post_draft", drafts],
+    ["reply_draft", replies],
+  ];
+  const rows = sections.flatMap(([kind, rs]) =>
+    rs.map((r) => [kind, r.id, r.who ?? "—", truncate(r.snip, 70)]),
+  );
+  const total = rows.length;
+  const table = mdTable(["kind", "id", "who", "snippet"], rows);
+  return text(`**Search "${q}"** in ${org.name} — ${total} match(es)\n\n${table}`);
+}
+
+async function handle(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult | null> {
+  switch (name) {
+    case "noelle_set_agent_config":
+      return guard(() => setAgentConfig(args, ctx));
+    case "noelle_requeue_lead":
+      return guard(() => requeueLead(args, ctx));
+    case "noelle_edit_post_draft":
+      return guard(() => editPostDraft(args, ctx));
+    case "noelle_search":
+      return guard(() => search(args, ctx));
+    default:
+      return null;
+  }
+}
+
+export const operateModule: ToolModule = { tools, handle };
