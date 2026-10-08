@@ -1,0 +1,35 @@
+.inbox { padding: 0 22px 22px; }
+.progress { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; padding: 14px 0 18px; border-top: 1px solid var(--rule); }
+.progressLabel { color: var(--ink-muted); font-size: 12px; white-space: nowrap; }
+.list { display: flex; flex-direction: column; gap: 18px; }
+.card { overflow: hidden; border: 1px solid var(--rule); border-radius: 18px; background: var(--paper); }
+.head { display: grid; grid-template-columns: 36px minmax(0,1fr) auto; align-items: center; gap: 14px; padding: 20px; background: var(--paper-2); border-bottom: 1px solid var(--rule); }
+.actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.angle { display: grid; grid-template-columns: 24px 105px minmax(0,1fr) auto; align-items: start; gap: 14px; padding: 20px; position: relative; cursor: pointer; }
+.angle + .angle { border-top: 1px solid var(--rule); }
+.angle[aria-checked="true"] { background: color-mix(in srgb, var(--accent-soft) 50%, var(--paper)); }
+.angle:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.angleText { font-size: 14px; line-height: 1.75; color: var(--ink-muted); overflow-wrap: anywhere; }
+.angle[aria-checked="true"] .angleText { color: var(--ink); }
+.angleMeta { display: grid; gap: 3px; }
+.angleMeta > :first-child { font-weight: 600; }
+.angleActions { display: flex; gap: 8px; flex-wrap: wrap; }
+.guide { display: flex; align-items: start; gap: 16px; margin-top: 22px; padding: 18px 20px; border-radius: 14px; background: var(--paper-2); color: var(--ink-muted); font-size: 12px; line-height: 1.75; }
+.guide > :first-child { min-width: 110px; }
+.empty { padding: 70px 24px; color: var(--ink-muted); text-align: center; font-size: 14px; line-height: 1.8; }
+@media (max-width: 1200px) {
+  .head { grid-template-columns: 36px minmax(0,1fr); }
+  .actions { grid-column: 2; }
+  .angle { grid-template-columns: 24px 90px minmax(0,1fr); }
+  .angleActions { grid-column: 3; }
+}
+@media (max-width: 768px) {
+  .inbox { padding: 0 16px 16px; }
+  .head { padding: 16px; gap: 10px; }
+  .actions { grid-column: 1 / -1; }
+  .angle { padding: 16px; grid-template-columns: 24px minmax(0,1fr); gap: 10px; }
+  .angleMeta { grid-column: 2; display: flex; align-items: baseline; gap: 8px; }
+  .angleText, .angleActions { grid-column: 2; }
+  .angle > :first-child { grid-row: 1 / 3; margin-top: 3px; }
+  .guide { flex-direction: column; gap: 6px; }
+}

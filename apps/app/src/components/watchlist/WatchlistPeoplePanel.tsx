@@ -198,3 +198,42 @@ function ObjectiveFields({
           className="input"
           style={{ flex: "1 1 120px", fontSize: 11.5 }}
           maxLength={240}
+        />
+      </>
+    );
+  }
+  if (objective.mode === "freetext") {
+    return (
+      <input
+        name="objective"
+        defaultValue={freetextValue}
+        placeholder={objective.placeholder ?? "optional engagement note"}
+        aria-label="Objective"
+        className="input"
+        style={{ flex: "1 1 100%", fontSize: 11.5 }}
+        maxLength={240}
+      />
+    );
+  }
+  return null;
+}
+
+/** Preset-objective picker. value="" means "no objective" (instance default). */
+function ObjectiveSelect({ name, defaultValue }: { name: string; defaultValue: string }) {
+  return (
+    <select
+      name={name}
+      defaultValue={defaultValue}
+      className="input"
+      style={{ flex: "0 0 auto", fontSize: 12 }}
+      aria-label="Objective for this person"
+    >
+      <option value={NO_OBJECTIVE}>No objective</option>
+      {WATCHLIST_OBJECTIVES.map((o) => (
+        <option key={o.key} value={o.key}>
+          {o.label}
+        </option>
+      ))}
+    </select>
+  );
+}
