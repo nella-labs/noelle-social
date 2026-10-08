@@ -1,0 +1,38 @@
+<!-- Representative hooks and nesting from a signed-in x.com/home feed on
+     2026-09-19. Obfuscated classes/media were omitted; the selectors, order,
+     primary timestamp, nested quote, action labels, and Ad label match the
+     observed DOM. One ordinary card deliberately carries placementTracking. -->
+<div data-testid="SideNav_AccountSwitcher_Button"><span>Alex</span><span>@demooperator2</span></div>
+<main>
+  <article data-testid="tweet">
+    <div data-testid="User-Name">
+      <a href="/jackfriks"><span>jack friks</span></a>
+      <a href="/jackfriks"><span>@jackfriks</span></a>
+      <a href="/jackfriks/status/2101481430098288767"><time datetime="2026-09-20T01:19:51.000Z">51m</time></a>
+    </div>
+    <div data-testid="tweetText">brb adding $10K MRR to my b2b SaaS overnight<br>the implementation is finally working</div>
+    <div data-testid="placementTracking"></div>
+    <div data-testid="quoteTweet">
+      <div data-testid="User-Name"><a href="/someone/status/2101481430098288700"><time datetime="2026-09-19T22:00:00.000Z">4h</time></a></div>
+      <div data-testid="tweetText">quoted text must not become the observed body</div>
+    </div>
+    <div role="group" aria-label="7 replies, 40 likes, 13 bookmarks, 3671 views">
+      <button data-testid="reply" aria-label="7 Replies. Reply"></button>
+      <button data-testid="like" aria-label="40 Likes. Like"></button>
+    </div>
+  </article>
+  <article data-testid="tweet">
+    <div data-testid="User-Name"><a href="/ziva"><span>Ziva.sh</span></a><a href="/ziva"><span>@ziva</span></a><span>Ad</span></div>
+    <div data-testid="tweetText">buy a subscription</div>
+    <div role="group" aria-label="2 replies, 30 likes">
+      <button data-testid="reply" aria-label="2 Replies. Reply"></button>
+      <button data-testid="like" aria-label="30 Likes. Like"></button>
+    </div>
+  </article>
+  <article data-testid="tweet">
+    <div data-testid="User-Name"><a href="/demooperator2"><span>Alex</span></a><a href="/demooperator2"><span>@demooperator2</span></a><a href="/demooperator2/status/2101481430098288768"><time datetime="2026-09-20T01:20:00.000Z">50m</time></a></div>
+    <div data-testid="tweetText">my own tweet is not a lead</div>
+    <button data-testid="reply" aria-label="1 Reply. Reply"></button>
+    <button data-testid="like" aria-label="3 Likes. Like"></button>
+  </article>
+</main>

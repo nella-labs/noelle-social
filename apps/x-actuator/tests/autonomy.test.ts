@@ -198,3 +198,164 @@ describe("shouldAutoDrain", () => {
     expect(shouldAutoDrain({ ...drainBase, pendingComments: 0 })).toBe(false);
   });
 
+  it("a manual STOP silences it for the rest of that day only", () => {
+    expect(shouldAutoDrain({ ...drainBase, stopDay: "2026-07-17" })).toBe(false);
+    expect(shouldAutoDrain({ ...drainBase, stopDay: "2026-07-16" })).toBe(true);
+  });
+
+  it("fails closed on a skewed/garbage re-arm stamp", () => {
+    expect(shouldAutoDrain({ ...drainBase, lastAutoDrainMs: drainBase.nowMs + 60_000 })).toBe(false); // future stamp
+    expect(shouldAutoDrain({ ...drainBase, lastAutoDrainMs: Number.NaN })).toBe(false);
+  });
+});
+
+describe("shouldRecoverStalledRun", () => {
+  // A run that is running, past warm-up, has drafts loaded and overdue comment
+  // slots, and hasn't posted in 25 min (> the 20-min threshold) → wedged.
+  const stalledBase: StalledRunInput = {
+    autonomous: true,
+    autoDrain: true,
+    runActive: true,
+    msSinceProgress: 25 * 60_000,
+    msSinceStart: 40 * 60_000,
+    warmupSuppressMs: 4 * 60_000,
+    stallThresholdMs: 20 * 60_000,
+    loadedDrafts: 6,
+    dueCommentSlots: 3,
+    localHour: 15,
+    startHour: 9,
+    endHour: 21,
+    lastAutoDrainMs: null,
+    nowMs: 1_000_000_000,
+    minGapMinutes: 30,
+    todayKey: "2026-07-19",
+    stopDay: null,
+  };
+
+  it("recovers a provably wedged run", () => {
+    expect(shouldRecoverStalledRun(stalledBase)).toBe(true);
+  });
+
+  it("does NOT fire on a healthy run that posted recently", () => {
+    expect(shouldRecoverStalledRun({ ...stalledBase, msSinceProgress: 19 * 60_000 })).toBe(false); // under threshold
+  });
+
+  it("does NOT fire when idle-waiting for supply (nothing loaded)", () => {
+    expect(shouldRecoverStalledRun({ ...stalledBase, loadedDrafts: 0 })).toBe(false);
+  });
+
+  it("does NOT fire when correctly paced (no overdue comment slots)", () => {
+    expect(shouldRecoverStalledRun({ ...stalledBase, dueCommentSlots: 0 })).toBe(false);
+  });
+
+  it("does NOT fire while still in warm-up", () => {
+    // msSinceStart inside the warm-up window, even though progress looks stale.
+    expect(shouldRecoverStalledRun({ ...stalledBase, msSinceStart: 3 * 60_000, warmupSuppressMs: 4 * 60_000 })).toBe(false);
+  });
+
+  it("only ever supersedes a LIVE run", () => {
+    expect(shouldRecoverStalledRun({ ...stalledBase, runActive: false })).toBe(false);
+  });
+
+  it("respects the opt-ins and the operating window", () => {
+    expect(shouldRecoverStalledRun({ ...stalledBase, autonomous: false })).toBe(false);
+    expect(shouldRecoverStalledRun({ ...stalledBase, autoDrain: false })).toBe(false);
+    expect(shouldRecoverStalledRun({ ...stalledBase, localHour: 8 })).toBe(false);
+    expect(shouldRecoverStalledRun({ ...stalledBase, localHour: 21 })).toBe(false); // end exclusive
+  });
+
+  it("shares the auto-drain re-arm cooldown (can't machine-gun)", () => {
+    expect(shouldRecoverStalledRun({ ...stalledBase, lastAutoDrainMs: stalledBase.nowMs - 29 * 60_000 })).toBe(false); // within cooldown
+    expect(shouldRecoverStalledRun({ ...stalledBase, lastAutoDrainMs: stalledBase.nowMs - 31 * 60_000 })).toBe(true);  // cooldown elapsed
+  });
+
+  it("a manual STOP silences recovery for the rest of that day", () => {
+    expect(shouldRecoverStalledRun({ ...stalledBase, stopDay: "2026-07-19" })).toBe(false);
+    expect(shouldRecoverStalledRun({ ...stalledBase, stopDay: "2026-07-18" })).toBe(true);
+  });
+
+  it("fails closed on a skewed/garbage re-arm stamp", () => {
+    expect(shouldRecoverStalledRun({ ...stalledBase, lastAutoDrainMs: stalledBase.nowMs + 60_000 })).toBe(false); // future
+    expect(shouldRecoverStalledRun({ ...stalledBase, lastAutoDrainMs: Number.NaN })).toBe(false);
+  });
+});
+
+describe("confirmStall (two-tick confirmation)", () => {
+  const sid = "sess-1";
+  it("observes on the first stalled sighting (no probe yet)", () => {
+    expect(confirmStall({ stalledNow: true, sessionId: sid, progressMs: 1000, probe: null })).toBe("observe");
+  });
+  it("recovers only when stalled twice with the same run + unchanged progress", () => {
+    expect(confirmStall({ stalledNow: true, sessionId: sid, progressMs: 1000, probe: { sid, progressMs: 1000 } })).toBe("recover");
+  });
+  it("re-observes (never recovers) when progress advanced — a healthy run posted between ticks", () => {
+    expect(confirmStall({ stalledNow: true, sessionId: sid, progressMs: 2000, probe: { sid, progressMs: 1000 } })).toBe("observe");
+  });
+  it("re-observes when the probe belongs to a superseded run (different session)", () => {
+    expect(confirmStall({ stalledNow: true, sessionId: "sess-2", progressMs: 1000, probe: { sid, progressMs: 1000 } })).toBe("observe");
+  });
+  it("clears the probe the moment the run is no longer stalled", () => {
+    expect(confirmStall({ stalledNow: false, sessionId: sid, progressMs: 1000, probe: { sid, progressMs: 1000 } })).toBe("clear");
+    expect(confirmStall({ stalledNow: false, sessionId: sid, progressMs: 1000, probe: null })).toBe("clear");
+  });
+});
+describe("shouldSelfReload", () => {
+  const reloadBase: SelfReloadInput = {
+    runActive: false,
+    embeddedStamp: "2026-07-17T16:00:00.000Z",
+    servedStamp: "2026-07-17T17:00:00.000Z",
+    lastAttemptedStamp: null,
+  };
+
+  it("reloads when idle and a newer build is on disk", () => {
+    expect(shouldSelfReload(reloadBase)).toBe(true);
+  });
+
+  it("never reloads during a run", () => {
+    expect(shouldSelfReload({ ...reloadBase, runActive: true })).toBe(false);
+  });
+
+  it("does nothing when already running the on-disk build", () => {
+    expect(shouldSelfReload({ ...reloadBase, servedStamp: reloadBase.embeddedStamp })).toBe(false);
+  });
+
+  it("fails closed when either stamp is unknown", () => {
+    expect(shouldSelfReload({ ...reloadBase, servedStamp: null })).toBe(false);
+    expect(shouldSelfReload({ ...reloadBase, embeddedStamp: null })).toBe(false);
+  });
+
+  it("attempts once per served stamp (a stale disk copy cannot loop)", () => {
+    expect(shouldSelfReload({ ...reloadBase, lastAttemptedStamp: reloadBase.servedStamp })).toBe(false);
+    expect(shouldSelfReload({ ...reloadBase, lastAttemptedStamp: "2026-07-16T09:00:00.000Z" })).toBe(true);
+  });
+
+  it("MAY reload a live-but-resumable run (persistent drain that will self-resume)", () => {
+    // The #488 fix: a persistent drain never ends, so `runActive` alone would pin
+    // the extension on a stale build forever. When a resume path will bring it
+    // back (Full-auto intent / auto-drain), a reload is allowed so the self-update
+    // completes instead of silently stopping the run.
+    expect(shouldSelfReload({ ...reloadBase, runActive: true, runResumable: true })).toBe(true);
+    // still never interrupts a BUSY run (not resumable this instant).
+    expect(shouldSelfReload({ ...reloadBase, runActive: true, runResumable: false })).toBe(false);
+  });
+});
+
+describe("shouldResumeDrain", () => {
+  const base = { intentSet: true, runActive: false, safe: true };
+
+  it("resumes when the standing intent is set, nothing runs, and it is safe", () => {
+    expect(shouldResumeDrain(base)).toBe(true);
+  });
+
+  it("does nothing without the durable intent (never auto-starts on its own)", () => {
+    expect(shouldResumeDrain({ ...base, intentSet: false })).toBe(false);
+  });
+
+  it("never starts a second overlapping run", () => {
+    expect(shouldResumeDrain({ ...base, runActive: true })).toBe(false);
+  });
+
+  it("holds off when the safety gate fails (post-challenge cooldown / bad health) — resumes later, no re-click", () => {
+    expect(shouldResumeDrain({ ...base, safe: false })).toBe(false);
+  });
+});
