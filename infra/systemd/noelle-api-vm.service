@@ -1,0 +1,53 @@
+[Unit]
+# Hono service for api.trynoelle.com, fronted by cloudflared. Lives on
+# noelle-vm-0 alongside the worker pool.
+#
+# Install: rsync infra/systemd/ to /etc/systemd/system/ on the VM (deploy.sh
+# handles this), then `sudo systemctl daemon-reload && sudo systemctl enable
+# --now noelle-api-vm`.
+Description=Noelle api-vm Hono service (api.trynoelle.com)
+Documentation=https://github.com/nella-labs/noelle-social/blob/HEAD/docs/architecture.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=noelle-api
+Group=noelle-api
+
+# Run in-place from the deployed checkout. deploy.sh keeps this directory
+# fresh; there is no separate APP_DIR (the legacy /srv/noelle/api-vm layout
+# was never used in production).
+WorkingDirectory=/opt/noelle/repo/apps/api-vm
+
+# Env file is hand-populated today (NOELLE_DATABASE_URL, HMAC, JWT secret,
+# etc.). A future pass moves these into GCP Secret Manager via
+# scripts/pull-secrets.sh; until then leave api-vm.env alone on the VM.
+EnvironmentFile=/etc/noelle/api-vm.env
+
+# Run TS sources directly under tsx — matches the api-vm package.json's
+# `start` script. Switch to a tsc build artifact when it stops paying off.
+ExecStart=/opt/noelle/repo/apps/api-vm/node_modules/.bin/tsx /opt/noelle/repo/apps/api-vm/src/index.ts
+
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Defense-in-depth.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+LimitNOFILE=4096
+
+# Don't get OOM-killed before the worker pool in pressure events.
+MemoryMax=512M
+OOMScoreAdjust=-100
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=noelle-api-vm
+
+[Install]
+WantedBy=multi-user.target

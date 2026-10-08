@@ -198,3 +198,56 @@ gcloud compute ssh noelle-listmonk --zone=us-central1-a --project=noelle-agents 
   --command="cd /opt/listmonk && export POSTGRES_PASSWORD=\$(gcloud secrets versions access latest --secret=listmonk-postgres-password --project=noelle-agents) && sudo POSTGRES_PASSWORD=\"\$POSTGRES_PASSWORD\" docker compose exec -T postgres psql -U listmonk -d listmonk -c \"UPDATE users SET password='$NEW' WHERE username='noelle-dashboard';\" && sudo docker compose restart listmonk"
 
 # Mirror to Vercel — required because the dashboard reads LISTMONK_PASSWORD
+# from env, not from GCP Secret Manager at runtime.
+vercel env rm LISTMONK_PASSWORD production --yes
+vercel env rm LISTMONK_PASSWORD preview --yes
+vercel env rm LISTMONK_PASSWORD development --yes
+echo -n "$NEW" | vercel env add LISTMONK_PASSWORD production
+echo -n "$NEW" | vercel env add LISTMONK_PASSWORD preview
+echo -n "$NEW" | vercel env add LISTMONK_PASSWORD development
+```
+
+Restart is required — Listmonk caches the users table in memory.
+
+## Rotate the SES read-only IAM access key
+
+```bash
+# 1. Create a new key (AWS lets you have two active per user)
+aws iam create-access-key --user-name noelle-ses-readonly
+
+# 2. Mirror to GCP Secret Manager + Vercel
+echo -n "$NEW_KEY_ID" | gcloud secrets versions add \
+  noelle-ses-readonly-access-key-id --data-file=- --project=noelle-agents
+echo -n "$NEW_SECRET" | gcloud secrets versions add \
+  noelle-ses-readonly-secret-access-key --data-file=- --project=noelle-agents
+# (Vercel update same shape as above)
+
+# 3. Once the new key is working in prod, delete the old one
+aws iam delete-access-key --user-name noelle-ses-readonly \
+  --access-key-id <OLD_KEY_ID>
+```
+
+The dashboard's SES client is read-only, so there's no in-flight write
+to worry about — just trigger a redeploy after the env update.
+
+## Backups
+
+Postgres data lives at `/opt/listmonk/pgdata` on the VM disk. For ad-hoc
+backups:
+
+```bash
+docker compose exec postgres pg_dump -U listmonk listmonk \
+  | gzip > /tmp/listmonk-$(date +%Y%m%d).sql.gz
+gcloud storage cp /tmp/listmonk-*.sql.gz gs://<noelle-backups-bucket>/listmonk/
+```
+
+(TODO: wire this into a cron + a backups bucket once we have one.)
+
+## Common operational tasks
+
+- **Tail Listmonk logs**: `docker compose logs -f listmonk`
+- **Tail Caddy access log**: `journalctl -u caddy -f`
+- **Restart only Listmonk**: `docker compose restart listmonk`
+- **Check disk**: `df -h /opt/listmonk`
+- **List campaigns / subscribers from CLI**: use Listmonk's REST API at
+  `https://listmonk.trynoelle.com/api/...` with admin credentials.
