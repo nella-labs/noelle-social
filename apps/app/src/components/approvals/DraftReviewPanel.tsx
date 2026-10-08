@@ -198,3 +198,203 @@ export function DraftReviewPanel({
   // Reverse the just-taken action and return the lead to the actionable queue.
   // Resets the result state so the picker re-enables; router.refresh() re-fetches
   // the server component (the restored pending angles reappear).
+  const onUndo = () => {
+    startTransition(async () => {
+      const res = markSentResult?.ok
+        ? await unmarkSentManual({ orgSlug, approvalId: targetApprovalId })
+        : await unskipDraft({ orgSlug, approvalId: targetApprovalId });
+      if (res.ok) {
+        setUndone(true);
+        setSkipResult(null);
+        setMarkSentResult(null);
+        router.refresh();
+      }
+    });
+  };
+
+  const onApprove = () => {
+    if (!selected || pending) return;
+    const outgoing = draft.trim() ? draft : selected.text;
+    setSendResult(null);
+    startTransition(async () => {
+      const res = await sendDraft({
+        orgSlug,
+        approvalId: targetApprovalId,
+        // originalBody = the angle the drafter produced; body = what's in the
+        // textarea. When they differ, `edited` fires and edited_body persists.
+        originalBody: selected.text,
+        body: outgoing,
+      });
+      setSendResult(res);
+    });
+  };
+
+  const onSkip = () => {
+    if (pending) return;
+    setSkipResult(null);
+    startTransition(async () => {
+      const res = await skipDraft({ orgSlug, approvalId: targetApprovalId, reason: "skipped" });
+      setSkipResult(res);
+    });
+  };
+
+  // "I already posted this on X by hand" — records the approval as sent
+  // without api-vm re-posting. Also the escape hatch when Approve & send
+  // fails (e.g. missing_in_reply_to on a lead with no real tweet anchor).
+  // /mark-sent carries no body, so if the operator edited the reply before
+  // posting it by hand, persist that edit first (edited_body) so the manual
+  // path still yields the learning signal.
+  const onMarkSent = () => {
+    if (pending) return;
+    setMarkSentResult(null);
+    startTransition(async () => {
+      if (edited && selected) {
+        const saved = await saveDraftEdit({ orgSlug, approvalId: targetApprovalId, body: draft });
+        if (!saved.ok) {
+          setMarkSentResult(saved);
+          return;
+        }
+      }
+      const res = await markSentManual({
+        orgSlug,
+        approvalId: targetApprovalId,
+        tweetUrl: manualUrl.trim() || undefined,
+      });
+      setMarkSentResult(res);
+    });
+  };
+
+  if (angles.length === 0) {
+    return (
+      <div className="card">
+        <div className="eyebrow">No angles available</div>
+        <div
+          style={{
+            marginTop: 10,
+            fontSize: 13,
+            color: "var(--ink-muted)",
+            lineHeight: 1.5,
+          }}
+        >
+          The drafter hasn&rsquo;t produced any angles for this lead yet, or
+          the payload didn&rsquo;t sync cleanly.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={styles.panel}>
+      <div className="eyebrow" style={{ marginBottom: 12 }}>
+        Reply options · pick one
+      </div>
+      <div className="angle-stack">
+        {angles.map((a, i) => {
+          const isSelected = a.id === selectedId;
+          return (
+            <button
+              key={a.id}
+              type="button"
+              className={`angle${isSelected ? " selected" : ""}`}
+              onClick={() => pickAngle(a)}
+              disabled={pending || !!success}
+              title="Click to copy this reply (and pick it)"
+            >
+              <h4>
+                <span className="num">0{i + 1}</span>
+                <span>{a.kind}</span>
+                {a.quality != null ? (
+                  <span style={{ marginLeft: "auto", color: "var(--ink-soft)" }}>
+                    quality · {(a.quality * 100).toFixed(0)}
+                  </span>
+                ) : null}
+              </h4>
+              <div className="text">{a.text}</div>
+              <div className="angle-foot">
+                <span>{a.text.length} chars</span>
+                <span>·</span>
+                <span
+                  style={{
+                    marginLeft: "auto",
+                    color: copiedKey === a.id ? "var(--ok)" : "var(--ink-soft)",
+                  }}
+                >
+                  {copiedKey === a.id ? "Copied ✓" : "click to copy"}
+                </span>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Editable reply. Seeded from the picked angle; tweak it before sending.
+          What's here is exactly what gets posted — and when it differs from the
+          angle text, the edit is persisted as the learning signal (edited_body). */}
+      <div style={{ marginTop: 18 }}>
+        <div
+          className="eyebrow"
+          style={{
+            marginBottom: 8,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <span>Your reply · edit before sending</span>
+          {edited ? (
+            <span className="tag" style={{ color: "var(--accent)", fontSize: 10.5 }}>
+              edited
+            </span>
+          ) : null}
+          <span style={{ marginLeft: "auto", color: "var(--ink-soft)", fontSize: 11 }}>
+            {draft.length} chars
+          </span>
+        </div>
+        <textarea
+          className="input"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          disabled={pending || !!success}
+          rows={4}
+          spellCheck
+          aria-label="Editable reply body"
+          placeholder="Edit the reply before you send it…"
+          style={{
+            width: "100%",
+            minHeight: 96,
+            resize: "vertical",
+            fontSize: 14,
+            lineHeight: 1.5,
+            fontFamily: "inherit",
+          }}
+        />
+        <div
+          style={{
+            marginTop: 6,
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+          }}
+        >
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={() => copy(draft, "__edited__")}
+            disabled={!draft.trim()}
+            title="Copy the edited reply to your clipboard"
+          >
+            {copiedKey === "__edited__" ? "Copied ✓" : "Copy edited"}
+          </button>
+          {edited ? (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              onClick={() => setDraft(selected?.text ?? "")}
+              disabled={pending || !!success}
+              title="Discard your edit and restore the drafter's original angle"
+            >
+              Reset to draft
+            </button>
+          ) : null}
+        </div>
+      </div>
