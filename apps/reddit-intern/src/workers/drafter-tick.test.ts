@@ -598,3 +598,203 @@ describe("decideOpus (score-based tiering rule)", () => {
     expect(decideOpus({ score: -2, comments: 0, ...th })).toEqual({ useOpus: false, score: -2, comments: 0 });
     expect(decideOpus({ score: 800.5, comments: 150.5, ...th })).toEqual({ useOpus: false, score: null, comments: null });
   });
+});
+
+describe("runDrafterTick — score-based Opus model override", () => {
+  const opusArgs = { opusScoreThreshold: 500, opusCommentsThreshold: 100, opusModel: "claude-opus-4-6" };
+
+  function routingOf(runner: { draft: { mock: { calls: unknown[][] } } }) {
+    return (runner.draft.mock.calls[0]![0] as { routing: { primary: { model: string }; fallback?: { model: string } } }).routing;
+  }
+
+  it("overrides to Opus when post score > 500", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { title: "post", text: "", score: 800, numComments: 2 } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      ...opusArgs,
+    });
+    expect(routingOf(runner).primary.model).toBe("claude-opus-4-6");
+    expect(routingOf(runner).fallback?.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("overrides to Opus when comments > 100", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { title: "post", text: "", score: 5, numComments: 150 } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      ...opusArgs,
+    });
+    expect(routingOf(runner).primary.model).toBe("claude-opus-4-6");
+  });
+
+  it("uses the default model (sonnet) for a normal low-engagement lead", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { title: "post", text: "", score: 10, numComments: 3 } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      ...opusArgs,
+    });
+    expect(routingOf(runner).primary.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("applies Opus tiering on the LIGHT path too (high-engagement win post)", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null, payload: { title: "we shipped!", text: "", score: 1200, numComments: 5 } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      ...opusArgs,
+    });
+    expect((runner.draft.mock.calls[0]![0] as { routing: { primary: { model: string } } }).routing.primary.model).toBe(
+      "claude-opus-4-6",
+    );
+  });
+
+  it("Opus tiering never trips when thresholds are left at default (omitted) — defensive", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { title: "post", text: "", score: 999999, numComments: 999999 } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(routingOf(runner).primary.model).toBe("claude-sonnet-4-6");
+  });
+});
+
+describe("runDrafterTick — knowledge grounding (grounded-drafting)", () => {
+  it("scopes the voice search to voiceDirs when configured (single pass, filterDirs)", async () => {
+    const { postOutbound, runner, markStatus } = deps();
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(8.0)]) };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      voiceDirs: ["02-brand"],
+    });
+    expect(kb.search).toHaveBeenCalledTimes(1);
+    expect(kb.search.mock.calls[0]![2]).toEqual({ filterDirs: ["02-brand"] });
+  });
+
+  it("runs a SECOND knowledge pass and injects 'Product knowledge' into the prompt", async () => {
+    const { postOutbound, runner, markStatus } = deps();
+    const kb = {
+      search: vi.fn().mockImplementation((_q: string, _k: number, opts?: { filterDirs?: string[] }) => {
+        if (opts?.filterDirs?.includes("01-business")) {
+          return Promise.resolve([
+            { snippet: "Nella does AST-aware code search", score: 9, filePath: "01-business/x.md", startLine: 1, endLine: 1, highlights: [] },
+          ]);
+        }
+        return Promise.resolve([anchorHit(8.0)]);
+      }),
+    };
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      knowledgeDirs: ["01-business"],
+      knowledgeTopK: 4,
+    });
+    expect(kb.search).toHaveBeenCalledTimes(2);
+    expect(kb.search.mock.calls.some((c) => c[2]?.filterDirs?.includes("01-business"))).toBe(true);
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    expect(prompt).toContain("Product knowledge");
+    expect(prompt).toContain("AST-aware code search");
+  });
+
+  it("skips the knowledge pass when no knowledge dirs are configured", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(kb.search).toHaveBeenCalledTimes(1);
+    expect((runner.draft.mock.calls[0]![0] as { prompt: string }).prompt).not.toContain("Product knowledge");
+  });
+});
+
+describe("runDrafterTick — vision caption (grounded-drafting)", () => {
+  it.each(["substantial", "light"])("stops %s before paid drafting when caption admission rejects", async (kind) => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const captionFn = vi.fn().mockRejectedValue(new BudgetExceededError({ layer: "instance", spent_cents: 1, cap_cents: 1, estimated_cents: 1 }));
+    expect(await runDrafterTick({ log, instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: kind, payload: { title: "image context", text: "",
+        images: ["https://image.test/a.jpg"] } })] as never, runner: runner as never,
+      kb: kb as never, postOutbound, markStatus, captionFn })).toBe(0);
+    expect(runner.draft).not.toHaveBeenCalled();
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ status: "errored",
+      meta: expect.objectContaining({ error: "budget_exceeded" }) }));
+  });
+
+  it("captions the post's images and injects 'THE POST'S IMAGE SHOWS:' into the prompt", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const captionFn = vi.fn().mockResolvedValue("a line chart of MRR doubling over 3 months");
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { title: "we hit a milestone", text: "", images: ["https://i.redd.it/a.jpg"] } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      captionFn,
+    });
+    expect(captionFn).toHaveBeenCalledTimes(1);
+    const prompt = (runner.draft.mock.calls[0]![0] as { prompt: string }).prompt;
+    expect(prompt).toContain("THE POST'S IMAGE SHOWS:");
+    expect(prompt).toContain("a line chart of MRR doubling");
+  });
+
+  it("no captionFn → no image line (drafting unchanged)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { title: "post", text: "", images: ["https://i.redd.it/a.jpg"] } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect((runner.draft.mock.calls[0]![0] as { prompt: string }).prompt).not.toContain("THE POST'S IMAGE SHOWS:");
+  });
+
+  it("fails open when the vision call throws (drafting proceeds, no image line)", async () => {
