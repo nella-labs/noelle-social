@@ -1998,3 +1998,203 @@ describe("runDmRequestTick (on-demand DM)", () => {
         model: "gpt-5",
       }),
     };
+    const n = await runDmRequestTick(callArgs(runner, postOutbound));
+    expect(n).toBe(0);
+    expect(postOutbound).not.toHaveBeenCalled();
+  });
+});
+
+// When a tweet has image(s) and a captionFn is wired, the drafter captions them
+// and injects "THE POST'S IMAGE SHOWS:" into the prompt so the reply isn't blind
+// to the visual. Fail-open everywhere: no images / no captionFn / a caption error
+// → no block, the draft still ships.
+describe("runDrafterTick — vision caption (X post images)", () => {
+  const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+  const mkRunner = () => ({
+    draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({
+        drafts: [
+          { angle: "empathetic", body: "e", char_count: 1 },
+          { angle: "technical", body: "t", char_count: 1 },
+          { angle: "contrarian", body: "c", char_count: 1 },
+        ],
+      }),
+      engine: "codex",
+      model: "gpt-5",
+    }),
+  });
+  const mkKb = () => ({
+    search: vi.fn().mockResolvedValue([
+      { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+    ]),
+  });
+  const leadWithImages = () => ({
+    id: "L",
+    external_id: "x1",
+    payload: { text: "look at this chart", url: "https://x.com/u/status/1", images: ["https://pbs.twimg.com/media/a.jpg"] },
+    author_handle: "u",
+    author_id: "uid",
+    status: "drafting",
+    tier: null,
+    classifier_label: null,
+    classifier_score: null,
+    priority: false,
+  });
+
+  it.each([false, true])("stops paid drafting after caption admission rejects (priority=%s)", async (priority) => {
+    const runner = mkRunner();
+    const markStatus = vi.fn().mockResolvedValue(undefined);
+    const postOutbound = vi.fn();
+    const captionFn = vi.fn().mockRejectedValue(new BudgetExceededError({ layer: "instance", spent_cents: 1, cap_cents: 1, estimated_cents: 1 }));
+    expect(await runDrafterTick({ log, instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [{ ...leadWithImages(), priority }] as never, runner: runner as never,
+      kb: mkKb() as never, postOutbound, markStatus, captionFn })).toBe(0);
+    expect(runner.draft).not.toHaveBeenCalled();
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ status: priority ? "classified" : "errored",
+      meta: expect.objectContaining({ error: "budget_exceeded" }) }));
+  });
+
+  it("captions the tweet's images and injects 'THE POST'S IMAGE SHOWS:' into the prompt", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = mkRunner();
+    const captionFn = vi.fn().mockResolvedValue("a line chart of MRR doubling over 3 months");
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [leadWithImages()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      captionFn,
+    });
+    expect(captionFn).toHaveBeenCalledTimes(1);
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("THE POST'S IMAGE SHOWS:");
+    expect(prompt).toContain("a line chart of MRR doubling");
+  });
+
+  it("no captionFn → no image line (drafting unchanged)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [leadWithImages()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("THE POST'S IMAGE SHOWS:");
+  });
+
+  it("no images on the lead → captionFn never called, no image line", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = mkRunner();
+    const captionFn = vi.fn().mockResolvedValue("should not be used");
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        { id: "L", external_id: "x1", payload: { text: "just words", url: "https://x.com/u/status/1" }, author_handle: "u", author_id: "uid", status: "drafting", tier: null, classifier_label: null, classifier_score: null, priority: false },
+      ] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      captionFn,
+    });
+    expect(captionFn).not.toHaveBeenCalled();
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("THE POST'S IMAGE SHOWS:");
+  });
+
+  it("fails open when the vision call throws (drafting proceeds, no image line)", async () => {
+    const postOutbound = vi.fn().mockResolvedValue({ id: "a", approval_id: "a" });
+    const runner = mkRunner();
+    const captionFn = vi.fn().mockRejectedValue(new Error("vision 500"));
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [leadWithImages()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound,
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      captionFn,
+    });
+    expect(n).toBe(1); // draft still shipped
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).not.toContain("THE POST'S IMAGE SHOWS:");
+  });
+});
+
+describe("runDrafterTick voice variety (NOELLE_DRAFTER_VARIETY)", () => {
+  const log = { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() } as never;
+  const mkRunner = () => ({
+    draft: vi.fn().mockResolvedValue({
+      text: JSON.stringify({
+        drafts: [
+          { angle: "empathetic", body: "e", char_count: 1 },
+          { angle: "technical", body: "t", char_count: 1 },
+          { angle: "contrarian", body: "c", char_count: 1 },
+        ],
+      }),
+      engine: "codex",
+      model: "gpt-5",
+    }),
+  });
+  const mkKb = () => ({
+    search: vi.fn().mockResolvedValue([
+      { path: "p.md", snippet: "anchor", score: 8.0, filePath: "p.md", startLine: 1, endLine: 1, highlights: [] },
+    ]),
+  });
+  const mkLead = () => ({
+    id: "L",
+    external_id: "x1",
+    payload: { text: "post text", url: "https://x.com/u/status/1" },
+    author_handle: "u",
+    author_id: "uid",
+    status: "drafting",
+    tier: null,
+    classifier_label: null,
+    classifier_score: null,
+    priority: false,
+  });
+
+  // A post with no strong energy takes the SHAPE lane: form rotates so the feed
+  // stops reading as one mold. (Before the form-variant port this lane injected a
+  // blind register instead; the register lane now lives on the tone-first
+  // energies, covered by the two tests below.)
+  it("assigns a rotating SHAPE (not a register) when variety is ON and the post has no strong energy", async () => {
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      variety: { enabled: true, rng: () => 0 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("THIS REPLY'S ASSIGNED SHAPE");
+    expect(prompt).not.toContain("ASSIGNED REGISTER FOR THIS REPLY");
+  });
+
+  it("lets a MICRO shape authorise a ONE-word reply (overrides the 40-120 budget)", async () => {
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      // Pin the rotation to MICRO so the assertion is about the wiring, not luck.
+      variety: {
