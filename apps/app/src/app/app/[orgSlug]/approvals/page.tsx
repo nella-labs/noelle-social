@@ -198,3 +198,203 @@ export default async function ApprovalsInboxPage({
       ? { provisioned: true, pending: linkedinPending }
       : null,
     redditIntern: redditInstance
+      ? { provisioned: true, pending: redditPending }
+      : null,
+  });
+  const activeId = streamParam ?? "x-intern";
+  const active = streams.find((s) => s.id === activeId) ?? streams[0];
+
+  const stale =
+    !lastSync?.finished_at ||
+    Date.now() - new Date(lastSync.finished_at).getTime() > STALE_THRESHOLD_MS;
+
+  const basePath = `/app/${orgSlug}/approvals`;
+  const isXIntern = active.id === "x-intern";
+  // The LinkedIn stream is live only when Lyra is provisioned; otherwise the
+  // tab falls through to the "hire" placeholder via LockedStream.
+  const isLinkedIn =
+    active.id === "linkedin-intern" && active.status === "live" && !!linkedinInstance;
+  // The Reddit stream is live only when Orion is provisioned; otherwise the tab
+  // falls through to the "hire" placeholder via LockedStream.
+  const isReddit =
+    active.id === "reddit-intern" && active.status === "live" && !!redditInstance;
+
+  // Watched-author sets for the VIP banner's "On watchlist ✓" state — sourced
+  // from the real watchlist tables so the indicator survives a reload (local
+  // button state alone reset to "Add to watchlist" on every refresh). Only
+  // fetched for the active stream to avoid a wasted query on the other tabs.
+  const xWatchedHandles = new Set<string>(
+    isXIntern && xInternInstance
+      ? (await getWatchlistPeopleForInstance(xInternInstance.id).catch(() => []))
+          .map((p) => p.handle.toLowerCase())
+      : [],
+  );
+  const liWatchedRefs = new Set<string>(
+    isLinkedIn && linkedinInstance
+      ? (await getLinkedInWatchlistPeopleForInstance(linkedinInstance.id).catch(() => []))
+          .map((p) => (p.public_id ?? "").toLowerCase())
+          .filter(Boolean)
+      : [],
+  );
+
+  // Load Lyra's pending review rows only when her tab is the active one (avoid
+  // a wasted query on every X-intern render). Every Lyra lead is a watched
+  // connection, so the "Per person → latest only" filter (?wlLatest=on)
+  // collapses both her Review list and Speedrun to one post per connection.
+  const liLastBatchSince =
+    liFilters.batch === "last"
+      ? (linkedinInstance?.last_goal_started_at ?? null)
+      : null;
+  const linkedinRowsRaw: LinkedInApprovalView[] =
+    isLinkedIn && linkedinInstance
+      ? await listPendingLinkedInApprovals(linkedinInstance.id, 300, {
+          status: liFilters.status,
+          watchlist: liFilters.watchlist,
+          sort: liFilters.sort,
+          lastBatchSince: liLastBatchSince,
+          dedupe: false,
+        }).catch(() => [])
+      : [];
+  const linkedinRows = latestPerWatchlisted
+    ? keepLatestLinkedInPostRowsPerPerson(linkedinRowsRaw)
+    : linkedinRowsRaw;
+  // The "N drafts from Lyra" headline counts REPLY cards only — post-less intro
+  // DMs (relationship outreach, hidden by default in the inbox) are not "drafts
+  // to a post". Keeps the headline aligned with the badge + the goal count.
+  const linkedinVoiceFloor = isLinkedIn ? await loadLinkedInVoiceFloor(org.id) : null;
+  const linkedinReviewRows = visibleLinkedInReviewRows(linkedinRows, true, linkedinVoiceFloor);
+  const linkedinReplyCount = linkedinReviewRows.filter((row) => row.kind !== "dm").length;
+  const linkedinDmCount = linkedinReviewRows.filter((row) => row.kind === "dm").length;
+  // Speedrun needs every reply angle per post (the Review inbox is deduped to
+  // one representative). Fetch un-deduped + project to SpeedrunDraft[]. When the
+  // per-person filter is on, first keep only each connection's newest post's
+  // rows (all its angles) so each person still becomes one full speedrun card.
+  const linkedinSpeedrunViews =
+    isLinkedIn && linkedinInstance
+      ? await listPendingLinkedInApprovals(linkedinInstance.id, 300, {
+          status: liFilters.status,
+          watchlist: liFilters.watchlist,
+          sort: liFilters.sort,
+          lastBatchSince: liLastBatchSince,
+          dedupe: false,
+        }).catch(() => [])
+      : [];
+  const linkedinSpeedrun = toLinkedInSpeedrunDrafts(
+    latestPerWatchlisted
+      ? keepLatestLinkedInPostRowsPerPerson(linkedinSpeedrunViews)
+      : linkedinSpeedrunViews,
+    linkedinInstance?.id,
+    liWatchedRefs,
+    linkedinVoiceFloor,
+  );
+  const linkedinFilterQuery = linkedInApprovalFilterQuery(liFilters);
+
+  // Orion's pending review rows — only when her tab is active (avoid a wasted
+  // query on every other render). Reuses the LinkedIn (reduced) filter schema.
+  const redditLastBatchSince =
+    liFilters.batch === "last"
+      ? (redditInstance?.last_goal_started_at ?? null)
+      : null;
+  const redditRows: RedditApprovalView[] =
+    isReddit && redditInstance
+      ? await listPendingRedditApprovals(redditInstance.id, 300, {
+          status: liFilters.status,
+          watchlist: liFilters.watchlist,
+          sort: liFilters.sort,
+          lastBatchSince: redditLastBatchSince,
+        }).catch(() => [])
+      : [];
+  const redditReplyCount = redditRows.length;
+  // Speedrun needs every reply angle per thread (the Review inbox is deduped to
+  // one representative). Fetch un-deduped + project to SpeedrunDraft[].
+  const redditSpeedrunViews =
+    isReddit && redditInstance
+      ? await listPendingRedditApprovals(redditInstance.id, 300, {
+          status: liFilters.status,
+          watchlist: liFilters.watchlist,
+          sort: liFilters.sort,
+          lastBatchSince: redditLastBatchSince,
+          dedupe: false,
+        }).catch(() => [])
+      : [];
+  const redditSpeedrun = toRedditSpeedrunDrafts(redditSpeedrunViews);
+  const redditConfigureHref = redditInstance
+    ? agentHref(orgSlug, redditInstance, "config")
+    : `/app/${orgSlug}/agents`;
+  // Nav suffix the inbox carries onto each detail link: Orion's stream + her
+  // active filters, so back/prev/next return to her tab with the same view.
+  const redditFilterQuery = linkedInApprovalFilterQuery(liFilters);
+  const redditNavQuery = redditFilterQuery
+    ? `?stream=reddit-intern&${redditFilterQuery.slice(1)}`
+    : "?stream=reddit-intern";
+
+  // The on-page count must match what's actually rendered. pendingCount is the
+  // true unfiltered backlog (= the sidebar/tab badge); pendingDisplayCount is
+  // the filtered subset actually rendered in the Review inbox — one entry per
+  // lead (deduped), not per draft variant — so the title/chip never overstate
+  // the cards. (The tab badge stays per-approval.)
+  const xReviewRows = visibleXReviewRows(scopedRows, true);
+  const pendingDisplayCount = xReviewRows.filter((row) => !isXApprovalDm(row)).length;
+  const pendingDmCount = xReviewRows.filter(isXApprovalDm).length;
+  // A narrowing filter is active when any queue filter is off its default.
+  const filtersActive = hasActiveFilter({
+    minScore,
+    status,
+    source,
+    watchlist,
+    sort,
+    batch,
+    latestPerWatchlisted,
+  });
+  // "Filtered empty" = the pending view rendered nothing ONLY because a filter
+  // hid the backlog (there ARE pending drafts, just none matching). This is
+  // distinct from a genuinely idle intern, so the empty state can say "no
+  // matches / clear filters" instead of "your intern hasn't drafted anything" —
+  // the latter reads as broken when e.g. "Watchlist only" is selected but the
+  // watchlist queue is momentarily drained even though 30+ keyword drafts wait.
+  const filteredEmpty =
+    status === "pending" &&
+    pendingDisplayCount === 0 &&
+    filtersActive &&
+    pendingCount > 0;
+  // Clear-filters target: the default pending view (drops every filter param).
+  const clearFiltersHref = basePath;
+
+  return (
+    <>
+      <AutoRefresh intervalMs={30_000} />
+      <PatternAlertBanner
+        orgSlug={orgSlug}
+        alerts={patternAlerts.map((a) => ({
+          id: a.id,
+          ruleId: a.rule_id,
+          patternName: a.pattern_name,
+          description: a.description,
+          severity: a.severity,
+          windowSize: a.window_size,
+          frequencyCount: a.frequency_count,
+          examples: a.examples ?? [],
+          status: a.status,
+          ruleInstruction: a.rule_instruction,
+          suggestion: a.rule_suggestion,
+          refineNote: a.refine_note,
+          refineRequestId: a.refine_request_id,
+          refineClaimed: a.refine_claim_id !== null,
+          refineFailed:
+            a.status === "open" && a.refine_request_id !== null && a.refine_claim_id !== null,
+        }))}
+      />
+      {linkedinInstance && patternPage === null ? (
+        <p role="status">Pattern alerts are unavailable. The draft inbox remains visible.</p>
+      ) : null}
+      {linkedinInstance && patternPage?.nextCursor ? (
+        <p>
+          Showing {patternAlerts.length} of {patternPage.total} visible pattern alerts.{" "}
+          <Link href={agentHref(orgSlug, linkedinInstance, "patterns")} className="btn btn-sm">
+            View pattern history
+          </Link>
+        </p>
+      ) : null}
+      <PageHeader
+        eyebrow={`Engage · ${active.network}`}
+        title={renderTitle(active, pendingDisplayCount, status, {
