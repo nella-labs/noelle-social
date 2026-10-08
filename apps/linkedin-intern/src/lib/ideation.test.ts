@@ -198,3 +198,30 @@ describe("assembleIdeas", () => {
     const parsed = IdeaSynthSchema.parse({
       ideas: [
         {
+          hook: "Dashboards do not fix a broken sales floor.",
+          thesis: "Automation ideas should start from where reps actually lose time.",
+          angle: "observation",
+          pillar: "sales",
+          inspiration_tags: ["R1"],
+        },
+      ],
+    });
+    const ideas = assembleIdeas(parsed, sources, {
+      idFactory,
+      sourceEngine: "codex",
+      model: "m",
+      batchId: null,
+      weekStart: null,
+    });
+    expect(ideas[0]!.inspirationRefs).toMatchObject([
+      { kind: "replied_post", leadId: "lead-r1", url: "https://li/r1", author: "carla" },
+    ]);
+  });
+});
+
+describe("addDays", () => {
+  it("adds days across a month boundary in UTC", () => {
+    expect(addDays("2026-06-29", 3)).toBe("2026-07-02");
+    expect(addDays("2026-06-22", 0)).toBe("2026-06-22");
+  });
+});
