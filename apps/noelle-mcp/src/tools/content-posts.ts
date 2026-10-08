@@ -198,3 +198,192 @@ function renderDraftBody(draft: PostDraftRow): string {
   const body = draft.final_body ?? draft.body ?? "";
   const meta =
     draft.verifier_meta == null
+      ? ""
+      : `\n\nReviewer/verifier metadata:\n\`\`\`json\n${JSON.stringify(draft.verifier_meta, null, 2)}\n\`\`\``;
+  return `#### ${draft.platform} · ${draft.status}/${draft.stage} · ${draft.id}\n\n${mdFields({
+    request_id: draft.generation_request_id,
+    created_at: draft.created_at,
+    updated_at: draft.updated_at,
+    chars: draft.char_count,
+    source_engine: draft.source_engine,
+    model: draft.model,
+    reviewer_result: reviewerSummary(draft),
+  })}\n\n\`\`\`text\n${body}\n\`\`\`${meta}`;
+}
+
+function generationStatus(
+  request: GenerationRequest,
+  drafts: PostDraftRow[],
+  timedOut: boolean,
+): string {
+  if (request.requestStatus === "drafted" || request.requestStatus === "needs_review") {
+    const expectedDrafts = drafts.filter((draft) =>
+      request.expectedPlatforms.includes(draft.platform),
+    );
+    if (!hasEveryExpectedPlatform(expectedDrafts, request.expectedPlatforms))
+      return "drafts_missing";
+    if (expectedDrafts.some((draft) => reviewVerdict(draft) === "failed"))
+      return "needs_review";
+    if (
+      request.reviewRequired &&
+      expectedDrafts.some((draft) => reviewVerdict(draft) === "incomplete")
+    )
+      return "review_pending";
+    return request.requestStatus;
+  }
+  if (request.requestStatus === "review_pending") return "review_pending";
+  if (timedOut) return "timeout";
+  if (request.waitSeconds > 0) return "pending";
+  return request.requestStatus;
+}
+
+export function renderGenerationResult(
+  request: GenerationRequest,
+  drafts: PostDraftRow[],
+  timedOut: boolean,
+): ToolResult {
+  const requestDrafts = drafts.filter((draft) =>
+    request.expectedPlatforms.includes(draft.platform),
+  );
+  const latest = latestPerPlatform(requestDrafts);
+  const missing = missingPlatforms(latest, request.expectedPlatforms);
+  const status = generationStatus(request, requestDrafts, timedOut);
+  const progress = mdFields({
+    idea_id: request.idea.id,
+    request_id: request.requestId,
+    status,
+    journal_status: request.requestStatus,
+    wait_timed_out: timedOut || null,
+    idea_status: request.idea.status,
+    requested_at: request.requestedAt,
+    requested_platforms: request.requestedPlatforms?.join(", ") ?? "all target platforms",
+    expected_platforms: request.expectedPlatforms.join(", "),
+    review_required: request.reviewRequired,
+    source: request.source,
+    request_drafts_found: requestDrafts.length,
+    waiting_for:
+      missing.join(", ") ||
+      (status === "review_pending"
+        ? "reviewer/verifier results"
+        : status === "queued" || status === "drafting" || status === "pending"
+          ? "worker finalization"
+          : null),
+  });
+  const bodies =
+    requestDrafts.length > 0
+      ? requestDrafts.map(renderDraftBody).join("\n\n")
+      : "_No worker-created drafts for this request yet._";
+  const note =
+    status === "drafted"
+      ? request.reviewRequired
+        ? "New worker-created draft(s) passed the existing reviewer/verifier for every expected platform."
+        : "Worker-created drafts exist for every expected platform. Automatic review was not required."
+      : status === "needs_review"
+        ? requestDrafts.some((draft) => reviewVerdict(draft) === "failed")
+          ? "At least one returned draft has a failed review result."
+          : "The request journal requires review; no failed reviewer result is available in the returned drafts."
+        : status === "review_pending"
+          ? "Returned drafts are awaiting complete reviewer/verifier results."
+          : "This result is not claiming the draft is done. Read the journal status and returned draft evidence below.";
+
+  return text(`## Post generation ${status}\n\n${note}\n\n${progress}\n\n${bodies}`);
+}
+
+function toGenerationRequest(
+  idea: PostIdeaRow,
+  row: GenerationRequestRow,
+  waitSeconds: number,
+): GenerationRequest {
+  return {
+    idea,
+    requestId: row.id,
+    requestStatus: row.status,
+    requestedAt: row.created_at,
+    requestedPlatforms: null,
+    expectedPlatforms: row.platforms,
+    reviewRequired: row.review_required,
+    source: row.source,
+    waitSeconds,
+  };
+}
+
+export async function generatePostWithProgress(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+  org: OrgRef,
+  ideaId: string,
+  guidance: string | undefined,
+): Promise<ToolResult> {
+  const waitSeconds = postWaitSeconds(args);
+  const requestedPlatforms = requestedPostPlatforms(args);
+  const admitted = await requestContentPostGeneration(ctx.sql, { orgId: org.orgId, ideaId }, {
+    platforms: requestedPlatforms, guidance, journal: { source: "mcp", reviewRequired: true },
+  });
+  if (!admitted.request) throw new NoelleError("Post generation request returned no receipt.");
+  const request = toGenerationRequest(admitted.idea, admitted.request, waitSeconds);
+  if (!admitted.reused) request.requestedPlatforms = requestedPlatforms;
+  const { request: currentRequest, drafts, timedOut } = await pollGenerationDrafts(ctx, request);
+  return renderGenerationResult(currentRequest, drafts, timedOut);
+}
+
+export async function getPostWithFullDrafts(
+  ctx: NoelleContext,
+  org: OrgRef,
+  ideaId: string,
+  args: Record<string, unknown> = {},
+): Promise<ToolResult> {
+  const idea = await loadIdea(ctx, org, ideaId);
+  const requestId = optStr(args, "requestId");
+  if (requestId) {
+    const row = await loadGenerationRequest(ctx, org, idea, requestId);
+    const request = toGenerationRequest(idea, row, postWaitSeconds(args));
+    const { request: currentRequest, drafts, timedOut } = await pollGenerationDrafts(ctx, request);
+    return renderGenerationResult(currentRequest, drafts, timedOut);
+  }
+
+  const drafts = await loadAllDrafts(ctx, org.orgId, ideaId);
+  const targetPlatforms = storedTargets(idea);
+  const pending =
+    Array.isArray(idea.pending_platforms) && idea.pending_platforms.length > 0
+      ? idea.pending_platforms
+      : [];
+  const latest = latestPerPlatform(drafts);
+  const progressTable = mdTable(
+    ["platform", "latest draft", "status/stage", "reviewer"],
+    targetPlatforms.map((platform) => {
+      const draft = latest.find((d) => d.platform === platform);
+      return [
+        platform,
+        draft ? draft.id : pending.includes(platform) ? "pending regeneration" : "missing",
+        draft ? `${draft.status}/${draft.stage}` : "—",
+        draft ? reviewerSummary(draft) : "—",
+      ];
+    }),
+  );
+  const header = mdFields({
+    id: idea.id,
+    status: idea.status,
+    active_request_id: idea.generation_request_id,
+    generation_review_required: idea.generation_review_required === true ? true : null,
+    platform: idea.platform,
+    targets: targetPlatforms.join(", "),
+    pending_regeneration: pending.join(", ") || null,
+    hook: idea.hook,
+    thesis: idea.thesis,
+    angle: idea.angle,
+    pillar: idea.pillar,
+    suggested_day: idea.suggested_day,
+    batch_id: idea.batch_id,
+    source_engine: idea.source_engine,
+    model: idea.model,
+    created_at: idea.created_at,
+    updated_at: idea.updated_at,
+  });
+  const body =
+    drafts.length > 0
+      ? drafts.map(renderDraftBody).join("\n\n")
+      : "_No post drafts have been created yet._";
+  return text(
+    `## Post idea\n\n${header}\n\n### Progress\n\n${progressTable}\n\n### Draft bodies (${drafts.length})\n\n${body}`,
+  );
+}
