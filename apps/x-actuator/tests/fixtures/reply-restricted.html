@@ -1,0 +1,24 @@
+<!--
+  A /status/ permalink whose author restricted who can reply ("Who can reply?").
+  X keeps the focal tweet's reply icon but disables it, renders the restriction
+  notice in a standalone cell, and never mounts [data-testid='tweetTextarea_0'].
+  isReplyRestricted must detect this so the actuator drops the draft (permanent,
+  marked skipped server-side) instead of retrying box-not-found forever.
+  Captured copy: "Who can reply? People @jane mentioned can reply".
+-->
+<div id="react-root">
+  <main role="main">
+    <div data-testid="primaryColumn">
+      <article data-testid="tweet">
+        <div data-testid="User-Name"><span>Jane Doe</span><span>@jane</span></div>
+        <div data-testid="tweetText">Hot take: most SaaS pricing pages are lying to you.</div>
+        <button data-testid="reply" aria-disabled="true" disabled></button>
+        <button data-testid="like"></button>
+      </article>
+      <div data-testid="cellInnerDiv">
+        <span>Who can reply?</span>
+        <span>People @jane mentioned can reply</span>
+      </div>
+    </div>
+  </main>
+</div>
