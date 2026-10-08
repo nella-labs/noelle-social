@@ -2198,3 +2198,203 @@ async function draftSubstantial(args: DraftCommonArgs & { tier: "T1" | "T2" | "T
   const safeReplyRows = replyRows.filter((r) => !makesCommitment(r.body));
   for (const r of replyRows) {
     if (makesCommitment(r.body)) {
+      log.warn(
+        { reason: commitmentReason(detectCommitments(r.body)) },
+        "commitment guard dropped a comment variant",
+      );
+    }
+  }
+  const safeDmRow = dmRow && makesCommitment(dmRow.body) ? null : dmRow;
+  if (dmRow && !safeDmRow) {
+    log.warn(
+      { reason: commitmentReason(detectCommitments(dmRow.body)) },
+      "commitment guard dropped the DM",
+    );
+  }
+
+  const draftRows = safeDmRow ? [...safeReplyRows, safeDmRow] : safeReplyRows;
+  const outbound = buildOutbound({ lead, postText, payload, anchors, drafts: draftRows, verifierMeta, style });
+  if (!outbound) {
+    // Every draft cleaned to empty. Skip with an ACCURATE reason rather than
+    // handing an empty set to a schema that requires min(1).
+    log.warn({ leadId: lead.id }, "every draft cleaned to empty; skipping the lead");
+    await markStatus({ leadId: lead.id, status: "skipped", meta: { reason: "empty-after-emoji-policy" } });
+    return false;
+  }
+  // The aggregate verdict drives regeneration; every non-browser reply gets a
+  // final exact-body review so neither a sibling nor a companion DM can change
+  // its own quality verdict. Browser-observed leads already review one reply.
+  const outboundReplies = outbound.drafts.filter((draft) => draft.kind === "reply");
+  if (reviewContext) {
+    for (const draft of outboundReplies) draft.reviewContext = reviewContext;
+  }
+  if (replyVerifyContext && !singleReply) {
+    for (const draft of outboundReplies) {
+      try {
+        const verdict = await verifyTiered(
+          [{ kind: "reply", angle: draft.angle, body: draft.body }],
+          replyVerifyContext,
+          replyVerifyCalls,
+        );
+        draft.verifierMeta = toOutboundVerifierMeta(verdict, verifierMeta?.attempts ?? 0);
+      } catch (error) {
+        log.warn({ leadId: lead.id, angle: draft.angle, err: (error as Error).message }, "reply-angle verifier failed");
+        draft.verifierMeta = {
+          pass: false,
+          scores: { voice: 0, grounding: 0, relevance: 0, format: 0 },
+          reasons: ["reply-angle verifier unavailable"],
+          attempts: verifierMeta?.attempts ?? 0,
+          judgeOk: false,
+          judgeProvider: "none",
+        };
+      }
+    }
+  }
+  const voiceFloor = verify?.voiceFloor;
+  if (voiceFloor && verifierMeta) {
+    const weakReplies = outboundReplies.filter((draft) => {
+      const review = draft.verifierMeta ?? verifierMeta;
+      return review.judgeOk === true && review.scores.voice < voiceFloor;
+    });
+    if (weakReplies.length && (isConversationReply || replyRequest)) {
+      log.info({ leadId: lead.id, angles: weakReplies.map((draft) => draft.angle) },
+        "conversation reply below voice floor — serving for human review");
+    } else if (weakReplies.length) {
+      const weakIds = new Set(weakReplies.map((draft) => draft.id));
+      outbound.drafts = outbound.drafts.filter((draft) => draft.kind !== "reply" || !weakIds.has(draft.id));
+      log.info({ leadId: lead.id, angles: weakReplies.map((draft) => draft.angle) },
+        "removed reply angles below voice floor");
+      if (!outbound.drafts.some((draft) => draft.kind === "reply")) {
+        const lowestVoice = Math.min(...weakReplies.map((draft) =>
+          (draft.verifierMeta ?? verifierMeta).scores.voice));
+        await markStatus({
+          leadId: lead.id,
+          status: "skipped",
+          meta: { skip_reason: "low-voice", voice: lowestVoice, model: selectedWriter.model },
+        });
+        return false;
+      }
+    }
+  }
+  await postOutbound(withReplyRequestOwner(outbound, replyRequest, instance));
+  await markStatus({
+    leadId: lead.id, status: "drafted",
+    meta: { engine: selectedWriter.engine, model: selectedWriter.model, tier, reply_kind: "substantial", ...(replyRequest ? { reply_request_key: replyRequest.requestKey } : {}) },
+  });
+  return true;
+}
+
+/**
+ * LIGHT draft: ONE short, warm, specific supportive comment (kind='reply'). No
+ * DM, no pitch. Returns true when a draft was posted.
+ */
+async function draftLight(args: DraftCommonArgs): Promise<boolean> {
+  const { lead, postText, payload, anchors, knowledgeAnchors, imageCaption, personDirective, commentDigest, brand, instance, routing, runner, postOutbound, markStatus, log, verify, registerBlock, shapeBlock, shapeAssigned, openingMoveBlock, genzBlock, priorReplies, recentPhrasings, replyRequest, style, postRegister, faithful } = args;
+  const browserReply = payload.source === "extension_observed";
+  const voiceReferences = voiceReferencesForReply({ anchors, style, browserReply, faithful, sentReplies: args.voiceExemplars });
+  const prompt = renderLightPrompt({
+    postText,
+    authorName: payload.authorName ?? null,
+    publicId: payload.authorPublicId ?? lead.author_handle,
+    voiceAnchors: browserReply ? voiceReferences.writerAnchors : [],
+    knowledgeAnchors,
+    imageCaption,
+    commentDigest,
+    registerBlock,
+    shapeBlock,
+    shapeAssigned,
+    openingMoveBlock,
+    genzBlock,
+    priorReplies,
+    recentPhrasings,
+    ...(replyRequest?.instructions ? { operatorInstructions: replyRequest.instructions } : {}),
+    // Notification leads carry the thread the sweep captured (the post it
+    // started from and our own last turn). Undefined for every other lane, so
+    // the cold-outbound prompt is byte-identical to before.
+    conversationBlock:
+      (payload as { source?: string }).source === "notification"
+        ? (renderConversationBlock(
+            (payload as { conversation?: ConversationBrief }).conversation,
+            payload.authorName ?? lead.author_handle ?? "them",
+            { fence: true },
+          ) ?? undefined)
+        : undefined,
+  });
+  const draftArgs = {
+    bucket: "drafter-codex",
+    routing,
+    orgId: instance.org_id,
+    instanceId: instance.id,
+    worker: "drafter" as const,
+    agentRole: "linkedin_intern" as const,
+    system: buildLightDrafterSystem(instance.objective, personDirective, brand, style, postRegister, args.patternRules, faithful, browserReply, args.voiceExemplars),
+  };
+  const res = await runner.draft({ ...draftArgs, prompt });
+  const parsed = LightOutput.safeParse(safeJsonParse(res.text));
+  if (!parsed.success) {
+    log.error({ leadId: lead.id, raw: res.text.slice(0, 200) }, "light drafter output schema fail");
+    await markStatus({ leadId: lead.id, status: "errored", meta: { error: "schema" } });
+    return false;
+  }
+  if ("skip" in parsed.data) {
+    log.info({ leadId: lead.id, skip_reason: parsed.data.skip }, "light drafter skipped lead");
+    await markStatus({
+      leadId: lead.id,
+      status: replyRequest ? "errored" : "skipped",
+      meta: {
+        skip_reason: parsed.data.skip, engine: res.engine, model: res.model,
+        ...(replyRequest ? { reply_request_key: replyRequest.requestKey, error: "reply_request_model_skip" } : {}),
+      },
+    });
+    return false;
+  }
+
+  // Review the single normalized reply that will reach outbound.
+  const prepare = (data: typeof parsed.data): typeof parsed.data => ({
+    drafts: applyReplyEmojiPolicy(data.drafts.slice(0, 1).map((draft) => ({
+      ...draft, angle: draft.angle === "supportive" ? "empathetic" as const : draft.angle,
+    })), postText),
+  });
+  let draftsData = prepare(parsed.data);
+  if (!draftsData.drafts.length) {
+    await markStatus({ leadId: lead.id, status: "skipped", meta: { reason: "empty-after-emoji-policy" } });
+    return false;
+  }
+  let selectedWriter: DraftWriter = { engine: res.engine, model: res.model };
+  let verifierMeta: OutboundIn["verifierMeta"] = null;
+  let reviewContext: OutboundIn["drafts"][number]["reviewContext"];
+  if (verify?.enabled) {
+    const ctx: VerifyContext = {
+      platform: "linkedin",
+      postText,
+      authorHandle: payload.authorPublicId ?? lead.author_handle,
+      voiceAnchors: voiceReferences.reviewAnchors,
+      knowledgeAnchors,
+      personProfile: browserReply ? null : personDirective ?? null,
+      // No charLimit — see runVerifyLoop note.
+      // LIGHT replies ARE a warm congrats on a win — don't hard-zero the
+      // celebration closers ("congrats on the launch", "love this"); they're the
+      // intended content here, not tacked-on slop.
+      allowCelebration: true,
+      dynamicBannedPatterns: args.patternRules,
+      priorRepliesToPerson: args.priorReplies,
+      // Feed-wide diversity (see substantial path) — keep light replies varied too.
+      recentReplies: args.recentPhrasings,
+      // Let the judge grade whether the reply engages an image-driven post.
+      ...(imageCaption ? { imageCaption } : {}),
+    };
+    reviewContext = OutboundFactualContextSchema.parse({ version: 1, ...ctx });
+    const calls = verify.makeCalls(lead.priority ?? false);
+    const toDrafts = (d: typeof draftsData): DraftToVerify[] =>
+      d.drafts.map((x) => ({ kind: "reply" as const, angle: x.angle, body: x.body }));
+    const { best, bestWriter, meta } = await runVerifyLoop({
+      initial: draftsData,
+      initialWriter: selectedWriter,
+      toDrafts,
+      regenerate: async (fixPrompt, useOpus) => {
+        const r = await runner.draft({ ...draftArgs, routing: useOpus ? args.opusRepairRouting : routing, prompt: fixPrompt });
+        const p = LightOutput.safeParse(safeJsonParse(r.text));
+        if (!p.success || "skip" in p.data) return null;
+        const draft = prepare(p.data);
+        return draft.drafts.length ? { draft, writer: { engine: r.engine, model: r.model } } : null;
+      },
