@@ -398,3 +398,203 @@ function AgentChatSession({
   };
 
   /**
+   * Force-apply Nova's latest suggestion. The model is chatty and often
+   * proposes a rewrite in prose without the structured block — so this sends a
+   * constrained follow-up ("output ONLY the edit block") that the model reliably
+   * answers, then applies the result. Doesn't depend on it volunteering JSON.
+   * The constrained turn isn't shown as a user message.
+   */
+  const applyLastToScript = async () => {
+    if (!instanceId || !onApplyScriptEdit) return;
+    const operation = beginAction();
+    if (!operation) return;
+    conversationStarted.current = true;
+    setError(null);
+    setThinking(true);
+    try {
+      const res = await fetch(`/api/agents/${encodeURIComponent(instanceId)}/chat`, {
+        method: "POST",
+        signal: operation.controller.signal,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          message:
+            "Apply the rewrite you just proposed to the draft. Output ONLY the noelle-script-edit block (valid JSON) implementing it — set the changed beats by their 0-based index and/or fullScript, plus a one-line summary. No prose, no questions.",
+          conversationId,
+          draftId,
+        }),
+      });
+      if (!res.ok) { if (isCurrent(operation)) setError("Couldn't apply that — try again."); return; }
+      const payload = (await res.json()) as { text?: string; scriptEdit?: ScriptEditProposal | null; conversationId?: string };
+      if (!isCurrent(operation)) return;
+      if (payload.conversationId) setConversationId(payload.conversationId);
+      if (payload.scriptEdit) {
+        if (!onApplyScriptEdit(payload.scriptEdit)) {
+          setError("That edit didn't change the current draft. Ask for an edit to an existing beat or the script.");
+          return;
+        }
+        setChat((c) => [...c, { who: "agent", at: "just now", body: "Done — I dropped those changes into your storyboard. Review them and hit Save." }]);
+      } else {
+        setChat((c) => [...c, { who: "agent", at: "just now", body: "I couldn't turn that into a concrete edit — tell me which beat or line to change and I'll apply it." }]);
+      }
+    } catch {
+      if (isCurrent(operation)) setError("Couldn't apply that — try again.");
+    } finally {
+      if (finish(operation)) setThinking(false);
+    }
+  };
+
+  const cancelProposal = (idx: number) => {
+    setChat((c) =>
+      c.map((m, i) => (i === idx ? { ...m, proposalState: "cancelled" as const } : m)),
+    );
+  };
+
+  const cancelVaultEdit = (idx: number) => {
+    setChat((c) =>
+      c.map((m, i) => (i === idx ? { ...m, vaultEditState: "cancelled" as const } : m)),
+    );
+  };
+
+  const cancelScriptEdit = (idx: number) => {
+    setChat((c) =>
+      c.map((m, i) => (i === idx ? { ...m, scriptEditState: "cancelled" as const } : m)),
+    );
+  };
+
+  const applyScriptEditMsg = (idx: number, edit: ScriptEditProposal) => {
+    if (!onApplyScriptEdit) {
+      setError("Can't apply edits here — open this draft in the studio.");
+      return;
+    }
+    const operation = beginAction();
+    if (!operation) return;
+    // Synchronous: the parent loads the new lines into the editor (marked dirty).
+    setError(null);
+    try {
+      if (!onApplyScriptEdit(edit)) {
+        setError("That edit didn't change the current draft. Ask for an edit to an existing beat or the script.");
+        return;
+      }
+      setChat((c) => [
+        ...c.map((m, i) => (i === idx ? { ...m, scriptEditState: "applied" as const } : m)),
+        {
+          who: "agent",
+          at: "just now",
+          body: "Done — I've dropped the changes into your storyboard. Review them and hit Save to keep them.",
+        },
+      ]);
+    } catch {
+      setError("Couldn't load that edit. Try again in a moment.");
+    } finally {
+      finish(operation);
+    }
+  };
+
+  const applyVaultEditMsg = async (idx: number) => {
+    if (!instanceId || !orgSlug) {
+      setError("Can't apply changes here — missing workspace context.");
+      return;
+    }
+    const receipt = chat[idx]?.vaultEditReceipt;
+    if (!receipt?.eligible || !receipt.messageId) return;
+    const operation = beginAction();
+    if (!operation) return;
+    setApplyingVaultIdx(idx);
+    setError(null);
+    try {
+      const result = await applyVaultEdit({ orgSlug, instanceId, messageId: receipt.messageId });
+      if (!isCurrent(operation)) return;
+      if (!result.ok) {
+        if (result.error === "conflict" || result.error === "refresh_required") {
+          setChat((c) => c.map((m, i) => i === idx ? { ...m, vaultEditReceipt: { ...receipt, eligible: false, refreshReason: "changed" } } : m));
+        }
+        setError(
+          result.error === "forbidden"
+            ? "You don't have permission to edit this vault."
+            : result.error === "no_vault"
+              ? "No vault is connected to this workspace."
+              : result.error === "conflict"
+                ? "This file changed since this proposal. Refresh it before applying an edit."
+                : result.error === "refresh_required"
+                  ? "This proposal needs the complete current file. Refresh it before applying."
+                  : result.error === "uncertain"
+                    ? "The write could not be confirmed. Retry this proposal to check the saved contents."
+              : "Couldn't apply that edit. Try again in a moment.",
+        );
+        return;
+      }
+      setChat((c) => [
+        ...c.map((m, i) =>
+          i === idx ? { ...m, vaultEditState: "applied" as const } : m,
+        ),
+        {
+          who: "agent",
+          at: "just now",
+          body: `Done — updated ${result.path} in your vault. The interns re-read it automatically, so it shapes how posts get written from here.`,
+        },
+      ]);
+    } catch (err) {
+      if (!isCurrent(operation)) return;
+      console.error("[agent-chat] applyVaultEdit failed:", err);
+      setError("Couldn't apply that edit. Try again in a moment.");
+    } finally {
+      if (finish(operation)) setApplyingVaultIdx(null);
+    }
+  };
+
+  const applyProposal = async (idx: number, proposal: TargetingProposal) => {
+    if (!targetingProposalMatchesRole(proposal, agentRole)) {
+      setError("That targeting change belongs to a different agent role.");
+      return;
+    }
+    if (!instanceId || !orgSlug) {
+      setError("Can't apply changes here — missing workspace context.");
+      return;
+    }
+    const operation = beginAction();
+    if (!operation) return;
+    setApplyingIdx(idx);
+    setError(null);
+    try {
+      const result = await applyTargetingChange({ orgSlug, instanceId, proposal });
+      if (!isCurrent(operation)) return;
+      if (!result.ok || !result.applied) {
+        setError(
+          result.error === "forbidden"
+            ? "You don't have permission to change this agent."
+            : "Couldn't apply that change. Try again in a moment.",
+        );
+        return;
+      }
+      setChat((c) => [
+        ...c.map((m, i) =>
+          i === idx ? { ...m, proposalState: "applied" as const } : m,
+        ),
+        {
+          who: "agent",
+          at: "just now",
+          body: `Done — ${summarizeApplied(result.applied)}. The next configured sweep will use it.`,
+        },
+      ]);
+    } catch (err) {
+      if (!isCurrent(operation)) return;
+      console.error("[agent-chat] applyTargetingChange failed:", err);
+      setError("Couldn't apply that change. Try again in a moment.");
+    } finally {
+      if (finish(operation)) setApplyingIdx(null);
+    }
+  };
+
+  return (
+    <div
+      style={
+        fillHeight
+          ? { display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }
+          : undefined
+      }
+    >
+      <div
+        ref={scrollRef}
+        style={{
+          display: "flex",
+          flexDirection: "column",
