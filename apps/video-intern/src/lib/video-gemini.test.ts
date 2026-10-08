@@ -198,3 +198,27 @@ describe("Video Gemini per-attempt accounting", () => {
   });
   it("records an ordinary HTTP failure once while keeping the existing null outcome", async () => {
     const s = setup(); s.fetchImpl.mockRejectedValue(new Error("inert network failure"));
+    expect(await s.json("system", "prompt")).toBeNull();
+    expect(s.fetchImpl).toHaveBeenCalledOnce(); expect(s.rows).toHaveLength(1);
+    expect(s.rows[0]).toMatchObject({ status: "error", costBasis: "failure_estimate" });
+  });
+  it("does not invent a price for a custom provider model", async () => {
+    const s = setup({ promptTokenCount: 2, candidatesTokenCount: 1 });
+    const json = createVertexJsonFn({ project: "", apiKey: "inert", model: "custom-model", fetchImpl: s.fetchImpl,
+      metering: { engine: "vertex", context: { orgId: "org", instanceId: "instance", agentRole: "video_intern", worker: "ideator", bucket: "drafter" },
+        budget: unlimitedBudget, recorder: { record: async row => { s.rows.push(row); } } } });
+    expect(await json("system", "prompt")).toEqual({ saved: true });
+    expect(s.rows[0]).toMatchObject({ model: "custom-model", inputTokens: 2, outputTokens: 1, costBasis: "unknown", cents: 0 });
+  });
+  it("checks the original deadline after admission before authentication or HTTP", async () => {
+    let clock = 0; vi.spyOn(performance, "now").mockImplementation(() => clock);
+    const s = setup(); s.admit.mockImplementation(async () => { clock = 10; return { attemptId: "gemini-attempt" }; });
+    const authClient = { getAccessToken: vi.fn(async () => "inert") };
+    const json = createVertexJsonFn({ project: "fixture", timeoutMs: 5, authClient, fetchImpl: s.fetchImpl,
+      metering: { engine: "vertex", context: { orgId: "org", instanceId: "instance", agentRole: "video_intern", worker: "ideator", bucket: "drafter" },
+        budget: { ...unlimitedBudget, adapters: { ...unlimitedBudget.adapters, reserveAttempt: s.admit } },
+        recorder: { record: async row => { s.rows.push(row); } } } });
+    expect(await json("system", "prompt")).toBeNull();
+    expect(authClient.getAccessToken).not.toHaveBeenCalled(); expect(s.fetchImpl).not.toHaveBeenCalled(); expect(s.rows).toHaveLength(1);
+  });
+});
