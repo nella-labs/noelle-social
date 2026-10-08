@@ -398,3 +398,203 @@ describe("searchPosts", () => {
     const h = harness(() => ({ items: [SAMPLE] })); // SAMPLE is 2026-05-28
     const recent = await h.client.searchPosts({ queries: ["x"], sinceISO: "2026-06-01T00:00:00Z" });
     expect(recent).toHaveLength(0);
+    const old = await h.client.searchPosts({ queries: ["x"], sinceISO: "2026-05-01T00:00:00Z" });
+    expect(old).toHaveLength(1);
+  });
+});
+
+describe("normalizeComment", () => {
+  it("maps the Apify comment shape to our LinkedInComment", () => {
+    const c = normalizeComment(SAMPLE_COMMENT)!;
+    expect(c.text).toContain("commenting IS the distribution");
+    expect(c.authorName).toBe("Dev Patel");
+    expect(c.authorHeadline).toBe("Founder, building in public");
+    expect(c.reactions).toBe(10); // 8 LIKE + 2 EMPATHY
+    expect(c.repliesCount).toBe(2);
+    expect(c.createdAt).toBe(new Date(1780000000000).toISOString());
+  });
+
+  it("returns null for an empty comment body", () => {
+    expect(normalizeComment({ commentary: "   " })).toBeNull();
+    expect(normalizeComment({})).toBeNull();
+  });
+
+  it("tolerates a missing reaction breakdown (reactions null)", () => {
+    const c = normalizeComment({ id: "c1", commentary: "nice" })!;
+    expect(c.reactions).toBeNull();
+    expect(c.repliesCount).toBeNull();
+  });
+});
+
+describe("postComments", () => {
+  it("calls the post-comments actor with the post URL + maxItems", async () => {
+    const h = harness(() => ({ items: [SAMPLE_COMMENT] }));
+    const comments = await h.client.postComments({
+      postUrl: "https://www.linkedin.com/feed/update/urn:li:activity:7300000000000000000/",
+      maxComments: 40,
+    });
+    expect(h.startUrl()).toContain(`/v2/acts/${POST_COMMENTS_ACTOR_ID}/runs`);
+    expect(h.body().postUrls).toEqual([
+      "https://www.linkedin.com/feed/update/urn:li:activity:7300000000000000000/",
+    ]);
+    expect(h.body().maxItems).toBe(40);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.text).toContain("commenting IS the distribution");
+  });
+
+  it("dedupes comments by id and caps at maxComments", async () => {
+    const h = harness(() => ({
+      items: [SAMPLE_COMMENT, SAMPLE_COMMENT, { ...SAMPLE_COMMENT, id: "c2", commentary: "second" }],
+    }));
+    const comments = await h.client.postComments({ postUrl: "https://x/y", maxComments: 1 });
+    expect(comments).toHaveLength(1);
+  });
+
+  it("requires a postUrl", async () => {
+    const h = harness(() => ({ items: [] }));
+    await expect(h.client.postComments({ postUrl: "" })).rejects.toBeInstanceOf(ApifyError);
+  });
+
+  it("throws ApifyError on a non-2xx actor run", async () => {
+    const h = harness(() => ({ status: 402, text: "usage limit" }));
+    await expect(h.client.postComments({ postUrl: "https://x/y" })).rejects.toBeInstanceOf(ApifyError);
+  });
+});
+
+describe("normalizeProfile", () => {
+  // The real profile-search "Short" mode shape (verified against a live run):
+  // no publicIdentifier/headline — firstName/lastName, summary, currentPositions.
+  const shortItem = {
+    id: "ACwAABD_ezUB04rOuKK9OYeuM9dZsLY895L0ygQ",
+    linkedinUrl: "https://www.linkedin.com/in/ACwAABD_ezUB04rOuKK9OYeuM9dZsLY895L0ygQ",
+    firstName: "Alessa",
+    lastName: "Gracida Tapia",
+    summary: "Building something in climate. Ex-bigco.",
+    currentPositions: [{ title: "Founder & CEO", companyName: "Acme" }],
+  };
+
+  it("derives the headline from currentPositions[].title (the ICP-gate signal)", () => {
+    const p = normalizeProfile(shortItem)!;
+    expect(p.headline).toBe("Founder & CEO");
+    expect(p.name).toBe("Alessa Gracida Tapia");
+    // slug + fsd id both come off the opaque member id.
+    expect(p.publicId).toBe("ACwAABD_ezUB04rOuKK9OYeuM9dZsLY895L0ygQ");
+    expect(p.fsdProfileId).toBe("ACwAABD_ezUB04rOuKK9OYeuM9dZsLY895L0ygQ");
+  });
+
+  it("joins multiple current positions with ·", () => {
+    const p = normalizeProfile({
+      ...shortItem,
+      currentPositions: [{ title: "Co-Founder & CEO" }, { title: "Creative Strategist" }],
+    })!;
+    expect(p.headline).toBe("Co-Founder & CEO · Creative Strategist");
+  });
+
+  it("falls back to summary when there are no positions", () => {
+    const p = normalizeProfile({ ...shortItem, currentPositions: [] })!;
+    expect(p.headline).toBe("Building something in climate. Ex-bigco.");
+  });
+
+  it("still reads an explicit headline / publicIdentifier when present (other modes)", () => {
+    const p = normalizeProfile({
+      id: "urn:li:fsd_profile:ACoAAA123",
+      publicIdentifier: "jane-builder",
+      linkedinUrl: "https://www.linkedin.com/in/jane-builder",
+      name: "Jane Builder",
+      headline: "Indie hacker building in public",
+    })!;
+    expect(p.publicId).toBe("jane-builder");
+    expect(p.headline).toBe("Indie hacker building in public");
+    expect(p.fsdProfileId).toBe("ACoAAA123"); // urn prefix stripped
+  });
+
+  it("returns null when there's no way to address the person (no slug)", () => {
+    expect(normalizeProfile({ firstName: "No", lastName: "Url" })).toBeNull();
+  });
+});
+
+describe("normalizeAuthoredComment", () => {
+  it("maps the profile-comments shape (nested engagement) to LinkedInComment", () => {
+    const c = normalizeAuthoredComment(SAMPLE_AUTHORED_COMMENT)!;
+    expect(c.text).toContain("the moat is distribution");
+    expect(c.url).toContain("commentUrn");
+    expect(c.authorName).toBe("Satya Nadella"); // actor = who authored the comment
+    expect(c.authorHeadline).toBe("Chairman and CEO at Microsoft");
+    expect(c.reactions).toBe(12); // 9 LIKE + 3 PRAISE
+    expect(c.repliesCount).toBe(3); // engagement.comments
+    expect(c.createdAt).toBe("2026-06-15T09:30:00.000Z");
+  });
+
+  it("falls back to engagement.likes when the reaction breakdown is absent", () => {
+    const c = normalizeAuthoredComment({
+      id: "x1",
+      commentary: "great point",
+      engagement: { likes: 4, comments: 0 },
+    })!;
+    expect(c.reactions).toBe(4);
+    expect(c.repliesCount).toBe(0);
+  });
+
+  it("derives createdAt from createdAtTimestamp when createdAt string is missing", () => {
+    const c = normalizeAuthoredComment({
+      id: "x2",
+      commentary: "yep",
+      createdAtTimestamp: 1781940600000,
+    })!;
+    expect(c.createdAt).toBe(new Date(1781940600000).toISOString());
+  });
+
+  it("tolerates a totally missing engagement object (null counts)", () => {
+    const c = normalizeAuthoredComment({ id: "x3", commentary: "nice" })!;
+    expect(c.reactions).toBeNull();
+    expect(c.repliesCount).toBeNull();
+    expect(c.createdAt).toBeNull();
+  });
+
+  it("returns null for an empty comment body", () => {
+    expect(normalizeAuthoredComment({ commentary: "   " })).toBeNull();
+    expect(normalizeAuthoredComment({})).toBeNull();
+  });
+});
+
+describe("authoredComments", () => {
+  it("exposes AUTHORED_COMMENTS_SUPPORTED = true (real actor wired)", () => {
+    expect(AUTHORED_COMMENTS_SUPPORTED).toBe(true);
+  });
+
+  it("calls the profile-comments actor with profiles[] (URL from publicId) + maxItems", async () => {
+    const h = harness(() => ({ items: [SAMPLE_AUTHORED_COMMENT] }));
+    const comments = await h.client.authoredComments({ publicId: "satyanadella", maxComments: 25 });
+    expect(h.startUrl()).toContain(`/v2/acts/${PROFILE_COMMENTS_ACTOR_ID}/runs`);
+    expect(h.startUrl()).toContain("token=apify_api_test");
+    // Targets by full profile URL (the actor has no publicIdentifier/targetUrls key).
+    expect(h.body().profiles).toEqual(["https://www.linkedin.com/in/satyanadella"]);
+    expect(h.body().maxItems).toBe(25);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.authorName).toBe("Satya Nadella");
+  });
+
+  it("accepts a full profileUrl directly", async () => {
+    const h = harness(() => ({ items: [SAMPLE_AUTHORED_COMMENT] }));
+    await h.client.authoredComments({ profileUrl: "https://www.linkedin.com/in/someone/" });
+    expect(h.body().profiles).toEqual(["https://www.linkedin.com/in/someone/"]);
+  });
+
+  it("maps a recent sinceISO to the coarse postedLimit bucket", async () => {
+    const h = harness(() => ({ items: [] }));
+    // 3 days ago -> "week"; the precise filter still runs client-side.
+    const since = new Date(Date.now() - 3 * 86_400_000).toISOString();
+    await h.client.authoredComments({ publicId: "satyanadella", sinceISO: since });
+    expect(h.body().postedLimit).toBe("week");
+  });
+
+  it("omits postedLimit when sinceISO is older than the widest bucket", async () => {
+    const h = harness(() => ({ items: [] }));
+    const since = new Date(Date.now() - 90 * 86_400_000).toISOString(); // ~3 months
+    await h.client.authoredComments({ publicId: "satyanadella", sinceISO: since });
+    expect("postedLimit" in h.body()).toBe(false);
+  });
+
+  it("enforces the sinceISO floor precisely client-side", async () => {
+    const h = harness(() => ({ items: [SAMPLE_AUTHORED_COMMENT] })); // comment is 2026-06-15
+    const dropped = await h.client.authoredComments({
