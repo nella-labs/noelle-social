@@ -198,3 +198,203 @@ export interface Classifier {
   /**
    * Classify a whole claimed batch in ONE model call. A `null` verdict means
    * that lead was not covered and the caller should fall back to `classify`.
+   */
+  classifyMany(inputs: ClassifyInput[]): Promise<BatchClassifyResult>;
+}
+
+/**
+ * Build a ClassifyOutput from validated model data. Shared by the single-lead
+ * and batched paths so a batched verdict is normalised EXACTLY like a solo one
+ * — the slop-forces-off-brand rule and the recomputed tier band in particular.
+ */
+function buildVerdict(
+  data: z.infer<typeof ClassifierOutput>,
+  callUsage: { inputTokens: number; outputTokens: number },
+): ClassifyOutput {
+  const aiSlop = data.ai_slop ?? false;
+  // An off-brand or slop verdict is a skip regardless of what reply_kind
+  // the model returned; otherwise honour it, defaulting to 'substantial'
+  // for an older prompt that omits the field (fail-open, as before).
+  const replyKind: "substantial" | "light" | "skip" =
+    !data.on_brand || aiSlop ? "skip" : (data.reply_kind ?? "substantial");
+  return {
+    // The LLM's slop verdict also forces off-brand, mirroring the system
+    // prompt's instruction (belt-and-suspenders if the model forgets).
+    on_brand: data.on_brand && !aiSlop,
+    on_brand_reason: data.on_brand_reason,
+    kind: data.kind,
+    velocity_score: data.velocity_score,
+    // Reply-worthiness. An older prompt omits it; fall back to velocity so
+    // the gate still has a number rather than silently dropping to null.
+    q: data.q ?? data.velocity_score,
+    reply_kind: replyKind,
+    comment_bait: data.comment_bait ?? false,
+    // Normalise the tier to the kind: only a SUBSTANTIAL lead carries one,
+    // and its band is recomputed from q rather than trusted, so a model
+    // that tiers a light lead or picks the wrong band cannot leak through.
+    tier: replyKind === "substantial" ? tierForQ(data.q ?? data.velocity_score) : null,
+    ai_slop: aiSlop,
+    ai_slop_reason: data.ai_slop_reason ?? null,
+    vip: data.relationship ?? null,
+    usage: callUsage,
+    raw: data,
+  };
+}
+
+/**
+ * Appended to the system prompt for a batched call. Every `claude -p` spawn
+ * pays a fixed toll — ~2,000 tokens of CLI scaffolding plus this prompt —
+ * before it reads a single lead. Measured on 20 real leads, one spawn per lead
+ * cost 58,900 input tokens; ten leads per spawn cost 9,529 for the same work,
+ * and agreement with production verdicts did not drop.
+ *
+ * The independence sentence is load-bearing: without it the model drifts toward
+ * grading the set relative to itself rather than against the ICP.
+ */
+const BATCH_SUFFIX = `
+
+BATCH MODE: the user message is a JSON ARRAY of posts, each with an "id".
+Return a JSON ARRAY with one verdict object per input, each carrying the same
+"id", and nothing else. Judge every post independently, exactly as if it had
+arrived alone. Do not let one post's verdict influence another's.`;
+
+/** Parse the model's text into a JSON array, tolerating fences and prose. */
+function extractJsonArray(text: string): unknown[] | null {
+  const fenced = text.replace(/```(?:json)?/gi, "");
+  const start = fenced.indexOf("[");
+  const end = fenced.lastIndexOf("]");
+  if (start < 0 || end <= start) return null;
+  try {
+    const v: unknown = JSON.parse(fenced.slice(start, end + 1));
+    return Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+export type BatchClassifyResult = {
+  /** One entry per input, in order. `null` ⇒ the batch did not cover that lead. */
+  verdicts: Array<ClassifyOutput | null>;
+  /** Usage for the ONE underlying call, to be recorded once by the caller. */
+  usage: { inputTokens: number; outputTokens: number };
+};
+
+export function createClassifier(opts: {
+  /** LLM backend — the Vertex Gemini backend in production. */
+  backend: EngineBackend;
+  model?: string;
+  /** Operator mission (agent_instances.objective) — steers the triage. */
+  objective?: string | null;
+  /**
+   * Turn on the relationship scout: the model also flags high-leverage authors
+   * and pre-drafts an intro DM, in the same call. The worker passes this from
+   * NOELLE_VIP_SCOUT. Off → classifier behaves exactly as before (no vip field).
+   */
+  vipScout?: boolean;
+  evaluate?: typeof evaluateJevChoice;
+}): Classifier {
+  const backend = opts.backend;
+  const model = opts.model ?? DEFAULT_CLASSIFIER_MODEL;
+  const system = buildClassifierSystem(opts.objective, opts.vipScout ?? false);
+  async function jevVerdict(
+    input: ClassifyInput,
+    strict = false,
+    threshold = 75,
+  ): Promise<ClassifyOutput | null> {
+    try {
+      const decision = await (opts.evaluate ?? evaluateJevChoice)({
+        state: JSON.stringify({ ...input, objective: opts.objective ?? null }),
+        instructions: "Classify this X post for a peer founder who replies only when it can add real value.",
+        criteria: {
+          substantial: "A genuine question, pain, or thought from a relevant builder that merits a useful specific reply.",
+          light: "A genuine personal launch or win from a relevant person that merits a brief warm reaction.",
+          skip: "Off-topic, generic promotion, engagement bait, news, AI slop, or nothing meaningful to add.",
+        },
+      });
+      if (decision.kind !== "choice") return null;
+      const { choice } = decision;
+      const probability = decision.probability;
+      if ((choice !== "substantial" && choice !== "light" && choice !== "skip") ||
+          typeof probability !== "number" || !Number.isFinite(probability) ||
+          probability < 0 || probability > 1) return null;
+      if (!strict && probability < 0.8) return null;
+      const qualified = choice !== "skip" && probability * 100 >= threshold;
+      const replyKind = strict && !qualified ? "skip" : choice;
+      const q = strict
+        ? Math.round((choice === "skip" ? 1 - probability : probability) * 100)
+        : choice === "substantial" ? Math.round(probability * 100) : choice === "light" ? 50 : 0;
+      return {
+        on_brand: replyKind !== "skip",
+        on_brand_reason: strict && !qualified ? "Jev category below qualification floor or skipped" :
+          `Jev classified this post as ${choice}`,
+        kind: "other",
+        velocity_score: null,
+        q,
+        reply_kind: replyKind,
+        comment_bait: false,
+        tier: replyKind === "substantial" ? tierForQ(q) : null,
+        ai_slop: false,
+        ai_slop_reason: null,
+        vip: null,
+        usage: { inputTokens: 0, outputTokens: 0 },
+        raw: { judge: "jev", choice, probability, ...(strict ? { threshold } : {}) },
+      };
+    } catch {
+      return null;
+    }
+  }
+  async function legacyVerdict(input: ClassifyInput): Promise<ClassifyOutput> {
+    try {
+      const { text, usage } = await backend.call({ system, prompt: JSON.stringify(input), model });
+      const callUsage = { inputTokens: usage.input_tokens, outputTokens: usage.output_tokens };
+      const obj = extractJson(text);
+      if (obj == null) return failOpen("unparseable", callUsage);
+      const parsed = ClassifierOutput.safeParse(obj);
+      if (!parsed.success) return failOpen("schema", callUsage);
+      const verdict = buildVerdict(parsed.data, callUsage);
+      return { ...verdict, raw: { ...parsed.data, judge: "legacy" } };
+    } catch (err) {
+      if (isBudgetAdmissionError(err)) throw err;
+      return failOpen((err as Error).message);
+    }
+  }
+  return {
+    classifyObserved: (input, threshold) => jevVerdict(input, true, threshold),
+    async classify(input) {
+      const jev = await jevVerdict(input);
+      if (!jev) return legacyVerdict(input);
+      if (!opts.vipScout) return jev;
+      // The existing classifier still supplies the relationship scout's rich
+      // metadata. Jev remains authoritative for whether this post is answered.
+      const scout = await legacyVerdict(input);
+      return {
+        ...jev,
+        vip: scout.vip,
+        usage: scout.usage,
+        raw: { ...(jev.raw as Record<string, unknown>), relationship: scout.vip },
+      };
+    },
+
+    async classifyMany(inputs) {
+      if (inputs.length === 0) return { verdicts: [], usage: { inputTokens: 0, outputTokens: 0 } };
+      const jev = await Promise.all(inputs.map((input) => jevVerdict(input)));
+      const legacyIndices = inputs.flatMap((_, i) => opts.vipScout || !jev[i] ? [i] : []);
+      if (legacyIndices.length === 0) {
+        return { verdicts: jev, usage: { inputTokens: 0, outputTokens: 0 } };
+      }
+      const legacyInputs = legacyIndices.map((i) => inputs[i]!);
+      const combine = (legacy: Array<ClassifyOutput | null>, usage: BatchClassifyResult["usage"]): BatchClassifyResult => {
+        const verdicts = [...jev];
+        legacyIndices.forEach((original, local) => {
+          const old = legacy[local] ?? null;
+          const primary = verdicts[original];
+          verdicts[original] = primary && opts.vipScout
+            ? { ...primary, vip: old?.vip ?? null, raw: { ...(primary.raw as Record<string, unknown>), relationship: old?.vip ?? null } }
+            : primary ?? old;
+        });
+        return { verdicts, usage };
+      };
+      try {
+        const { text, usage } = await backend.call({
+          system: system + BATCH_SUFFIX,
+          prompt: JSON.stringify(legacyInputs.map((input, id) => ({ id, ...input }))),
