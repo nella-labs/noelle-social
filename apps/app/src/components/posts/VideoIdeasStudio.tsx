@@ -198,3 +198,76 @@ export function VideoIdeasStudio({
       ) : (
         <IdeasGrid>
           {visible.map((idea) => (
+            <VideoIdeaCard
+              key={idea.id}
+              idea={idea}
+              busy={pending && busyId === idea.id}
+              onApprove={() => approve(idea.id)}
+              onSchedule={(d) => schedule(idea.id, d)}
+              onDismiss={() => dismiss(idea.id)}
+            />
+          ))}
+        </IdeasGrid>
+      )}
+    </div>
+  );
+}
+
+function VideoIdeaCard({
+  idea,
+  busy,
+  onApprove,
+  onSchedule,
+  onDismiss,
+}: {
+  idea: VideoIdeaRow;
+  busy: boolean;
+  onApprove: () => void;
+  onSchedule: (day: string | null) => void;
+  onDismiss: () => void;
+}) {
+  return (
+    // minWidth:0 lets the 1fr grid track stay put; overflow:hidden keeps the
+    // inspiration reels (nowrap captions) clipped inside the card instead of
+    // blowing the column out past its neighbours.
+    <article className={styles.ideaCard} style={{ minWidth: 0, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+        <span style={{ fontFamily: "var(--mono)", fontSize: 9, letterSpacing: "0.06em", textTransform: "uppercase", color: NOVA_ACCENT,
+                       padding: "2px 7px", borderRadius: 999, background: `color-mix(in oklch, ${NOVA_ACCENT} 12%, var(--paper))`,
+                       boxShadow: `0 0 0 0.5px color-mix(in oklch, ${NOVA_ACCENT} 35%, var(--rule))` }}>
+          Video
+        </span>
+        {idea.pillar ? <span className="tag" style={{ height: 18 }}>{idea.pillar}</span> : null}
+        {idea.angle ? <span className="tag" style={{ height: 18 }}>{idea.angle}</span> : null}
+      </div>
+
+      <h3 className={styles.ideaHook}>{idea.hook}</h3>
+      {idea.concept ? (
+        <div style={{ marginTop: 10, fontSize: 11.5, color: "var(--ink-muted)", lineHeight: 1.45, display: "flex", gap: 6 }}>
+          <span style={{ color: "var(--accent)", flexShrink: 0 }}>◆</span>
+          <span>{idea.concept}</span>
+        </div>
+      ) : null}
+
+      <InspirationStrip
+        clips={idea.inspiration}
+        heading={idea.inspirationIsFallback ? "Top reels from your watched creators" : "Inspired by"}
+      />
+
+      <div className={styles.ideaCardActions}>
+        <button className="btn btn-sm btn-primary" style={{ flex: "1 1 auto" }} onClick={onApprove} disabled={busy}>
+          {busy ? "Working…" : "Generate draft →"}
+        </button>
+        <input
+          type="date"
+          defaultValue={idea.suggested_day ?? ""}
+          onChange={(e) => onSchedule(e.target.value || null)}
+          aria-label="Schedule day"
+          style={{ height: 30, borderRadius: 8, border: 0, background: "var(--paper-2)", boxShadow: "0 0 0 0.5px var(--rule)",
+                   fontFamily: "var(--mono)", fontSize: 11, padding: "0 8px", color: "var(--ink)" }}
+        />
+        <button className="btn btn-sm btn-ghost" onClick={onDismiss} disabled={busy}>Dismiss</button>
+      </div>
+    </article>
+  );
+}

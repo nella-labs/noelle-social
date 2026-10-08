@@ -398,3 +398,57 @@ export default async function ContactDetailPage({ params }: PageProps) {
                     orgSlug={orgSlug}
                     approvalId={it.approvalId}
                     body={it.body}
+                    recipientId={it.recipientId}
+                  />
+                ) : null}
+              </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function AccountRow({
+  label,
+  account,
+}: {
+  label: string;
+  account: PersonSocialAccountView | undefined;
+}) {
+  const href =
+    account?.url ??
+    (account?.platform === "x" && account.handle ? `https://x.com/${account.handle}` : null);
+  return (
+    <li
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "10px 0",
+        borderTop: "1px dashed var(--rule-soft)",
+      }}
+    >
+      <span style={{ width: 80, fontWeight: 600, fontSize: 13 }}>{label}</span>
+      <span style={{ flex: 1, minWidth: 0, fontFamily: "var(--mono)", fontSize: 12.5, color: "var(--ink-2)" }}>
+        {account?.handle ? `@${account.handle}` : account?.url ?? "Not linked"}
+      </span>
+      {href ? (
+        <a href={href} target="_blank" rel="noreferrer" className="btn btn-xs">
+          Open →
+        </a>
+      ) : null}
+    </li>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <>
+      <dt style={{ color: "var(--ink-muted)" }}>{label}</dt>
+      <dd style={{ margin: 0, fontFamily: "var(--mono)", textAlign: "right" }}>{value}</dd>
+    </>
+  );
+}
