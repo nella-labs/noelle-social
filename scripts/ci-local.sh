@@ -1,17 +1,5 @@
 #!/usr/bin/env bash
-# Local CI — the same gate .github/workflows/ci.yml runs, on this machine.
-#
-# GitHub Actions has produced `startup_failure` with zero jobs on every push
-# since 2026-08-25, so nothing has validated a commit in days. That matters more
-# here than in most repos: `.git/hooks/post-commit` fires `noelle sync` on every
-# commit in the runtime checkout, and the com.noelle.autoupdate LaunchAgent
-# fast-forwards main every ~10 minutes — so main deploys itself. Without a gate,
-# a red main ships.
-#
-# Keep this in lockstep with .github/workflows/ci.yml. It runs the SAME
-# commands, plus `lint:reply-variation`, which the workflow misses: the root
-# `lint` script chains it, but the workflow invokes the turbo `lint` TASK and
-# then only `lint:sst`, so that check has never run in CI.
+# Shared local and GitHub CI gate.
 set -uo pipefail
 
 usage() {
@@ -20,15 +8,15 @@ Local CI — the gate .github/workflows/ci.yml runs, on this machine.
 
 Usage: scripts/ci-local.sh [options]
 
-  --full           validate everything (what a push to main gets)
+  --full           validate everything (used for pushes and manual CI runs)
   --affected       validate only what changed vs the base ref (default on a branch)
   --base <ref>     comparison point for --affected (default: origin/main)
   --skip-install   reuse node_modules as-is, skip `pnpm install`
   --pre-push       quiet mode used by the git hook; prints output only on failure
   -h, --help       this text
 
-Scope mirrors the workflow: a branch validates what it touched, main validates
-everything. Exit code is the failing step's, 0 when everything passes.
+GitHub uses affected scope for pull requests and full scope for pushes and manual
+runs. Exit code is the failing step's, 0 when everything passes.
 USAGE
 }
 
@@ -84,10 +72,7 @@ if [ -n "$want_pnpm" ] && [ -n "$have_pnpm" ] && [ "$have_pnpm" != "$want_pnpm" 
 fi
 
 # --- scope -------------------------------------------------------------------
-# The workflow uses --affected on pull_request and FULL validation on a push to
-# main. Mirror that exactly. main is the branch that deploys itself, so it must
-# never get the weaker gate — local commits ahead of origin/main would otherwise
-# send it down --affected.
+# Local checks on main retain full validation even when affected scope is requested.
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 if [ "$MODE" = affected ] && [ "$BRANCH" = "main" ]; then
   say "${yellow}note${reset} on main — validating everything, as the workflow does"
@@ -139,16 +124,16 @@ if [ "$DO_INSTALL" = 1 ]; then
 fi
 
 # One turbo invocation so build outputs are computed once and reused, exactly as
-# the workflow does. `test` is a real gate; workspaces without tests pass via
-# `vitest run --passWithNoTests`.
+# the workflow does. Two concurrent tasks bound competing build and test processes.
+# Workspaces without tests pass via `vitest run --passWithNoTests`.
 # shellcheck disable=SC2086
-step "typecheck + lint + build + test" pnpm exec turbo run typecheck lint build test $AFFECTED || exit $?
+step "typecheck + lint + build + test" pnpm exec turbo run typecheck lint build test --concurrency=2 $AFFECTED || exit $?
 
 # Repo-wide single-source-of-truth check. Not a turbo task, so it always runs
 # regardless of --affected.
 step "lint:sst" pnpm lint:sst || exit $?
 
-# Chained by the root `lint` script but never reached by the workflow.
+# Repo-wide reply guard, independent of affected workspace scope.
 step "lint:reply-variation" pnpm lint:reply-variation || exit $?
 
 # The suite covering this script and its hook wiring. `scripts/` is not a pnpm
