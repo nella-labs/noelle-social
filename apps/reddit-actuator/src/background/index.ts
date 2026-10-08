@@ -1198,3 +1198,203 @@ async function clearComposer(tabId: number, item: RedditPoolItem | undefined, rn
           ).catch(() => null);
           if (!st) return false;
           return st.observed?.present === false || st.observed?.empty === true;
+        },
+        sleep,
+      }
+      : {
+        focusBox: async () => {
+          if (!lastTypedBody) return false;
+          // scroll:true — this one is about to click, so the box must be in view.
+          const box = await send<LocateResult>(
+            tabId, { cmd: "locateDirtyReplyBox", scroll: true, ownBody: lastTypedBody },
+          ).catch(() => null);
+          if (!box?.ok || box.x == null) return false;
+          await cdp.moveAndClick(tabId, rectFrom(box), rng, sleep);
+          return true;
+        },
+        clearKeys: () => cdp.clearFocusedEditor(tabId, sleep),
+        // "Nothing here for US to clear" — either no composer on the page holds
+        // text at all, or the one that does is not the reply this run typed.
+        //
+        // The ownership half matters as much as the emptiness half.
+        // locateDirtyReplyBox answers page-wide, so on an ambient or
+        // ensureOnFeed hop the dirty box it finds can easily be a comment the
+        // operator is part-way through writing — and new Reddit PERSISTS comment
+        // drafts, so clearing it destroys their text rather than discarding
+        // something the navigation would have dropped anyway. Same rule the
+        // LinkedIn half applies to the messaging overlay.
+        //
+        // A read error is "not confirmed", never a false empty. scroll:false —
+        // this runs in a poll loop and must not drag the viewport around.
+        isEmpty: async () => {
+          if (!lastTypedBody) return true; // this run has typed nothing — nothing of ours
+          // ownBody makes the SEARCH ownership-aware rather than filtering its
+          // single answer afterwards. Asking for "any dirty box" and then
+          // comparing would stop at the operator's own text whenever theirs
+          // sorts first — the expanded page-level composer sits above every
+          // comment composer — and report "nothing to clear" while OUR reply sat
+          // further down, arming the dialog with nothing logged.
+          const box = await send<LocateResult>(
+            tabId, { cmd: "locateDirtyReplyBox", scroll: false, ownBody: lastTypedBody },
+          ).catch(() => null);
+          if (!box) return false; // unreadable → not confirmed
+          return box.observed?.present !== true;
+        },
+        sleep,
+      },
+  );
+  // Confirmed independently of the return value. runClearComposer reports
+  // success when the box cannot be FOCUSED, on the reasonable assumption that
+  // an unfocusable box is an absent one — but a composer can also be present,
+  // dirty and unfocusable (hidden ⇒ zero rect, which the locator rightly
+  // refuses rather than clicking the viewport corner). Trusting the return
+  // there would swallow the warning for the one state that still arms the
+  // dialog.
+  //
+  // The probe MATCHES THE BRANCH. The unscoped clear asks the page-wide
+  // question it was given; the scoped clear asks about the composer it was
+  // actually pointed at. Using the page-wide probe for both would warn on a
+  // perfectly successful scoped clear whenever some unrelated box (an expanded
+  // post composer, say) happened to be dirty — poisoning the reddit_activity
+  // diagnostic this whole change exists to make trustworthy.
+  const stillDirty = item
+    ? await send<{ observed?: { present?: boolean; empty?: boolean } }>(
+      tabId, { cmd: "readReplyBox", commentId: scope },
+    ).then((st) => st?.observed?.present === true && st?.observed?.empty === false).catch(() => false)
+    : !lastTypedBody
+      ? false
+      : await send<LocateResult>(
+        tabId, { cmd: "locateDirtyReplyBox", scroll: false, ownBody: lastTypedBody },
+      ).then((box) => box?.observed?.present === true).catch(() => false);
+  if (!cleared || stillDirty) {
+    sinkLog("warn", "composer would not clear; next navigation may raise a leave-site dialog", { tabId });
+  }
+}
+
+/**
+ * Every navigation this actuator makes. Binds the shared clear-then-navigate
+ * helper (see makeNavigateTab for why the clear belongs at the navigation and
+ * not only on the failure path) to Orion's composer.
+ *
+ * Declared as a `function` deliberately: ensureOnFeed calls it a thousand lines
+ * above clearComposer's definition, which only hoisting makes legal.
+ */
+function navigateTab(tabId: number, url: string, rng: ReturnType<typeof makeRng>): Promise<void> {
+  return makeNavigateTab({
+    clearComposer: (id) => clearComposer(id, undefined, rng),
+    updateTab: async (id, u) => {
+      await chrome.tabs.update(id, { url: u });
+    },
+  })(tabId, url);
+}
+
+/**
+ * Wrapper around the real reply flow: a reply that did NOT land must not leave
+ * its text in the box (see clearComposer). `finally` rather than a check on the
+ * result, so a STOP unwinding mid-flow is covered too.
+ */
+async function doReply(
+  tabId: number,
+  item: RedditPoolItem,
+  cfg: ActuatorConfig,
+  rng: ReturnType<typeof makeRng>,
+  wpm: number,
+): Promise<ReplyOutcome> {
+  let res: ReplyOutcome | undefined;
+  try {
+    res = await doReplyInner(tabId, item, cfg, rng, wpm);
+    return res;
+  } finally {
+    if (res?.kind !== "ok") await clearComposer(tabId, item, rng);
+    // A LANDED reply must be forgotten immediately. On old.reddit the operator
+    // can click "edit" on the comment Orion just posted, which makes a textarea
+    // holding EXACTLY that text visible — so a later hop's unscoped clear would
+    // match it as "ours" and wipe their edit box. The hidden-prefill filter does
+    // not help there, because editing is precisely what makes it visible. Once
+    // the reply has left our composer the token has no job left anyway.
+    //
+    // A FAILED one is kept on purpose: the scoped clear above may itself have
+    // failed, and then our text really is still sitting in a box that a later
+    // hop should be allowed to empty.
+    if (res?.kind === "ok") lastTypedBody = undefined;
+  }
+}
+
+async function doReplyInner(
+  tabId: number,
+  item: RedditPoolItem,
+  cfg: ActuatorConfig,
+  rng: ReturnType<typeof makeRng>,
+  wpm: number,
+): Promise<ReplyOutcome> {
+  // 1. Navigate to the target (new Reddit by default; rewrites www→old.reddit.com
+  // only when the operator explicitly opts into preferOldReddit) + read.
+  const url = targetUrl(item.url, cfg.preferOldReddit === true);
+  await navigateTab(tabId, url, rng);
+  await waitTabComplete(tabId);
+  await sleep(readingDwellMs(rng, Math.max(0, Math.round(rng.normal(60, 40))), {}, wpm));
+
+  // 2. Hard-challenge gate right after navigation — bail (the loop halts next tick).
+  const ch = await send<{ observed?: ChallengeResult }>(tabId, { cmd: "detectChallenge" }).catch(() => null);
+  if (ch?.observed?.challenge) return { kind: "failed", detail: "challenge-gate" };
+
+  // 2b. Removed-post gate: if the target thread was removed/deleted/unavailable,
+  // SKIP it here — BEFORE locating or opening any composer — so we never type a
+  // reply into a dead post ("Sorry, this post was removed by Reddit's filters.").
+  // classifyRemovedProbe splits CONFIRMED removal (positive attr/phrase evidence
+  // → durable, may markSkipped) from a merely-absent post shell (transient
+  // 5xx/interstitial states too → session-local drop only).
+  const rem = await send<RemovedProbe>(tabId, { cmd: "checkPostRemoved" }).catch(() => null);
+  const removedOutcome = classifyRemovedProbe(rem);
+  if (removedOutcome) return removedOutcome;
+
+  // 2c. Locked/archived gate: the post renders fine but its comments are locked
+  // (or the post is archived — "New comments cannot be posted"), so no composer
+  // will EVER render. Permanent for this thread: skip it exactly like a removed
+  // post (drop + markSkipped) instead of dying in the reply-box retry loop that
+  // re-serves the same permalink forever. The cause rides in the reason
+  // (comments-locked | post-archived).
+  // Always durable: isCommentsUnavailable only trips on POSITIVE signals (the
+  // locked/archived attribute or class, or a banner-chrome-scoped phrase).
+  const lock = await send<{ blocked?: boolean; reason?: string }>(tabId, { cmd: "checkCommentsLocked" }).catch(() => null);
+  if (lock?.blocked) return { kind: "removed", reason: lock.reason ?? "comments-locked", durable: true };
+
+  // For a COMMENT target, every downstream locate is SCOPED to this comment id so
+  // we act on the right comment's composer, never the page-level post box.
+  const scope = item.targetType === "comment" ? item.commentId : undefined;
+
+  // 3. Open the composer.
+  if (item.targetType === "comment") {
+    const btn = await send<LocateResult>(tabId, { cmd: "locateCommentReplyButton", commentId: item.commentId });
+    if (!btn.ok || btn.x == null) return { kind: "failed", detail: btn.skipReason ?? "reply-button-not-found" };
+    // Never post to an UNVERIFIED target: the located node's id MUST match the
+    // intended comment. (The locator already returns ok:false when a provided id
+    // matches nothing; this is defense-in-depth against a stale content script.)
+    if (!locatedCommentMatches(btn.observed, item.commentId)) return { kind: "failed", detail: "target-mismatch" };
+    await cdp.moveAndClick(tabId, rectFrom(btn), rng, sleep);
+    await sleep(rng.float(500, 1200)); // the reply composer mounts near the comment
+  } else {
+    const entry = await send<LocateResult>(tabId, { cmd: "locateComposerEntry" });
+    if (!entry.ok || entry.x == null) return { kind: "failed", detail: entry.skipReason ?? "composer-entry-not-found" };
+    await cdp.moveAndClick(tabId, rectFrom(entry), rng, sleep); // focus / expand
+    if (entry.observed?.needsExpand === true) await sleep(rng.float(400, 1000)); // editable expands to a non-zero rect
+  }
+
+  // 4. Poll for the reply box to become READY (non-zero rect), then type + submit.
+  let box: LocateResult | null = null;
+  for (let i = 0; i < 6; i++) {
+    box = await send<LocateResult>(tabId, { cmd: "locateReplyBox", commentId: scope }).catch(() => null);
+    if (box?.ok && box.x != null) break;
+    await sleep(rng.float(300, 700));
+  }
+  if (!box?.ok || box.x == null) {
+    // No composer. Re-check the locked/archived banner (it can render a beat
+    // after the read dwell): a blocked thread is permanent (drop), everything
+    // else stays a transient failure the tick defers + retries.
+    const l2 = await send<{ blocked?: boolean; reason?: string }>(tabId, { cmd: "checkCommentsLocked" }).catch(() => null);
+    if (l2?.blocked) return { kind: "removed", reason: l2.reason ?? "comments-locked", durable: true };
+    return { kind: "failed", detail: box?.skipReason ?? "reply-box-not-found" };
+  }
+  await cdp.moveAndClick(tabId, rectFrom(box), rng, sleep); // focus the box
+  throwIfAborted(runAbort.signal); // STOP before we type anything
+  const typed = sanitizeReplyBody(item.body);
