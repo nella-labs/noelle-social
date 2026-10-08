@@ -398,3 +398,203 @@ describe("verifyDrafts", () => {
           "@eliana_jordan: this is kind of ridiculous (I love it)",
           "Voice notes: warm, playful, lowercase",
         ],
+      },
+      (_system, prompt) => {
+        seenPrompt = prompt;
+        return goodJudge();
+      },
+    );
+
+    expect(seenPrompt).toContain("PINNED FAITHFUL VOICE TARGET");
+    expect(seenPrompt).toContain("authoritative for the voice score");
+    expect(seenPrompt).toContain("@eliana_jordan: this is kind of ridiculous (I love it)");
+    expect(seenPrompt).toContain("secondary voice evidence");
+  });
+
+  it("passes structure guidance and bounded recent-feed context to the judge", async () => {
+    const recent = Array.from({ length: 25 }, (_, i) =>
+      i === 0 ? "event happened, therefore everyone should learn the same lesson".repeat(20) : `recent reply ${i}`,
+    );
+    let seenSystem = "";
+    let seenPrompt = "";
+
+    await verifyDrafts([reply("this deserves a different move")], { ...ctx, recentReplies: recent }, (system, prompt) => {
+      seenSystem = system;
+      seenPrompt = prompt;
+      return goodJudge();
+    });
+
+    expect(seenSystem).toContain("0.7 is the passing bar");
+    expect(seenSystem).toContain("Let the content earn its ending");
+    expect(seenSystem).toContain("Do not invent a moral, personal realization, emotion, number, or sensory detail");
+    expect(seenPrompt).toContain("RECENT REPLIES ACROSS THE FEED");
+    expect(seenPrompt).toContain("public reply drafts");
+    expect(seenPrompt).toContain("repeated sequence of ideas and endings");
+    expect(seenPrompt.match(/\[\d+\] recent reply/g) ?? []).toHaveLength(19);
+    expect(seenPrompt).not.toContain("recent reply 20");
+    expect(seenPrompt).toContain("…");
+  });
+
+  it("does not show unrelated feed-wide reply history to DM-only or repost-only judge calls", async () => {
+    const dm: DraftToVerify = { kind: "dm", angle: null, body: "worth comparing notes on this rollout" };
+    const repost: DraftToVerify = { kind: "repost", angle: null, body: "shipping notes from this week" };
+
+    for (const draft of [dm, repost]) {
+      let seenPrompt = "";
+      await verifyDrafts([draft], { ...ctx, recentReplies: ["recent public reply shape"] }, (_system, prompt) => {
+        seenPrompt = prompt;
+        return goodJudge();
+      });
+
+      expect(seenPrompt).not.toContain("RECENT REPLIES ACROSS THE FEED");
+      expect(seenPrompt).not.toContain("recent public reply shape");
+    }
+  });
+
+});
+
+describe("original post verifier prompt", () => {
+  it("grades original posts against the requested premise, not as replies to an original post", async () => {
+    const post = {
+      kind: "post",
+      angle: null,
+      body: "Useful DMs start with something you actually noticed.",
+    } as DraftToVerify;
+    let seenSystem = "";
+    let seenPrompt = "";
+
+    await verifyDrafts([post], ctx, (system, prompt) => {
+      seenSystem = system;
+      seenPrompt = prompt;
+      return goodJudge();
+    });
+
+    expect(seenSystem).toContain("draft original social posts");
+    expect(seenSystem).toContain("requested premise");
+    expect(seenSystem).not.toContain("draft social replies");
+    const groundingRule = seenSystem.split("\n").find((line) => line.startsWith("- grounding:"));
+    expect(groundingRule).not.toContain("voice anchors");
+    expect(seenSystem).toContain("Voice anchors are tone examples only, never factual support");
+    expect(seenPrompt).toContain("POST PREMISE / REQUESTED IDEA:");
+    expect(seenPrompt).not.toContain("ORIGINAL POST");
+    expect(seenPrompt).toContain("[post]");
+  });
+
+  it("keeps reply verifier prompts unchanged", async () => {
+    let seenSystem = "";
+    let seenPrompt = "";
+
+    await verifyDrafts([reply("rust build times are brutal")], ctx, (system, prompt) => {
+      seenSystem = system;
+      seenPrompt = prompt;
+      return goodJudge();
+    });
+
+    expect(seenSystem).toContain("draft social replies");
+    expect(seenPrompt).toContain("ORIGINAL POST by @u:");
+  });
+});
+
+describe("verifyTiered", () => {
+  it("with one judge behaves like verifyDrafts", async () => {
+    const v = await verifyTiered([reply("grounded and specific")], ctx, [goodJudge]);
+    expect(v.pass).toBe(true);
+  });
+
+  it("majority of 3 judges decides pass", async () => {
+    const v = await verifyTiered([reply("grounded and specific")], ctx, [goodJudge, goodJudge, badJudge]);
+    expect(v.pass).toBe(true); // 2 pass, 1 fail → pass
+  });
+
+  it("majority of 3 judges decides fail and takes the strictest fix", async () => {
+    const v = await verifyTiered([reply("meh generic")], ctx, [badJudge, badJudge, goodJudge]);
+    expect(v.pass).toBe(false); // 2 fail, 1 pass → fail
+    expect(v.fix).toContain("rust build times");
+  });
+
+  it("uses the median score across judges", async () => {
+    const mid = () => Promise.resolve(JSON.stringify({ voice: 0.7, grounding: 0.7, relevance: 0.7, reasons: [], fix: null }));
+    const v = await verifyTiered([reply("ok")], ctx, [badJudge, mid, goodJudge]);
+    // medians of {0.3,0.7,0.9}=0.7 voice; {0.4,0.7,0.9}=0.7 grounding; {0.5,0.7,0.9}=0.7
+    expect(v.scores.voice).toBeCloseTo(0.7);
+    expect(v.scores.grounding).toBeCloseTo(0.7);
+    expect(v.scores.relevance).toBeCloseTo(0.7);
+  });
+
+  it("runs judges in parallel", async () => {
+    const calls: number[] = [];
+    const slow = (n: number) => () => new Promise<string>((res) => {
+      calls.push(n);
+      res(JSON.stringify({ voice: 0.9, grounding: 0.9, relevance: 0.9, reasons: [], fix: null }));
+    });
+    await verifyTiered([reply("x")], ctx, [slow(1), slow(2), slow(3)]);
+    expect(calls).toHaveLength(3);
+  });
+});
+
+describe("per-person novelty (repetition vs prior replies to this person)", () => {
+  const cleanFour = JSON.stringify({ voice: 0.9, grounding: 0.9, relevance: 0.9, novelty: 0.9, reasons: [], fix: null });
+
+  it("FAILS a draft the judge marks redundant vs prior replies to this person", async () => {
+    const judge = () =>
+      Promise.resolve(JSON.stringify({ voice: 0.9, grounding: 0.9, relevance: 0.9, novelty: 0.2, reasons: ["you already told them sccache helps"], fix: "you already recommended sccache to them; take a new angle" }));
+    const v = await verifyDrafts([reply("honestly sccache is the move for rust builds")], { ...ctx, priorRepliesToPerson: ["sccache fixed my rust build times too"] }, judge);
+    expect(v.scores.novelty).toBe(0.2);
+    expect(v.pass).toBe(false);
+    expect(v.fix).toContain("new angle");
+  });
+
+  it("PASSES a fresh draft even when there IS prior history", async () => {
+    const v = await verifyDrafts([reply("i swapped the linker for mold and my link step halved")], { ...ctx, priorRepliesToPerson: ["sccache fixed my rust build times too"] }, () => Promise.resolve(cleanFour));
+    expect(v.scores.novelty).toBe(0.9);
+    expect(v.pass).toBe(true);
+  });
+
+  it("forces novelty=1.0 on FIRST contact (no prior replies) — never penalizes", async () => {
+    // judge claims low novelty, but with no history it must be ignored.
+    const judge = () => Promise.resolve(JSON.stringify({ voice: 0.9, grounding: 0.9, relevance: 0.9, novelty: 0.1, reasons: [], fix: null }));
+    const v = await verifyDrafts([reply("mold is a great linker for rust")], { ...ctx, priorRepliesToPerson: [] }, judge);
+    expect(v.scores.novelty).toBe(1);
+    expect(v.pass).toBe(true);
+  });
+
+  it("defaults novelty to 1.0 when the judge omits it (back-compat)", async () => {
+    const v = await verifyDrafts([reply("mold is a great linker")], ctx, goodJudge);
+    expect(v.scores.novelty).toBe(1);
+  });
+
+  it("shows the PRIOR REPLIES block to the judge only when history exists", async () => {
+    let seenPrompt = "";
+    const spy = (_system: string, prompt: string) => {
+      seenPrompt = prompt;
+      return Promise.resolve(cleanFour);
+    };
+    await verifyDrafts([reply("x")], { ...ctx, priorRepliesToPerson: ["earlier reply about sccache"] }, spy);
+    expect(seenPrompt).toContain("PRIOR REPLIES TO THIS PERSON");
+    expect(seenPrompt).toContain("earlier reply about sccache");
+
+    seenPrompt = "";
+    await verifyDrafts([reply("x")], ctx, spy);
+    expect(seenPrompt).not.toContain("PRIOR REPLIES TO THIS PERSON");
+  });
+
+  it("verifyTiered medians novelty across judges", async () => {
+    const j = (n: number) => () => Promise.resolve(JSON.stringify({ voice: 0.9, grounding: 0.9, relevance: 0.9, novelty: n, reasons: [], fix: null }));
+    const v = await verifyTiered([reply("x")], { ...ctx, priorRepliesToPerson: ["prior"] }, [j(0.2), j(0.9), j(0.8)]);
+    expect(v.scores.novelty).toBe(0.8); // median of 0.2/0.8/0.9
+  });
+});
+
+describe("replyDiversityScore (feed-wide repetition)", () => {
+  it("scores a near-verbatim repeat LOW", () => {
+    const { score } = replyDiversityScore(
+      "sccache cut my rust builds in half, worth a look",
+      ["sccache cut my rust builds in half, worth a try"],
+    );
+    expect(score).toBeLessThan(0.5);
+  });
+
+  it("flags a reused opener/template even on a different topic", () => {
+    // Same "honestly the X is the real bottleneck, try Y" shape.
+    const { score } = replyDiversityScore(
+      "honestly i swapped in mold and my link step halved",
