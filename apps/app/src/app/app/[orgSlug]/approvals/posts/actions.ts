@@ -198,3 +198,203 @@ export const generatePost = withRateLimit(
       });
       const out = PostGenerateOutSchema.parse(res);
       revalidatePath(`/app/${parsed.orgSlug}/content`);
+      revalidatePath(`/app/${parsed.orgSlug}/content/${parsed.ideaId}`);
+      return { ok: true as const, status: out.status };
+    } catch (e) {
+      return toError(e);
+    }
+  },
+);
+
+// Ask the agent to sharpen ONE idea's hook/thesis in place. Async: enqueues a
+// polish request the ideation worker drains; the refined idea appears on the
+// next refresh (AutoRefresh, 30s).
+const PolishInput = z.object({
+  orgSlug: z.string().min(1),
+  ideaId: z.string().uuid(),
+});
+export type PolishInput = z.infer<typeof PolishInput>;
+
+export const polishIdea = withRateLimit(
+  "posts.polish",
+  { capacity: 60, refillPerSecond: 1, cost: 1 },
+  async (input: PolishInput) => {
+    const parsed = PolishInput.parse(input);
+    try {
+      const res = await noelleFetch(`/api/posts/${encodeURIComponent(parsed.ideaId)}/polish`, {
+        method: "POST",
+        body: {},
+      });
+      const out = PostPolishOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/content`);
+      revalidatePath(`/app/${parsed.orgSlug}/content/${parsed.ideaId}`);
+      return { ok: true as const, queued: out.queued };
+    } catch (e) {
+      return toError(e);
+    }
+  },
+);
+
+const MarkReadyInput = z.object({
+  orgSlug: z.string().min(1),
+  draftId: z.string().uuid(),
+  /** The operator's edited body, when they changed it inline. */
+  editedBody: z.string().max(8000).optional(),
+});
+export type MarkReadyInput = z.infer<typeof MarkReadyInput>;
+
+export const markReadyPost = withRateLimit(
+  "posts.mark_ready",
+  { capacity: 60, refillPerSecond: 1, cost: 1 },
+  async (input: MarkReadyInput) => {
+    const parsed = MarkReadyInput.parse(input);
+    const wire: PostMarkReadyIn = { editedBody: parsed.editedBody };
+    PostMarkReadyInSchema.parse(wire);
+    try {
+      const res = await noelleFetch(`/api/posts/${encodeURIComponent(parsed.draftId)}/mark-ready`, {
+        method: "POST",
+        body: wire,
+      });
+      PostActionOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/content`);
+      return { ok: true as const };
+    } catch (e) {
+      return toError(e);
+    }
+  },
+);
+
+const MarkPostedInput = z.object({
+  orgSlug: z.string().min(1),
+  draftId: z.string().uuid(),
+  // Optional URL of the live post the operator just published by hand.
+  postedUrl: z.string().url().max(2000).optional(),
+});
+export type MarkPostedInput = z.infer<typeof MarkPostedInput>;
+
+// Operator posted this variant by hand → archive it off the board (+ store url).
+export const markPostedPost = withRateLimit(
+  "posts.mark_posted",
+  { capacity: 60, refillPerSecond: 1, cost: 1 },
+  async (input: MarkPostedInput) => {
+    const parsed = MarkPostedInput.parse(input);
+    try {
+      const res = await noelleFetch(`/api/posts/${encodeURIComponent(parsed.draftId)}/mark-posted`, {
+        method: "POST",
+        body: parsed.postedUrl ? { postedUrl: parsed.postedUrl } : {},
+      });
+      PostActionOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/content`);
+      return { ok: true as const };
+    } catch (e) {
+      return toError(e);
+    }
+  },
+);
+
+// Inline edit of one platform variant's rich column fields. Only the keys the
+// caller passes are sent (and written server-side); the rest are left untouched.
+const PatchInput = z.object({
+  orgSlug: z.string().min(1),
+  draftId: z.string().uuid(),
+  hook: z.string().max(2000).nullable().optional(),
+  cta: z.string().max(2000).nullable().optional(),
+  notes: z.string().max(8000).nullable().optional(),
+  category: z.enum(["building", "studying", "workout", "gtm"]).nullable().optional(),
+  stage: z.enum(["draft", "written", "scheduled", "posted"]).optional(),
+  body: z.string().max(8000).optional(),
+  postedUrl: z.string().url().max(2000).nullable().optional(),
+});
+export type PatchInput = z.infer<typeof PatchInput>;
+
+export const patchPostDraft = withRateLimit(
+  "posts.patch",
+  { capacity: 120, refillPerSecond: 2, cost: 1 },
+  async (input: PatchInput) => {
+    const { orgSlug, draftId, ...rest } = PatchInput.parse(input);
+    // Only forward keys that were actually provided.
+    const wire = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined));
+    if (Object.keys(wire).length === 0) return { ok: true as const };
+    try {
+      await noelleFetch(`/api/posts/${encodeURIComponent(draftId)}/patch`, { method: "POST", body: wire });
+      revalidatePath(`/app/${orgSlug}/content`);
+      return { ok: true as const };
+    } catch (e) {
+      return toError(e);
+    }
+  },
+);
+
+const ChatInput = z.object({
+  orgSlug: z.string().min(1),
+  ideaId: z.string().uuid(),
+  message: z.string().min(1).max(4000),
+  pin: z.boolean().default(false),
+});
+export type ChatInput = z.infer<typeof ChatInput>;
+
+export const sendPostChat = withRateLimit(
+  "posts.chat",
+  { capacity: 40, refillPerSecond: 1, cost: 2 },
+  async (input: ChatInput) => {
+    const parsed = ChatInput.parse(input);
+    const wire: PostChatIn = { message: parsed.message, pin: parsed.pin };
+    PostChatInSchema.parse(wire);
+    try {
+      const res = await noelleFetch(`/api/posts/${encodeURIComponent(parsed.ideaId)}/chat`, {
+        method: "POST",
+        body: wire,
+      });
+      const out = PostChatOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/content/${parsed.ideaId}`);
+      revalidatePath(`/app/${parsed.orgSlug}/content`);
+      return { ok: true as const, queued: out.queued, pinned: out.pinned };
+    } catch (e) {
+      return toError(e);
+    }
+  },
+);
+
+const DismissInput = z.object({
+  orgSlug: z.string().min(1),
+  id: z.string().uuid(),
+  target: z.enum(["idea", "draft"]),
+  // "set" (Drafts board) dismisses every version of the draft's (idea, platform)
+  // so the card actually disappears; "row" (per-version Dismiss) drops only this
+  // one. Only meaningful for target:"draft". Omitted ⇒ server default "row".
+  scope: z.enum(["row", "set"]).optional(),
+});
+export type DismissInput = z.infer<typeof DismissInput>;
+
+export const dismissPost = withRateLimit(
+  "posts.dismiss",
+  { capacity: 60, refillPerSecond: 1, cost: 1 },
+  async (input: DismissInput) => {
+    const parsed = DismissInput.parse(input);
+    try {
+      const res = await noelleFetch(`/api/posts/${encodeURIComponent(parsed.id)}/dismiss`, {
+        method: "POST",
+        body: { target: parsed.target, ...(parsed.scope ? { scope: parsed.scope } : {}) },
+      });
+      PostActionOutSchema.parse(res);
+      revalidatePath(`/app/${parsed.orgSlug}/content`);
+      return { ok: true as const };
+    } catch (e) {
+      return toError(e);
+    }
+  },
+);
+
+const ReplaceInput = z.object({
+  orgSlug: z.string().min(1),
+  ideaId: z.string().uuid(),
+});
+export type ReplaceInput = z.infer<typeof ReplaceInput>;
+
+// Kill an idea AND queue ONE replacement on the same theme (the review board's
+// "kill an idea → another appears"). One call = dismiss + single-idea ideation;
+// the fresh proposed idea surfaces on the next refresh.
+export const replacePostIdea = withRateLimit(
+  "posts.replace",
+  { capacity: 40, refillPerSecond: 0.5, cost: 2 },
+  async (input: ReplaceInput) => {
