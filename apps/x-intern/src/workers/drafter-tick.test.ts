@@ -2198,3 +2198,203 @@ describe("runDrafterTick voice variety (NOELLE_DRAFTER_VARIETY)", () => {
       markStatus: vi.fn().mockResolvedValue(undefined),
       // Pin the rotation to MICRO so the assertion is about the wiring, not luck.
       variety: {
+        enabled: true,
+        formVariantRotation: {
+          next: () => X_FORM_VARIANTS.find((v) => v.id === "MICRO")!,
+        },
+      },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    const system = runner.draft.mock.calls[0]![0].system as string;
+    expect(prompt).toContain("between ONE and 8 words");
+    // The shape must be granted authority over the default length budget, or the
+    // 40-char floor in SYSTEM_X silently wins and MICRO never lands.
+    expect(prompt).toMatch(/OVERRIDES the default reply length/);
+    expect(system).toMatch(/ASSIGNED SHAPE/);
+    // ...and the prompt's OWN closing output contract must not re-impose the
+    // budget underneath the shape block. This is the LAST line of the user
+    // message, so a fixed "40-120 / hard max 150" there sits BELOW the shape and
+    // its "overrides the rules above" can never reach it.
+    expect(prompt).not.toContain("40-120 chars with a hard max of 150");
+    const lines = prompt.split("\n");
+    expect(lines[lines.length - 1]).toMatch(/ASSIGNED SHAPE above asks for/);
+  });
+
+  it("keeps the fixed 40-120 output contract when NO shape is assigned", () => {
+    // The shape-aware trailer must not leak into the non-shape path.
+    const runner = mkRunner();
+    return runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+    }).then(() => {
+      const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+      expect(prompt).toContain("40-120 chars with a hard max of 150");
+      expect(prompt).not.toContain("THIS REPLY'S ASSIGNED SHAPE");
+    });
+  });
+
+  // The REGISTER lane still exists: on a tone-first energy (joke/celebration/
+  // vent/hot take) mirroring the tone beats varying the form, so the register
+  // wins and no shape is assigned.
+  it("uses the energy REGISTER instead of a shape on a celebration (tone-first energy)", async () => {
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        {
+          ...mkLead(),
+          classifier_label: "light",
+          payload: {
+            text: "we just raised our seed round!! so happy to announce this",
+            url: "https://x.com/u/status/1",
+          },
+        },
+      ] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      // r=0.9 is above TONE_FIRST_SHAPE_SHARE, so this celebration lands on the
+      // REGISTER half of the tone-first split. Within the celebration register
+      // set, 0.9 walks past HYPE/ULTRA_SHORT/SLANG to NORMAL, so the assertion
+      // below is on the block, not on a specific register's wording.
+      variety: { enabled: true, rng: () => 0.9 },
+      energy: { enabled: true },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("ASSIGNED REGISTER FOR THIS REPLY");
+    expect(prompt).not.toContain("THIS REPLY'S ASSIGNED SHAPE");
+  });
+
+  it("gives the SHAPED half of the tone-first split an energy-scoped shape", async () => {
+    // The tone-first lane used to mean "register, and no shape at all", so
+    // every joke/celebration/vent/hot-take lead came out in the default length
+    // band. Half of them now get a shape instead — drawn only from the shapes
+    // that can carry that energy.
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        {
+          ...mkLead(),
+          classifier_label: "light",
+          payload: {
+            text: "we just raised our seed round!! so happy to announce this",
+            url: "https://x.com/u/status/1",
+          },
+        },
+      ] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      // r=0 is below TONE_FIRST_SHAPE_SHARE → the shaped half.
+      variety: { enabled: true, rng: () => 0, genzMarkerRate: 0 },
+      energy: { enabled: true },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("THIS REPLY'S ASSIGNED SHAPE");
+    expect(prompt).not.toContain("ASSIGNED REGISTER FOR THIS REPLY");
+    // You cannot disagree with someone's launch, and QUESTION_ONLY is already
+    // off-register on a win via the LIGHT lane.
+    expect(prompt).not.toContain("Disagree, flat, in your own words");
+    expect(prompt).not.toContain("The whole reply is ONE genuine, specific question");
+  });
+
+  it("offers a gen-z marker on the leads that roll under the rate, and none above it", async () => {
+    const promptFor = async (rate: number, r: number) => {
+      const runner = mkRunner();
+      await runDrafterTick({
+        log,
+        instance: { id: "i", org_id: "o" } as never,
+        claimedLeads: [mkLead()] as never,
+        runner: runner as never,
+        kb: mkKb() as never,
+        postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+        markStatus: vi.fn().mockResolvedValue(undefined),
+        variety: { enabled: true, rng: () => r, genzMarkerRate: rate },
+      });
+      return runner.draft.mock.calls[0]![0].prompt as string;
+    };
+    expect(await promptFor(0.9, 0.1)).toContain("SPOKEN REGISTER FOR THIS REPLY");
+    expect(await promptFor(0.9, 0.95)).not.toContain("SPOKEN REGISTER FOR THIS REPLY");
+    // Rate 0 is the off switch and must emit nothing at all.
+    expect(await promptFor(0, 0)).not.toContain("SPOKEN REGISTER FOR THIS REPLY");
+  });
+
+  it("keeps the marker OUT of the DM and never stacks two markers", async () => {
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      variety: { enabled: true, rng: () => 0.1, genzMarkerRate: 1 },
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    // Exactly one marker block, and it says so.
+    expect(prompt.match(/SPOKEN REGISTER FOR THIS REPLY/g)).toHaveLength(1);
+    expect(prompt).toContain("never two markers in one reply");
+    expect(prompt).toContain("never a DM");
+    // The cosplay tier stays banned inside the very block that grants slang.
+    expect(prompt).toContain("stay banned");
+  });
+
+  it("wires the X rotation to all three conversational moves", () => {
+    const expected = new Set([
+      "GROUNDED_AGREEMENT",
+      "CONTEXT_SUPPORTED_ADDRESS",
+      "RELATIONAL_TAG",
+    ]);
+    const seen = new Set<string>();
+    for (let i = 0; i < 120; i++) {
+      const marker = xGenZMarkerRotation.next(makeLcgForShapes(i + 1), "analytical");
+      if (marker && expected.has(marker.id)) seen.add(marker.id);
+    }
+    expect(seen).toEqual(expected);
+  });
+
+  it("puts a forced conversational move in the public reply guidance once and excludes the DM", async () => {
+    const marker = GENZ_MARKERS.find((candidate) => candidate.id === "GROUNDED_AGREEMENT");
+    expect(marker).toBeDefined();
+
+    const runner = mkRunner();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [mkLead()] as never,
+      runner: runner as never,
+      kb: mkKb() as never,
+      postOutbound: vi.fn().mockResolvedValue({ id: "a", approval_id: "a" }),
+      markStatus: vi.fn().mockResolvedValue(undefined),
+      variety: {
+        enabled: true,
+        rng: () => 0,
+        genzMarkerRate: 1,
+        genzMarkerRotation: { next: () => marker ?? null },
+      },
+    });
+
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt.match(/SPOKEN REGISTER FOR THIS REPLY/g)).toHaveLength(1);
+    expect(prompt).toContain(marker?.directive);
+    expect(prompt).toContain("public reply only, never a DM");
+    expect(prompt).toContain("AT MOST ONE of them");
+  });
+
+  it("keeps an emoji-only draft alive instead of emptying the outbound", async () => {
+    // The post-aware emoji gate can strip a body to "": a reply that is only an
+    // allowlisted emoji, under a post with no emoji. Every naive handling of
+    // that is worse than the problem — shipping "" violates body.min(1) and
+    // THROWS, and on LinkedIn's batched path that throw re-runs the whole batch
+    // (duplicate approvals plus duplicate paid calls); filtering to an empty
