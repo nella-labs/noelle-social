@@ -1198,3 +1198,203 @@ export interface SpendDayPoint {
 /**
  * Daily spend for the trailing `days` days (default 30), SPLIT into LLM vs Apify
  * so the spend-over-time chart can stack the cap-relevant LLM spend separately
+ * from the Apify data-fetch cost. Reads noelle.llm_calls (the rollup is monthly,
+ * so it can't drive a daily chart) and carries the `engine` column. Every day in
+ * the window is present (0 for empty days). Tenancy guard before the query.
+ */
+export async function getOrgSpendDailyBySource(
+  orgId: string,
+  days = 30,
+): Promise<SpendDayPoint[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const span = Math.max(1, Math.min(120, Math.floor(days))) - 1;
+  const rows = await readSql<
+    Array<{ day: string; llm_cents: string | number; apify_cents: string | number }>
+  >`
+    with days as (
+      select generate_series(
+        (current_date - (${span} || ' days')::interval)::date,
+        current_date,
+        interval '1 day'
+      )::date as day
+    )
+    select
+      d.day::text as day,
+      coalesce(sum(l.cents) filter (where l.engine <> 'apify'), 0)::bigint as llm_cents,
+      coalesce(sum(l.cents) filter (where l.engine = 'apify'), 0)::bigint  as apify_cents
+    from days d
+    left join noelle.llm_calls l
+      on l.org_id = ${orgId}
+     and l.started_at::date = d.day
+    group by d.day
+    order by d.day asc
+  `;
+  return rows.map((r) => ({
+    day: r.day,
+    llmCents: Number(r.llm_cents ?? 0),
+    apifyCents: Number(r.apify_cents ?? 0),
+  }));
+}
+
+export interface SpendByWorkerRow {
+  /** Worker name ("drafter" | "classifier" | "discovery" | "profiler" | …). */
+  worker: string;
+  /** LLM spend for this worker (engine <> 'apify') in cents. */
+  llmCents: number;
+  /** Apify spend for this worker (engine = 'apify') in cents. */
+  apifyCents: number;
+}
+
+/**
+ * This month's spend grouped by WORKER, split into LLM vs Apify cents. Drives the
+ * "by worker" chart on the spend page. Reads raw noelle.llm_calls (carries both
+ * `worker` and `engine`). Coerces bigint sums. Tenancy guard before the query.
+ */
+export async function getOrgSpendByWorkerMonth(orgId: string): Promise<SpendByWorkerRow[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<
+    Array<{ worker: string | null; llm_cents: string | number; apify_cents: string | number }>
+  >`
+    select
+      coalesce(worker, 'other') as worker,
+      coalesce(sum(cents) filter (where engine <> 'apify'), 0)::bigint as llm_cents,
+      coalesce(sum(cents) filter (where engine = 'apify'), 0)::bigint  as apify_cents
+    from noelle.llm_calls
+    where org_id = ${orgId}
+      and started_at >= date_trunc('month', now())
+    group by 1
+    order by (
+      coalesce(sum(cents) filter (where engine <> 'apify'), 0)
+      + coalesce(sum(cents) filter (where engine = 'apify'), 0)
+    ) desc
+  `;
+  return rows.map((r) => ({
+    worker: r.worker ?? "other",
+    llmCents: Number(r.llm_cents ?? 0),
+    apifyCents: Number(r.apify_cents ?? 0),
+  }));
+}
+
+/** The time windows the Spend page can be viewed over (all are "to-date"). */
+export type SpendRangeKey = "month" | "quarter" | "year" | "all";
+
+export interface SpendRange {
+  key: SpendRangeKey;
+  /** Inclusive lower bound (UTC ISO). Everything from here to now is in range. */
+  startIso: string;
+  /** Full label, e.g. "This quarter". */
+  label: string;
+  /** Trend-chart bucketing: daily for short ranges, monthly for long ones. */
+  granularity: "day" | "month";
+}
+
+/**
+ * Resolve a `?range=` value into its UTC start bound + display metadata. Unknown
+ * values fall back to "month". Ranges are cumulative to-date: quarter = this
+ * quarter so far, year = year-to-date, all = since the account began. "all" uses
+ * a fixed pre-history floor (Noelle did not exist before 2026).
+ */
+export function resolveSpendRange(key: string | undefined, now = new Date()): SpendRange {
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const iso = (d: Date) => d.toISOString();
+  switch (key) {
+    case "quarter":
+      return {
+        key: "quarter",
+        startIso: iso(new Date(Date.UTC(y, Math.floor(m / 3) * 3, 1))),
+        label: "This quarter",
+        granularity: "day",
+      };
+    case "year":
+      return { key: "year", startIso: iso(new Date(Date.UTC(y, 0, 1))), label: "This year", granularity: "month" };
+    case "all":
+      return { key: "all", startIso: iso(new Date(Date.UTC(2000, 0, 1))), label: "All time", granularity: "month" };
+    case "month":
+    default:
+      return { key: "month", startIso: iso(new Date(Date.UTC(y, m, 1))), label: "This month", granularity: "day" };
+  }
+}
+
+export interface SpendBucketRow {
+  bucket: string;
+  cents: number;
+}
+
+/**
+ * Spend grouped by bucket over an arbitrary window (started_at >= startIso), read
+ * straight from noelle.llm_calls (the source of truth) rather than the monthly
+ * rollup, so quarter/year/all-time views sum the real per-call cents. Coerces the
+ * bigint sum. Tenancy guard before the query.
+ */
+export async function getOrgSpendByBucketRange(orgId: string, startIso: string): Promise<SpendBucketRow[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<Array<{ bucket: string | null; cents: string | number }>>`
+    select coalesce(bucket, 'other') as bucket, coalesce(sum(cents), 0)::bigint as cents
+    from noelle.llm_calls
+    where org_id = ${orgId} and started_at >= ${startIso}
+    group by 1
+    order by 2 desc
+  `;
+  return rows.map((r) => ({ bucket: r.bucket ?? "other", cents: Number(r.cents ?? 0) }));
+}
+
+/** Spend grouped by WORKER (LLM vs Apify split) over an arbitrary window. */
+export async function getOrgSpendByWorkerRange(orgId: string, startIso: string): Promise<SpendByWorkerRow[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows = await readSql<
+    Array<{ worker: string | null; llm_cents: string | number; apify_cents: string | number }>
+  >`
+    select
+      coalesce(worker, 'other') as worker,
+      coalesce(sum(cents) filter (where engine <> 'apify'), 0)::bigint as llm_cents,
+      coalesce(sum(cents) filter (where engine = 'apify'), 0)::bigint  as apify_cents
+    from noelle.llm_calls
+    where org_id = ${orgId} and started_at >= ${startIso}
+    group by 1
+    order by (
+      coalesce(sum(cents) filter (where engine <> 'apify'), 0)
+      + coalesce(sum(cents) filter (where engine = 'apify'), 0)
+    ) desc
+  `;
+  return rows.map((r) => ({
+    worker: r.worker ?? "other",
+    llmCents: Number(r.llm_cents ?? 0),
+    apifyCents: Number(r.apify_cents ?? 0),
+  }));
+}
+
+/**
+ * Spend trend (LLM vs Apify, stacked) over an arbitrary window, bucketed by day
+ * or month. A gap-filled series (0 for empty buckets) so the chart has one column
+ * per period. Monthly buckets keep long ranges (year/all) readable. Tenancy guard.
+ */
+export async function getOrgSpendTrendRange(
+  orgId: string,
+  startIso: string,
+  granularity: "day" | "month",
+): Promise<SpendDayPoint[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+  const rows =
+    granularity === "month"
+      ? await readSql<Array<{ day: string; llm_cents: string | number; apify_cents: string | number }>>`
+          with bounds as (
+            -- Clamp the series to the org's first activity so "all time" (which
+            -- starts at a pre-history floor) doesn't emit hundreds of empty months.
+            select greatest(
+              ${startIso}::timestamptz,
+              coalesce((select min(started_at) from noelle.llm_calls where org_id = ${orgId}), now())
+            ) as start_at
+          ),
+          buckets as (
+            select generate_series(
