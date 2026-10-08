@@ -198,3 +198,203 @@ async function main() {
               {
                 org_id: inst.org_id,
                 produced: goal.produced,
+                target: goal.target,
+                stalled: goal.stalled,
+              },
+              goal.stalled
+                ? "goal STALLED (no new replies for the stall window) — auto-paused so it stops polling Apify; keyword lane off, watchlist lane continues"
+                : "goal reached — keyword lane paused (watchlist lane continues)",
+            );
+          }
+          if (!keywordBlocked) {
+            const cap = effectiveDraftsCap(inst);
+            if (cap != null) {
+              const pending = await countPendingApprovalsForInstance(sql, inst.id);
+              if (pending >= cap) {
+                keywordBlocked = true;
+                log.info({ org_id: inst.org_id, pending, cap }, "keyword lane paused: pending at cap");
+              }
+            }
+          }
+          if (!keywordBlocked && inst.lead_backlog_cap != null) {
+            const backlog = await countLeadBacklogForInstance(sql, inst.id);
+            if (backlog >= inst.lead_backlog_cap) {
+              keywordBlocked = true;
+              log.info(
+                { org_id: inst.org_id, backlog, cap: inst.lead_backlog_cap },
+                "keyword lane paused: lead backlog at cap",
+              );
+            }
+          }
+          if (keywordBlocked) {
+            if (!watchlistLaneOn) {
+              await run.finish({ status: "ok", rowsProcessed: 0 });
+              return;
+            }
+            watchlistOnly = true;
+          }
+        }
+
+        // HUMAN-HOURS GATE (read side). Scraping X round the clock is a bot
+        // signal; the actuator already has a write curfew, this covers the read
+        // half. START==END disables it, which is the default, so this is inert
+        // until the operator sets a window.
+        if (!withinActiveHours(env)) {
+          log.info({ instance: inst.id }, "outside active hours — skipping discovery tick");
+          await run.finish({ status: "ok", rowsProcessed: 0 });
+          return;
+        }
+
+        // DAILY EXTRACT BUDGET. One cap across all lanes, with the top band
+        // reserved for the always-on WATCH lane so the high-volume keyword lane
+        // cannot burn the day's Apify budget and starve the operator's
+        // hand-picked accounts. Cap 0 = unlimited (default) ⇒ both checks are
+        // no-ops and behaviour is byte-identical.
+        const extractedToday =
+          env.X_DAILY_EXTRACT_CAP > 0 ? await countExtractedToday(sql, inst.id).catch(() => 0) : 0;
+        if (dailyCapReached(extractedToday, env.X_DAILY_EXTRACT_CAP)) {
+          log.info(
+            { instance: inst.id, extractedToday, cap: env.X_DAILY_EXTRACT_CAP },
+            "daily extract cap reached — discovery paused for the day",
+          );
+          await run.finish({ status: "ok", rowsProcessed: 0 });
+          return;
+        }
+        // Inside the reserved band: the watch lane keeps drawing, the keyword
+        // lane stops. Expressed by flipping the tick into watchlist-only mode,
+        // which is exactly the lane split that already exists for a paused run.
+        if (
+          !watchlistOnly &&
+          searchLanesExhausted(extractedToday, env.X_DAILY_EXTRACT_CAP, env.X_WATCHLIST_DAILY_RESERVE)
+        ) {
+          log.info(
+            { instance: inst.id, extractedToday, reserve: env.X_WATCHLIST_DAILY_RESERVE },
+            "daily budget entered the watch-lane reserve — keyword lane paused for the day",
+          );
+          watchlistOnly = true;
+        }
+
+        // Resolve the org's Apify tokens as N DISJOINT shards (N=1 ⇒ the plain
+        // single-client path, byte-identical to before). Capped by how many
+        // tokens are actually available, so a big concurrency setting on a thin
+        // pool simply yields fewer shards rather than shards sharing a token.
+        const shardHandles = await resolveApifyShards(
+          inst.org_id,
+          env.NOELLE_APIFY_MAX_CONCURRENCY,
+        );
+        if (shardHandles.length === 0) {
+          await run.finish({ status: "ok", rowsProcessed: 0 });
+          return;
+        }
+
+        const wl = await getWatchlist(sql, inst.id);
+
+        // Self-curating watchlist: periodically promote keyword authors with
+        // multiple drafted replies into the always-on watchlist, so their future
+        // posts become priority leads. Gated by WATCHLIST_AUTOPROMOTE_MAX (0
+        // disables) + an hourly cooldown; only on the active keyword lane.
+        // Failures never block discovery. Runs before getWatchlistPeople so any
+        // promotions are polled this same tick.
+        if (env.WATCHLIST_AUTOPROMOTE_MAX > 0 && !watchlistOnly) {
+          const last = lastPromoteAt.get(inst.id) ?? 0;
+          if (Date.now() - last >= PROMOTE_INTERVAL_MS) {
+            lastPromoteAt.set(inst.id, Date.now());
+            try {
+              const promoted = await promoteWatchlistAuthors(sql, inst.id, inst.org_id, {
+                minDrafted: env.WATCHLIST_AUTOPROMOTE_MIN_DRAFTED,
+                maxPerRun: env.WATCHLIST_AUTOPROMOTE_MAX,
+              });
+              if (promoted.length) {
+                log.info({ instance: inst.id, promoted }, "auto-promoted keyword authors to watchlist");
+              }
+            } catch (err) {
+              log.warn(
+                { instance: inst.id, err: (err as Error).message },
+                "watchlist auto-promote failed",
+              );
+            }
+          }
+        }
+
+        const people = await getWatchlistPeople(sql, inst.id);
+
+        // One ICP reader for BOTH person lanes (feeder + retention) and the
+        // classifier, so "in-ICP" cannot come to mean two different things.
+        const icpGate = readIcpGate(inst.icp_config);
+
+        // FOLLOWER FEEDER — person DISCOVERY. Harvests the audience of a seed
+        // account and retains the ones whose bio matches the ICP. Default OFF
+        // because, unlike every other discovery knob, this one spends per RUN
+        // rather than per useful lead: the actor floors its list at 200 users
+        // (~$0.03 a run), so an unthrottled loop would drain a free-tier token's
+        // monthly credit in days.
+        //
+        // The throttle stamp lives on the BUS, not in process memory: the worker
+        // restarts on every deploy tick, and an in-memory stamp would let each
+        // restart re-trigger a paid run. isFeederDue treats an unreadable stamp
+        // as "recently run" so a bus glitch costs nothing.
+        if (env.X_FOLLOWER_FEEDER_ENABLED && !watchlistOnly && icpGateConfigured(icpGate)) {
+          const stampKey = `follower_feeder:${inst.id}`;
+          const state = await bus
+            ?.get<{ lastRunAt?: string; cursor?: number }>("pipeline", stampKey)
+            .catch(() => null);
+          if (isFeederDue(state?.lastRunAt, env.X_FOLLOWER_FEEDER_INTERVAL_HOURS, new Date())) {
+            const seeds = pickSeeds(
+              {
+                configured: readSeedHandles(inst.icp_config),
+                // The watchlist PEOPLE (x_watchlist_people), not wl.handles.
+                // wl.handles is the TARGETING-handle list, which is empty on the
+                // live instance (54 watch people, 34 keywords, 0 targeting
+                // handles) — so falling back to it would have left the feeder
+                // silently seedless and spending nothing forever. The people are
+                // the accounts the operator actually hand-picked, which is
+                // exactly the audience worth harvesting.
+                watchlist: people.map((p) => p.handle),
+              },
+              env.X_FOLLOWER_FEEDER_SEEDS_PER_RUN,
+              state?.cursor ?? 0,
+            );
+            if (seeds.length > 0) {
+              // Stamp BEFORE the run: a crash mid-run must not leave the feeder
+              // eligible again on the very next tick, which is how a paid loop
+              // starts. Worst case we skip one window.
+              await bus
+                ?.put("pipeline", stampKey, {
+                  lastRunAt: new Date().toISOString(),
+                  cursor: (state?.cursor ?? 0) + seeds.length,
+                })
+                .catch(() => {});
+              try {
+                await runFollowerFeeder({
+                  sql,
+                  orgId: inst.org_id,
+                  agentInstanceId: inst.id,
+                  icpGate: icpGate!,
+                  seeds,
+                  maxUsers: env.X_FOLLOWER_FEEDER_MAX_USERS,
+                  scrapeFollowers: (a) => withMeteredApifyCall({
+                    client: shardHandles[0]!.client, recorder, log,
+                    orgId: inst.org_id, instanceId: inst.id, agentRole: "x_intern",
+                    worker: "discovery", actor: X_FOLLOWER_ACTOR, startedAt: new Date(),
+                    credentialId: shardHandles[0]!.credentialId,
+                  }, operation => operation.scrapeFollowers(a)),
+                  recordPerson: (p) =>
+                    upsertDiscoveredPerson(sql, {
+                      orgId: inst.org_id,
+                      agentInstanceId: inst.id,
+                      handle: p.handle,
+                      authorId: p.id,
+                      displayName: p.displayName,
+                      bio: p.bio,
+                      source: "follower_scrape",
+                    }),
+                  log,
+                });
+              } catch (err) {
+                // A dead pool propagates (the handler pages); anything else is
+                // non-fatal — the watch + keyword lanes already ran.
+                if (err instanceof AllApifyTokensExhaustedError) throw err;
+                log.warn(
+                  { instance: inst.id, err: (err as Error).message },
+                  "follower feeder failed (ignored)",
+                );
