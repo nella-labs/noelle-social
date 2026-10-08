@@ -198,3 +198,203 @@ describe("toInboundItem clamps every scraped field", () => {
       ],
       "demooperator",
       "2026-07-26T12:00:00.000Z",
+    );
+    expect(item.text.length).toBe(MAX_TEXT);
+    expect(item.conversation!.root_post_text!.length).toBe(MAX_TEXT);
+    expect(item.conversation!.our_reply_text!.length).toBe(MAX_TEXT);
+  });
+});
+
+// Exercise sweep navigation with injected dependencies. Empty or failed
+// notification reads must keep the tab on the notifications page.
+describe("runNotificationSweep navigation behaviour", () => {
+  const setupChrome = (seen: string[] = []) => {
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      storage: { local: { get: async () => ({ [SEEN_KEY]: seen }), set: async () => undefined } },
+    };
+  };
+  const deps = (over: Record<string, unknown>) => ({
+    cdp: { wheel: async () => undefined } as never,
+    rng: { float: () => 1, int: () => 1, normal: () => 40, gamma: () => 1, next: () => 0.5, pickWeighted: () => 0 } as never,
+    sleep: async () => undefined,
+    api: { postInboundReplies: async () => ({ accepted: 1, skipped: 0, results: [] }) } as never,
+    instanceId: "i",
+    wpm: 300,
+    stopped: () => false,
+    ...over,
+  });
+
+  it("with nothing new: opens notifications and NEVER navigates to the feed", async () => {
+    setupChrome();
+    const urls: string[] = [];
+    const out = await runNotificationSweep(1, deps({
+      navigate: async (_id: number, url: string) => { urls.push(url); },
+      // one cell, but it is a reply to somebody else
+      send: async (_id: number, msg: { cmd: string }) =>
+        msg.cmd === "readSelfHandle"
+          ? { ok: true, handle: "operator" }
+          : { ok: true, items: [{ tweet_id: "1", handle: "ada", text: "hi there friend", url: "https://x.com/ada/status/1", posted_at: FRESH(), replying_to: ["someoneelse"] }] },
+    }) as never);
+    expect(urls).toEqual([NOTIFICATIONS_URL]);
+    expect(urls.some((u) => u.includes("/home"))).toBe(false);
+    expect(out.fresh).toBe(0);
+    expect(out.harvested).toBe(1); // read a cell — distinguishes drift from quiet
+  });
+
+  it("when the self-handle cannot be resolved: says so and does not go to the feed", async () => {
+    setupChrome();
+    const urls: string[] = [];
+    const out = await runNotificationSweep(1, deps({
+      navigate: async (_id: number, url: string) => { urls.push(url); },
+      send: async (_id: number, msg: { cmd: string }) =>
+        msg.cmd === "readSelfHandle" ? { ok: true, handle: null } : { ok: true, items: [] },
+      configuredHandle: undefined,
+    }) as never);
+    expect(out.detail).toMatch(/which account is logged in/i);
+    expect(urls.some((u) => u.includes("/home"))).toBe(false);
+  });
+
+  it("falls back to the operator-configured handle when the DOM read fails", async () => {
+    setupChrome();
+    const out = await runNotificationSweep(1, deps({
+      navigate: async () => undefined,
+      send: async (_id: number, msg: { cmd: string }) =>
+        msg.cmd === "readSelfHandle"
+          ? { ok: true, handle: null }
+          : { ok: true, items: [{ tweet_id: "9", handle: "ada", text: "a real question for you?", url: "https://x.com/ada/status/9", posted_at: FRESH(), replying_to: ["operator"] }] },
+      configuredHandle: "operator",
+    }) as never);
+    // It resolved the handle, so the reply WAS recognised as ours.
+    expect(out.detail).not.toMatch(/which account/i);
+    expect(out.fresh).toBe(1);
+  });
+
+  it("after ingesting, returns to notifications — not the feed", async () => {
+    setupChrome();
+    const urls: string[] = [];
+    await runNotificationSweep(1, deps({
+      navigate: async (_id: number, url: string) => { urls.push(url); },
+      send: async (_id: number, msg: { cmd: string }) => {
+        if (msg.cmd === "readSelfHandle") return { ok: true, handle: "operator" };
+        if (msg.cmd === "harvestThread") return { ok: true, chain: [{ tweet_id: "0", handle: "carol", text: "root post" }] };
+        return { ok: true, items: [{ tweet_id: "9", handle: "ada", text: "a real question for you?", url: "https://x.com/ada/status/9", posted_at: FRESH(), replying_to: ["operator"] }] };
+      },
+    }) as never);
+    expect(urls[0]).toBe(NOTIFICATIONS_URL);
+    expect(urls).toContain("https://x.com/ada/status/9"); // opened the thread
+    expect(urls[urls.length - 1]).toBe(NOTIFICATIONS_URL); // and came back HERE
+    expect(urls.some((u) => u.includes("/home"))).toBe(false);
+  });
+});
+
+describe("the sweep stays on the notifications page", () => {
+  it("targets the All tab, which renders strictly more than /mentions", () => {
+    // The All tab carries real replies (article[data-testid="tweet"]) alongside
+    // like/follow cards (data-testid="notification"), which the harvester
+    // ignores. /mentions would only ever be a subset.
+    expect(NOTIFICATIONS_URL).toBe("https://x.com/notifications");
+    expect(NOTIFICATIONS_URL).not.toMatch(/mentions/);
+  });
+
+  it("never sends the tab to the feed — notifications is home base", () => {
+    // The notifications lane keeps its own home page on every exit path.
+    expect(NOTIFICATIONS_URL).not.toMatch(/\/home/);
+  });
+
+  it("caches a discovered self-handle so one bad DOM read cannot disable the feature", () => {
+    expect(SELF_HANDLE_KEY).toBe("actuator.selfHandle");
+  });
+});
+
+// Adversarial review caught this: `detail` was built over EVERY harvested cell
+// and on the whole fresh===0 path, so it blamed the 6h window for zeroes the
+// window had nothing to do with — and printed a self-contradictory line
+// ("none new within 6h (0 older, 0 undated)"). The notifications page is mostly
+// likes, follows and our own tweets, and the steady state after answering
+// someone is that their reply sits there, recent and already ingested, for hours.
+describe("describeEmptySweep tells the truth about WHICH zero this is", () => {
+  const ages = (recent: number, stale: number, undated: number) => ({ recent, stale, undated });
+
+  it("says nothing when the page rendered no cells — the caller's 'selectors may have drifted' is better", () => {
+    expect(describeEmptySweep({ harvested: 0, ages: ages(0, 0, 0) })).toBeUndefined();
+  });
+
+  it("says nothing when cells were read but none were replies to us", () => {
+    // 12 likes and follows is not a 6h-window story.
+    expect(describeEmptySweep({ harvested: 12, ages: ages(0, 0, 0) })).toBeUndefined();
+  });
+
+  it("blames the window only when the window is actually the reason", () => {
+    const d = describeEmptySweep({ harvested: 20, ages: ages(0, 4, 0) })!;
+    expect(d).toMatch(/none within 12h/);
+    expect(d).toMatch(/4 older/);
+  });
+
+  it("names the seen-ring case WITHOUT claiming the person was answered", () => {
+    // THE steady state. Saying "none within 6h" here is a flat lie repeated
+    // every ten minutes at exactly the moment someone is debugging.
+    const d = describeEmptySweep({ harvested: 20, ages: ages(3, 0, 0) })!;
+    expect(d).toMatch(/already ingested/);
+    expect(d).not.toMatch(/none within/);
+  });
+
+  it("calls out a markup break when every candidate is undated", () => {
+    const d = describeEmptySweep({ harvested: 9, ages: ages(0, 0, 5) })!;
+    expect(d).toMatch(/no readable timestamp/);
+    expect(d).toMatch(/markup may have changed/);
+  });
+
+  it("never emits a line whose own counts contradict it", () => {
+    // The bug in prose form: "3 replies, none within 6h (0 older, 0 undated)".
+    // The candidate total is DERIVED from the buckets now, so a caller cannot
+    // disagree with itself — this asserts that property directly.
+    for (const a of [ages(3, 0, 0), ages(0, 3, 0), ages(0, 0, 3), ages(1, 1, 1), ages(0, 0, 0), ages(2, 5, 1)]) {
+      const d = describeEmptySweep({ harvested: 10, ages: a });
+      if (!d) continue;
+      const total = a.recent + a.stale + a.undated;
+      const claimed = Number(/^(\d+)/.exec(d)?.[1] ?? -1);
+      if (d.includes("none within")) {
+        expect(a.recent).toBe(0);
+        expect(claimed).toBe(total); // the headline count IS the candidate count
+        expect(d).toContain(`${a.stale} older`);
+        expect(d).toContain(`${a.undated} undated`);
+      }
+      if (d.includes("already ingested")) expect(claimed).toBe(a.recent);
+      if (d.includes("no readable timestamp")) expect(a.undated).toBe(total);
+    }
+  });
+});
+
+describe("isReplyToMe — the candidate gate, on its own", () => {
+  const item = (handle: string, replying_to: string[]) => ({ handle, replying_to });
+
+  it("accepts somebody else replying to us", () => {
+    expect(isReplyToMe(item("alice", ["demooperator"]), "demooperator")).toBe(true);
+  });
+
+  it("rejects our own tweet", () => {
+    expect(isReplyToMe(item("demooperator", ["demooperator"]), "demooperator")).toBe(false);
+  });
+
+  it("rejects a bare mention and a reply to someone else", () => {
+    expect(isReplyToMe(item("alice", []), "demooperator")).toBe(false);
+    expect(isReplyToMe(item("alice", ["carol"]), "demooperator")).toBe(false);
+  });
+
+  it("rejects everything when we don't know our own handle", () => {
+    expect(isReplyToMe(item("alice", ["demooperator"]), "")).toBe(false);
+  });
+});
+
+// End-to-end through the REAL runNotificationSweep: the two cases the reviewer
+// demonstrated emitting "3 cells on the page, none new within 6h (0 older, 0
+// undated)" — a line that contradicts itself and points a debugger at the age
+// parser when the age parser is fine.
+describe("the sweep no longer misreports why it did nothing", () => {
+  const setupChrome = (seen: string[] = []) => {
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      storage: { local: { get: async () => ({ "actuator.seenNotifications": seen }), set: async () => undefined } },
+    };
+  };
+  const base = {
+    cdp: { wheel: async () => undefined } as never,
