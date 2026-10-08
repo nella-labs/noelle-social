@@ -198,3 +198,158 @@ function looksLikeQuestion(text: string): boolean {
     !/\b(unpopular|hot take|change my mind|fight me)\b/i.test(s)
   );
 }
+
+export interface DetectEnergyOpts {
+  /** The lead's classifier_label ('light' == a win/celebration). */
+  classifierLabel?: string | null;
+  /** A persisted energy label produced by the classifier — trusted first when valid. */
+  energyLabel?: string | null;
+}
+
+/**
+ * Decide the post's ENERGY. Trust order:
+ *   1. an explicit persisted energy label (the classifier already judged it),
+ *   2. classifier_label === 'light' → celebration (matches detectPostRegister),
+ *   3. text heuristics: joke → hot_take → vent → question (first match wins),
+ *   4. any other non-empty classifier label → analytical (substantive),
+ *   5. no label at all → looksCelebratory ? celebration : analytical.
+ * Everything falls open to 'analytical', which is today's default drafter behavior.
+ */
+export function detectPostEnergy(
+  postText: string,
+  opts: DetectEnergyOpts = {},
+): PostEnergy {
+  const { classifierLabel, energyLabel } = opts;
+  if (isPostEnergy(energyLabel)) return energyLabel;
+  if (classifierLabel === "light") return "celebration";
+
+  const t = postText ?? "";
+  // Order matters. Vent and question are checked BEFORE joke: "lol" and 😂 are
+  // common in grief/casual posts, and answering real distress or a genuine question
+  // with a forced joke is exactly the misfire this feature must avoid. So a post
+  // that trips both a vent signal and a joke signal resolves to vent, not joke.
+  if (VENT_SIGNALS.test(t)) return "vent";
+  if (looksLikeQuestion(t)) return "question";
+  if (HOT_TAKE_SIGNALS.test(t)) return "hot_take";
+  if (JOKE_SIGNALS.test(t)) return "joke";
+
+  if (classifierLabel && classifierLabel.trim().length > 0) return "analytical";
+  return looksCelebratory(t) ? "celebration" : "analytical";
+}
+
+/** Collapse the rich energy to the binary PostRegister the Account Feeder consumes. */
+export function energyToRegister(energy: PostEnergy): PostRegister {
+  return energy === "celebration" ? "celebration" : "neutral";
+}
+
+// ---- Energy-aware register selection ---------------------------------------
+// Each energy samples from a register SUBSET tuned to it. The weights need not sum
+// to 1 — weightedPick renormalizes. Design rules baked in:
+//   • HYPE only ever appears under celebration (CAPS + "LETS GOOO" is fake anywhere else).
+//   • DEADPAN (dry humor) appears under joke/hot_take, NEVER under a genuine question
+//     or vent (snark on someone asking for help / venting reads badly).
+//   • question/vent avoid the giddy short forms; they lean helpful/real.
+const ENERGY_REGISTERS: Record<PostEnergy, Register[]> = {
+  celebration: [
+    reg("HYPE", 0.5),
+    reg("ULTRA_SHORT", 0.25),
+    reg("SLANG", 0.15),
+    reg("NORMAL", 0.1),
+  ],
+  joke: [
+    reg("DEADPAN", 0.4),
+    reg("PUNCHY", 0.25),
+    reg("ULTRA_SHORT", 0.2),
+    reg("SLANG", 0.15),
+  ],
+  hot_take: [
+    reg("PUNCHY", 0.45),
+    reg("ULTRA_SHORT", 0.2),
+    reg("DEADPAN", 0.2),
+    reg("SLANG", 0.15),
+  ],
+  vent: [
+    reg("SLANG", 0.35),
+    reg("PUNCHY", 0.25),
+    reg("NORMAL", 0.25),
+    reg("ULTRA_SHORT", 0.15),
+  ],
+  question: [reg("NORMAL", 0.45), reg("PUNCHY", 0.35), reg("ULTRA_SHORT", 0.2)],
+  analytical: [
+    reg("NORMAL", 0.3),
+    reg("SLANG", 0.24),
+    reg("ULTRA_SHORT", 0.24),
+    reg("PUNCHY", 0.22),
+  ],
+};
+
+/** The register subset to sample from for a given post energy. */
+export function registersForEnergy(energy: PostEnergy): Register[] {
+  return ENERGY_REGISTERS[energy] ?? ENERGY_REGISTERS.analytical;
+}
+
+/**
+ * Pick ONE register conditioned on the post's energy. Same weighted walk as
+ * pickRegister but over registersForEnergy(energy). rng is injectable for tests.
+ */
+export function pickRegisterForEnergy(
+  energy: PostEnergy,
+  rng: () => number = Math.random,
+): Register {
+  return weightedPick(registersForEnergy(energy), rng);
+}
+
+/**
+ * A one-line, post-specific "mirror the energy" hint for the reply prompt, shared by
+ * the X and Reddit drafters. Stronger than a general "match the energy" instruction
+ * because it names THIS post's detected energy. Returns "" for 'analytical' so an
+ * ordinary substantive post stays byte-identical. The wording is platform-neutral.
+ */
+export function renderEnergyHint(energy: PostEnergy): string {
+  switch (energy) {
+    case "joke":
+      return "POST ENERGY: this reads as a joke / satire / shitpost. MIRROR it — answer in kind with something funnier or sharper. A dry one-liner or a good riff beats any analysis; do NOT explain the joke or reply with earnest philosophy.";
+    case "hot_take":
+      return "POST ENERGY: this is a hot take / spicy opinion. Match it with a sharp take of your own — agree hard, push back, or one-up it. No fence-sitting, no both-sides hedging.";
+    case "vent":
+      return "POST ENERGY: this is a vent / frustration. Commiserate like a peer who gets it. Do NOT be chirpy, do NOT lecture or try to fix it, and do NOT pitch anything.";
+    case "celebration":
+      return "POST ENERGY: this is a win / celebration. Be genuinely warm and hyped for them, short and real — never a corporate 'congratulations on this milestone'.";
+    case "question":
+      return "POST ENERGY: they asked a real question. Actually answer it, concretely and directly. No preamble, no 'great question'.";
+    case "analytical":
+    default:
+      return "";
+  }
+}
+
+// ---- Backward-compatible celebration/neutral API ---------------------------
+// Preserved so existing callers/tests keep working while the finer energy API is
+// adopted. detectPostRegister is now defined in terms of detectPostEnergy.
+
+/**
+ * Decide the post's register (celebration vs neutral). Backward-compatible wrapper
+ * over detectPostEnergy — 'light' → celebration, any other non-empty label →
+ * neutral, no label → text heuristic.
+ */
+export function detectPostRegister(
+  postText: string,
+  classifierLabel?: string | null,
+): PostRegister {
+  return energyToRegister(detectPostEnergy(postText, { classifierLabel: classifierLabel ?? null }));
+}
+
+/** The register subset for a celebration/neutral post register (compat). */
+export function registersForPost(postRegister: PostRegister): Register[] {
+  if (postRegister === "celebration") return ENERGY_REGISTERS.celebration;
+  // neutral → everything EXCEPT HYPE (no manufactured excitement on a serious post).
+  return REGISTERS.filter((r) => r.id !== "HYPE");
+}
+
+/** Pick ONE register conditioned on a celebration/neutral post register (compat). */
+export function pickRegisterForPost(
+  postRegister: PostRegister,
+  rng: () => number = Math.random,
+): Register {
+  return weightedPick(registersForPost(postRegister), rng);
+}

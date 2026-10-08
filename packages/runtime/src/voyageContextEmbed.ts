@@ -198,3 +198,8 @@ export async function voyageContextEmbed(
 export async function voyageContextEmbedQuery(
   query: string,
   opts?: Omit<VoyageContextEmbedOptions, "inputType">,
+): Promise<number[]> {
+  if (!query.trim()) return [];
+  const out = await voyageContextEmbed([[query]], { ...opts, inputType: "query" });
+  return out[0]?.[0] ?? [];
+}
