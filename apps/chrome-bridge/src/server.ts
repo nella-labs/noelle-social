@@ -198,3 +198,60 @@ export function createServer(deps: ServerDeps): Hono {
     }
     return c.json({ ok: true });
   });
+
+  app.get("/ext/build", (c) => {
+    // build-stamp.json is { stamp: "<ISO>" }; unwrap to { stamp: <string|null> }
+    // — byte-identical to api-vm's GET /api/actuator/extension-build so the ext's
+    // self-reload compares its embedded stamp against the same shape.
+    try {
+      const raw = JSON.parse(readFileSync(env.extStampPath, "utf8")) as { stamp?: unknown };
+      return c.json({ stamp: typeof raw.stamp === "string" ? raw.stamp : null });
+    } catch {
+      return c.json({ stamp: null });
+    }
+  });
+
+  // --- ingest (loopback-open, no bearer) ------------------------------------
+
+  app.post("/ingest/logs", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = LogIngestSchema.safeParse(body);
+    if (!parsed.success) return c.json({ ok: false, error: "invalid ingest", stored: 0 }, 400);
+    const { stored } = sink.appendLogs(parsed.data);
+    return c.json({ ok: true, stored });
+  });
+
+  app.post("/ingest/heartbeat", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const parsed = HeartbeatSchema.safeParse(body);
+    if (!parsed.success) return c.json({ ok: false, error: "invalid heartbeat" }, 400);
+    sink.setHeartbeat(parsed.data);
+    return c.json({ ok: true });
+  });
+
+  app.notFound((c) => c.json({ ok: false, error: "not_found" }, 404));
+  app.onError((err, c) => {
+    logger.error({ err: String(err) }, "unhandled error");
+    return c.json({ ok: false, error: "internal_error" }, 500);
+  });
+
+  return app;
+}
+
+function numOr(v: string | undefined): number | undefined {
+  if (v === undefined || v.trim() === "") return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function asString(v: unknown): string | undefined {
+  return typeof v === "string" ? v : undefined;
+}
+
+function coerceLevel(v: unknown): LogLevel {
+  const s = typeof v === "string" ? v.toLowerCase() : "";
+  if (s === "error" || s === "err") return "error";
+  if (s === "warn" || s === "warning") return "warn";
+  if (s === "debug" || s === "verbose" || s === "trace") return "debug";
+  return "info";
+}
