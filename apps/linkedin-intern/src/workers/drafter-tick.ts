@@ -2798,3 +2798,203 @@ function renderSubstantialPrompt(args: {
     args.postText,
     ...imageBlock(args.imageCaption),
     ...(args.commentDigest ? ["", args.commentDigest] : []),
+    ...priorRepliesBlock(args.priorReplies),
+    ...recentPhrasingsBlock(args.recentPhrasings),
+    ...(args.registerBlock
+      ? ["", args.registerBlock]
+      : args.shapeBlock
+        ? ["", args.shapeBlock]
+        : []),
+    ...(args.openingMoveBlock ? ["", args.openingMoveBlock] : []),
+    ...(args.genzBlock ? ["", args.genzBlock] : []),
+    ...(args.operatorInstructions ? ["", "OPERATOR REQUEST FOR THIS REPLY — follow this guidance for this draft only:", args.operatorInstructions] : []),
+    "",
+    "Voice anchors from the operator's knowledge base (use these to ground tone + specific opinions, not as topics to force):",
+    args.anchors.length
+      ? args.anchors.map((a, i) => `[${i + 1}] ${a}`).join("\n")
+      : "(none — draft from general voice)",
+    ...knowledgeBlock(args.knowledgeAnchors),
+    "",
+    args.singleReply
+      ? `This lead has already been judged worth a substantial reply by the upstream gate. Draft exactly one comment, choosing the strongest angle for this post from: ${angleList}.${args.allowedAngles.length > 1 ? " The example JSON uses empathetic; choose another listed angle when that is stronger." : ""} Do NOT draft a DM or output a skip.`
+      : `This lead has already been judged worth a substantial reply by the upstream gate. Draft exactly ${args.allowedAngles.length} comment${args.allowedAngles.length > 1 ? "s" : ""} (angles: ${angleList})${args.wantDm ? " AND one DM" : " (no DM for this tier)"}. Do NOT output a skip — the gate already decided.`,
+    "",
+    "OUTPUT FORMAT — STRICT JSON, NO PREAMBLE, NO MARKDOWN FENCES:",
+    "The very first character of your response MUST be `{` and the last `}`.",
+    `  {"drafts":[${draftsShape}]${dmShape}}`,
+    // SHAPE-AWARE. This is the LAST line of the user message, below the shape
+    // block, so the shape's own "overrides the rules above" cannot reach it. A
+    // fixed 90-180/220 band here competes with every shape whose band falls
+    // outside it — which was most of the rotation, and is why Lyra's feed
+    // measured 181 +/- 44 chars while Vega's spread 131 +/- 58.
+    args.shapeAssigned || args.registerBlock
+      ? "Each comment's length and sentence count are EXACTLY what the ASSIGNED SHAPE / ASSIGNED REGISTER block above says — that block REPLACES the default ~90-180 target and the ~220 ceiling, and may legitimately be three words or a ~320-char run-on. Do not pad a short one to feel substantial and do not compress a long one. One thread, not a summary of the post."
+      : "Each comment is ONE sharp sentence (a short second only if it earns a beat): aim ~90-180 chars, ~220 hard ceiling. One thread, not a summary of the post.",
+    args.singleReply
+      ? "Output exactly one comment with its chosen angle. Do NOT include a `dm`."
+      : args.wantDm
+      ? "Output the comment drafts (one per listed angle, in that order) plus exactly one `dm` (the longer cold-outreach message, ~400-700 chars, fragmented with \\n between chunks)."
+      : "Output the comment drafts (one per listed angle, in that order). Do NOT include a `dm` for this tier.",
+  ].join("\n");
+}
+
+function renderLightPrompt(args: {
+  postText: string;
+  authorName: string | null;
+  publicId: string | null;
+  voiceAnchors?: string[];
+  knowledgeAnchors: string[];
+  imageCaption: string;
+  commentDigest: string;
+  /**
+   * The "ASSIGNED REGISTER FOR THIS REPLY" block (lib/register.ts), or undefined
+   * when voice variety is off. A light post is a win/launch — HYPE lands here.
+   */
+  registerBlock?: string;
+  /**
+   * The standalone "THIS REPLY'S ASSIGNED SHAPE" block, rendered in the register
+   * slot (they are mutually exclusive — both claim reply length).
+   */
+  shapeBlock?: string;
+  /**
+   * True when a shape was assigned at all, inline in the STYLE block or as
+   * `shapeBlock`. Only this flag can neutralise the closing length line below.
+   */
+  shapeAssigned?: boolean;
+  /** The "OPENING MOVE FOR THIS REPLY" block (lib/opening-move.ts), or undefined when variety is off. */
+  openingMoveBlock?: string;
+  /** The gen-z "SPOKEN REGISTER" marker block, or undefined when no marker was offered. */
+  genzBlock?: string;
+  /** Reply bodies already sent/queued to this person (do-not-repeat memory). */
+  priorReplies?: string[];
+  /** Recent reply bodies across the whole feed (global avoid-list). */
+  recentPhrasings?: string[];
+  /**
+   * The CONVERSATION block for a notification lead — the post this exchange
+   * started from, and the last thing WE said. Without it the drafter has no
+   * idea it is mid-conversation and writes an opening remark into a two-person
+   * exchange.
+   */
+  /** Operator guidance attached to an explicit MCP reply request. */
+  operatorInstructions?: string;
+  conversationBlock?: string | undefined;
+}): string {
+  const who = args.authorName ?? (args.publicId ? `@${args.publicId}` : "a watchlist person");
+  return [
+    // First, so the model reads "this is a thread you are already in" BEFORE it
+    // reads the post — otherwise it frames the whole thing as a cold comment.
+    ...(args.conversationBlock ? [args.conversationBlock, ""] : []),
+    `LinkedIn post by ${who}:`,
+    args.postText,
+    ...imageBlock(args.imageCaption),
+    ...(args.commentDigest ? ["", args.commentDigest] : []),
+    ...(args.voiceAnchors?.length
+      ? ["", "CURATED OPERATOR VOICE ANCHORS (tone and form only; do not use these as facts about this post or as a personal story):", ...args.voiceAnchors.slice(0, 4).map((anchor, i) => `[${i + 1}] ${anchor.slice(0, 320)}`)]
+      : []),
+    ...knowledgeBlock(args.knowledgeAnchors),
+    ...priorRepliesBlock(args.priorReplies),
+    ...recentPhrasingsBlock(args.recentPhrasings),
+    ...(args.registerBlock
+      ? ["", args.registerBlock]
+      : args.shapeBlock
+        ? ["", args.shapeBlock]
+        : []),
+    ...(args.openingMoveBlock ? ["", args.openingMoveBlock] : []),
+    ...(args.genzBlock ? ["", args.genzBlock] : []),
+    ...(args.operatorInstructions ? ["", "OPERATOR REQUEST FOR THIS REPLY — follow this guidance for this draft only:", args.operatorInstructions] : []),
+    "",
+    // "short" is a LENGTH word sitting below the shape block, so it needs the
+    // same carve-out the trailing sentence-count line already got. Newly
+    // load-bearing: light leads are almost always celebration, which used to
+    // mean no shape at all — now half of them take RUN_ON or SELF_STORY
+    // (~150-260 chars) and would be arguing with a later "short".
+    args.shapeAssigned
+      ? "This is a win / launch / milestone post. Write ONE warm, specific congratulatory comment in the operator's voice, at exactly the length the ASSIGNED SHAPE block above asks for. No pitch, no link, no DM."
+      : "This is a win / launch / milestone post. Write ONE short, warm, specific congratulatory comment in the operator's voice. No pitch, no link, no DM.",
+    "",
+    "OUTPUT FORMAT — STRICT JSON, NO PREAMBLE, NO MARKDOWN FENCES:",
+    "The very first character of your response MUST be `{` and the last `}`.",
+    '  {"drafts":[{"angle":"empathetic","body":"…","char_count":N}]}',
+    // Shape-aware for the same reason as the substantial path: a trailing
+    // "1-2 sentences" outranks an assigned shape that asked for one word.
+    args.shapeAssigned || args.registerBlock
+      ? "Exactly ONE draft. Its length and sentence count are EXACTLY what the ASSIGNED SHAPE / ASSIGNED REGISTER block above says, which replaces the default 1-2 sentences. No `dm`."
+      : "Exactly ONE draft. 1-2 sentences. No `dm`.",
+  ].join("\n");
+}
+
+function safeJsonParse(s: string): unknown {
+  try { return normalizeSkipShape(JSON.parse(s)); } catch { /* fall through */ }
+  try {
+    const stripped = s.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
+    return normalizeSkipShape(JSON.parse(stripped));
+  } catch { /* fall through */ }
+  const firstBrace = s.indexOf("{");
+  const lastBrace = s.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    try { return normalizeSkipShape(JSON.parse(s.slice(firstBrace, lastBrace + 1))); }
+    catch { /* fall through */ }
+  }
+  const trimmed = s.trim();
+  const skipMatch = trimmed.match(/^SKIP:\s*(.+)/is);
+  if (skipMatch) return { skip: skipMatch[1]!.trim() };
+  if (looksLikeProseSkip(trimmed)) {
+    return { skip: trimmed.slice(0, 480) };
+  }
+  return null;
+}
+
+const PROSE_SKIP_MARKERS = [
+  "no overlap",
+  "no fit",
+  "not a fit",
+  "recommending skip",
+  "recommend skipping",
+  "skip this lead",
+];
+
+function looksLikeProseSkip(s: string): boolean {
+  const lower = s.toLowerCase();
+  return PROSE_SKIP_MARKERS.some((m) => lower.includes(m));
+}
+
+function normalizeSkipShape(parsed: unknown): unknown {
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    "drafts" in parsed &&
+    Array.isArray((parsed as { drafts: unknown }).drafts)
+  ) {
+    const drafts = (parsed as { drafts: Array<{ angle?: unknown; body?: unknown }> }).drafts;
+    const allSkip =
+      drafts.length > 0 &&
+      drafts.every((d) => typeof d?.angle === "string" && /^skip$/i.test(d.angle));
+    if (allSkip) {
+      const body = drafts[0]?.body;
+      const reason = typeof body === "string" ? body : "skipped by model";
+      return { skip: reason };
+    }
+  }
+  return parsed;
+}
+
+/**
+ * On-demand DM generation pass (Lyra). Given leads the operator flagged via the
+ * dashboard "Generate DM" action (claimed by claimDmRequestLeads, which clears
+ * the flag), draft a single DM for each — reusing the substantial prompt + voice
+ * (the T1 angle set + wantDm) — and queue ONLY the DM (the comment was already
+ * handled). Independent of the auto-DM toggle + the reply lane, so it runs
+ * whenever the drafter ticks. Lyra is draft-only — buildOutbound omits autoSend.
+ */
+export async function runDmRequestTick(
+  args: Pick<
+    RunDrafterTickArgs,
+    "log" | "instance" | "claimedLeads" | "runner" | "postOutbound" | "sql"
+  >,
+): Promise<number> {
+  const { log, instance, claimedLeads, runner, postOutbound, sql } = args;
+  if (claimedLeads.length === 0) return 0;
+  const routing = linkedinInternRouting(instance);
+  let drafted = 0;
+  for (const lead of claimedLeads) {
+    const payload = lead.payload as {
