@@ -598,3 +598,203 @@ describe("replyDiversityScore (feed-wide repetition)", () => {
     // Same "honestly the X is the real bottleneck, try Y" shape.
     const { score } = replyDiversityScore(
       "honestly i swapped in mold and my link step halved",
+      ["honestly i swapped in sccache and my build cache stopped thrashing"],
+    );
+    expect(score).toBeLessThan(0.7);
+  });
+
+  it("scores two genuinely distinct replies HIGH", () => {
+    const { score } = replyDiversityScore(
+      "the pricing tiers feel off for early teams",
+      ["congrats on the seed round, that is a real milestone", "the cohort retention angle is underrated here"],
+    );
+    expect(score).toBeGreaterThan(0.8);
+  });
+
+  it("does not flag two replies that merely share a tiny opener ('this is')", () => {
+    const { score } = replyDiversityScore(
+      "this is a sharp framing of the tradeoff between speed and safety",
+      ["this is the kind of nuance most product teams completely miss"],
+    );
+    expect(score).toBeGreaterThan(0.7);
+  });
+
+  it("returns 1.0 with no recent history", () => {
+    expect(replyDiversityScore("anything goes here", []).score).toBe(1);
+    expect(replyDiversityScore("anything goes here").score).toBe(1);
+  });
+});
+
+describe("feed-wide diversity dimension (verifyDrafts)", () => {
+  const cleanJudge = goodJudge;
+
+  it("FAILS a reply that echoes a recent reply across the feed", async () => {
+    const v = await verifyDrafts(
+      [reply("sccache cut my rust builds in half, worth a look")],
+      { ...ctx, recentReplies: ["sccache cut my rust builds in half, worth a try"] },
+      cleanJudge,
+    );
+    expect(v.scores.diversity).toBeLessThan(0.7);
+    expect(v.pass).toBe(false);
+    expect(v.fix).toContain("different shape");
+  });
+
+  it("PASSES a distinct reply even when there IS recent history", async () => {
+    const v = await verifyDrafts(
+      [reply("mold is the linker that actually moved the needle for us")],
+      { ...ctx, recentReplies: ["sccache cut my rust builds in half, worth a try"] },
+      cleanJudge,
+    );
+    expect(v.scores.diversity).toBeGreaterThanOrEqual(0.7);
+    expect(v.pass).toBe(true);
+  });
+
+  it("forces diversity=1.0 when there is no recent history (back-compat)", async () => {
+    const v = await verifyDrafts([reply("a clean grounded reply about rust builds")], ctx, cleanJudge);
+    expect(v.scores.diversity).toBe(1);
+  });
+
+  it("exempts DM drafts from the diversity check", async () => {
+    const dm: DraftToVerify = { kind: "dm", angle: null, body: "sccache cut my rust builds in half, worth a try" };
+    const v = await verifyDrafts([dm], { ...ctx, recentReplies: ["sccache cut my rust builds in half, worth a try"] }, cleanJudge);
+    expect(v.scores.diversity).toBe(1);
+  });
+
+  it("verifyTiered keeps the strictest (min) diversity across judges", async () => {
+    const v = await verifyTiered(
+      [reply("sccache cut my rust builds in half, worth a look")],
+      { ...ctx, recentReplies: ["sccache cut my rust builds in half, worth a try"] },
+      [goodJudge, goodJudge],
+    );
+    expect(v.scores.diversity).toBeLessThan(0.7);
+    expect(v.pass).toBe(false);
+  });
+});
+
+// judgeOk exposes whether the LLM judge GENUINELY returned. Consumers that must
+// fail CLOSED (the X unattended auto-send gate) require judgeOk===true; a
+// fail-open pass (judge threw / unparseable) is pass:true but judgeOk:false.
+describe("judgeOk (fail-closed signal)", () => {
+  it("marks judgeOk=false when the judge throws (still passes open)", async () => {
+    const v = await verifyDrafts(
+      [reply("a clean grounded reply")],
+      ctx,
+      () => Promise.reject(new Error("503")),
+    );
+    expect(v.pass).toBe(true);
+    expect(v.judgeOk).toBe(false);
+  });
+
+  it("marks judgeOk=false on unparseable judge output", async () => {
+    const v = await verifyDrafts(
+      [reply("a clean grounded reply")],
+      ctx,
+      () => Promise.resolve("I think it's fine!"),
+    );
+    expect(v.pass).toBe(true);
+    expect(v.judgeOk).toBe(false);
+  });
+
+  it("marks judgeOk=true on a good judge", async () => {
+    const v = await verifyDrafts([reply("sccache cut my rust builds in half, worth a look")], ctx, goodJudge);
+    expect(v.judgeOk).toBe(true);
+  });
+
+  it("verifyTiered: one judge throwing makes the SET judgeOk=false (every())", async () => {
+    const throwing = () => Promise.reject(new Error("503"));
+    const v = await verifyTiered(
+      [reply("sccache cut my rust builds in half, worth a look")],
+      ctx,
+      [goodJudge, goodJudge, throwing],
+    );
+    // Two good judges still carry the majority pass, but the set is NOT judge-ok
+    // because one judge did not genuinely return.
+    expect(v.pass).toBe(true);
+    expect(v.judgeOk).toBe(false);
+  });
+});
+
+describe("Jev-first draft verification", () => {
+  const jevAnswers = (probability: number) => async (request: { questions: Record<string, unknown> }) => ({
+    answers: Object.fromEntries(Object.keys(request.questions).map((name) => [name, { type: "boolean", probability }])),
+  });
+
+  it("uses clear Jev scores without calling the legacy judge", async () => {
+    let legacyCalls = 0;
+    const verdict = await verifyDrafts([reply("sccache cut my rust builds in half, worth a look")], ctx,
+      async () => { legacyCalls++; return goodJudge(); }, { jevRun: jevAnswers(0.93) });
+    expect(verdict.pass).toBe(true);
+    expect(verdict.judgeOk).toBe(true);
+    expect(verdict.judgeProvider).toBe("jev");
+    expect(verdict.scores.voice).toBe(0.93);
+    expect(legacyCalls).toBe(0);
+  });
+
+  it("routes the pinned faithful voice target through Jev-first verification", async () => {
+    let jevState = "";
+    let voiceQuestion = "";
+
+    const verdict = await verifyDrafts(
+      [reply("this is kind of ridiculous (I love it)")],
+      {
+        ...ctx,
+        faithfulVoiceAnchors: ["@eliana_jordan: tiny warm reaction (playful aside)"],
+      },
+      async () => { throw new Error("legacy should not run"); },
+      {
+        jevRun: async (request) => {
+          jevState = request.state;
+          voiceQuestion = request.questions.voice!.instructions;
+          return { answers: {
+            voice: { type: "boolean", probability: 0.93 },
+            grounding: { type: "boolean", probability: 0.93 },
+            relevance: { type: "boolean", probability: 0.93 },
+          } };
+        },
+      },
+    );
+
+    expect(jevState).toContain("faithfulVoiceAnchors");
+    expect(jevState).toContain("@eliana_jordan: tiny warm reaction (playful aside)");
+    expect(voiceQuestion).toMatch(/pinned faithful voice target.*authoritative/i);
+    expect(voiceQuestion).toMatch(/short repl(?:y|ies).*not.*same length.*topic.*post structure/i);
+    expect(verdict.judgeProvider).toBe("jev");
+    expect(verdict.pass).toBe(true);
+  });
+
+  it("repairs a short faithful reply without copying the longer post shape", async () => {
+    const verdict = await verifyDrafts(
+      [reply("generic corporate acknowledgement")],
+      { ...ctx, faithfulVoiceAnchors: ["@eliana_jordan: a much longer original post"] },
+      async () => { throw new Error("legacy should not run"); },
+      {
+        jevRun: async () => ({ answers: {
+          voice: { type: "boolean", probability: 0.2 },
+          grounding: { type: "boolean", probability: 0.93 },
+          relevance: { type: "boolean", probability: 0.93 },
+        } }),
+      },
+    );
+
+    expect(verdict.pass).toBe(false);
+    expect(verdict.fix).toMatch(/short reply.*without copying.*length.*topic.*post structure/i);
+    expect(verdict.fix).toMatch(/tiny reaction can be fully on-voice/i);
+  });
+
+  it("rejects clear Jev quality failures without a fallback", async () => {
+    const verdict = await verifyDrafts([reply("sccache cut my rust builds in half, worth a look")], ctx,
+      async () => { throw new Error("legacy should not run"); }, { jevRun: jevAnswers(0.15) });
+    expect(verdict.pass).toBe(false);
+    expect(verdict.judgeOk).toBe(true);
+    expect(verdict.judgeProvider).toBe("jev");
+    expect(verdict.fix).toContain("voice");
+  });
+
+  it("gives the writer a grounding repair when Jev clearly rejects an invented operator claim", async () => {
+    const legacy = vi.fn(goodJudge);
+    const verdict = await verifyDrafts([reply("I keep every agent draft behind an approval click")], {
+      ...ctx,
+      platform: "linkedin",
+      postText: "A demo shows the workflow; a showcase proves what people built with it.",
+      voiceAnchors: ["Pinned writer example (FORM and voice only): I built my own agent workflow."],
+    }, legacy, { jevRun: async () => ({ answers: {
