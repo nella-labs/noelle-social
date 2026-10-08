@@ -398,3 +398,203 @@ describe("NOELLE_CLAUDE_CLI rewrite (VM cost switch)", () => {
         calls += 1;
         if (calls === 1) throw new Error("claude cli timed out after 1ms");
         return { text: "cli-fallback", usage: { input_tokens: 1, output_tokens: 1 } };
+      }),
+    };
+    const bed = stubBackend("bedrock-fallback");
+    const res = await callAgentModel(
+      { ...baseArgs, routing: { primary: bedrock, fallback: bedrockFallback } },
+      deps({ "claude-cli": cli, bedrock: bed }),
+    );
+    // Fallback engine is claude-cli (rewritten from the bedrock fallback handle),
+    // carrying the fallback handle's model. Bedrock is never invoked.
+    expect(res.engineUsed).toEqual({ engine: "claude-cli", model: "claude-opus-4-6" });
+    expect(res.text).toBe("cli-fallback");
+    expect(res.outcome).toBe("fallback");
+    expect(bed.call).not.toHaveBeenCalled();
+  });
+
+  it("preserves the bedrock fallback when the flag is off (paid safety net for llm_backend='aws')", async () => {
+    // Flag OFF → neither handle is rewritten. A non-bedrock primary throws and
+    // the bedrock FALLBACK serves on paid Bedrock — NOT claude-cli — even with a
+    // claude-cli backend present. (Flag ON would rewrite the fallback; see above.)
+    const directPrimary: EngineHandle = { engine: "claude", model: "claude-sonnet-4-6" };
+    const failingPrimary = failingBackend(new Error("primary boom"));
+    const bed = stubBackend("bedrock-fallback");
+    const cli = stubBackend("cli-should-not-run");
+    const res = await callAgentModel(
+      { ...baseArgs, routing: { primary: directPrimary, fallback: bedrockFallback } },
+      deps({ claude: failingPrimary, bedrock: bed, "claude-cli": cli }),
+    );
+    expect(res.engineUsed).toEqual(bedrockFallback);
+    expect(res.outcome).toBe("fallback");
+    expect(cli.call).not.toHaveBeenCalled();
+  });
+
+  it("does not rewrite when the flag is off", async () => {
+    const bed = stubBackend("bedrock-text");
+    const res = await callAgentModel(
+      { ...baseArgs, routing: { primary: bedrock } },
+      deps({ bedrock: bed }),
+    );
+    expect(res.engineUsed).toEqual(bedrock);
+    expect(res.text).toBe("bedrock-text");
+  });
+
+  it("does not rewrite non-bedrock engines even when the flag is on", async () => {
+    process.env.NOELLE_CLAUDE_CLI = "1";
+    const direct: EngineHandle = { engine: "claude", model: "claude-sonnet-4-6" };
+    const res = await callAgentModel(
+      { ...baseArgs, routing: { primary: direct } },
+      deps({ claude: stubBackend("claude-direct") }),
+    );
+    expect(res.engineUsed).toEqual(direct);
+  });
+});
+
+describe("claude-cli is capped like any other engine", () => {
+  // An over-cap budget that WOULD throw BudgetExceededError for any paid engine.
+  const overCapBudget: CallAgentModelDeps["budget"] = {
+    estimateCents: () => 100,
+    adapters: {
+      fetchSpend: vi.fn(async () => ({ bucket: 9999, org: 0, instance: 0 })),
+      fetchCaps: vi.fn(async () => ({ bucket: 10000, org: 999999, instance: 999999 })),
+    },
+  };
+
+  it("blocks claude-cli when the bucket is over cap", async () => {
+    // claude-cli used to skip the pre-flight entirely, on the premise that a
+    // flat-rate subscription costs ~$0/call. It draws on a weekly allowance,
+    // and the exemption is why 9,374 calls burned about half a 20x Max week
+    // without the cap ever seeing them.
+    const cli = stubBackend("cli-text");
+    const err = await callAgentModel(
+      { ...baseArgs, routing: { primary: { engine: "claude-cli", model: "claude-opus-4-6" } } },
+      { engines: { "claude-cli": cli }, budget: overCapBudget, recorder: noopSpendRecorder },
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(BudgetExceededError);
+    expect(cli.call).not.toHaveBeenCalled();
+  });
+
+  it("still blocks a paid (bedrock) engine under the same over-cap condition", async () => {
+    const bed = stubBackend("bedrock-text");
+    const err = await callAgentModel(
+      { ...baseArgs, routing: { primary: { engine: "bedrock", model: "claude-opus-4-6" } } },
+      { engines: { bedrock: bed }, budget: overCapBudget, recorder: noopSpendRecorder },
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(BudgetExceededError);
+    expect(bed.call).not.toHaveBeenCalled();
+  });
+});
+
+describe("per-org getLlmBackend controls the claude-cli rewrite", () => {
+  const bedrock: EngineHandle = { engine: "bedrock", model: "claude-sonnet-4-6" };
+
+  afterEach(() => {
+    delete process.env.NOELLE_CLAUDE_CLI;
+  });
+
+  it("getLlmBackend='aws' keeps a bedrock primary on bedrock even when claude-cli is wired", async () => {
+    const cli = stubBackend("cli-text");
+    const bed = stubBackend("bedrock-text");
+    const res = await callAgentModel(
+      { ...baseArgs, routing: { primary: bedrock } },
+      {
+        ...deps({ "claude-cli": cli, bedrock: bed }),
+        getLlmBackend: async () => "aws",
+      },
+    );
+    expect(res.engineUsed).toEqual(bedrock);
+    expect(res.text).toBe("bedrock-text");
+    expect(bed.call).toHaveBeenCalledOnce();
+    expect(cli.call).not.toHaveBeenCalled();
+  });
+
+  it("getLlmBackend='claude' rewrites a bedrock primary to claude-cli when wired", async () => {
+    const cli = stubBackend("cli-text");
+    const bed = stubBackend("bedrock-text");
+    const res = await callAgentModel(
+      { ...baseArgs, routing: { primary: bedrock } },
+      {
+        ...deps({ "claude-cli": cli, bedrock: bed }),
+        getLlmBackend: async () => "claude",
+      },
+    );
+    expect(res.engineUsed).toEqual({ engine: "claude-cli", model: "claude-sonnet-4-6" });
+    expect(res.text).toBe("cli-text");
+    expect(cli.call).toHaveBeenCalledOnce();
+    expect(bed.call).not.toHaveBeenCalled();
+  });
+
+  it("getLlmBackend='claude' but claude-cli NOT wired stays on bedrock (does not throw)", async () => {
+    const bed = stubBackend("bedrock-text");
+    const res = await callAgentModel(
+      { ...baseArgs, routing: { primary: bedrock } },
+      {
+        ...deps({ bedrock: bed }),
+        getLlmBackend: async () => "claude",
+      },
+    );
+    expect(res.engineUsed).toEqual(bedrock);
+    expect(res.text).toBe("bedrock-text");
+    expect(bed.call).toHaveBeenCalledOnce();
+  });
+
+  it("no getLlmBackend + NOELLE_CLAUDE_CLI=1 falls back to the env flag (back-compat)", async () => {
+    process.env.NOELLE_CLAUDE_CLI = "1";
+    const cli = stubBackend("cli-text");
+    const bed = stubBackend("bedrock-text");
+    const res = await callAgentModel(
+      { ...baseArgs, routing: { primary: bedrock } },
+      deps({ "claude-cli": cli, bedrock: bed }),
+    );
+    expect(res.engineUsed).toEqual({ engine: "claude-cli", model: "claude-sonnet-4-6" });
+    expect(cli.call).toHaveBeenCalledOnce();
+    expect(bed.call).not.toHaveBeenCalled();
+  });
+
+  it("getLlmBackend overrides the env flag: 'aws' wins even with NOELLE_CLAUDE_CLI=1", async () => {
+    process.env.NOELLE_CLAUDE_CLI = "1";
+    const cli = stubBackend("cli-text");
+    const bed = stubBackend("bedrock-text");
+    const res = await callAgentModel(
+      { ...baseArgs, routing: { primary: bedrock } },
+      {
+        ...deps({ "claude-cli": cli, bedrock: bed }),
+        getLlmBackend: async () => "aws",
+      },
+    );
+    expect(res.engineUsed).toEqual(bedrock);
+    expect(bed.call).toHaveBeenCalledOnce();
+    expect(cli.call).not.toHaveBeenCalled();
+  });
+});
+
+describe("per-bucket call deadlines", () => {
+  it("gives ideation room and leaves every other bucket on the default", () => {
+    // pattern-breaker reads up to 100 posts and emits ~12,000 tokens; observed
+    // runs finished in 157-175s and blew the 180s default 82% of the time.
+    expect(bucketTimeoutMs("ideation")).toBe(600_000);
+    for (const b of ["classifier", "drafter-codex", "drafter-verify", "profiler-codex"]) {
+      expect(bucketTimeoutMs(b)).toBeUndefined();
+    }
+  });
+
+  it("passes the deadline to the backend for ideation only", async () => {
+    const seen: Array<number | undefined> = [];
+    const spy = (text: string) => ({
+      call: vi.fn(async (args: { timeoutMs?: number }) => {
+        seen.push(args.timeoutMs);
+        return { text, usage: { input_tokens: 1, output_tokens: 1 } };
+      }),
+    });
+    for (const bucket of ["ideation", "classifier"]) {
+      const b = spy("ok");
+      await callAgentModel(
+        { ...baseArgs, bucket, routing: { primary: { engine: "bedrock", model: "claude-opus-4-6" } } },
+        { engines: { bedrock: b }, budget: unlimitedBudget, recorder: noopSpendRecorder },
+      );
+    }
+    expect(seen).toEqual([600_000, undefined]);
+  });
+});
+
