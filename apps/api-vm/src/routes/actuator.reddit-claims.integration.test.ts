@@ -398,3 +398,203 @@ describe.skipIf(!url)("native permanent Reddit reply reservations", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ reason: "removed" }),
     });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ skipped: false });
+    expect(
+      (await sql`select status from noelle.approvals where id=${reply.approval_id}`)[0]!.status,
+    ).toBe("errored");
+  });
+  async function companionAngles(reply: RedditReplyItem) {
+    const rows: { id: string; status: string }[] = [];
+    for (const status of ["pending", "deferred", "errored"]) {
+      const [draft] = await sql<{ id: string }[]>`insert into noelle.drafts(org_id,lead_id,payload)
+        select org_id,lead_id,payload from noelle.drafts where id=${reply.draft_id} returning id`;
+      const [approval] = await sql<
+        { id: string }[]
+      >`insert into noelle.approvals(org_id,agent_instance_id,lead_id,draft_id,status)
+        values (${org},${instance},${reply.lead_id},${draft!.id},${status}) returning id`;
+      rows.push({ id: approval!.id, status });
+    }
+    return rows;
+  }
+  it.each(["reddit", "x", "linkedin"])(
+    "skips only the selected pending %s approval through the browser endpoint",
+    async (platform) => {
+      const reply = await seed();
+      await sql`update noelle.agent_instances set role=${platform + "_intern"} where id=${instance}`;
+      await sql`update noelle.leads set platform=${platform} where id=${reply.lead_id}`;
+      const companions = await companionAngles(reply);
+      const response = await actuator.request(`/api/actuator/mark-skipped/${reply.approval_id}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: "removed" }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ skipped: true });
+      expect(
+        (await sql`select status from noelle.approvals where id=${reply.approval_id}`)[0]!.status,
+      ).toBe("skipped");
+      for (const companion of companions)
+        expect(
+          (await sql`select status from noelle.approvals where id=${companion.id}`)[0]!.status,
+        ).toBe(companion.status);
+    },
+  );
+  it("preserves grouped operator skip across pending, deferred and errored angles", async () => {
+    const reply = await seed();
+    const companions = await companionAngles(reply);
+    expect(await skipApproval(sql, scope(reply))).toMatchObject({ count: 4 });
+    for (const id of [reply.approval_id, ...companions.map((row) => row.id)])
+      expect((await sql`select status from noelle.approvals where id=${id}`)[0]!.status).toBe(
+        "skipped",
+      );
+  });
+  it("blocks the actual browser skip entry after reservation", async () => {
+    const reply = await seed();
+    expect((await claim(reply)).status).toBe(200);
+    const response = await actuator.request(`/api/actuator/mark-skipped/${reply.approval_id}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason: "removed" }),
+    });
+    expect(response.status).toBe(409);
+    expect(
+      (await sql`select status from noelle.approvals where id=${reply.approval_id}`)[0]!.status,
+    ).toBe("pending");
+  });
+  it("denies an extension receipt without a reservation and preserves explicit manual recording", async () => {
+    const reply = await seed();
+    expect(await mark(reply)).toMatchObject({ ok: false, error: "reddit_claim_required" });
+    expect(await mark(reply, "manual")).toMatchObject({ ok: true });
+  });
+  it("preserves a claimed angle when a sibling is manually recorded", async () => {
+    const reply = await seed();
+    expect((await claim(reply)).status).toBe(200);
+    const [draft] = await sql<{ id: string }[]>`insert into noelle.drafts(org_id,lead_id,payload)
+      values (${org},${reply.lead_id},'{"kind":"reply","body":"Manual alternate angle"}') returning id`;
+    const [approval] = await sql<
+      { id: string }[]
+    >`insert into noelle.approvals(org_id,agent_instance_id,lead_id,draft_id,status)
+      values (${org},${instance},${reply.lead_id},${draft!.id},'pending') returning id`;
+    expect(
+      await markApprovalSent(sql, {
+        orgId: org,
+        approvalId: approval!.id,
+        decidedBy: "operator",
+        sentVia: "manual",
+      }),
+    ).toMatchObject({ ok: true });
+    expect(
+      (await sql`select status from noelle.approvals where id=${reply.approval_id}`)[0]!.status,
+    ).toBe("pending");
+    expect(await mark(reply)).toMatchObject({ ok: true });
+  });
+  it("keeps original digests and confirmation timestamps stable across receipt retries", async () => {
+    const reply = await seed();
+    expect((await claim(reply)).status).toBe(200);
+    const [before] = await sql`select * from noelle.reddit_reply_claims`;
+    expect(await mark(reply, "manual")).toMatchObject({ ok: false, error: "send_already_claimed" });
+    const first = await mark(reply);
+    expect(first).toMatchObject({ ok: true });
+    const again = await mark(reply);
+    expect(again).toEqual(first);
+    const [after] = await sql`select * from noelle.reddit_reply_claims`;
+    expect(after).toMatchObject({
+      status: "sent",
+      source_sha256: before!.source_sha256,
+      draft_sha256: before!.draft_sha256,
+      body_sha256: before!.body_sha256,
+      target_sha256: before!.target_sha256,
+    });
+    expect(after!.receipt_draft_sha256).not.toBe(after!.draft_sha256);
+    expect(await undoManualSent(sql, { orgId: org, approvalId: reply.approval_id })).toMatchObject({
+      ok: false,
+    });
+  });
+  it.each(["body", "source", "parent"])(
+    "rejects waited %s drift before confirmation",
+    async (kind) => {
+      const reply = await seed();
+      expect((await claim(reply)).status).toBe(200);
+      const result = await locked(
+        reply,
+        kind === "body" ? "draft" : kind === "source" ? "source" : "parent",
+        () => mark(reply),
+        async (tx) => {
+          if (kind === "body")
+            await tx`update noelle.drafts set payload=payload||'{"body":"Changed"}' where id=${reply.draft_id}`;
+          else if (kind === "source")
+            await tx`update noelle.leads set payload=payload||'{"source_text":"Changed"}' where id=${reply.lead_id}`;
+          else await tx`update noelle.agent_instances set org_id=${foreign} where id=${instance}`;
+        },
+      );
+      expect(result).toMatchObject({ ok: false, error: "reddit_claim_changed" });
+      expect(
+        (await sql`select status from noelle.approvals where id=${reply.approval_id}`)[0]!.status,
+      ).toBe("pending");
+    },
+  );
+  it("rechecks a waited parent rebind before admission", async () => {
+    const reply = await seed();
+    const result = await locked(
+      reply,
+      "parent",
+      () => claim(reply),
+      async (tx) => {
+        await tx`update noelle.agent_instances set org_id=${foreign} where id=${instance}`;
+      },
+    );
+    expect((result as Response).status).toBe(409);
+    expect(await count()).toBe(0);
+  });
+  it("times out a held parent without any late claim and recovers", async () => {
+    const reply = await seed();
+    const response = await withHeldRow(
+      reply,
+      "parent",
+      () => claim(reply),
+      async (pending) => {
+        await pending;
+      },
+    );
+    expect(response.status).toBe(503);
+    await sleep(30);
+    expect(await count()).toBe(0);
+    expect((await claim(reply)).status).toBe(200);
+  });
+  it("bounds the entire held-parent queued batch with no late claims and recovery", async () => {
+    vi.stubEnv("NOELLE_REDDIT_ACTUATOR_DAILY_WRITE_CAP", "off");
+    const replies: RedditReplyItem[] = [];
+    for (let i = 0; i < 36; i++) replies.push(await seed(`post${i}`));
+    const results = await withHeldRow(
+      replies[0]!,
+      "parent",
+      () => Promise.allSettled(replies.map((reply) => claim(reply))),
+      async (pending) => {
+        await pending;
+      },
+    );
+    expect(
+      results.every((result) => result.status === "fulfilled" && result.value.status === 503),
+    ).toBe(true);
+    expect(await count()).toBe(0);
+    await sleep(100);
+    expect(await count()).toBe(0);
+    expect((await claim(replies[0]!)).status).toBe(200);
+  }, 10000);
+  it("admits a large unselected source while withholding an oversized selected frame", async () => {
+    const reply = await seed();
+    await sql`update noelle.leads set payload=payload||${sql.json({ unrelated: "x".repeat(200000) })}
+      where id=${reply.lead_id}`;
+    expect((await claim(reply)).status).toBe(200);
+    const next = await seed("other9");
+    await sql`update noelle.leads set author_handle=${"x".repeat(131073)} where id=${next.lead_id}`;
+    expect((await claim(next)).status).toBe(409);
+    expect(await count()).toBe(1);
+  });
+  it("does not grant DELETE of permanent claims to noelle_app", async () => {
+    expect(
+      (
+        await sql<
+          { allowed: boolean }[]
+        >`select has_table_privilege('noelle_app','noelle.reddit_reply_claims','DELETE') as allowed`
