@@ -198,3 +198,147 @@ export async function nativeFetchAndFastForward(
   branch: string,
 ): Promise<FfOutcome> {
   const fetched = await run("git", ["-C", repoRoot, "fetch", "origin", branch], {
+    allowFailure: true,
+  });
+  if (fetched.code !== 0) {
+    return {
+      action: "fetch-failed",
+      detail: (fetched.stderr || fetched.stdout).trim().slice(-200) || "git fetch failed",
+    };
+  }
+  const cur = (
+    await run("git", ["-C", repoRoot, "rev-parse", "--abbrev-ref", "HEAD"], { allowFailure: true })
+  ).stdout.trim();
+  const dirty = (
+    await run("git", ["-C", repoRoot, ...GIT_DIRTY_ARGS], { allowFailure: true })
+  ).stdout.trim();
+  const count = async (range: string): Promise<number | null> => {
+    const r = await run("git", ["-C", repoRoot, "rev-list", "--count", range], {
+      allowFailure: true,
+    });
+    if (r.code !== 0) return null;
+    const n = Number(r.stdout.trim());
+    return Number.isFinite(n) ? n : null;
+  };
+  const outcome = ffDecision({
+    currentBranch: cur,
+    branch,
+    dirtyFiles: dirty ? dirty.split("\n").length : 0,
+    aheadCount: await count(`origin/${branch}..HEAD`),
+    behindCount: await count(`HEAD..origin/${branch}`),
+  });
+  if (outcome.action !== "fast-forwarded") return outcome;
+  // allowFailure: index.lock contention from a parallel git session must not
+  // abort the tick; a failed merge just means this tick deploys local HEAD.
+  const merged = await run("git", ["-C", repoRoot, "merge", "--ff-only", `origin/${branch}`], {
+    allowFailure: true,
+  });
+  if (merged.code !== 0) {
+    return {
+      action: "merge-failed",
+      detail: (merged.stderr || merged.stdout).trim().slice(-200) || "git merge --ff-only failed",
+    };
+  }
+  return outcome;
+}
+
+/** Pure — is this a native (host-run) install? Tolerates null/partial config. */
+export function isNativeRuntime(config: { runtime?: string } | null | undefined): boolean {
+  return config?.runtime === "native";
+}
+
+// ---------------------------------------------------------------------------
+// Deploy failure backoff. A sha that keeps failing must not rebuild and page
+// every 10 minutes forever: page once, retry a bounded number of ticks, then
+// hold until a new sha lands (or the operator forces a deploy).
+// ---------------------------------------------------------------------------
+
+export interface DeployFailureState {
+  sha: string;
+  attempts: number;
+}
+
+/** Auto ticks stop retrying a sha after this many consecutive failures. */
+export const DEPLOY_MAX_ATTEMPTS = 3;
+
+/**
+ * Pure: fold a new failure into the state. `alert` is true only for the FIRST
+ * failure of a given sha, so a broken build pages once instead of 144x/day.
+ */
+export function recordDeployFailure(
+  prev: DeployFailureState | null | undefined,
+  sha: string,
+): { state: DeployFailureState; alert: boolean } {
+  if (prev && prev.sha === sha) {
+    return { state: { sha, attempts: prev.attempts + 1 }, alert: false };
+  }
+  return { state: { sha, attempts: 1 }, alert: true };
+}
+
+/** Pure: should an auto tick hold (skip) this sha after repeated failures? */
+export function shouldHoldDeploy(
+  prev: DeployFailureState | null | undefined,
+  sha: string,
+  max: number = DEPLOY_MAX_ATTEMPTS,
+): boolean {
+  return !!prev && prev.sha === sha && prev.attempts >= max;
+}
+
+// ---------------------------------------------------------------------------
+// Stack self-heal. The auto tick used to exit early on an unchanged HEAD
+// without ever looking at the stack, so a crash (reboot, wedged Postgres,
+// dead pm2 daemon) stayed down until an operator noticed the page. Now every
+// auto tick probes the stack first and runs the full bring-up when it is down
+// — unless the operator stopped it on purpose (`noelle down` writes a marker).
+// ---------------------------------------------------------------------------
+
+export interface StackHealthFacts {
+  postgresOk: boolean;
+  apiOk: boolean;
+  appOk: boolean;
+  /** `noelle down` marker present — the stack is down on purpose. */
+  markedDown: boolean;
+}
+
+export interface SelfHealDecision {
+  heal: boolean;
+  /** What is down (for the log/page), or why healing is skipped. */
+  detail: string;
+}
+
+/** Pure (unit-tested): should this auto tick run the bring-up? */
+export function selfHealDecision(f: StackHealthFacts): SelfHealDecision {
+  const down = [
+    !f.postgresOk && "postgres",
+    !f.apiOk && "api-vm",
+    !f.appOk && "dashboard",
+  ].filter((x): x is string => typeof x === "string");
+  if (down.length === 0) return { heal: false, detail: "" };
+  if (f.markedDown) {
+    return {
+      heal: false,
+      detail: `stack is down (${down.join(", ")}) but was stopped with \`noelle down\`; not self-healing`,
+    };
+  }
+  return { heal: true, detail: down.join(", ") };
+}
+
+// ---------------------------------------------------------------------------
+// Docs-only detection. A merge that changes nothing the runtime executes
+// (docs, task notes, agent/skill definitions, any markdown) advances the
+// stamp without a build or a 21-app restart.
+// ---------------------------------------------------------------------------
+
+/** Path prefixes that never require a build or restart. */
+export const NO_BUILD_PREFIXES = ["docs/", "tasks/", ".agents/", ".claude/"] as const;
+
+/**
+ * Pure: does this changed-path list require no build? Empty input returns
+ * false (an empty or failed diff must fall through to a full build).
+ */
+export function isDocsOnlyDiff(paths: string[]): boolean {
+  if (paths.length === 0) return false;
+  return paths.every(
+    (p) => p.endsWith(".md") || NO_BUILD_PREFIXES.some((prefix) => p.startsWith(prefix)),
+  );
+}
