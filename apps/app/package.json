@@ -39,7 +39,7 @@
     "remotion": "^4.0.484",
     "server-only": "0.0.1",
     "tailwind-merge": "^2.5.4",
-    "zod": "^3.23.8"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.0",
