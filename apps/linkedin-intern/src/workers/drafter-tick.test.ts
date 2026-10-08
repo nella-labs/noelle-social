@@ -998,3 +998,203 @@ describe("runDrafterTick (linkedin quality pipeline)", () => {
   });
 
   it("stamps a budget-deferred LIGHT lead with kind 'light'", async () => {
+    // Covers the inner light branch of the single-call loop (light leads always
+    // carry a precomputed ctx, so they are handled and `continue`d there).
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = {
+      draft: vi.fn(async () => {
+        throw new BudgetExceededError({ layer: "instance", spent_cents: 9999, cap_cents: 10000, estimated_cents: 200 });
+      }),
+    };
+    const sqlValues: unknown[] = [];
+    const sql = Object.assign(
+      vi.fn(async (_s: unknown, ...vals: unknown[]) => {
+        sqlValues.push(...vals);
+        return [];
+      }),
+      { json: (x: unknown) => x },
+    );
+    await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      sql: sql as never,
+    });
+
+    expect(sqlValues).toContainEqual({ budget_deferred: "light" });
+    expect(markStatus).not.toHaveBeenCalledWith(expect.objectContaining({ status: "errored" }));
+  });
+
+  it("stops paying for pre-draft gathering once the budget cap trips", async () => {
+    // The spend cap is org-wide, so after the first BudgetExceededError every
+    // remaining lead this tick would hit the same wall. The gathering that runs
+    // BEFORE the model call is NOT free (vision caption + a metered Apify
+    // comment fetch, and Apify is outside the LLM cap), and budget-deferred
+    // leads retry next tick — so re-paying it per lead would burn real money in
+    // a ~30s loop. Only the FIRST lead may pay; the rest defer untouched.
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = {
+      draft: vi.fn(async () => {
+        throw new BudgetExceededError({ layer: "instance", spent_cents: 9999, cap_cents: 10000, estimated_cents: 200 });
+      }),
+    };
+    const fetchPostComments = vi.fn(async () => [{ text: "nice", authorName: "a" }]);
+    const sql = Object.assign(vi.fn(async () => []), { json: (x: unknown) => x });
+    await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ id: "L1", external_id: "1", tier: "T3", classifier_score: 77 }),
+        lead({ id: "L2", external_id: "2", tier: "T3", classifier_score: 77 }),
+        lead({ id: "L3", external_id: "3", tier: "T3", classifier_score: 77 }),
+      ] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      fetchPostComments: fetchPostComments as never,
+      commentFetchMinCount: 1,
+      sql: sql as never,
+    });
+
+    // The model was attempted exactly once: lead 1 tripped the cap, 2 and 3 were
+    // deferred without ever reaching a paid call.
+    expect(runner.draft).toHaveBeenCalledTimes(1);
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).not.toHaveBeenCalledWith(expect.objectContaining({ status: "errored" }));
+  });
+
+  it("uses the linkedin feed-update URL fallback when payload has no url", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { text: "hi" } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.originalPostUrl).toContain("linkedin.com/feed/update/urn:li:activity:");
+  });
+
+  it("weaves the per-person profile + objective into the substantial system prompt", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const sql = vi
+      .fn()
+      .mockResolvedValueOnce([
+        {
+          fsd_profile_id: "ABC123",
+          public_id: "jane-builder",
+          summary: "Ships fast, posts about DX.",
+          topics: ["dx", "agents"],
+          tone: "earnest",
+          engagement_notes: "be concrete",
+        },
+      ])
+      .mockResolvedValueOnce([{ public_id: "jane-builder", objective: "befriend and learn from her" }]);
+
+    await runDrafterTick({
+      patternRules: [],
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      sql: sql as never,
+    });
+
+    const system: string = runner.draft.mock.calls[0]![0].system;
+    expect(system).toContain("PER-PERSON CONTEXT");
+    expect(system).toContain("Ships fast, posts about DX.");
+    expect(system).toContain("befriend and learn from her");
+  });
+});
+
+describe("decideOpus (reaction-based tiering rule)", () => {
+  const th = { likesThreshold: 80, commentsThreshold: 30 };
+
+  it("uses Opus when likes > threshold", () => {
+    expect(decideOpus({ likes: 104, comments: 2, commentBait: false, ...th }).useOpus).toBe(true);
+  });
+
+  it("uses Opus when genuine comments > threshold (not bait)", () => {
+    expect(decideOpus({ likes: 5, comments: 40, commentBait: false, ...th }).useOpus).toBe(true);
+  });
+
+  it("does NOT use Opus when comments > threshold but the post is comment-bait", () => {
+    // 1158 comments but it's a comment-farming giveaway → comment count ignored.
+    expect(decideOpus({ likes: 5, comments: 1158, commentBait: true, ...th }).useOpus).toBe(false);
+  });
+
+  it("STILL uses Opus on a comment-bait post when likes clear the threshold (likes always reliable)", () => {
+    expect(decideOpus({ likes: 240, comments: 1158, commentBait: true, ...th }).useOpus).toBe(true);
+  });
+
+  it("does NOT use Opus for a normal low-engagement post", () => {
+    expect(decideOpus({ likes: 10, comments: 3, commentBait: false, ...th }).useOpus).toBe(false);
+  });
+
+  it("uses strict > (equal to threshold does not trip Opus)", () => {
+    expect(decideOpus({ likes: 80, comments: 30, commentBait: false, ...th }).useOpus).toBe(false);
+  });
+
+  it("treats missing/null engagement as 0", () => {
+    expect(decideOpus({ likes: null, comments: undefined, commentBait: false, ...th }).useOpus).toBe(false);
+  });
+});
+
+describe("runDrafterTick — reaction-based Opus model override", () => {
+  const opusArgs = { opusLikesThreshold: 80, opusCommentsThreshold: 30, opusModel: "claude-opus-4-6" };
+
+  function routingOf(runner: { draft: { mock: { calls: unknown[][] } } }) {
+    return (runner.draft.mock.calls[0]![0] as { routing: { primary: { model: string }; fallback?: { model: string } } }).routing;
+  }
+
+  it("overrides to Opus when post likes > 80", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1", payload: { text: "post", reactions: 104, comments: 2 } })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      ...opusArgs,
+    });
+    expect(routingOf(runner).primary.model).toBe("claude-opus-4-6");
+    // Tiering's fallback is the base routing's primary (now sonnet), so a draft
+    // is never left unrun if Opus is unavailable.
+    expect(routingOf(runner).fallback?.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("uses browser-observed reactions for substantial model tiering", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ payload: { text: "post", source: "extension_observed", reactionCount: 104, commentCount: 2 } })] as never,
+      runner: runner as never, kb: kb as never, postOutbound, markStatus, ...opusArgs,
+    });
+    expect(routingOf(runner).primary.model).toBe("claude-opus-4-6");
+  });
+
+  it("overrides to Opus when genuine comments > 30 (comment_bait=false)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [
+        lead({ tier: "T1", comment_bait: false, payload: { text: "post", reactions: 5, comments: 40 } }),
+      ] as never,
+      runner: runner as never,
