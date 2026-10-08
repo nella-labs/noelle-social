@@ -398,3 +398,182 @@ export function createXApiClient(opts: XApiClientOpts): XWriteClient {
   }
 
   async function metricsRequest(ids: string[]): Promise<FetchResp> {
+    // RAW (un-encoded) query values — URLSearchParams and the OAuth base string
+    // both percent-encode them, so the two encodings match on the wire.
+    const query: Record<string, string> = { ids: ids.join(","), "tweet.fields": "public_metrics" };
+    const url = `${tweetUrl}?${new URLSearchParams(query).toString()}`;
+    const authorization = opts.oauth1a
+      ? oauth1aHeader("GET", tweetUrl, opts.oauth1a, { query })
+      : `Bearer ${tokens.accessToken}`;
+    return (await doFetch(url, { method: "GET", headers: { authorization } } as RequestInit)) as unknown as FetchResp;
+  }
+  async function meRequest(): Promise<FetchResp> {
+    // Same RAW-query discipline as metricsRequest: the OAuth 1.0a base string and
+    // URLSearchParams must percent-encode the same un-encoded values.
+    const meUrl = `${X_API_BASE}/users/me`;
+    const query: Record<string, string> = { "user.fields": "public_metrics,username,name" };
+    const url = `${meUrl}?${new URLSearchParams(query).toString()}`;
+    const authorization = opts.oauth1a
+      ? oauth1aHeader("GET", meUrl, opts.oauth1a, { query })
+      : `Bearer ${tokens.accessToken}`;
+    return (await doFetch(url, { method: "GET", headers: { authorization } } as RequestInit)) as unknown as FetchResp;
+  }
+  // Multipart upload. OAuth 1.0a signs ONLY the oauth_* params for a
+  // multipart/form-data body (form fields are excluded from the base string —
+  // exactly what oauth1aHeader already does), and fetch sets the multipart
+  // Content-Type + boundary from the FormData, so we must NOT set it by hand.
+  function buildMediaForm(bytes: Uint8Array, mimeType: string): FormData {
+    const form = new FormData();
+    // Copy into a fresh ArrayBuffer so the Blob part is a plain ArrayBuffer
+    // (not the ArrayBufferLike/SharedArrayBuffer union) and any byte-offset view
+    // is normalised.
+    const ab = new ArrayBuffer(bytes.byteLength);
+    new Uint8Array(ab).set(bytes);
+    form.append("media", new Blob([ab], { type: mimeType || "application/octet-stream" }));
+    return form;
+  }
+  async function uploadRequest(bytes: Uint8Array, mimeType: string): Promise<FetchResp> {
+    const authorization = opts.oauth1a
+      ? oauth1aHeader("POST", X_MEDIA_UPLOAD_URL, opts.oauth1a)
+      : `Bearer ${tokens.accessToken}`;
+    return (await doFetch(X_MEDIA_UPLOAD_URL, {
+      method: "POST",
+      headers: { authorization },
+      body: buildMediaForm(bytes, mimeType),
+    } as unknown as RequestInit)) as unknown as FetchResp;
+  }
+
+  return {
+    handle,
+    async uploadMedia({ bytes, mimeType }) {
+      if (!bytes || bytes.length === 0) throw new XError("x media upload: empty bytes", 400);
+      let res = await uploadRequest(bytes, mimeType);
+      if (res.status === 401 && (await refresh())) {
+        res = await uploadRequest(bytes, mimeType);
+      }
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        classifyApiError(res.status, body, res.headers);
+      }
+      const j = (await res.json()) as { media_id_string?: string; media_id?: number | string };
+      const mediaId = j.media_id_string ?? (j.media_id != null ? String(j.media_id) : "");
+      if (!mediaId) throw new XError("x media upload returned no media_id", res.status);
+      return { mediaId };
+    },
+    async postTweet({ text, inReplyToId, mediaIds }) {
+      // RC3 — proactive refresh: if the OAuth2 access token is at/near expiry,
+      // refresh BEFORE the first write instead of eating a 401 round-trip. With a
+      // coordinator this also collapses the ~2h-boundary stampede (every writer
+      // hits the same lock and reuses one rotation). Best-effort: on failure we
+      // fall through and the reactive 401 path is the safety net. No-op on the
+      // oauth1a path (no refreshToken/expiresAt).
+      if (tokens.refreshToken && tokens.expiresAt && Date.now() >= tokens.expiresAt - 60_000) {
+        await refresh();
+      }
+      // The single no-links chokepoint: top-level posts are stripped; replies keep links.
+      const finalText = inReplyToId ? text : stripExternalLinksForPost(text);
+      const payload: {
+        text: string;
+        reply?: { in_reply_to_tweet_id: string };
+        media?: { media_ids: string[] };
+      } = { text: finalText };
+      if (inReplyToId) payload.reply = { in_reply_to_tweet_id: inReplyToId };
+      const ids = (mediaIds ?? []).filter((m) => !!m).slice(0, MAX_TWEET_MEDIA);
+      if (ids.length > 0) payload.media = { media_ids: ids };
+
+      let res = await tweetRequest(payload);
+      if (res.status === 401 && (await refresh())) {
+        res = await tweetRequest(payload);
+      }
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        if (res.status >= 500 || res.status === 408) {
+          throw new XWriteUncertainError(`x post returned ${res.status}; check X before retrying`);
+        }
+        classifyApiError(res.status, body, res.headers);
+      }
+      const j = (await res.json().catch(() => null)) as { data?: { id?: unknown } } | null;
+      const id = typeof j?.data?.id === "string" ? readXSourceId(j.data.id) : null;
+      if (!id) {
+        throw new XWriteUncertainError("x post returned no valid receipt; check X before retrying");
+      }
+      return { id, url: `https://x.com/${handle || "i"}/status/${id}` };
+    },
+
+    async getMyAccount() {
+      let res = await meRequest();
+      if (res.status === 401 && (await refresh())) res = await meRequest();
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        classifyApiError(res.status, body, res.headers); // 401/403/429 → typed throw
+      }
+      const j = (await res.json()) as {
+        data?: {
+          id?: string;
+          username?: string;
+          name?: string;
+          public_metrics?: {
+            followers_count?: number;
+            following_count?: number;
+            tweet_count?: number;
+          };
+        };
+      };
+      const d = j.data;
+      if (!d?.id || !d.username) throw new XError("x users/me: malformed response", 502);
+      const m = d.public_metrics ?? {};
+      const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+      return {
+        id: d.id,
+        handle: d.username,
+        displayName: typeof d.name === "string" && d.name ? d.name : null,
+        followers: num(m.followers_count),
+        following: num(m.following_count),
+        posts: num(m.tweet_count),
+      };
+    },
+
+    async getTweetMetrics(ids) {
+      const unique = [...new Set(ids.filter((s) => /^\d+$/.test(s)))];
+      if (unique.length === 0) return [];
+      const out: TweetMetrics[] = [];
+      for (const group of chunk(unique, TWEETS_LOOKUP_MAX)) {
+        let res = await metricsRequest(group);
+        if (res.status === 401 && (await refresh())) res = await metricsRequest(group);
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          classifyApiError(res.status, body, res.headers); // 401/403/429 → typed throw
+        }
+        // A 200 can still carry a partial `errors[]` (deleted/protected tweets)
+        // alongside `data` — we take whatever `data` came back, never throw on it.
+        const j = (await res.json()) as {
+          data?: Array<{
+            id?: string;
+            public_metrics?: {
+              like_count?: number;
+              retweet_count?: number;
+              reply_count?: number;
+              quote_count?: number;
+              impression_count?: number;
+              bookmark_count?: number;
+            };
+          }>;
+        };
+        for (const t of j.data ?? []) {
+          if (!t.id) continue;
+          const m = t.public_metrics ?? {};
+          out.push({
+            id: t.id,
+            views: measuredCount(m.impression_count),
+            likes: measuredCount(m.like_count) ?? 0,
+            reposts: measuredCount(m.retweet_count) ?? 0,
+            replies: measuredCount(m.reply_count) ?? 0,
+            quotes: measuredCount(m.quote_count),
+            bookmarks: measuredCount(m.bookmark_count),
+          });
+        }
+      }
+      return out;
+    },
+  };
+}
