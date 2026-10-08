@@ -198,3 +198,203 @@ export default async function WatchlistPage({ params }: PageProps) {
  * card); the SEARCH lane is the keyword topics she searches LinkedIn-wide for
  * high-engagement posts (LinkedinKeywordColumn → noelle.linkedin_watchlist).
  * Plus the mission/objective card.
+ */
+async function LinkedInWatchlist({
+  orgSlug,
+  instanceId,
+  objective,
+  displayName: displayNameRaw,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  objective: string | null;
+  displayName: string | null;
+}) {
+  const fixture = channelForRole("linkedin_intern")!;
+  const displayName = displayNameRaw ?? fixture.label;
+  const resolvedObjective = resolveObjective(objective, fixture.description);
+  const objectiveIsCustom = hasCustomObjective(objective);
+  const people = await getLinkedInWatchlistPeopleForInstance(instanceId).catch(() => []);
+  const keywordRows = await sql<{ id: string; value: string }[]>`
+    select id, value
+    from noelle.linkedin_watchlist
+    where agent_instance_id = ${instanceId} and kind = 'keyword'
+    order by created_at asc
+  `.catch(() => [] as { id: string; value: string }[]);
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="LinkedIn Growth Intern · Watchlist"
+        title={<>Who <em>{displayName}</em> watches & hunts</>}
+        sub="Two lanes. People are the LinkedIn connections Lyra always watches — every new post from one earns a drafted reply. Keywords are topics she searches LinkedIn-wide for high-engagement posts from people outside your network. She drafts replies for approval and never posts (DMs are off by default)."
+        right={
+          <Link href={`/app/${orgSlug}/agents/${instanceId}`} className="btn btn-sm">
+            ← Back to agent
+          </Link>
+        }
+      />
+
+      <div style={{ marginBottom: 24 }}>
+        <ObjectiveCard
+          orgSlug={orgSlug}
+          instanceId={instanceId}
+          mission={resolvedObjective}
+          isCustom={objectiveIsCustom}
+          agentName={displayName}
+        />
+      </div>
+
+      {/* People — the always-on watch lane: connections Lyra always engages. */}
+      <div style={{ marginBottom: 24 }}>
+        <LinkedInWatchlistCard orgSlug={orgSlug} instanceId={instanceId} people={people} />
+      </div>
+
+      {/* Keywords — the search lane: net-new high-engagement posts by topic. */}
+      <div className="eyebrow" style={{ marginBottom: 10 }}>
+        Keywords · search lane
+      </div>
+      <LinkedinKeywordColumn orgSlug={orgSlug} instanceId={instanceId} rows={keywordRows} />
+    </>
+  );
+}
+
+/**
+ * Lyra's keyword editor (noelle.linkedin_watchlist). Mirrors Vega's keyword
+ * Column but writes to the LinkedIn table via the LinkedIn-gated actions. Topics
+ * here drive the SEARCH lane — high-engagement posts from outside the network.
+ */
+function LinkedinKeywordColumn({
+  orgSlug,
+  instanceId,
+  rows,
+}: {
+  orgSlug: string;
+  instanceId: string;
+  rows: { id: string; value: string }[];
+}) {
+  return (
+    <section className="card">
+      <div className="card-h">
+        <h3>Keywords</h3>
+        <span className="tag">{rows.length}</span>
+      </div>
+      <p className="muted" style={{ fontSize: 12, margin: "0 0 12px" }}>
+        Topics Lyra searches LinkedIn-wide for high-engagement posts. Empty = she
+        only watches your connections (no search). Set engagement floors under
+        Configure agent → Discovery.
+      </p>
+
+      <form
+        action={async (fd: FormData) => {
+          "use server";
+          const value = String(fd.get("value") ?? "");
+          if (!value) return;
+          await addLinkedinKeyword({ orgSlug, instanceId, value });
+        }}
+        style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}
+      >
+        <input
+          name="value"
+          placeholder="building in public"
+          className="input"
+          style={{ flex: 1 }}
+          required
+          maxLength={200}
+        />
+        <button className="btn btn-sm btn-accent" type="submit">Add</button>
+      </form>
+
+      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        {rows.map((r) => (
+          <li key={r.id} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderTop: "1px dashed var(--rule-soft)" }}>
+            <span style={{ fontFamily: "var(--mono)", fontSize: 12 }}>{r.value}</span>
+            <form
+              action={async () => {
+                "use server";
+                await removeLinkedinKeyword({ orgSlug, instanceId, rowId: r.id });
+              }}
+            >
+              <button className="btn btn-xs" type="submit">×</button>
+            </form>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function Column({
+  title,
+  rows,
+  orgSlug,
+  instanceId,
+  kind,
+  placeholder,
+}: {
+  title: string;
+  rows: { id: string; value: string }[];
+  orgSlug: string;
+  instanceId: string;
+  kind: "handle" | "keyword";
+  placeholder: string;
+}) {
+  return (
+    <section className="card">
+      <div className="card-h">
+        <h3>{title}</h3>
+        <span className="tag">{rows.length}</span>
+      </div>
+
+      <form
+        action={async (fd: FormData) => {
+          "use server";
+          const value = String(fd.get("value") ?? "");
+          if (!value) return;
+          await addWatchlistEntry({ orgSlug, instanceId, kind, value });
+        }}
+        style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}
+      >
+        <input
+          name="value"
+          placeholder={placeholder}
+          className="input"
+          style={{ flex: 1 }}
+          required
+          maxLength={200}
+        />
+        <button className="btn btn-sm btn-accent" type="submit">Add</button>
+      </form>
+
+      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        {rows.map((r) => (
+          <li key={r.id} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderTop: "1px dashed var(--rule-soft)" }}>
+            <span style={{ fontFamily: "var(--mono)", fontSize: 12 }}>
+              {kind === "handle" ? `@${r.value}` : r.value}
+            </span>
+            <form
+              action={async () => {
+                "use server";
+                await removeWatchlistEntry({ orgSlug, instanceId, rowId: r.id });
+              }}
+            >
+              <button className="btn btn-xs" type="submit">×</button>
+            </form>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/**
+ * Orion's watchlist editor — a list of SUBREDDITS (not people/handles). Each
+ * subreddit may carry a free-text objective (how to engage) and a min-score
+ * floor (skip low-signal threads). Plus the mission/objective card, mirroring
+ * the X / LinkedIn watchlist layout.
+ */
+async function RedditWatchlist({
+  orgSlug,
+  instanceId,
+  objective,
+  displayName: displayNameRaw,
