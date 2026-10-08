@@ -1,0 +1,160 @@
+<!--
+  REAL captured post-page comments (linkedin.com, 2026-07-27) — the LEGACY EMBER
+  generation, which is what the actuator ACTUALLY meets on a post permalink.
+  Distilled (svg/img/dropdown chrome trimmed); every attribute the locators key
+  on is verbatim.
+
+  This is a DIFFERENT UI generation from post-comments-2026.html, and the
+  difference is why every threaded run failed with `comment-not-found`:
+
+    2026 obfuscated            legacy ember (this file)
+    ------------------------   ----------------------------------------
+    id="replaceableComment_…"  data-id="urn:li:comment:(ugcPost:P,C)"
+    urn:li:ugcPost:P inside    ugcPost:P inside — no `urn:li:` prefix
+    aria-label="Reply"         aria-label="Reply to <Name>’s comment"
+    tiptap ProseMirror         Quill .ql-editor
+    "See N more comments"      "Load more comments"
+
+  And critically: REPLIES ARE NESTED inside the parent comment's <article>
+  (comments-replies-list), where the 2026 markup renders them as siblings.
+-->
+<div class="feed-shared-update-v2__comments-container display-flex flex-column">
+  <div id="ember68" class="comments-comment-box--cr comments-comment-box--no-avatar" data-scroll-name="true">
+    <div class="display-flex flex-1">
+      <form class="comments-comment-box__form">
+        <div class="comments-comment-texteditor">
+          <div class="comments-comment-box-comment__text-editor">
+            <div class="editor-container relative">
+              <div class="editor-content ql-container">
+                <div class="ql-editor ql-blank" contenteditable="true" data-placeholder="Add a comment…" aria-placeholder="Add a comment…" aria-label="Text editor for creating content" role="textbox" aria-multiline="true"><p><br></p></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="ember75" class="comments-comments-list comments-comments-list--cr">
+    <div class="comments-comment-list__container comments-infinite-comment-list__container">
+      <div class="scaffold-finite-scroll scaffold-finite-scroll--infinite">
+        <div class="scaffold-finite-scroll__content">
+
+          <!-- OUR comment, with THEIR reply NESTED inside it -->
+          <div>
+            <article class="comments-comment-entity" data-id="urn:li:comment:(ugcPost:7486054278927835136,7486091099183251456)" id="ember76" tabindex="-1">
+              <div class="comments-comment-meta__container comments-comment-meta__container--parent">
+                <div class="comments-comment-meta__actor">
+                  <a class="comments-comment-meta__description-container" href="https://www.linkedin.com/in/demooperator">
+                    <h3 class="comments-comment-meta__description">
+                      <span class="comments-comment-meta__description-title">Alex Rivera</span><span class="comments-comment-meta__data"><span class="white-space-pre"> </span>• You</span>
+                    </h3>
+                  </a>
+                </div>
+                <div class="comments-comment-meta__info"><time class="comments-comment-meta__data">3d</time></div>
+              </div>
+              <div class="comments-thread-entity">
+                <div class="comments-thread-item">
+                  <section class="comments-comment-entity__content">
+                    <span class="comments-comment-item__main-content feed-shared-main-content--comment t-14 t-black t-normal" dir="ltr">
+                      <div dir="ltr" class="update-components-text relative"><span dir="ltr">a week to teach yourself advanced econometrics and python, on your own, as the only second-year in the room.</span></div>
+                    </span>
+                  </section>
+                </div>
+              </div>
+              <div id="ember82" class="comment-social-activity">
+                <div class="comments-thread-entity">
+                  <div class="comments-thread-item">
+                    <div class="comments-comment-social-bar--cr">
+                      <div class="comments-comment-social-bar__action-group--cr">
+                        <button aria-label="Reply to Alex Rivera’ comment" id="ember86" class="artdeco-button ember-view comments-comment-social-bar__reply-action-button--cr button reply"><span class="artdeco-button__text"><span aria-hidden="true">Reply</span></span></button>
+                        <span aria-hidden="true" class="comments-comment-social-bar__replies-count--cr">1 reply</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- THEIR reply — NESTED inside our comment's article -->
+                <div class="comments-replies-list">
+                  <div class="comments-thread-entity comments-replies-list--anchored-animation">
+                    <div class="comments-thread-item">
+                      <article class="comments-comment-entity comments-comment-entity--reply" data-id="urn:li:comment:(ugcPost:7486054278927835136,7487199472029192192)" id="ember87" tabindex="-1">
+                        <div class="comments-comment-meta__container">
+                          <div class="comments-comment-meta__actor">
+                            <a class="comments-comment-meta__description-container" href="https://www.linkedin.com/in/malena-mir-garcia">
+                              <h3 class="comments-comment-meta__description"><span class="comments-comment-meta__description-title">Malena M.</span></h3>
+                            </a>
+                          </div>
+                          <div class="comments-comment-meta__info"><time class="comments-comment-meta__data">11h</time></div>
+                        </div>
+                        <div class="comments-thread-entity">
+                          <div class="comments-thread-item">
+                            <section class="comments-comment-entity__content">
+                              <span class="comments-comment-item__main-content feed-shared-main-content--comment t-14 t-black t-normal" dir="ltr">
+                                <div dir="ltr" class="update-components-text relative"><span dir="ltr"><span><a href="/in/demooperator/">Alex Rivera</a></span><span class="white-space-pre"> </span>thank you so much!! I will</span></div>
+                              </span>
+                            </section>
+                          </div>
+                        </div>
+                        <div id="ember94" class="comment-social-activity comment-social-activity--is-reply">
+                          <div class="comments-thread-entity">
+                            <div class="comments-thread-item">
+                              <div class="comments-comment-social-bar--cr">
+                                <div class="comments-comment-social-bar__action-group--cr">
+                                  <button aria-label="Reply to Malena M.’s comment" id="ember98" class="artdeco-button ember-view comments-comment-social-bar__reply-action-button--cr button reply"><span class="artdeco-button__text"><span aria-hidden="true">Reply</span></span></button>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </article>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <!-- an unrelated third-party comment -->
+          <div>
+            <article class="comments-comment-entity" data-id="urn:li:comment:(ugcPost:7486054278927835136,7486071797881315328)" id="ember105" tabindex="-1">
+              <div class="comments-comment-meta__container comments-comment-meta__container--parent">
+                <div class="comments-comment-meta__actor">
+                  <a class="comments-comment-meta__description-container" href="https://www.linkedin.com/in/mateu-rojas-comella-89a878337">
+                    <h3 class="comments-comment-meta__description"><span class="comments-comment-meta__description-title">Mateu Rojas Comella</span></h3>
+                  </a>
+                </div>
+                <div class="comments-comment-meta__info"><time class="comments-comment-meta__data">3d</time></div>
+              </div>
+              <div class="comments-thread-entity">
+                <div class="comments-thread-item">
+                  <section class="comments-comment-entity__content">
+                    <span class="comments-comment-item__main-content feed-shared-main-content--comment t-14 t-black t-normal" dir="ltr">
+                      <div dir="ltr" class="update-components-text relative"><span dir="ltr">Congratulations, Malena! What an incredible year.</span></div>
+                    </span>
+                  </section>
+                </div>
+              </div>
+              <div id="ember111" class="comment-social-activity">
+                <div class="comments-thread-entity">
+                  <div class="comments-thread-item">
+                    <div class="comments-comment-social-bar--cr">
+                      <div class="comments-comment-social-bar__action-group--cr">
+                        <button aria-label="Reply to Mateu Rojas Comella’s comment" id="ember115" class="artdeco-button ember-view comments-comment-social-bar__reply-action-button--cr button reply"><span class="artdeco-button__text"><span aria-hidden="true">Reply</span></span></button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </article>
+          </div>
+
+        </div>
+      </div>
+    </div>
+    <div class="comments-comment-list__load-more-container">
+      <button aria-label="Load more comments" id="ember367" class="artdeco-button ember-view comments-comments-list__load-more-comments-arrows"><span class="artdeco-button__text"></span></button>
+      <button id="ember368" class="comments-comments-list__load-more-comments-button--cr artdeco-button ember-view"><span class="artdeco-button__text">Load more comments</span></button>
+    </div>
+  </div>
+</div>
