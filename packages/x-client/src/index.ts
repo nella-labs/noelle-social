@@ -198,3 +198,177 @@ function extractImages(t: TweetData): string[] {
  * (not `retweeted_status_*`) and the text is the author's own commentary, so
  * none of these checks fire and they survive the discovery filter.
  */
+function extractIsRepost(t: TweetData): boolean {
+  const legacies = rawTweetNodes(t).map((node) => node.legacy);
+  for (const legacy of legacies) {
+    if (legacy?.retweeted_status_id_str != null || legacy?.retweeted_status_result != null) {
+      return true;
+    }
+  }
+  return /^RT @\w/.test(t.text ?? "");
+}
+
+/**
+ * Raw author metadata complements Bird's typed identity. Public follower
+ * counts and profile descriptions remain unknown when absent or malformed.
+ */
+type RawTweetNode = {
+  legacy?: Record<string, unknown>;
+  core?: { user_results?: { result?: { rest_id?: unknown; legacy?: { followers_count?: unknown; description?: unknown } } } };
+};
+
+function rawTweetNodes(t: TweetData): RawTweetNode[] {
+  const raw = t._raw as (RawTweetNode & {
+    tweet?: RawTweetNode;
+    result?: RawTweetNode & { tweet?: RawTweetNode };
+  }) | null | undefined;
+  return [raw, raw?.tweet, raw?.result, raw?.result?.tweet]
+    .filter((node): node is RawTweetNode => !!node && typeof node === "object" && !Array.isArray(node));
+}
+
+function extractAuthorMetadata(t: TweetData): Pick<XTweet["author"], "id" | "followers" | "bio"> {
+  const nodes = rawTweetNodes(t);
+  const users = nodes.map((node) => node.core?.user_results?.result);
+  const bio = users.map((user) => user?.legacy?.description)
+    .find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  return {
+    id: readXSourceId(t.authorId, ...users.map((user) => user?.rest_id)) ?? "",
+    followers: readXSourceCount(...nodes.flatMap((node) => [
+      node.core?.user_results?.result?.legacy?.followers_count, node.legacy?.followers_count,
+    ])),
+    bio: bio?.trim() ?? null,
+  };
+}
+
+function extractRelations(t: TweetData): Pick<XTweet, "is_reply" | "conversation_id" | "in_reply_to_id"> {
+  const legacies = rawTweetNodes(t).map((node) => node.legacy);
+  const conversation = readXSourceId(...legacies.map((legacy) => legacy?.conversation_id_str));
+  const parent = readXSourceId(...legacies.map((legacy) => legacy?.in_reply_to_status_id_str));
+  return { is_reply: parent !== null || (conversation !== null && conversation !== t.id),
+    ...(conversation ? { conversation_id: conversation } : {}), ...(parent ? { in_reply_to_id: parent } : {}) };
+}
+
+/**
+ * Best-effort tweet-creation-time extraction. Bird types `createdAt`, but omits
+ * it for some result shapes (e.g. visibility-wrapped tweets); the real value
+ * still rides on the raw GraphQL `legacy.created_at` we fetch via `includeRaw`.
+ * Read the typed field first, then the raw block across its known nestings —
+ * mirroring author metadata. Returns an ISO string, or null when the tweet
+ * carries no parseable date anywhere. Callers MUST NOT fabricate one: a faked
+ * "now" makes an ancient post look fresh and defeats every age guard.
+ */
+function extractCreatedAt(t: TweetData): string | null {
+  return readXSourceTimestamp(t.createdAt, ...rawTweetNodes(t).map((node) => node.legacy?.created_at));
+}
+
+function classifyError(message: string | undefined): never {
+  const msg = message ?? "unknown bird error";
+  // Bird normalises errors to a string. Heuristic-classify them. ORDER MATTERS:
+  // lock/challenge signals must be caught BEFORE the broad auth match (an
+  // automation lock often also contains "authenticate"), and rate-limit before
+  // auth so a 429 isn't mis-read.
+  //
+  // Account LOCK / "looks automated" (Error 226), temporary lock (326),
+  // "temporarily limited", the /account/access or /i/flow/login interstitial,
+  // or a persistent CSRF-mismatch 403 → XLockError (hard stop, never retry).
+  if (
+    /\b226\b|looks like it might be automated|automated behaviou?r|temporarily limited|account.{0,15}lock|\b326\b|\/account\/access|\/i\/flow\/login|matching csrf/i.test(
+      msg,
+    )
+  ) {
+    throw new XLockError(`x ${msg}`);
+  }
+  // Interactive human challenge (Arkose / CAPTCHA / verify) → XChallengeError.
+  if (/arkose|captcha|challenge|verify you|are you a robot|funcaptcha/i.test(msg)) {
+    throw new XChallengeError(`x ${msg}`);
+  }
+  if (/429|rate.?limit/i.test(msg)) throw new XRateLimitError(`x ${msg}`);
+  if (/401|unauthor|auth/i.test(msg)) throw new XAuthError(`x ${msg}`);
+  if (/404/.test(msg)) throw new XError(`x ${msg}`, 404);
+  throw new XError(`x ${msg}`, 500);
+}
+
+export function createXClient(opts: CreateXClientOpts): XClient {
+  const bird: BirdLike =
+    opts.client ??
+    (new TwitterClient({
+      cookies: {
+        ct0: opts.ct0,
+        authToken: opts.authToken,
+        cookieHeader: `ct0=${opts.ct0}; auth_token=${opts.authToken}`,
+        source: "noelle",
+      },
+    }) as unknown as BirdLike);
+
+  return {
+    async verifyCredentials() {
+      // Best-effort identity check. Bird's getCurrentUser hits a working
+      // graphql op (not the retired /verify_credentials.json), so this
+      // doubles as a cheap "are the cookies valid" probe. We swallow
+      // soft lookup failures and return placeholders. Account stop signals and
+      // rate limits must reach the caller before it starts posting.
+      try {
+        const me = await bird.getCurrentUser();
+        if (me.success && me.user?.id) {
+          return { screen_name: me.user.username ?? "unknown", id_str: me.user.id };
+        }
+        if (me.error) classifyError(me.error);
+      } catch (err) {
+        if (err instanceof XAuthError || err instanceof XLockError ||
+            err instanceof XChallengeError || err instanceof XRateLimitError) throw err;
+        // Otherwise: ignore. Real X calls below will surface their own errors.
+      }
+      return { screen_name: "unknown", id_str: "0" };
+    },
+
+    async userTweets({ handle, sinceISO, limit = 40 }) {
+      const lookup = await bird.getUserIdByUsername(handle);
+      if (!lookup.success || !lookup.userId) {
+        classifyError(lookup.error ?? `no user id for @${handle}`);
+      }
+      const res = await bird.getUserTweets(lookup.userId!, limit, { includeRaw: true });
+      if (!res.success) classifyError(res.error);
+      const since = sinceISO ? new Date(sinceISO).getTime() : 0;
+      return (res.tweets ?? [])
+        .map(toXTweet)
+        .filter((t): t is XTweet => t !== null)
+        .filter((t) => new Date(t.created_at).getTime() > since);
+    },
+
+    async searchTimeline({ query, sinceISO, limit = 40 }) {
+      const res = await bird.search(query, limit, { includeRaw: true });
+      if (!res.success) classifyError(res.error);
+      const since = sinceISO ? new Date(sinceISO).getTime() : 0;
+      return (res.tweets ?? [])
+        .map(toXTweet)
+        .filter((t): t is XTweet => t !== null)
+        .filter((t) => new Date(t.created_at).getTime() > since);
+    },
+
+    async createTweet({ inReplyToId, text }) {
+      const res = await bird.reply(text, inReplyToId);
+      if (!res.success) classifyError(res.error);
+      const id = typeof res.tweetId === "string" ? readXSourceId(res.tweetId) : null;
+      if (!id) throw new XWriteUncertainError("x reply returned no valid receipt; check X before retrying");
+      // Posting is already confirmed. An optional identity lookup must never
+      // turn that receipt into a retryable send failure.
+      const me = await bird.getCurrentUser().catch(() => null);
+      const handle = me?.success ? me.user?.username : undefined;
+      return {
+        id,
+        url: `https://x.com/${handle || "i"}/status/${id}`,
+      };
+    },
+
+    async likeTweet(tweetId) {
+      // Best-effort: never throw. The caller (reply send) treats a like as a
+      // nice-to-have, so a failure here must not surface as a send failure.
+      try {
+        const res = await bird.like(tweetId);
+        return !!res.success;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
