@@ -398,3 +398,133 @@ describe("analyzePatterns", () => {
       draftId: `p${i}`,
       kind: "post" as const,
       body: i >= 10 && i < 16 ? `Post ${i} repeats the same claim-to-lesson ending.` : `Post ${i} has a different shape.`,
+    }));
+    const structure = JSON.stringify({
+      findings: [
+        {
+          label: "claim-to-lesson ending",
+          kind: "structure",
+          description: "Six posts in the recent window repeat the same meaning.",
+          instruction: "Do not force a broad lesson after operational claims.",
+          regex: null,
+          severity: "medium",
+          frequencyCount: 6,
+          examples: [],
+          evidence: Array.from({ length: 6 }, (_, i) => ({
+            sourceIndex: i + 10,
+            snippet: "repeats the same claim-to-lesson ending",
+          })),
+        },
+      ],
+    });
+    const out = await analyzePatterns({ posts: corpus, call: () => Promise.resolve(structure), minFrequency: 3 });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.windowSize).toBe(20);
+    expect(out[0]!.finding.frequencyCount).toBe(6);
+  });
+
+  it("drops a structure finding below the share floor after evidence verification", async () => {
+    const matchIndexes = [0, 20, 40, 60, 80];
+    const corpus: PatternPost[] = Array.from({ length: 100 }, (_, i) => ({
+      draftId: `p${i}`,
+      kind: "post" as const,
+      body: matchIndexes.includes(i) ? `Post number ${i} repeats a rare structure.` : `Post number ${i} with a varied shape.`,
+    }));
+    const structure = JSON.stringify({
+      findings: [
+        {
+          label: "all-caps shouted emphasis word",
+          kind: "structure",
+          description: "You SHOUT a single word in all caps for emphasis in roughly 5 posts.",
+          instruction: "Don't SHOUT a single word in all caps for emphasis.",
+          regex: null,
+          severity: "medium",
+          frequencyCount: 5,
+          examples: [],
+          evidence: matchIndexes.map((sourceIndex) => ({ sourceIndex, snippet: "repeats a rare structure" })),
+        },
+      ],
+    });
+    const out = await analyzePatterns({ posts: corpus, call: () => Promise.resolve(structure), minFrequency: 3 });
+    expect(out).toEqual([]);
+  });
+
+  it("keeps a structure finding once verified evidence clears the share floor", async () => {
+    const corpus: PatternPost[] = Array.from({ length: 10 }, (_, i) => ({
+      draftId: `p${i}`,
+      kind: "post" as const,
+      body: i < 4 ? `Post number ${i} repeats a common structure.` : `Post number ${i}`,
+    }));
+    const structure = JSON.stringify({
+      findings: [
+        {
+          label: "all-caps shouted emphasis word",
+          kind: "structure",
+          description: "You SHOUT a single word in all caps in a third of posts.",
+          instruction: "Don't SHOUT a single word in all caps for emphasis.",
+          regex: null,
+          severity: "medium",
+          frequencyCount: 35,
+          examples: [],
+          evidence: Array.from({ length: 4 }, (_, i) => ({ sourceIndex: i, snippet: "repeats a common structure" })),
+        },
+      ],
+    });
+    const out = await analyzePatterns({ posts: corpus, call: () => Promise.resolve(structure), minFrequency: 3 });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.finding.frequencyCount).toBe(4);
+  });
+
+  it("drops a bad-regex phrase that degrades to structure without valid evidence", async () => {
+    const badRegex = JSON.stringify({
+      findings: [
+        {
+          label: "broken regex pattern",
+          kind: "phrase",
+          description: "shows up a lot",
+          instruction: "stop doing the thing",
+          regex: "(unclosed",
+          severity: "medium",
+          frequencyCount: 5,
+          examples: [],
+        },
+      ],
+    });
+    const out = await analyzePatterns({
+      posts: congratsCorpus(),
+      call: () => Promise.resolve(badRegex),
+      minFrequency: 3,
+    });
+    expect(out).toEqual([]);
+  });
+});
+
+describe("refineRule", () => {
+  it("returns the rewritten instruction from the model", async () => {
+    const out = await refineRule({
+      currentInstruction: "Do not end with congrats.",
+      description: "ends posts with congrats",
+      note: "only when it's a genuine win",
+      call: async () => JSON.stringify({ instruction: "Only add 'congrats' when the post is a genuine win; otherwise end on the point." }),
+    });
+    expect(out).toContain("genuine win");
+  });
+
+  it("returns null on unusable model output (caller keeps current)", async () => {
+    expect(await refineRule({ currentInstruction: "x".repeat(10), description: "d".repeat(10), call: async () => "garbage" })).toBeNull();
+    expect(await refineRule({ currentInstruction: "x".repeat(10), description: "d".repeat(10), call: async () => JSON.stringify({ instruction: "tiny" }) })).toBeNull();
+  });
+
+  it("returns null when the model call throws", async () => {
+    expect(await refineRule({ currentInstruction: "x".repeat(10), description: "d".repeat(10), call: async () => { throw new Error("boom"); } })).toBeNull();
+  });
+});
+it("rejects a refinement longer than the rule admission contract", async () => {
+  expect(
+    await refineRule({
+      currentInstruction: "Avoid repeating a stock closer",
+      description: "Recent replies repeat a stock closer",
+      call: async () => JSON.stringify({ instruction: "x".repeat(601) }),
+    }),
+  ).toBeNull();
+});
