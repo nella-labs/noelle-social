@@ -598,3 +598,70 @@ function XPreview({ userName, userHandle, content, cta }: { userName: string; us
           <div style={{ marginTop: 6, fontSize: 14.5, lineHeight: 1.5, color: body ? "var(--ink)" : "var(--ink-soft)", whiteSpace: "pre-wrap", fontStyle: body ? "normal" : "italic" }}>
             {ph(body, "Your post renders here.")}
           </div>
+          <div style={{ display: "flex", gap: 22, marginTop: 14, color: "var(--ink-soft)", fontSize: 12, fontFamily: "var(--mono)" }}>
+            <span>↩</span><span>⇄</span><span>♡</span>
+            <span style={{ marginLeft: "auto", color: content.length > 280 ? "var(--danger)" : "var(--ink-soft)" }}>{content.length}/280</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LinkedInPreview({ userName, hook, content, cta }: { userName: string; hook: string; content: string; cta: string }) {
+  return (
+    <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+      <div style={{ padding: 16 }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <Avatar role="you" size={42} accent="var(--paper)" />
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 13.5 }}>{userName}</div>
+            <div style={{ fontSize: 10.5, color: "var(--ink-soft)", fontFamily: "var(--mono)" }}>now · 🌐</div>
+          </div>
+        </div>
+        <div style={{ marginTop: 12, fontSize: 13.5, lineHeight: 1.55, whiteSpace: "pre-wrap", color: content ? "var(--ink-2)" : "var(--ink-soft)", fontStyle: content ? "normal" : "italic" }}>
+          {hook ? <span style={{ fontWeight: 600, color: "var(--ink)" }}>{hook}{"\n\n"}</span> : null}
+          {ph(content, "Your LinkedIn post body appears here.")}
+        </div>
+        {cta && <div style={{ marginTop: 10, fontSize: 13, color: "var(--info)" }}>{cta}</div>}
+      </div>
+      <div style={{ display: "flex", gap: 6, padding: "10px 16px", borderTop: "1px solid var(--rule-soft)", color: "var(--ink-muted)", fontSize: 11.5 }}>
+        <span>👍 Like</span><span style={{ marginLeft: "auto" }}>💬 Comment</span><span style={{ marginLeft: "auto" }}>↻ Repost</span>
+      </div>
+    </div>
+  );
+}
+
+function RedditPreview({ userHandle, hook, content, cta }: { userHandle: string; hook: string; content: string; cta: string }) {
+  return (
+    <div className="card" style={{ padding: 16 }}>
+      <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--ink-muted)" }}>
+        Reddit · <span style={{ color: "var(--ink-soft)" }}>{userHandle ? `u/${userHandle.replace("@", "")}` : "Your profile"} · now</span>
+      </div>
+      <div className="serif" style={{ fontSize: 18, lineHeight: 1.25, marginTop: 6, color: hook ? "var(--ink)" : "var(--ink-soft)", fontStyle: hook ? "normal" : "italic" }}>
+        {ph(hook, "Your post title")}
+      </div>
+      <div style={{ marginTop: 8, fontSize: 13, lineHeight: 1.55, whiteSpace: "pre-wrap", color: content ? "var(--ink-2)" : "var(--ink-soft)", fontStyle: content ? "normal" : "italic" }}>
+        {ph(content, "Body text…")}
+      </div>
+      {cta && <div style={{ marginTop: 8, fontSize: 12.5, color: "var(--accent)" }}>{cta}</div>}
+      <div style={{ display: "flex", gap: 16, marginTop: 12, color: "var(--ink-soft)", fontSize: 11.5, fontFamily: "var(--mono)" }}>
+        <span>▲ 1 ▼</span><span>💬 comments</span><span>↗ share</span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Small shared bits ───────────────────────────────────────────────────
+function PlatChip({ label, color, active, onClick }: { label: string; color?: string; active: boolean; onClick: () => void }) {
+  return (
+    <button onClick={onClick}
+            style={{ border: 0, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 5, padding: "4px 9px", borderRadius: 999, fontSize: 11,
+                     background: active ? "var(--paper-2)" : "transparent",
+                     boxShadow: active ? `0 0 0 1px ${color || "var(--ink)"}` : "0 0 0 0.5px var(--rule)",
+                     color: active ? "var(--ink)" : "var(--ink-muted)" }}>
+      {color && <span style={{ width: 6, height: 6, borderRadius: "50%", background: color }} />}
+      {label}
+    </button>
+  );
+}
