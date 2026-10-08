@@ -198,3 +198,203 @@ describe("expireStaleClassifiedLeads", () => {
   });
 
   it("leaves explicit reply requests out of the age sweep", async () => {
+    const { sql, fragments } = captureSql();
+
+    await expireStaleClassifiedLeads(sql, { agentInstanceId: "i", maxAgeHours: 48 });
+
+    expect(fragments.join("\n")).toMatch(/payload->>'reply_requested' is distinct from 'true'/);
+  });
+
+  it("leaves browser-observed leads out of the legacy age sweep", async () => {
+    const { sql, fragments } = captureSql();
+    await expireStaleClassifiedLeads(sql, { agentInstanceId: "i", maxAgeHours: 48 });
+    expect(fragments.join("\n")).toContain("payload->>'source' is distinct from 'extension_observed'");
+  });
+
+  it("is a no-op (no query) when the ceiling is 0 / disabled", async () => {
+    const { sql, fragments } = captureSql();
+    const n = await expireStaleClassifiedLeads(sql, { agentInstanceId: "i", maxAgeHours: 0 });
+    expect(n).toBe(0);
+    expect(fragments.length).toBe(0);
+  });
+});
+
+describe("reapStaleClaims", () => {
+  function captureSql() {
+    const fragments: string[] = [];
+    const params: unknown[][] = [];
+    const sql = Object.assign(
+      vi.fn(async (strings: TemplateStringsArray, ...vals: unknown[]) => {
+        fragments.push(strings.join("?"));
+        params.push(vals);
+        return [{ id: "L1" }];
+      }),
+      { unsafe: vi.fn(), json: (x: unknown) => x },
+    ) as never;
+    return { sql, fragments, params };
+  }
+
+  it("requeues fresh strands to the pre-claim status, bounded by the expiry horizon", async () => {
+    const { sql, fragments, params } = captureSql();
+    const out = await reapStaleClaims(sql, {
+      agentInstanceId: "i",
+      claimedStatus: "drafting",
+      requeueStatus: "classified",
+    });
+    expect(out).toEqual({ requeued: 1, expired: 1 });
+    expect(fragments[0]).toMatch(/update noelle\.leads/);
+    // stale = older than the claim TTL...
+    expect(fragments[0]).toMatch(/updated_at < now\(\) - make_interval\(mins =>/);
+    // ...but still young enough to be worth a retry
+    expect(fragments[0]).toMatch(/updated_at >= now\(\) - make_interval\(hours =>/);
+    expect(params[0]).toContain("classified");
+    expect(params[0]).toContain("drafting");
+    expect(params[0]).toContain("i");
+  });
+
+  it("expires ancient strands to 'skipped' with an audit marker, never a retry", async () => {
+    const { sql, fragments } = captureSql();
+    await reapStaleClaims(sql, {
+      agentInstanceId: "i",
+      claimedStatus: "classifying",
+      requeueStatus: "new",
+    });
+    expect(fragments[1]).toMatch(/set status = 'skipped'/);
+    expect(fragments[1]).toMatch(/stale_claim/);
+    expect(fragments[1]).toMatch(/updated_at < now\(\) - make_interval\(hours =>/);
+  });
+
+  it("requeues stale explicit reply requests instead of expiring them", async () => {
+    const { sql, fragments } = captureSql();
+
+    await reapStaleClaims(sql, {
+      agentInstanceId: "i",
+      claimedStatus: "drafting",
+      requeueStatus: "classified",
+    });
+
+    expect(fragments[0]).toMatch(/payload->>'reply_requested' = 'true'/);
+    expect(fragments[1]).toMatch(/payload->>'reply_requested' is distinct from 'true'/);
+  });
+
+  it("retains orphaned browser observations for Jev outage recovery without an expiry horizon", async () => {
+    const { sql, fragments } = captureSql();
+    const out = await reapStaleClaims(sql, {
+      agentInstanceId: "i", claimedStatus: "observed_classifying", requeueStatus: "observed",
+    });
+    expect(out).toEqual({ requeued: 1, expired: 0 });
+    expect(fragments).toHaveLength(1);
+    expect(fragments[0]).not.toContain("updated_at >= now()");
+  });
+});
+
+describe("expireStaleClassifiedLeads — notification exemption", () => {
+  // The cold-reply age ceiling is about not answering a stale STRANGER.
+  // A notification lead is someone who replied to US, and answering them three
+  // days later is an ordinary conversation. Applying the ceiling there made the
+  // whole notifications lane dead on arrival (8/8 leads expired before drafting).
+  it("excludes notification-source leads from the age sweep", async () => {
+    const captured: string[] = [];
+    const fake = (strings: TemplateStringsArray) => {
+      captured.push(strings.join("?"));
+      return Promise.resolve([]);
+    };
+    // the impl builds a jsonb marker via sql.json
+    (fake as unknown as { json: (v: unknown) => unknown }).json = (v) => v;
+    const sql = fake as never;
+    await expireStaleClassifiedLeads(sql, { agentInstanceId: "i", maxAgeHours: 24 });
+    const q = captured.join("\n");
+    expect(q).toContain("'notification'");
+    // The exemption must be BOUNDED. An unbounded one would leave a months-old
+    // mention eligible forever, and unattended sending would answer it.
+    // The notification lane's bound comes from NOTIFICATION_MAX_AGE_HOURS now,
+    // interpolated as make_interval rather than a literal, so a change to the
+    // shared constant cannot leave this predicate behind.
+    expect(q).toContain("make_interval(hours =>");
+    // ...and it still filters on age for everything else.
+    expect(q).toContain("posted_at");
+  });
+
+  it("still no-ops when the ceiling is disabled", async () => {
+    const sql = (() => Promise.resolve([])) as never;
+    expect(await expireStaleClassifiedLeads(sql, { agentInstanceId: "i", maxAgeHours: 0 })).toBe(0);
+  });
+});
+
+describe("claimReplyRequestLeads", () => {
+  it("atomically claims one-off reply requests without duplicating completed keys", async () => {
+    const fragments: string[] = [];
+    const params: unknown[][] = [];
+    const sql = Object.assign(
+      vi.fn(async (strings: TemplateStringsArray, ...vals: unknown[]) => {
+        fragments.push(strings.join("?"));
+        params.push(vals);
+        return [{ id: "L1", payload: { reply_request: { request_key: "manual-1" } } }];
+      }),
+      { unsafe: vi.fn(), json: (x: unknown) => x },
+    ) as never;
+
+    const out = await claimReplyRequestLeads(sql, { agentInstanceId: "i", cap: 5 });
+
+    expect(out).toHaveLength(1);
+    expect(fragments[0]).toMatch(/update noelle\.leads/);
+    expect(fragments[0]).toMatch(/status = 'drafting'/);
+    expect(fragments[0]).not.toMatch(/payload = payload - 'reply_requested'/);
+    expect(fragments[0]).toMatch(/payload->>'reply_requested' = 'true'/);
+    expect(fragments[0]).toMatch(/payload->'reply_request'->>'request_key'/);
+    expect(fragments[0]).toMatch(/for update skip locked/);
+    expect(params[0]).toContain("i");
+    expect(params[0]).toContain(5);
+  });
+});
+
+describe("markLeadStatus — reply request lifecycle", () => {
+  function captureSql() {
+    const fragments: string[] = [];
+    const params: unknown[][] = [];
+    const sql = Object.assign(
+      vi.fn(async (strings: TemplateStringsArray, ...vals: unknown[]) => {
+        fragments.push(strings.join("?"));
+        params.push(vals);
+        return [];
+      }),
+      { unsafe: vi.fn(), json: (x: unknown) => x },
+    ) as never;
+    return { sql, fragments, params };
+  }
+
+  it("clears an explicit reply request only when the lead reaches a terminal status", async () => {
+    const terminal = captureSql();
+
+    await markLeadStatus(terminal.sql, {
+      leadId: "L1",
+      status: "drafted",
+      meta: { reply_request_key: "manual-1" },
+    });
+
+    expect(terminal.fragments[0]).toMatch(/payload \? 'reply_request'/);
+    expect(terminal.fragments[0]).toMatch(/reply_requested/);
+
+    const retry = captureSql();
+    await markLeadStatus(retry.sql, {
+      leadId: "L1",
+      status: "classified",
+      meta: { outbound_error: "api-vm 502" },
+    });
+
+    expect(retry.fragments[0]).toMatch(/payload \? 'reply_request'/);
+    expect(retry.params[0]).toContain(false);
+  });
+});
+
+describe("supersedeOlderPriorityLeads", () => {
+  it("does not supersede an explicit reply request for the same watchlist author", async () => {
+    const fragments: string[] = [];
+    const sql = Object.assign(
+      vi.fn(async (strings: TemplateStringsArray) => {
+        fragments.push(strings.join("?"));
+        return [];
+      }),
+      { unsafe: vi.fn(), json: (x: unknown) => x },
+    ) as never;
+
