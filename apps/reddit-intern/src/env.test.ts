@@ -198,3 +198,9 @@ it("keeps local retrieval free of implicit remote workspace defaults", () => {
     expect(loadEnv().NELLA_WORKSPACE).toBe("");
     process.env.NELLA_WORKSPACE = " configured-workspace ";
     resetEnvForTests();
+    expect(loadEnv().NELLA_WORKSPACE).toBe("configured-workspace");
+  } finally {
+    process.env = original;
+    resetEnvForTests();
+  }
+});

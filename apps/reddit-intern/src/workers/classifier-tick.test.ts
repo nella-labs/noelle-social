@@ -398,3 +398,10 @@ describe("classifierBudgetBlock", () => {
       fetchSpend: async () => {
         throw new Error("db down");
       },
+      fetchCaps: async () => ({ bucket: 1, org: 1, instance: 1 }),
+    };
+    await expect(
+      classifierBudgetBlock(broken, { orgId: "o", instanceId: "i" }),
+    ).rejects.toThrow("db down");
+  });
+});
