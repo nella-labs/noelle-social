@@ -198,3 +198,36 @@ export const GUIDED_STEPS: readonly GuidedStep[] = [
       return Boolean(vega?.replySendEnabled) && s.xPostingReady;
     },
     blockedBy: (s) => (xIntern(s) ? null : "Hire Vega, the X intern, first."),
+    // X session cookies (ct0 / auth_token) live in the runtime environment, not
+    // in `noelle.*`. There is no SQL signal for them, so an operator who posts
+    // through cookies rather than the X API would otherwise stare at a step that
+    // can never tick. Say what we can and cannot see instead of guessing.
+    waitingOn: (s) =>
+      xIntern(s)?.replySendEnabled && !s.xPostingReady
+        ? "Reply sending is on. If you post with session cookies instead of the X API, " +
+          "Noelle reads those from the runtime environment and cannot confirm them here."
+        : null,
+  },
+] as const;
+
+// ---------------------------------------------------------------------------
+// Caveats — things an operator would otherwise discover by waiting
+// ---------------------------------------------------------------------------
+
+/**
+ * Truths an operator would otherwise learn by staring at an empty queue.
+ *
+ * Keep these honest about the DEFAULT configuration. A warning about a cost that
+ * only occurs behind an off-by-default flag is noise, and noise trains people to
+ * skip warnings that matter.
+ */
+export function guidedCaveats(s: GuidedSignals): string[] {
+  const out: string[] = [];
+  // hiredInterns, not s.agents: never warn about an agent the org only has a
+  // waitlist placeholder for.
+  const hired = hiredInterns(s);
+  if (hired.some((a) => a.role === "video_intern")) {
+    out.push("Automatic short video harvesting is unavailable. Existing clips and script tools remain available.");
+  }
+  return out;
+}
