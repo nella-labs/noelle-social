@@ -198,3 +198,15 @@ it("keeps native model mapping/history/cache fallback and validated usage", asyn
         res.end(JSON.stringify({ message: "system.0.cache_control: unsupported" })); }
       else reply(res);
     });
+  });
+  environment(server.url);
+  try {
+    const backend = createBedrockBackend({ accessKeyId: "fixture-access", secretAccessKey: "fixture-secret", timeoutMs: 10_000 });
+    expect(await backend.call({ ...modelCall, cacheSystem: true, history: [{ role: "user", content: "Prior fixture" }, { role: "assistant", content: "Prior response" }] }))
+      .toMatchObject({ text: "Native fixture response", usage: { input_tokens: 3, output_tokens: 2 } });
+    expect(paths).toEqual(["/model/us.anthropic.claude-sonnet-4-6/invoke", "/model/us.anthropic.claude-sonnet-4-6/invoke"]);
+    expect(bodies[0]!.system).toEqual([{ type: "text", text: modelCall.system, cache_control: { type: "ephemeral" } }]);
+    expect(bodies[1]!.system).toBe(modelCall.system);
+    expect(bodies[1]!.messages).toEqual([{ role: "user", content: "Prior fixture" }, { role: "assistant", content: "Prior response" }, { role: "user", content: modelCall.prompt }]);
+  } finally { await server.close(); }
+});
