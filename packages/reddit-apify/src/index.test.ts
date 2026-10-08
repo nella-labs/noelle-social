@@ -398,3 +398,31 @@ describe("runActorSync real cost capture (drainLastRunUsd)", () => {
     const h = harness(() => ({ items: [SAMPLE], usageTotalUsd: 0.37 }));
     await h.client.subredditPosts({ subreddit: "SaaS" });
     expect(h.client.drainLastRunUsd?.()).toBe(0.37);
+    // Drained: a second read (no new run) is null → caller falls back to estimate.
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("is null when the run object reports no usage", async () => {
+    const h = harness(() => ({ items: [SAMPLE] })); // no usageTotalUsd
+    await h.client.subredditPosts({ subreddit: "SaaS" });
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("polls a still-running run to completion, then returns its items + cost", async () => {
+    const h = harness(() => ({ items: [SAMPLE], usageTotalUsd: 0.02, runStatus: "RUNNING" }));
+    const posts = await h.client.subredditPosts({ subreddit: "SaaS" });
+    expect(posts).toHaveLength(1);
+    expect(h.client.drainLastRunUsd?.()).toBe(0.02);
+  });
+
+  it("throws (and records no cost) when the run finishes not-SUCCEEDED", async () => {
+    const h = harness(() => ({ items: [SAMPLE], runStatus: "FAILED" }));
+    await expect(h.client.subredditPosts({ subreddit: "SaaS" })).rejects.toBeInstanceOf(ApifyError);
+    expect(h.client.drainLastRunUsd?.()).toBeNull();
+  });
+
+  it("surfaces a token-fatal status on the run start so the rotator can retire it", async () => {
+    const h = harness(() => ({ status: 403, text: "Monthly usage hard limit exceeded" }));
+    await expect(h.client.subredditPosts({ subreddit: "SaaS" })).rejects.toMatchObject({ status: 403 });
+  });
+});
