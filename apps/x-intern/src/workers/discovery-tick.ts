@@ -198,3 +198,203 @@ export async function runDiscoveryTick(args: RunDiscoveryTickArgs): Promise<numb
   // issuing NEW actor runs (an in-flight run still finishes under its own per-run
   // timeout) and defers the untouched sources to the next tick — so a pool of
   // slow/queued free-tier tokens can't make one tick run for 10+ minutes.
+  const clockNow = args.clockNow ?? Date.now;
+  const deadline = args.budgetMs != null ? clockNow() + args.budgetMs : Infinity;
+  const overBudget = () => clockNow() >= deadline;
+  let deferredHandles = 0;
+  let deferredKeywords = 0;
+
+  const batches: XTweet[][] = [];
+  let cooledDown = 0;
+  // Ring index of the first source this tick could NOT actually poll — budget-
+  // deferred or rate-starved. That's where the next tick resumes. Cooldown
+  // skips and failed fetches DO advance the cursor: they were handled, and
+  // re-hammering them next tick would be waste.
+  let firstUnpolled: number | null = null;
+  // Set when the Apify pool dies mid-ring. We stop polling immediately but still
+  // persist whatever was already fetched (and paid for) before re-throwing, so a
+  // dead pool costs the operator nothing twice.
+  let exhausted: AllApifyTokensExhaustedError | null = null;
+  for (let i = 0; i < ring.length; i++) {
+    const src = ring[i]!;
+    if (overBudget()) {
+      firstUnpolled ??= i;
+      if (src.kind === "handle") deferredHandles++;
+      else deferredKeywords++;
+      continue;
+    }
+    if (src.kind === "handle") {
+      const handle = src.value;
+      // Re-poll cooldown — WATCH-lane handles only. A handle that is also a
+      // targeting handle is gated only in watchlist-only mode (with the keyword
+      // lane on, its poll doubles as targeting coverage and must stay every-tick).
+      const watchLaneOnly =
+        peopleAddedAt.has(handle) && (args.watchlistOnly || !targetingHandles.has(handle));
+      if (args.repollGate && watchLaneOnly && !args.repollGate.due(handle)) {
+        cooledDown++;
+        continue;
+      }
+      if (!rateBucket.tryTake()) {
+        firstUnpolled ??= i;
+        log.warn({ handle }, "rate bucket empty; skipping handle this tick");
+        continue;
+      }
+      // Stamp BEFORE the fetch (but after the rate-bucket take, so a token-starved
+      // skip retries next tick) — a throwing handle also cools down instead of
+      // being re-hammered every tick.
+      if (args.repollGate && watchLaneOnly) args.repollGate.stamp(handle);
+      // Stamp a person-first candidate as polled BEFORE the fetch, so one whose
+      // timeline errors cools down like everyone else instead of sitting at the
+      // front of the never-polled queue and being retried every tick.
+      const isCandidate = candidateHandles.includes(handle);
+      if (isCandidate && args.onPersonPolled) {
+        await args.onPersonPolled(handle).catch(() => {});
+      }
+      try {
+        const { tweets } = await fetchTweets(operation => operation.userTweets({
+          handle,
+          limit,
+          // Narrow to max(window, added_at). Posts from BEFORE a watchlist person
+          // was added are dropped client-side a few lines below (their history
+          // belongs to the profiler, not the reply pipeline) — and Apify bills
+          // PER ITEM, so without this bound the lane pays for rows it is
+          // guaranteed to discard. Only tightens the window, never widens it, and
+          // a targeting-only handle (no added_at) keeps the plain window.
+          // Gate on watchLaneOnly so this agrees with the backfill rule ~130
+          // lines below: a DUAL-ROLE handle (both a watch person and a targeting
+          // handle) deliberately keeps its pre-added_at posts as normal
+          // non-priority leads, so narrowing its fetch to added_at would cut
+          // exactly the targeting coverage that rule preserves.
+          sinceISO:
+            laterISO(sinceISO ?? "", watchLaneOnly ? peopleAddedAt.get(handle) : null) ||
+            undefined,
+          // Server-side operators: both would be billed then dropped client-side
+          // otherwise. Reposts never become leads at all (dropped uncondition-
+          // ally below), so retweets are always excluded server-side.
+          excludeReplies: config.excludeReplies,
+          excludeRetweets: true,
+        }));
+        batches.push(tweets);
+      } catch (err) {
+        // A DEAD POOL is systemic, not per-source: every remaining source would
+        // fail the same way, and swallowing it made the worker's own
+        // AllApifyTokensExhaustedError handler unreachable — discovery could sit
+        // dead for a day with no errored run and no alert (#494). But do NOT
+        // unwind straight out: tweets already fetched this tick were paid for
+        // and metered, and their handles are already on the re-poll cooldown, so
+        // throwing here would bin them and re-buy them later. Stop polling, fall
+        // through to persistence, and re-throw after the leads are saved.
+        if (err instanceof AllApifyTokensExhaustedError) {
+          exhausted = err;
+          break;
+        }
+        log.error({ handle, err: (err as Error).message }, "userTweets failed");
+      }
+    } else {
+      const keyword = src.value;
+      if (!rateBucket.tryTake()) {
+        firstUnpolled ??= i;
+        log.warn({ keyword }, "rate bucket empty; skipping keyword this tick");
+        continue;
+      }
+      try {
+        const query = buildSearchQuery(keyword, config, now);
+        const { tweets } = await fetchTweets(operation => operation.searchTimeline({ query, limit, sinceISO }));
+        batches.push(tweets);
+      } catch (err) {
+        // Systemic — see the handle lane above.
+        if (err instanceof AllApifyTokensExhaustedError) {
+          exhausted = err;
+          break;
+        }
+        log.error({ keyword, err: (err as Error).message }, "searchTimeline failed");
+      }
+    }
+  }
+  // Advance the cursor to the first source this tick could not poll (budget-
+  // deferred or rate-starved); a full pass wraps back to the head.
+  const advance = firstUnpolled ?? ring.length;
+  args.sourceCursor?.set(sources.length > 0 ? (offset + advance) % sources.length : 0);
+  if (cooledDown > 0) {
+    log.info(
+      { cooledDown, watchlistPeople: watchlistPeople.length },
+      "watch lane: handles skipped by re-poll cooldown",
+    );
+  }
+
+  // Surface a budget-truncated tick — never a silent cap. The deferred sources
+  // are the ring's tail, so the rotated next tick starts exactly there.
+  if (deferredHandles > 0 || deferredKeywords > 0) {
+    log.warn(
+      { instance: instance.id, deferredHandles, deferredKeywords, budgetMs: args.budgetMs },
+      "discovery tick hit its Apify time budget; deferring remaining sources to next tick",
+    );
+  }
+
+  const all = mergeDiscoveryTweets(batches);
+  for (const t of all) {
+    try {
+      // Reposts (native retweets) never become leads. The author is sharing
+      // someone else's words verbatim, so a reply would land on a stranger's
+      // tweet, not theirs. This runs BEFORE the priority/backfill checks so it
+      // covers BOTH lanes — a watchlist person's repost is dropped even though
+      // priority leads otherwise bypass the classifier + relevance gates.
+      // Quote-tweets are NOT reposts (is_repost=false) and still flow through.
+      if (t.is_repost) {
+        skippedRepost++;
+        continue;
+      }
+      // Replies (a post sitting under someone else's tweet) are dropped when
+      // excludeReplies is on, so the agent answers ORIGINAL posts, not buried
+      // comments. BOTH lanes also ask X to `-filter:replies` server-side now
+      // (buildSearchQuery for keywords, the from: query for handle polls), but
+      // those operators are best-effort — this client-side skip (on the
+      // normaliser's is_reply flag) stays as the guarantee for BOTH lanes. Runs
+      // before the priority/backfill checks so a watchlist person's replies are
+      // dropped too (priority leads otherwise bypass the classifier gate).
+      if (config.excludeReplies && t.is_reply) {
+        skippedReply++;
+        continue;
+      }
+      // PER-LANE ENGAGEMENT FLOOR. minFaves is a KEYWORD-lane heuristic: when
+      // trawling strangers, engagement is the only cheap proxy for "is this
+      // worth reading". It is the wrong instrument for the WATCH lane, where the
+      // operator already hand-picked the person — "the person is the gate, not
+      // the post" (#185). A watched founder's quiet 2-like question is exactly
+      // what Vega should answer, and dropping it at discovery meant the operator
+      // could add someone and still never see their posts.
+      //
+      // The old comment justified the blanket floor with "priority leads
+      // otherwise bypass the classifier gate". That is no longer true: watchlist
+      // leads are now classified like everything else, with the priority clamp's
+      // off-topic floor (CLAMP_MIN_Q) dropping genuinely off-topic ones. So the
+      // quality judgement happens where it belongs — on content, downstream —
+      // instead of on a like count at ingest.
+      //
+      // Only drops when the like count is KNOWN to be below: an unknown (null)
+      // count is never punished (mirrors author_followers), and for the search
+      // lane the server-side operator already filters the unknowns out.
+      const laneHandle = normHandle(t.author.handle);
+      const isWatchPerson = peopleAddedAt.has(laneHandle);
+      // PERSON-FIRST RETENTION. Decide "is this the right person" from their BIO
+      // and keep the ones that qualify, whether or not this particular tweet
+      // becomes a lead. Without it the author of every non-reply-worthy tweet is
+      // discarded and has to be rediscovered from scratch next time.
+      // Watchlist people are already retained by the watchlist itself, so they
+      // are skipped. Fail-open on a missing bio would retain everyone, so here —
+      // unlike the classifier's gate — an UNKNOWN bio does NOT qualify: this is
+      // a speculative prospect list, and filling it with unvetted handles would
+      // spend Apify budget polling strangers.
+      if (
+        args.recordDiscoveredPerson &&
+        !isWatchPerson &&
+        icpGateConfigured(args.icpGate) &&
+        qualifyByProfileText(t.author.bio, args.icpGate!, "reject").qualified
+      ) {
+        await args
+          .recordDiscoveredPerson({
+            handle: laneHandle,
+            authorId: t.author.id || null,
+            displayName: null,
+            bio: t.author.bio ?? null,
+          })
