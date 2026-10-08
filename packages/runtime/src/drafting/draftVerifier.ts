@@ -598,3 +598,203 @@ function antiAiTellHits(raw: string): string[] {
   for (let i = 0; hits.length < ANTI_AI_MAX_REASONS; i++) {
     const round = [markers[i], tells[i], words[i]].filter((r): r is string => r != null);
     if (round.length === 0) break;
+    for (const r of round) {
+      if (hits.length < ANTI_AI_MAX_REASONS) hits.push(r);
+    }
+  }
+  return hits;
+}
+
+// Negative parallelism receives a strong format penalty. A rare supported
+// contrast can still be queued; ordinary either/or phrasing should not match.
+// Keep the patterns aligned with the drafter prompt and incoming-post policy.
+const REFRAME_PATTERNS: RegExp[] = [
+  // negate → re-assert: "isn't a win, it's a countdown timer" / "is not X, it's Y"
+  /\b(?:isn'?t|aren'?t|wasn'?t|weren'?t|ain'?t|is not|are not|was not|were not)\b[^.?!;\n]{1,55},\s+(?:it'?s|it is|its|that'?s|that is|they'?re|they are)\b/i,
+  // affirm → negate tail: "a filter, not a handicap" / "the deciding, not the doing"
+  /,\s+not\s+(?:a|an|the|your|my|his|her|their|its|about|some|another)\s+\w/i,
+  // amplifier: "not just X, it's Y" / "not only X, but Y"
+  /\bnot\s+(?:just|only|merely|simply)\b[^.?!;\n]{1,55},?\s+(?:it'?s|it is|but|they'?re|that'?s)\b/i,
+  // slogan antitheses: "X is dead, Y is the future" / "stop Xing, start Ying" / "less X, more Y"
+  /\bis dead\b[^.?!\n]{0,40}?\bis the future\b/i,
+  /\bstop\s+\w+ing\b[^.?!\n]{0,40}?\bstart\s+\w+ing\b/i,
+  /\bless\s+\w+,?\s+more\s+\w+\b/i,
+];
+
+/** How many DISTINCT contrastive-reframe patterns a body leans on (0 = clean). */
+function reframeCrutchHits(body: string): number {
+  let n = 0;
+  for (const re of REFRAME_PATTERNS) if (re.test(body)) n++;
+  return n;
+}
+
+// Contrastive-reframe penalty sizing. One distinct lean → 0.5 (below the 0.7 pass
+// bar, so it regenerates); each extra distinct pattern piles on; capped below 1.0
+// so it is never a guaranteed hard zero (a rare, genuinely-best single use can
+// still win the best-of-set selection). Applies to posts AND replies.
+const REFRAME_BASE_PENALTY = 0.5;
+const REFRAME_STACK_PENALTY = 0.4;
+const REFRAME_MAX_PENALTY = 0.9;
+
+// House-skeleton penalty (see ../houseSkeleton.ts). Sized ABOVE the soft tier
+// (AUTO_PATTERN / HONESTLY = 0.3, which one hit survives) because this is not a
+// texture tic the operator's real voice uses — it is the single most repeated
+// SHAPE across both interns: the narrow frames alone hit ~16% of Lyra's live
+// drafts and ~11% of Vega's over 30 days. One canned frame should drop below the
+// bar and regenerate. Not a hard zero: the check is lexical, so a rare sentence
+// where the frame genuinely is the right words can still survive best-of-set.
+const HOUSE_SKELETON_BASE_PENALTY = 0.4;
+const HOUSE_SKELETON_STACK_PENALTY = 0.3;
+const HOUSE_SKELETON_MAX_PENALTY = 0.9;
+
+// Choppy "fragment. fragment. fragment." — a top AI tell. Flag a body carried by
+// 3+ terminal stops of short, stacked declaratives with little connective tissue
+// (the operator: "avoid using periods", "text. text. text."). Tightened from the
+// old avg<28 so normal-length staccato ("This is sharp. The gap is real. Curious
+// how it lands.") is also caught.
+function looksChoppy(body: string): boolean {
+  const sentences = body.split(/[.!?]+(?:\s+|$)/).filter((s) => s.trim().length > 0);
+  if (sentences.length < 3) return false;
+  const connectors = /\b(and|but|so|because|though|while|yet|honestly|yeah|plus|which|that's why)\b/i;
+  const glued = sentences.filter((s) => connectors.test(s)).length;
+  const avgLen = body.length / sentences.length;
+  // 3+ stops AND either short stacked declaratives OR almost no connective tissue.
+  return avgLen < 55 || glued <= 1;
+}
+
+// Broken/garbled output: the same sentence or clause repeated (e.g. "you want
+// me to mass. you want me to mass."), or an immediately-repeated phrase. This is
+// never intentional — it's a model hiccup that reads as obvious slop. Returns
+// the offending text, or null. Normalizes case/punctuation; ignores very short
+// fragments so deliberate one-word echoes ("ship. ship.") don't trip it.
+function repeatedFragment(body: string): string | null {
+  const norm = (s: string) => s.trim().toLowerCase().replace(/[^a-z0-9 ]+/g, "").replace(/\s+/g, " ").trim();
+  const sentences = body.split(/[.!?\n]+/).map(norm).filter((s) => s.split(" ").length >= 3);
+  const seen = new Set<string>();
+  for (const s of sentences) {
+    if (seen.has(s)) return s;
+    seen.add(s);
+  }
+  // Immediately-repeated 3+ word phrase within a sentence ("you want me to mass you want me to mass").
+  const m = norm(body).match(/\b(\w+(?: \w+){2,})\s+\1\b/);
+  return m ? m[1]! : null;
+}
+
+/**
+ * Deterministic format/policy score for one draft. No LLM. Returns 1.0 when
+ * clean; deducts for over-limit length, em-dashes, choppy-period style, and
+ * HARD-ZEROES on banned slop phrases or repeated/garbled text.
+ */
+export function scoreFormat(
+  draft: DraftToVerify,
+  charLimit?: number,
+  allowCelebration = false,
+  strictVoice = false,
+  dynamicPatterns?: DynamicPattern[],
+): { score: number; reasons: string[] } {
+  // `strictVoice` is the LinkedIn/Lyra gate: it turns on the "honestly" filler
+  // ban AND the anti-ai skill's reader-mode sweep (significance markers, AI
+  // constructions, tier-1 wordbank). Kept as one flag because both come from the
+  // same operator decision — Lyra holds the tightest voice bar of the three
+  // interns, and she is draft-only so a false positive costs a regenerate, not a
+  // bad public reply.
+  const reasons: string[] = [];
+  let score = 1;
+  const len = [...draft.body].length;
+  if (charLimit && len > charLimit) {
+    reasons.push(`over length: ${len} > ${charLimit} chars — cut it down`);
+    // Scale the penalty with how far over (a 5% overflow shouldn't equal 2x).
+    score -= Math.min(0.6, ((len - charLimit) / charLimit) * 2 + 0.2);
+  }
+  // Em dash → HARD ZERO. There is no acceptable use; one occurrence fails the
+  // draft outright (operator: "an em dash should be considered a 0 value").
+  if (EM_DASH.test(draft.body)) {
+    reasons.push("contains an em dash / double hyphen (—) — BANNED, never use one; rewrite with a comma or two sentences");
+    score = 0;
+  }
+  // Named slop tells → HARD ZERO. These are the exact phrasings flagged over and
+  // over; any hit fails the draft and the reason tells the drafter what to drop.
+  for (const label of slopPhraseHits(draft.body, allowCelebration)) {
+    reasons.push(`AI-slop phrasing: ${label} — cut it entirely, say something specific instead`);
+    score = 0;
+  }
+  // Contrastive-reframe crutch ("not X, it's Y" / "is X, not Y") → STRONG penalty
+  // (one distinct lean fails the pass bar and regenerates; a stack drives it near
+  // zero). Deliberately NOT a hard zero so a rare, genuinely-best single contrast
+  // can still survive best-of-set — targeted at OVERUSE, not all contrast.
+  const reframeHits = reframeCrutchHits(draft.body);
+  if (reframeHits > 0) {
+    reasons.push(
+      "contrastive-reframe crutch (the 'not X, it's Y' / 'is X, not Y' antithesis, e.g. \"raising $8M isn't a win, it's a countdown timer\") — the operator flagged this shape as over-used; state the positive claim as a plain declarative and delete the rejected half, don't define by negation",
+    );
+    score -= Math.min(REFRAME_MAX_PENALTY, REFRAME_BASE_PENALTY + (reframeHits - 1) * REFRAME_STACK_PENALTY);
+  }
+  // Filler-hedge tic, scoped to platforms that ban it (LinkedIn/Lyra): "honestly"
+  // as a crutch is a tell the operator flagged and asked be killed. Other platforms
+  // (e.g. X) keep "honestly" as intentional casual filler, so this fires only when
+  // the caller opts in via strictVoice.
+  // SOFT, not a hard zero (operator decision). The prompt has always allowed a
+  // single natural "honestly"/"tbh" as texture because the operator talks that
+  // way, while this check hard-zeroed every occurrence — the two disagreed, and
+  // the verifier was winning. Across 1646 live drafts, 72 used "honestly" and 51
+  // of those (71%) were the mid-sentence texture the prompt explicitly permits.
+  //
+  // Sized like AUTO_PATTERN_PENALTY and for the same reason: ONE use on an
+  // otherwise-clean draft still clears the bar (1 - 0.3 = 0.7), so the operator's
+  // real voice survives, while leaning on it twice (0.4) or once alongside any
+  // other tell drops below and regenerates. That stacking is what keeps the tic
+  // from drifting back now that nothing hard-stops it.
+  if (strictVoice) {
+    const honestlyHits = draft.body.match(/\bhonestly\b/gi)?.length ?? 0;
+    if (honestlyHits > 0) {
+      reasons.push(
+        honestlyHits > 1
+          ? `'honestly' used ${honestlyHits}x — leaning on it is a filler tic, keep at most one and only mid-sentence`
+          : "'honestly' as filler — fine as texture mid-sentence, but never as a throat-clearing opener or tacked on the end; if it's just hedging, cut it",
+      );
+      score -= Math.min(0.9, HONESTLY_PENALTY * honestlyHits);
+    }
+  }
+  // anti-ai skill sweep → HARD ZERO, same weight as SLOP_PHRASES. A significance
+  // marker alone was sufficient for a 100% AI verdict in the skill's field test,
+  // so these are not worth a soft penalty.
+  if (strictVoice) {
+    for (const reason of antiAiTellHits(draft.body)) {
+      reasons.push(reason);
+      score = 0;
+    }
+  }
+  // HOUSE SKELETON — "lift a detail out of their post, make it the subject,
+  // attach a verdict to it". Replies only: a DM is a different register and these
+  // frames are not a tell there. The reason string names the frame AND the
+  // positive rewrite, so a regenerate is told what to write, not only what to cut.
+  if (draft.kind === "reply") {
+    const skeletonHits = houseSkeletonHits(draft.body);
+    if (skeletonHits.length > 0) {
+      for (const label of skeletonHits) reasons.push(`house skeleton: ${label}`);
+      score -= Math.min(
+        HOUSE_SKELETON_MAX_PENALTY,
+        HOUSE_SKELETON_BASE_PENALTY + (skeletonHits.length - 1) * HOUSE_SKELETON_STACK_PENALTY,
+      );
+    }
+  }
+  if (draft.kind === "reply" && looksChoppy(draft.body)) {
+    reasons.push("choppy 'sentence. sentence. sentence.' staccato (AI tell) — glue clauses into flowing prose with connectors (and, but, so, because), stop over-using periods");
+    score -= 0.5;
+  }
+  // Repeated/garbled text → HARD ZERO. Applies to every kind (replies + posts):
+  // a duplicated sentence or immediately-repeated phrase is broken output, the
+  // most blatant slop. Regenerate.
+  const dup = repeatedFragment(draft.body);
+  if (dup) {
+    reasons.push(`repeated/garbled text ("${dup.slice(0, 40)}…") — broken output, rewrite it cleanly with no duplicated lines`);
+    score = 0;
+  }
+  // Learned 'phrase' rules from the Pattern Breaker. Operator-confirmed rules
+  // ('refined'/'manual') and undefined-source rules HARD-ZERO like SLOP_PHRASES.
+  // AUTO-detected rules are a SOFT penalty: occasional reuse is allowed
+  // (a lone hit still clears
+  // the bar) and the rolling-window `diversity` check carries the real
+  // anti-repetition load.
+  for (const p of dynamicPatternHits(draft.body, dynamicPatterns)) {
+    // Public replies have an explicit NO FULL STOPS rule. An automatic corpus
