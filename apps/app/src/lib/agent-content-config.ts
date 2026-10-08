@@ -198,3 +198,177 @@ const VEGA: AgentContentConfig = {
     quietStartHourUtc: 6,
     quietEndHourUtc: 13,
     defaultWindowsUtc: [14, 17, 21],
+    predraftHorizonDays: 14,
+    jitHorizonHours: 36,
+  },
+  draftOnly: false,
+};
+
+const LYRA: AgentContentConfig = {
+  role: "linkedin_intern",
+  platform: "linkedin",
+  identity: { agent: "Lyra", label: "LinkedIn", glyph: "linkedin-intern", color: "var(--info)", sub: "posts · comments" },
+  copy: { titleEm: "Lyra", titleTail: " · LinkedIn", sub: `Lyra's lane · posts · comments. ${GROUNDED}` },
+  sections: [...AGENT_SECTIONS],
+  defaultSection: "overview",
+  dataSource: "org",
+  headerActions: textHeaderActions,
+  capabilities: {
+    canAutoPost: false,
+    canIdeate: true,
+    draftKinds: ["reply", "dm", "post"],
+    hasInboundReplies: false,
+    hasEngagementData: false,
+    hasTrending: false,
+    hasVideoStudio: false,
+  },
+  source: { kind: "connections", watchlistTables: [] },
+  scheduling: {
+    canPost: false,
+    maxPerDay: 4,
+    minDelaySec: 1800,
+    maxDelaySec: 9000,
+    quietStartHourUtc: 6,
+    quietEndHourUtc: 13,
+    defaultWindowsUtc: [13, 16],
+    predraftHorizonDays: 14,
+    jitHorizonHours: 36,
+  },
+  draftOnly: true,
+};
+
+const ORION: AgentContentConfig = {
+  role: "reddit_intern",
+  platform: "reddit",
+  identity: { agent: "Orion", label: "Reddit", glyph: "reddit-intern", color: "var(--ok)", sub: "replies" },
+  copy: { titleEm: "Orion", titleTail: " · Reddit", sub: `Orion's lane · replies. ${GROUNDED}` },
+  sections: [...AGENT_SECTIONS],
+  defaultSection: "overview",
+  dataSource: "org",
+  headerActions: textHeaderActions,
+  capabilities: {
+    canAutoPost: false,
+    canIdeate: false,
+    draftKinds: ["reply", "post"],
+    hasInboundReplies: false,
+    hasEngagementData: false,
+    hasTrending: false,
+    hasVideoStudio: false,
+  },
+  source: { kind: "subreddits", watchlistTables: [] },
+  scheduling: {
+    canPost: false,
+    maxPerDay: 4,
+    minDelaySec: 1800,
+    maxDelaySec: 9000,
+    quietStartHourUtc: 6,
+    quietEndHourUtc: 13,
+    defaultWindowsUtc: [15, 23],
+    predraftHorizonDays: 14,
+    jitHorizonHours: 36,
+  },
+  draftOnly: true,
+};
+
+const NOVA: AgentContentConfig = {
+  role: "video_intern",
+  platform: "video",
+  identity: { agent: "Nova", label: "Video", glyph: "video-intern", color: "oklch(0.58 0.13 305)", sub: "IG · TikTok", isNew: true },
+  copy: {
+    titleEm: "Nova",
+    titleTail: " · Video",
+    sub: "Nova's lane · IG · TikTok. Plan, structure, and script short-form video — grounded on what actually performs for the creators you watch. Nothing posts; you record by hand.",
+  },
+  sections: [...AGENT_SECTIONS],
+  defaultSection: "overview",
+  dataSource: "instance",
+  headerActions: (ctx) =>
+    ctx.instanceId
+      ? [
+          { label: "Creators & harvest →", href: `/app/${ctx.orgSlug}/agents/${ctx.instanceId}/watchlist` },
+          { label: "My analytics →", href: `/app/${ctx.orgSlug}/agents/${ctx.instanceId}/analytics` },
+          { label: "Brand Guide →", href: `/app/${ctx.orgSlug}/agents/${ctx.instanceId}/brand-guide` },
+          { label: "◆ Voice vault", href: `/app/${ctx.orgSlug}/vault` },
+        ]
+      : [{ label: "◆ Voice vault", href: `/app/${ctx.orgSlug}/vault` }],
+  capabilities: {
+    canAutoPost: false,
+    canIdeate: true,
+    draftKinds: ["video_script"],
+    hasInboundReplies: false,
+    hasEngagementData: true,
+    hasTrending: false,
+    hasVideoStudio: true,
+  },
+  source: { kind: "creators", watchlistTables: [] },
+  scheduling: {
+    canPost: false,
+    maxPerDay: 2,
+    minDelaySec: 1800,
+    maxDelaySec: 9000,
+    quietStartHourUtc: 6,
+    quietEndHourUtc: 13,
+    defaultWindowsUtc: [16, 22],
+    predraftHorizonDays: 14,
+    jitHorizonHours: 36,
+  },
+  draftOnly: true,
+};
+
+/** The aggregate "All" lane — a view, not an agent. Never gains compose/schedule. */
+export const ALL_AGGREGATE: WorkspaceLaneView = {
+  role: null,
+  platform: "all",
+  identity: { agent: "—", label: "All", glyph: null, color: "var(--ink)", sub: "" },
+  copy: {
+    titleEm: "Content studio",
+    sub: "Plan ideas, review drafts, and manage media across your content channels.",
+  },
+  sections: [...BASE_SECTIONS],
+  defaultSection: "overview",
+  dataSource: "org",
+  headerActions: textHeaderActions,
+};
+
+export const AGENT_CONTENT_CONFIGS: Record<ContentAgentRole, AgentContentConfig> = {
+  x_intern: VEGA,
+  linkedin_intern: LYRA,
+  reddit_intern: ORION,
+  video_intern: NOVA,
+};
+
+/** Platform → config map (excludes the "all" aggregate). */
+export const CONFIG_BY_PLATFORM: Record<Exclude<ContentPlatform, "all">, AgentContentConfig> = {
+  x: VEGA,
+  linkedin: LYRA,
+  reddit: ORION,
+  video: NOVA,
+};
+
+/** Switcher order: All first, then LinkedIn · X · Reddit · Video. */
+export const LANE_VIEWS: WorkspaceLaneView[] = [
+  ALL_AGGREGATE,
+  LYRA,
+  VEGA,
+  ORION,
+  NOVA,
+];
+
+export function platformToRole(platform: ContentPlatform): ContentAgentRole | null {
+  if (platform === "all") return null;
+  return CONFIG_BY_PLATFORM[platform].role;
+}
+
+export function roleToPlatform(role: ContentAgentRole): Exclude<ContentPlatform, "all"> {
+  return AGENT_CONTENT_CONFIGS[role].platform;
+}
+
+/** Resolve the lane view for a `?platform=` value (defaults to the aggregate). */
+export function configForPlatform(platform: ContentPlatform): WorkspaceLaneView {
+  if (platform === "all") return ALL_AGGREGATE;
+  return CONFIG_BY_PLATFORM[platform];
+}
+
+export function configForRole(role: ContentAgentRole): AgentContentConfig {
+  return AGENT_CONTENT_CONFIGS[role];
+}
