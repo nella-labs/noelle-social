@@ -198,3 +198,21 @@ describe("ActuatorApi (X)", () => {
     const fetchImpl = vi.fn<typeof fetch>(async () => jsonResponse({ error: "down" }, 503));
     const api = new ActuatorApi(config, fetchImpl as unknown as typeof fetch);
     await expect(api.health()).rejects.toThrow();
+  });
+
+  it("default fetch is bound to the global scope (avoids 'Illegal invocation')", async () => {
+    // The browser throws "Illegal invocation" if fetch runs with `this` set to
+    // anything but the realm global. The default fetchImpl must be bound so that
+    // calling it as `this.fetchImpl(...)` still runs with this === globalThis.
+    const original = globalThis.fetch;
+    const fetchImpl = vi.fn<typeof fetch>(async () => jsonResponse({}));
+    globalThis.fetch = fetchImpl;
+    try {
+      const api = new ActuatorApi(config); // no fetchImpl → exercises the default
+      await api.markSent("d");
+      expect(fetchImpl.mock.contexts).toEqual([globalThis]);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
