@@ -398,3 +398,155 @@ aws iam create-access-key --user-name noelle-ses-readonly
 ```
 
 If creds are absent the SES card shows a placeholder + a deep-link to the
+AWS SES console. Sandbox vs production never silently fails — it's read
+from `ProductionAccessEnabled` on every page load.
+
+---
+
+## 10. Wiring Supabase auth through SES (optional but recommended)
+
+By default Supabase sends auth mail from `noreply@mail.app.supabase.io` —
+not branded, not aligned with our DMARC. Point it at SES:
+
+Supabase Dashboard → Project settings → Auth → SMTP settings:
+
+| Field | Value |
+|---|---|
+| Enable custom SMTP | ON |
+| Sender name | Noelle |
+| Sender email | `auth@trynoelle.com` |
+| Host | `email-smtp.us-east-1.amazonaws.com` |
+| Port | 587 |
+| Username | (create a second IAM SMTP user, `noelle-supabase-smtp`) |
+| Password | (stored in GCP Secret Manager + Supabase settings) |
+| Minimum interval between emails per recipient | 60s |
+
+Use a **separate** IAM SMTP user for Supabase so the credential can be
+rotated independently of Listmonk. Both go through the same SES identity
+(`trynoelle.com`), so DKIM + DMARC just work.
+
+After this is wired, the auth templates in `supabase/templates/*` are sent
+**from your domain, signed by your DKIM key, aligned with your DMARC** — and
+the SES reviewer can see the full setup is real and working.
+
+---
+
+## 11. Smoke tests (before applying)
+
+Run these from inside the SES sandbox (you're capped to verified recipient
+addresses until production access is granted, but the tests below all work
+within that constraint):
+
+1. **mail-tester.com** — copy the address it gives you, verify it in SES
+   sandbox first (Identities → Create identity → Email address), then send
+   a Listmonk test campaign to it. Goal: **10/10**.
+2. **dmarcanalyzer.com / dmarc.postmarkapp.com** — send a test to their
+   address, get a DMARC alignment report.
+3. **mxtoolbox.com** — check `trynoelle.com` and `mail.trynoelle.com` for
+   SPF, DKIM, DMARC syntax.
+4. **Send to a Gmail you own** — verified in sandbox — and inspect headers.
+   Confirm `Authentication-Results: dkim=pass; spf=pass; dmarc=pass`.
+
+Any failure here is a SES rejection waiting to happen. Fix before applying.
+
+---
+
+## 12. Apply for SES production access
+
+SES console → Account dashboard → Request production access.
+
+**Use type**: Transactional **and** Marketing (be honest — split your answer).
+
+**Website URL**: `https://trynoelle.com`
+
+**Describe how you will send email** — paste the following, adjusted for any
+factual specifics:
+
+> Noelle (trynoelle.com) is a SaaS that helps small teams hire AI agents
+> organized as a real company. We send three categories of email, each from
+> a separate sender identity inside this AWS account:
+>
+> 1. **Authentication mail** (`auth@trynoelle.com`) — magic links, email
+>    confirmations, password resets, and email-change confirmations. These
+>    are triggered by individual user actions inside the product and are
+>    sent via SMTP from our Supabase auth service. Volume scales 1:1 with
+>    sign-ins; we project under 5,000 per month for the next six months.
+>
+> 2. **Transactional product mail** (`noelle@trynoelle.com`) — invitations
+>    to a workspace, security notices, billing receipts. Triggered by
+>    explicit user actions. Volume under 2,000 per month.
+>
+> 3. **Marketing / product update mail** (`news@mail.trynoelle.com`) — sent
+>    via Listmonk (self-hosted, GCP) to users who explicitly opted in
+>    inside the product or via a double-opt-in form on our marketing site.
+>    Campaigns are sent at most twice per month. Volume under 10,000 per
+>    month at current list size.
+>
+> **List acquisition**: 100% opt-in. Users opt in during product signup
+> (logged with timestamp + IP in our database) or via a double-opt-in form
+> on trynoelle.com (Listmonk-managed confirmation). We have never imported
+> a purchased, scraped, or third-party list and never will.
+>
+> **Unsubscribe**: every marketing email includes a one-click unsubscribe
+> link in the footer rendered by Listmonk (`List-Unsubscribe` and
+> `List-Unsubscribe-Post` headers also set). Unsubscribes are processed
+> immediately and the recipient is moved to a permanent blocklist. Auth
+> and transactional mail do not include an unsubscribe link, as is
+> standard for transactional mail under CAN-SPAM §7702 and GDPR.
+>
+> **Bounce + complaint handling**: SES is configured with a configuration
+> set `noelle-default` that publishes Bounce, Complaint, Delivery, Reject,
+> and Rendering Failure events to an SNS topic. The topic delivers to a
+> Listmonk HTTPS webhook that auto-blocklists any recipient after one
+> complaint or two hard bounces. We monitor the SES reputation dashboard
+> weekly and alert if bounce rate > 2% or complaint rate > 0.1%.
+>
+> **Authentication**: both sender domains (`trynoelle.com` and
+> `mail.trynoelle.com`) are verified in SES with DKIM (RSA 2048) and
+> custom MAIL FROM domains (`bounces.trynoelle.com` and
+> `bounces.mail.trynoelle.com`) so the envelope sender is aligned with
+> the header From: for strict DMARC alignment. DMARC policy is currently
+> `p=none` with aggregate reporting to `dmarc@trynoelle.com` and will be
+> moved to `p=quarantine` once 30 days of clean reports are collected.
+
+**Recipients**: only users who have signed up to a Noelle account, or who
+have submitted and double-opted-in via the waitlist form on trynoelle.com.
+
+**How will you handle bounces and complaints?**
+
+> Automated, via SNS → Listmonk webhook. One complaint or two hard bounces
+> moves the address to a permanent blocklist. We also subscribe to the
+> SES reputation dashboard alerts and treat any dip below 95% as a P1.
+
+**Compliance**: read AWS AUP, will not send unsolicited mail, will honor
+unsubscribe within 10 calendar days (SES standard).
+
+---
+
+## 13. After approval — reputation hygiene
+
+1. **Warm up gradually**: Listmonk supports per-campaign send rates. First
+   campaign max 1,000 recipients; double weekly until you're hitting full
+   list size. SES auto-throttle helps but a steep ramp can still flag the
+   shared IP pool.
+2. **Monitor**: weekly check of SES reputation dashboard. Set a CloudWatch
+   alarm on Bounce Rate > 2% and Complaint Rate > 0.1%.
+3. **DMARC**: after 30 days of clean aggregate reports, move policy from
+   `p=none` to `p=quarantine`. Another 30 days clean → `p=reject`.
+4. **List hygiene**: every 6 months, prune subscribers with zero opens in
+   12 months. Cold subscribers tank engagement metrics with the major
+   inbox providers.
+5. **Rotate SMTP creds yearly** — there are two IAM users, one for
+   Listmonk and one for Supabase, so they rotate independently with no
+   user-facing downtime.
+
+---
+
+## 14. References
+
+- SES sender authentication: https://docs.aws.amazon.com/ses/latest/dg/send-email-authentication.html
+- SES Custom MAIL FROM: https://docs.aws.amazon.com/ses/latest/dg/mail-from.html
+- Listmonk SES bounce handling: https://listmonk.app/docs/bounces/
+- Cloudflare Email Routing: https://developers.cloudflare.com/email-routing/
+- DMARC policy stepup: https://dmarc.org/overview/
+- AWS AUP: https://aws.amazon.com/aup/
