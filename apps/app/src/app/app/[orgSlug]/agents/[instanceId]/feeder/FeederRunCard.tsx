@@ -198,3 +198,16 @@ export function FeederRunCard({
       >
         Last pulled: {rel(status.lastRunAt, now)}
         {inFlight ? " · pull running, this can take a minute…" : null}
+      </div>
+
+      {status.state === "errored" && status.lastError ? (
+        <div style={{ marginTop: 8, fontSize: 11.5, color: "var(--warn)" }}>
+          Last run failed: {status.lastError}
+        </div>
+      ) : null}
+      {error ? (
+        <div style={{ marginTop: 8, fontSize: 11.5, color: "var(--warn)" }}>{error}</div>
+      ) : null}
+    </section>
+  );
+}
