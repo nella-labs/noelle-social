@@ -198,3 +198,203 @@ importers:
         version: 3.25.76
     devDependencies:
       '@tailwindcss/postcss':
+        specifier: ^4.3.0
+        version: 4.3.0
+      '@types/node':
+        specifier: ^25.9.3
+        version: 25.9.3
+      '@types/react':
+        specifier: ^19.2.17
+        version: 19.2.17
+      '@types/react-dom':
+        specifier: ^19.2.3
+        version: 19.2.3(@types/react@19.2.17)
+      eslint:
+        specifier: ^10
+        version: 10.4.0(jiti@2.7.0)
+      eslint-config-next:
+        specifier: ^16.2.6
+        version: 16.2.6(@typescript-eslint/parser@8.59.3(eslint@10.4.0(jiti@2.7.0))(typescript@6.0.3))(eslint@10.4.0(jiti@2.7.0))(typescript@6.0.3)
+      jsdom:
+        specifier: ^29.1.1
+        version: 29.1.1
+      postcss:
+        specifier: ^8.4.49
+        version: 8.5.14
+      sharp:
+        specifier: 0.34.5
+        version: 0.34.5
+      tailwindcss:
+        specifier: ^4.3.0
+        version: 4.3.0
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.6
+        version: 4.1.6(@types/node@25.9.3)(jsdom@29.1.1)(vite@6.4.3(@types/node@25.9.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.22.4)(yaml@2.9.0))
+
+  apps/chrome-bridge:
+    dependencies:
+      '@hono/node-server':
+        specifier: ^1.13.5
+        version: 1.19.14(hono@4.12.19)
+      '@noelle/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      hono:
+        specifier: ^4.6.10
+        version: 4.12.19
+      pino:
+        specifier: ^9.5.0
+        version: 9.14.0
+      zod:
+        specifier: ^3.23.8
+        version: 3.25.76
+    devDependencies:
+      '@types/node':
+        specifier: ^25.9.3
+        version: 25.9.3
+      tsx:
+        specifier: ^4.22.4
+        version: 4.22.4
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.6
+        version: 4.1.6(@types/node@25.9.3)(jsdom@29.1.1)(vite@6.4.3(@types/node@25.9.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.22.4)(yaml@2.9.0))
+
+  apps/chrome-bridge-ext:
+    dependencies:
+      '@noelle/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+    devDependencies:
+      '@types/chrome':
+        specifier: ^0.0.270
+        version: 0.0.270
+      '@types/node':
+        specifier: ^25.9.1
+        version: 25.9.3
+      jsdom:
+        specifier: ^25.0.1
+        version: 25.0.1
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.6
+        version: 4.1.6(@types/node@25.9.3)(jsdom@25.0.1)(vite@6.4.3(@types/node@25.9.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.22.4)(yaml@2.9.0))
+      wxt:
+        specifier: ^0.19.0
+        version: 0.19.29(@types/node@25.9.3)(lightningcss@1.32.0)(rollup@4.61.1)(tsx@4.22.4)(yaml@2.9.0)
+
+  apps/chrome-bridge-mcp:
+    dependencies:
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.26.0
+        version: 1.29.0(zod@3.25.76)
+      '@noelle/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@noelle/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
+      zod:
+        specifier: ^3.23.8
+        version: 3.25.76
+    devDependencies:
+      '@types/node':
+        specifier: ^25.9.3
+        version: 25.9.3
+      tsx:
+        specifier: ^4.22.4
+        version: 4.22.4
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.6
+        version: 4.1.6(@types/node@25.9.3)(jsdom@29.1.1)(vite@6.4.3(@types/node@25.9.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.22.4)(yaml@2.9.0))
+
+  apps/cli:
+    dependencies:
+      '@noelle/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@noelle/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
+      '@noelle/secrets':
+        specifier: workspace:*
+        version: link:../../packages/secrets
+      jose:
+        specifier: ^6.1.0
+        version: 6.2.3
+      pm2:
+        specifier: ^6.0.5
+        version: 6.0.14
+      postgres:
+        specifier: ^3.4.5
+        version: 3.4.9
+    devDependencies:
+      '@types/node':
+        specifier: ^25.9.3
+        version: 25.9.3
+      tsx:
+        specifier: ^4.22.4
+        version: 4.22.4
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.6
+        version: 4.1.6(@types/node@25.9.3)(jsdom@29.1.1)(vite@6.4.3(@types/node@25.9.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.22.4)(yaml@2.9.0))
+
+  apps/linkedin-actuator:
+    dependencies:
+      '@noelle/actuator-cdp':
+        specifier: workspace:*
+        version: link:../../packages/actuator-cdp
+      '@noelle/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+    devDependencies:
+      '@types/chrome':
+        specifier: ^0.0.270
+        version: 0.0.270
+      '@types/node':
+        specifier: ^25.9.1
+        version: 25.9.3
+      jsdom:
+        specifier: ^25.0.1
+        version: 25.0.1
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.6
+        version: 4.1.6(@types/node@25.9.3)(jsdom@25.0.1)(vite@6.4.3(@types/node@25.9.3)(jiti@2.7.0)(lightningcss@1.32.0)(tsx@4.22.4)(yaml@2.9.0))
+      wxt:
+        specifier: ^0.19.0
+        version: 0.19.29(@types/node@25.9.3)(lightningcss@1.32.0)(rollup@4.61.1)(tsx@4.22.4)(yaml@2.9.0)
+
+  apps/linkedin-intern:
+    dependencies:
+      '@noelle/agents':
+        specifier: workspace:*
+        version: link:../../packages/agents
+      '@noelle/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@noelle/linkedin-apify':
+        specifier: workspace:*
+        version: link:../../packages/linkedin-apify
+      '@noelle/linkedin-client':
+        specifier: workspace:*
+        version: link:../../packages/linkedin-client
+      '@noelle/runtime':
+        specifier: workspace:*
+        version: link:../../packages/runtime
+      '@noelle/secrets':
