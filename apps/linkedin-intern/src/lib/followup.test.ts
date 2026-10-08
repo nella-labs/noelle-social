@@ -198,3 +198,65 @@ describe("buildConnectionBrief", () => {
   it.each(["Curious how you chose the controller?", "the line that stuck with me was the force loop"])("blocks a repeatedly rejected follow-up: %s", async (dm) => {
     const { runner, calls } = stubRunner([brief({ dm })]);
     expect(await buildConnectionBrief({ runner, ...baseArgs })).toBeNull();
+    expect(calls).toHaveLength(2);
+  });
+
+  it("prunes a stray empty bullet instead of rejecting the whole brief", async () => {
+    const { runner } = stubRunner([
+      JSON.stringify({
+        common_ground: ["Both build hard hardware"],
+        talking_points: ["Force control shipped", "", "   "],
+        questions: ["What broke first?", ""],
+        followup_dm: "six months for force control is wild. what fought back hardest?",
+      }),
+    ]);
+    const out = await buildConnectionBrief({ runner, ...baseArgs });
+    expect(out).not.toBeNull();
+    expect(out?.talkingPoints).toEqual(["Force control shipped"]);
+    expect(out?.questions).toEqual(["What broke first?"]);
+  });
+
+  it("strips em-dashes from questions + talking points, not only the DM", async () => {
+    const { runner } = stubRunner([
+      JSON.stringify({
+        common_ground: [],
+        talking_points: ["Shipped force control — after six months"],
+        questions: ["What surprised you — the actuator or the controller?"],
+        followup_dm: "what fought back hardest while tuning the force loop?",
+      }),
+    ]);
+    const out = await buildConnectionBrief({ runner, ...baseArgs });
+    expect(out?.questions[0]).not.toContain("—");
+    expect(out?.talkingPoints[0]).not.toContain("—");
+  });
+
+  it("regenerates when the DM ends with a banned 'Let me know' closer", async () => {
+    const { runner, calls } = stubRunner([
+      brief({ dm: "your force-control ship stuck with me. what fought back hardest? Let me know what you land on." }),
+      brief({ dm: "your force-control ship stuck with me. what fought back hardest?" }),
+    ]);
+    const out = await buildConnectionBrief({ runner, ...baseArgs });
+    expect(calls).toHaveLength(2);
+    expect(out?.followupDm).toBe("your force-control ship stuck with me. what fought back hardest?");
+  });
+});
+
+describe("scrubFollowupDm", () => {
+  it("unwraps a real 'Here's a DM:' instruction wrapper + quotes and strips em-dashes", () => {
+    expect(scrubFollowupDm(`Here's a DM: "nice work — really sharp"`)).toBe("nice work, really sharp");
+  });
+
+  it("preserves a legitimate warm 'Here's what ...:' opener (not a wrapper)", () => {
+    const dm = "Here's what stuck with me: your closed-loop force control ship. what fought back hardest?";
+    expect(scrubFollowupDm(dm)).toBe(dm);
+  });
+
+  it("does not strip a lone closing quote when the DM isn't a wrapped pair", () => {
+    const dm = 'that idea you called your "moat" is the part I keep thinking about.';
+    expect(scrubFollowupDm(dm)).toBe(dm);
+  });
+
+  it("keeps a single paragraph break but collapses blank-line runs", () => {
+    expect(scrubFollowupDm("line one\n\n\n\nline two")).toBe("line one\n\nline two");
+  });
+});
