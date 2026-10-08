@@ -198,3 +198,22 @@ describe("handleTokenFatal — verify before invalidating (parity with the Linke
 
 describe("resolved reactive credential scope", () => {
   it("binds the actual resolver organization and captured stored key to its fatal callback", async () => {
+    const db = await import("./connections-db.js");
+    const { checkApifyToken } = await import("@noelle/reddit-apify");
+    const rotation = await import("./apify-rotating.js");
+    vi.mocked(checkApifyToken).mockResolvedValue({ alive: false, httpStatus: 401 });
+    vi.mocked(db.markApifyTokenInvalid).mockClear();
+    vi.mocked(rotation.createRotatingApifyClient).mockClear();
+    const resolve = createApifyPoolResolver({
+      sql: makeSql([[tok("captured-id", " captured-key ")]]),
+      secrets: { get: vi.fn() }, apifyTokenSecretId: "fixture", log,
+    });
+    await resolve("actual-org");
+    const callback = vi.mocked(rotation.createRotatingApifyClient).mock.calls[0]?.[0].onTokenFatal;
+    expect(callback).toBeTypeOf("function");
+    callback!("captured-id", 401, " captured-key ");
+    await vi.waitFor(() => expect(db.markApifyTokenInvalid).toHaveBeenCalledWith(expect.anything(), {
+      orgId: "actual-org", credentialId: "captured-id", token: " captured-key ",
+    }));
+  });
+});
