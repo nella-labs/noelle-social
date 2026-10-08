@@ -198,3 +198,184 @@ async function listAgents(args: Record<string, unknown>, ctx: NoelleContext): Pr
 async function getAgent(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
   const org = await ctx.resolveOrg(optStr(args, "org"));
   const sel = await resolveAgentInstance(ctx, org.orgId, args);
+  const [a] = await ctx.sql<Array<Record<string, unknown>>>`
+    select id, role, display_name, status, objective, budget_cap_cents, budget_alert_pct,
+      discovery_enabled, classifier_enabled, drafter_enabled, send_enabled, profiler_enabled,
+      watchlist_enabled, dm_autodraft_enabled, linkedin_intro_dm_enabled, auto_defer_dms, reply_send_enabled,
+      coalesce(lane_config #> '{dms,relationship_dms_enabled}' = 'true'::jsonb, false) as friendly_dms_enabled,
+      auto_send_enabled, auto_send_min_delay_sec, auto_send_max_delay_sec, auto_send_max_per_hour,
+      pending_drafts_cap, lead_backlog_cap, classifier_threshold, x_api_write_enabled,
+      x_api_daily_write_cap, goal_target, pipeline_started_at::text as pipeline_started_at,
+      created_at::text as created_at
+    from noelle.agent_instances where id = ${sel.id} and org_id = ${org.orgId} limit 1`;
+  if (!a) throw new NoelleError(`Agent ${sel.id} not found.`);
+
+  const [spend] = await ctx.sql<Array<{ cents: number }>>`
+    select coalesce(sum(cents), 0)::int as cents from noelle.llm_calls
+    where org_id = ${org.orgId} and agent_role = ${sel.role} and engine <> 'apify'
+      and started_at >= date_trunc('month', now())`;
+
+  const lines: string[] = [
+    `## ${a.display_name ?? sel.role}  (\`${sel.role}\`)`,
+    `- **id:** ${a.id}`,
+    `- **status:** ${a.status}`,
+  ];
+  if (a.objective) lines.push(`- **objective:** ${a.objective}`);
+  lines.push(
+    `- **lanes:** discovery=${a.discovery_enabled} classifier=${a.classifier_enabled} drafter=${a.drafter_enabled} send=${a.send_enabled} profiler=${a.profiler_enabled} watchlist=${a.watchlist_enabled} dm_autodraft=${a.dm_autodraft_enabled}`,
+    `- **Friendly DMs:** enabled=${a.friendly_dms_enabled} (independent of the reply pipeline)`,
+    `- **reply sending:** enabled=${a.reply_send_enabled}`,
+    `- **auto-send:** enabled=${a.auto_send_enabled} delay=${a.auto_send_min_delay_sec}-${a.auto_send_max_delay_sec}s max/hr=${a.auto_send_max_per_hour}`,
+    `- **caps:** budget=${a.budget_cap_cents != null ? `$${(Number(a.budget_cap_cents) / 100).toFixed(0)}` : "—"} pending_drafts=${a.pending_drafts_cap ?? "—"} lead_backlog=${a.lead_backlog_cap ?? "—"}`,
+    `- **X API write:** enabled=${a.x_api_write_enabled} daily_cap=${a.x_api_daily_write_cap}`,
+    `- **spend this month:** $${((spend?.cents ?? 0) / 100).toFixed(2)}`,
+  );
+  return text(lines.join("\n"));
+}
+
+async function hireAgent(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("hire an agent");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const role = reqStr(args, "role");
+  const preset = HIRE_PRESETS[role];
+  if (!preset)
+    throw new NoelleError(
+      `Unknown role "${role}". Supported: ${Object.keys(HIRE_PRESETS).join(", ")}.`,
+    );
+  const displayName = optStr(args, "displayName") ?? preset.display_name;
+
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    insert into noelle.agent_instances
+      (org_id, role, status, display_name, budget_cap_cents, classifier_enabled, send_enabled, auto_send_enabled)
+    values (${org.orgId}, ${role}, 'active', ${displayName}, 5000, ${preset.classifier}, ${preset.send}, ${preset.auto_send})
+    on conflict (org_id, role) do nothing
+    returning id`;
+
+  if (rows.length === 0)
+    return text(`Agent role **${role}** already exists in ${org.name}. No change.`);
+  return text(`Hired **${displayName}** (\`${role}\`) in ${org.name}. id=${rows[0]!.id}`);
+}
+
+async function setAgentStatus(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("change agent status");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const sel = await resolveAgentInstance(ctx, org.orgId, args);
+  const status = reqStr(args, "status");
+  if (status !== "active" && status !== "paused")
+    throw new NoelleError(`status must be "active" or "paused".`);
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    update noelle.agent_instances set status = ${status}, updated_at = now()
+    where id = ${sel.id} and org_id = ${org.orgId} and status in ('active', 'paused')
+    returning id`;
+  if (rows.length === 0)
+    throw new NoelleError(`Could not update ${sel.role} (not active/paused?).`);
+  return text(`${sel.display_name ?? sel.role} (\`${sel.role}\`) is now **${status}**.`);
+}
+
+async function setWorkerEnabled(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("toggle a worker lane");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const sel = await resolveAgentInstance(ctx, org.orgId, args);
+  const worker = reqStr(args, "worker");
+  const column = WORKER_COLUMN[worker];
+  if (!column) throw new NoelleError(`Unknown worker "${worker}".`);
+  const enabled = reqBool(args, "enabled");
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    update noelle.agent_instances set ${ctx.sql(column)} = ${enabled}, updated_at = now()
+    where id = ${sel.id} and org_id = ${org.orgId}
+    returning id`;
+  if (rows.length === 0) throw new NoelleError(`Could not update ${sel.role}.`);
+  return text(
+    `${sel.display_name ?? sel.role}: **${worker}** lane is now ${enabled ? "enabled" : "disabled"}.`,
+  );
+}
+
+async function setActuatorState(
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult> {
+  ctx.assertWritable("start/stop the actuator");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const sel = await resolveAgentInstance(ctx, org.orgId, args);
+  const desired = reqStr(args, "desired");
+  if (desired !== "running" && desired !== "stopped")
+    throw new NoelleError(`desired must be "running" or "stopped".`);
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    update noelle.agent_instances
+    set actuator_desired_state = ${desired}, actuator_command_at = now(), updated_at = now()
+    where id = ${sel.id} and org_id = ${org.orgId}
+    returning id`;
+  if (rows.length === 0) throw new NoelleError(`Could not update ${sel.role}.`);
+  const verb = desired === "running" ? "**start** (Full-automatic)" : "**stop**";
+  const note =
+    desired === "running"
+      ? " — the hands are now allowed to run (replies still only post when reply-sending is on)."
+      : " — any live run ends and the hands stay paused until you start again.";
+  return text(`${sel.display_name ?? sel.role}'s actuator is set to ${verb}${note}`);
+}
+
+async function startAll(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("start all agents");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const goal = optNum(args, "goalTarget") ?? null;
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    update noelle.agent_instances set
+      status = 'active', discovery_enabled = true, classifier_enabled = true, drafter_enabled = true,
+      pipeline_started_at = now(), goal_target = ${goal},
+      goal_started_at = case when ${goal}::int is null then goal_started_at else now() end,
+      last_goal_started_at = case when ${goal}::int is null then last_goal_started_at else now() end,
+      updated_at = now()
+    where org_id = ${org.orgId} and status in ('active', 'paused')
+      and role = any(${[...SOCIAL_AGENT_ROLES]}::text[])
+    returning id`;
+  return text(
+    `Started **${rows.length}** agent(s) in ${org.name}${goal ? ` toward a goal of ${goal} leads` : ""}.`,
+  );
+}
+
+async function stopAll(args: Record<string, unknown>, ctx: NoelleContext): Promise<ToolResult> {
+  ctx.assertWritable("stop all agents");
+  const org = await ctx.resolveOrg(optStr(args, "org"));
+  const rows = await ctx.sql<Array<{ id: string }>>`
+    update noelle.agent_instances set
+      status = 'paused', goal_target = null, goal_started_at = null, run_config = null, updated_at = now()
+    where org_id = ${org.orgId} and status in ('active', 'paused')
+      and role = any(${[...SOCIAL_AGENT_ROLES]}::text[])
+    returning id`;
+  return text(`Paused **${rows.length}** agent(s) in ${org.name}.`);
+}
+
+async function handle(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: NoelleContext,
+): Promise<ToolResult | null> {
+  switch (name) {
+    case "noelle_list_agents":
+      return guard(() => listAgents(args, ctx));
+    case "noelle_get_agent":
+      return guard(() => getAgent(args, ctx));
+    case "noelle_hire_agent":
+      return guard(() => hireAgent(args, ctx));
+    case "noelle_set_agent_status":
+      return guard(() => setAgentStatus(args, ctx));
+    case "noelle_set_worker_enabled":
+      return guard(() => setWorkerEnabled(args, ctx));
+    case "noelle_set_actuator_state":
+      return guard(() => setActuatorState(args, ctx));
+    case "noelle_start_all_agents":
+      return guard(() => startAll(args, ctx));
+    case "noelle_stop_all_agents":
+      return guard(() => stopAll(args, ctx));
+    default:
+      return null;
+  }
+}
+
+export const agentsModule: ToolModule = { tools, handle };
