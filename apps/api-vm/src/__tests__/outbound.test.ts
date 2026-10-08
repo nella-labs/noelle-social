@@ -1198,3 +1198,10 @@ describe("POST /api/outbound", () => {
         "x-noelle-timestamp": String(ts),
         "x-noelle-signature": signature,
       },
+    });
+
+    expect(res.status).toBe(500);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toBe("no_active_instance");
+  });
+});
