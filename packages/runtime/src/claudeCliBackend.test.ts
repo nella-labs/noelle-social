@@ -398,3 +398,140 @@ describe("createClaudeCliBackend", () => {
     const errJson = JSON.stringify({
       type: "result",
       is_error: true,
+      result: "Invalid API key - please log in",
+    });
+    const { spawnImpl } = fakeSpawn({ stdout: errJson, code: 0 });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    const err = await backend
+      .call({ system: "s", prompt: "p", model: "claude-sonnet-4-6" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClaudeCliAuthError);
+    expect(err).toBeInstanceOf(ClaudeCliError);
+  });
+
+  it("resolves a successful draft whose result text mentions oauth/login (no false auth error)", async () => {
+    const draft =
+      "Honestly the OAuth flow is the real win here \u2014 just hit the button and please log in once, that is it.";
+    const successJson = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: draft,
+      usage: { input_tokens: 100, output_tokens: 30 },
+    });
+    const { spawnImpl } = fakeSpawn({ stdout: successJson, code: 0 });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    const res = await backend.call({
+      system: "you are an intern",
+      prompt: "draft a reply about oauth login",
+      model: "claude-sonnet-4-6",
+    });
+    expect(res.text).toBe(draft);
+    expect(res.usage).toEqual({ input_tokens: 100, output_tokens: 30 });
+  });
+
+  it("non-zero exit with raw (non-JSON) auth text in STDOUT (clean stderr) throws plain ClaudeCliError, not auth", async () => {
+    // Unstructured stdout text must NEVER drive auth classification — only a
+    // structured is_error:true JSON detail (or stderr) may.
+    const { spawnImpl } = fakeSpawn({
+      stdout: "unauthorized: garbage non-json",
+      stderr: "",
+      code: 1,
+    });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    const err = await backend
+      .call({ system: "s", prompt: "p", model: "claude-sonnet-4-6" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClaudeCliError);
+    expect(err).not.toBeInstanceOf(ClaudeCliAuthError);
+  });
+
+  it("real not-logged-in payload (is_error:true JSON on stdout, empty stderr, exit 1) throws ClaudeCliAuthError", async () => {
+    // EXACT real-world response captured from `claude -p` on the live VM.
+    const notLoggedIn = JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "Not logged in · Please run /login",
+      total_cost_usd: 0,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    });
+    const { spawnImpl } = fakeSpawn({ stdout: notLoggedIn, stderr: "", code: 1 });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    const err = await backend
+      .call({ system: "s", prompt: "p", model: "claude-sonnet-4-6" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClaudeCliAuthError);
+    expect(err).toBeInstanceOf(ClaudeCliError);
+    expect((err as Error).message).toContain("Not logged in");
+  });
+
+  it("throws ClaudeCliError on unparseable stdout", async () => {
+    const { spawnImpl } = fakeSpawn({ stdout: "not json at all", code: 0 });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    await expect(
+      backend.call({ system: "s", prompt: "p", model: "claude-sonnet-4-6" }),
+    ).rejects.toBeInstanceOf(ClaudeCliError);
+  });
+
+  it("throws ClaudeCliError on spawn error (binary missing)", async () => {
+    const { spawnImpl } = fakeSpawn({ emitError: new Error("ENOENT claude") });
+    const backend = createClaudeCliBackend({ spawnImpl });
+    await expect(
+      backend.call({ system: "s", prompt: "p", model: "claude-sonnet-4-6" }),
+    ).rejects.toBeInstanceOf(ClaudeCliError);
+  });
+
+  it("a per-call timeoutMs overrides the backend default", async () => {
+    // One global timeout cannot serve a ~9s drafter reply and a ~160s
+    // pattern-breaker run. The pattern-breaker blew the 180s default 54 times
+    // out of 66, paying for the generation each time and keeping none of it.
+    const { spawnImpl, child } = fakeSpawn({ hang: true });
+    const backend = createClaudeCliBackend({ spawnImpl, timeoutMs: 5_000 });
+    const err = await backend
+      .call({ system: "s", prompt: "p", model: "claude-sonnet-4-6", timeoutMs: 20 })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClaudeCliError);
+    expect((err as Error).message).toMatch(/timed out after 20ms/i);
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it("times out a hung process and kills it", async () => {
+    const { spawnImpl, child } = fakeSpawn({ hang: true });
+    const backend = createClaudeCliBackend({ spawnImpl, timeoutMs: 20 });
+    const err = await backend
+      .call({ system: "s", prompt: "p", model: "claude-sonnet-4-6" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClaudeCliError);
+    expect((err as Error).message).toMatch(/timed out/i);
+    expect(child.kill).toHaveBeenCalled();
+  });
+
+  it("default timeout is 180000ms (does not fire on a sub-second hang)", async () => {
+    vi.useFakeTimers();
+    try {
+      const { spawnImpl } = fakeSpawn({ hang: true });
+      const backend = createClaudeCliBackend({ spawnImpl }); // no timeoutMs override
+      let settled = false;
+      const promise = backend
+        .call({ system: "s", prompt: "p", model: "claude-opus-4-6" })
+        .then(
+          () => {
+            settled = true;
+          },
+          () => {
+            settled = true;
+          },
+        );
+      // Advance well past the OLD 120s default but short of the new 180s one.
+      await vi.advanceTimersByTimeAsync(150_000);
+      expect(settled).toBe(false);
+      // Now cross the 180s default → it times out.
+      await vi.advanceTimersByTimeAsync(31_000);
+      await promise;
+      expect(settled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
