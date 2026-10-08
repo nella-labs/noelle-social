@@ -398,3 +398,32 @@ export function upvotesInWindow(upvoteAtMs: number[] | undefined, now: number, w
  *    long (a cooldown-band or long-break gap; scheduler.inQuietDrainGap). Firing an
  *    idle-upvote through it would erase the very "stepped away" pause the timing
  *    archetype drew; the ambient browse alone keeps the session looking alive.
+ *  - enabled: the operator opt-in (cfg.upvotesEnabled !== false). Off ⇒ never.
+ *  - curfew: never while `inCurfew` (the shared write-curfew gate, ../lib/curfew —
+ *    dependency-injected so this stays pure; currently always false, disabled).
+ *  - cap: at most `cap` (default 10) upvotes in the trailing `windowMs` (15 min).
+ *  - pace: no sooner than `minGapMs` (~60s) after the most recent upvote OR
+ *    upvote ATTEMPT (lastAttemptMs, optional) — anchoring on the attempt too
+ *    means a failing locateUpvote scan retries on the min-gap cadence, not on
+ *    every ~4s idle tick — so they never cluster.
+ * UPVOTE-ONLY — this only ever authorizes an upvote; there is no downvote path.
+ */
+export function canUpvoteNow(args: {
+  enabled: boolean;
+  inCurfew: boolean;
+  upvoteAtMs: number[] | undefined;
+  now: number;
+  cap: number;
+  windowMs: number;
+  minGapMs: number;
+  lastAttemptMs?: number;
+  inQuietGap?: boolean;
+}): boolean {
+  if (args.inQuietGap) return false;
+  if (!args.enabled) return false;
+  if (args.inCurfew) return false;
+  if (upvotesInWindow(args.upvoteAtMs, args.now, args.windowMs) >= args.cap) return false;
+  const lastHit = args.upvoteAtMs && args.upvoteAtMs.length > 0 ? Math.max(...args.upvoteAtMs) : -Infinity;
+  const last = Math.max(lastHit, args.lastAttemptMs ?? -Infinity);
+  return args.now - last > args.minGapMs;
+}
