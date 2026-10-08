@@ -198,3 +198,203 @@ describe("runDrafterTick (reddit quality pipeline)", () => {
       runner: runner as never,
       kb: kb as never,
       postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(1);
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.platform).toBe("reddit");
+    const replies = body.drafts.filter((d: { kind: string }) => d.kind === "reply");
+    const dms = body.drafts.filter((d: { kind: string }) => d.kind === "dm");
+    expect(replies).toHaveLength(3);
+    expect(replies.map((r: { angle: string }) => r.angle)).toEqual(["empathetic", "technical", "contrarian"]);
+    expect(dms).toHaveLength(0);
+  });
+
+  it("T2 substantial: 2 comment angles (empathetic, technical)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2", classifier_score: 85 })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(1);
+    const replies = postOutbound.mock.calls[0]![0].drafts.filter((d: { kind: string }) => d.kind === "reply");
+    expect(replies.map((r: { angle: string }) => r.angle)).toEqual(["empathetic", "technical"]);
+  });
+
+  it("T3 substantial: 1 comment angle (empathetic)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T3", classifier_score: 77 })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(1);
+    const replies = postOutbound.mock.calls[0]![0].drafts.filter((d: { kind: string }) => d.kind === "reply");
+    expect(replies.map((r: { angle: string }) => r.angle)).toEqual(["empathetic"]);
+  });
+
+  // Regression (2026-07-19, Lyra sibling bug): the model often omits `char_count`
+  // or emits garbage (null / string / float). charCount is recomputed off the
+  // cleaned body in buildOutbound, so a bad count must never error the lead.
+  it("drafts with missing/null/garbage char_count still post (count recomputed)", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = {
+      draft: vi.fn().mockResolvedValue({
+        text: JSON.stringify({
+          drafts: [
+            { angle: "empathetic", body: "solid launch" },
+            { angle: "technical", body: "t", char_count: null },
+            { angle: "contrarian", body: "c", char_count: "1" },
+          ],
+        }),
+        engine: "claude-cli",
+        model: "claude-sonnet-4-6",
+      }),
+    };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(1);
+    const replies = postOutbound.mock.calls[0]![0].drafts.filter((d: { kind: string }) => d.kind === "reply");
+    expect(replies).toHaveLength(3);
+    expect(replies[0].charCount).toBe([..."solid launch"].length);
+    expect(markStatus).toHaveBeenCalledWith(expect.objectContaining({ leadId: "L", status: "drafted" }));
+  });
+
+  it("low-engagement lead drafts on the default model (sonnet)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T2" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    expect(runner.draft.mock.calls[0]![0].routing.primary.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("light: ONE short supportive reply (kind='reply'), uses the LIGHT system prompt", async () => {
+    const { postOutbound, kb, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null, classifier_score: 60 })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+
+    expect(n).toBe(1);
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.drafts).toHaveLength(1);
+    expect(body.drafts[0].kind).toBe("reply");
+    expect(body.drafts.some((d: { kind: string }) => d.kind === "dm")).toBe(false);
+    expect(runner.draft.mock.calls[0]![0].system).toContain("supportive");
+  });
+
+  it("light leads bypass the relevance threshold (a congrats needs no anchor)", async () => {
+    const { postOutbound, markStatus } = deps();
+    const runner = { draft: vi.fn().mockResolvedValue({ text: JSON.stringify(oneLight), engine: "bedrock", model: "m" }) };
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(0.1)]) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ classifier_label: "light", tier: null })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+    expect(n).toBe(1);
+    expect(postOutbound).toHaveBeenCalledTimes(1);
+  });
+
+  it("substantial lead below the relevance threshold is skipped without an LLM call", async () => {
+    const { postOutbound, markStatus } = deps();
+    const draft = vi.fn();
+    const kb = { search: vi.fn().mockResolvedValue([anchorHit(0.1)]) };
+    const n = await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: { draft } as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+      relevanceThreshold: 1.5,
+    });
+    expect(n).toBe(0);
+    expect(draft).not.toHaveBeenCalled();
+    expect(postOutbound).not.toHaveBeenCalled();
+    expect(markStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "skipped", meta: expect.objectContaining({ relevance_threshold: 1.5 }) }),
+    );
+  });
+
+  it("NEVER includes an autoSend field on the outbound payload (draft-only invariant)", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o", auto_send_enabled: true } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    const body = postOutbound.mock.calls[0]![0];
+    expect(body.autoSend).toBeUndefined();
+    expect("autoSend" in body).toBe(false);
+  });
+
+  it("combines title + body into the post text the model reads", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    await runDrafterTick({
+      log,
+      instance: { id: "i", org_id: "o" } as never,
+      claimedLeads: [lead({ tier: "T1" })] as never,
+      runner: runner as never,
+      kb: kb as never,
+      postOutbound,
+      markStatus,
+    });
+    const prompt = runner.draft.mock.calls[0]![0].prompt as string;
+    expect(prompt).toContain("We shipped our MVP");
+    expect(prompt).toContain("post body");
+    expect(prompt).toContain("r/SaaS");
+  });
+
+  it("enforces the daily SUBSTANTIAL cap: defers the lead to 'classified', does not draft", async () => {
+    const { postOutbound, runner, kb, markStatus } = deps();
+    const sqlCalls: unknown[][] = [];
+    const sql = Object.assign(
+      vi.fn(async (_s: TemplateStringsArray, ...vals: unknown[]) => {
+        sqlCalls.push(vals);
+        return [];
+      }),
+      { json: (x: unknown) => x },
+    );
