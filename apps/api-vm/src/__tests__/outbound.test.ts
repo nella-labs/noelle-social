@@ -598,3 +598,203 @@ describe("sanitizeForJsonb", () => {
     expect(out.anchors[0]!.snippet).toBe("x ");
     expect(out.anchors[0]!.score).toBe(4.2);
     expect(out.drafts[0]!.body).toBe("ok ");
+    expect(out.drafts[0]!.char_count).toBe(3);
+  });
+  it("leaves clean strings, numbers, null, and booleans untouched", () => {
+    const o = { a: "hi", n: 5, z: null, b: true };
+    expect(sanitizeForJsonb(o)).toEqual(o);
+  });
+});
+
+describe("outbound saved factual evidence", () => {
+  const context = { version: 1, platform: "x", postText: "Original selected source", knowledgeAnchors: ["Oriole maps Atlas"] };
+  it("stores the supplied factual context on the exact draft", async () => {
+    const db = makeFakeDb({ agent_instances: { rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }] },
+      leads: { rows: [] }, drafts: { rows: [] }, approvals: { rows: [] } });
+    __setDbClientForTests(db);
+    const input = basePayload();
+    Object.assign(input.drafts[0]!, { reviewContext: context });
+    expect((await postOutbound(createApp(), input)).status).toBe(200);
+    expect(db.__state.drafts!.rows[0]!.payload).toMatchObject({ body: "ok", review_context: context });
+  });
+  it("rejects changed factual evidence on a reused draft without enriching the lead", async () => {
+    const db = makeFakeDb({ agent_instances: { rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }] },
+      leads: { rows: [] }, drafts: { rows: [] }, approvals: { rows: [] } });
+    __setDbClientForTests(db);
+    const input = basePayload();
+    Object.assign(input.drafts[0]!, { reviewContext: context });
+    expect((await postOutbound(createApp(), input)).status).toBe(200);
+    const before = structuredClone(db.__state);
+    const changed = structuredClone(input);
+    changed.originalPostText = "Later lead enrichment";
+    Object.assign(changed.drafts[0]!, { reviewContext: { ...context, knowledgeAnchors: [] } });
+    expect((await postOutbound(createApp(), changed)).status).toBe(409);
+    expect(db.__state).toEqual(before);
+  });
+});
+
+describe("shouldNotifyBatch", () => {
+  it("batch size 1 (default) notifies on every bundle — back-compat", () => {
+    expect(shouldNotifyBatch(1, 1)).toBe(true);
+    expect(shouldNotifyBatch(7, 1)).toBe(true);
+  });
+  it("batch size 10 notifies only on every 10th bundle", () => {
+    for (const n of [1, 2, 9, 11, 19]) expect(shouldNotifyBatch(n, 10)).toBe(false);
+    for (const n of [10, 20, 30]) expect(shouldNotifyBatch(n, 10)).toBe(true);
+  });
+  it("treats a non-positive batch size as 'every bundle'", () => {
+    expect(shouldNotifyBatch(3, 0)).toBe(true);
+  });
+});
+
+describe("POST /api/outbound", () => {
+  it("upserts lead+drafts+approvals and returns the empathetic approval id", async () => {
+    const db = makeFakeDb({
+      agent_instances: {
+        rows: [
+          { id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" },
+        ],
+        error: null,
+      },
+      leads: { rows: [], error: null },
+      drafts: { rows: [], error: null },
+      approvals: { rows: [], error: null },
+    });
+    __setDbClientForTests(db);
+
+    const app = createApp();
+    const body = JSON.stringify(basePayload());
+    const ts = Math.floor(Date.now() / 1000);
+    const { signature } = signHmacBody(HMAC_SECRET, ts, body);
+
+    const res = await app.request("/api/outbound", {
+      method: "POST",
+      body,
+      headers: {
+        "content-type": "application/json",
+        "x-noelle-timestamp": String(ts),
+        "x-noelle-signature": signature,
+      },
+    });
+
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      approval_id: string;
+      approval_ids: string[];
+      draft_ids: string[];
+      lead_id: string;
+      pushover_fired: boolean;
+    };
+    expect(json.approval_ids).toHaveLength(3);
+    expect(json.draft_ids).toEqual(
+      expect.arrayContaining([DRAFT_ID_E, DRAFT_ID_T, DRAFT_ID_C])
+    );
+    expect(json.lead_id).toBeDefined();
+    // No NOELLE_APP_BASE_URL set in this test → Pushover skipped.
+    expect(json.pushover_fired).toBe(false);
+
+    // The lead was upserted by external_id.
+    const fakeState = (db as unknown as { __state: Record<string, TableState> })
+      .__state;
+    const leadRows = fakeState.leads!.rows;
+    expect(leadRows).toHaveLength(1);
+    expect(leadRows[0]!.external_id).toBe(LEAD_EXTERNAL_ID);
+    expect(leadRows[0]!.org_id).toBe(ORG_ID);
+
+    // 3 drafts persisted with drafter-supplied ids.
+    const draftRows = fakeState.drafts!.rows;
+    expect(draftRows.map((r) => r.id).sort()).toEqual(
+      [DRAFT_ID_E, DRAFT_ID_T, DRAFT_ID_C].sort()
+    );
+
+    // All variants remain auditable, but only the first passing reply is actor-ready.
+    const approvalRows = fakeState.approvals!.rows;
+    expect(approvalRows).toHaveLength(3);
+    expect(approvalRows[0]).toMatchObject({ status: "pending", decided_at: null });
+    expect(approvalRows.slice(1).every((r) =>
+      r.status === "skipped"
+      && r.decided_by === "automatic-review"
+      && r.skip_reason === "automatic-review-sibling"
+      && typeof r.decided_at === "string"
+    )).toBe(true);
+  });
+
+  it("uses an explicit owner to select the correct same-platform active instance", async () => {
+    const otherOrg = "00000000-0000-4000-8000-000000000101";
+    const otherInstance = "00000000-0000-4000-8000-000000000102";
+    const db = makeFakeDb({
+      agent_instances: {
+        rows: [
+          { id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" },
+          { id: otherInstance, org_id: otherOrg, role: "x_intern", status: "active" },
+        ],
+        error: null,
+      },
+      leads: { rows: [], error: null },
+      drafts: { rows: [], error: null },
+      approvals: { rows: [], error: null },
+    });
+    __setDbClientForTests(db);
+
+    const res = await postOutbound(createApp(), {
+      ...basePayload(),
+      owner: { orgId: otherOrg, agentInstanceId: otherInstance },
+      leadId: "owned-lead-1",
+    });
+    expect(res.status).toBe(200);
+
+    const fakeState = (db as unknown as { __state: Record<string, TableState> }).__state;
+    expect(fakeState.leads!.rows[0]!.org_id).toBe(otherOrg);
+    expect(fakeState.approvals!.rows).toHaveLength(3);
+    expect(fakeState.approvals!.rows.every((r) => r.agent_instance_id === otherInstance)).toBe(true);
+  });
+
+  it("stores the same source post separately for two tenants", async () => {
+    const otherOrg = "00000000-0000-4000-8000-000000000101";
+    const otherInstance = "00000000-0000-4000-8000-000000000102";
+    const db = makeFakeDb({
+      agent_instances: { rows: [
+        { id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" },
+        { id: otherInstance, org_id: otherOrg, role: "x_intern", status: "active" },
+      ] },
+      leads: { rows: [] }, drafts: { rows: [] }, approvals: { rows: [] },
+    });
+    __setDbClientForTests(db);
+    const app = createApp();
+    const first = await postOutbound(app, { ...basePayload(), owner: { orgId: ORG_ID, agentInstanceId: INSTANCE_ID } });
+    const second = await postOutbound(app, {
+      ...basePayload(), owner: { orgId: otherOrg, agentInstanceId: otherInstance },
+      drafts: basePayload().drafts.map((draft, i) => ({ ...draft, id: `00000000-0000-4000-8000-${String(20 + i).padStart(12, "0")}` })),
+    });
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(db.__state.leads!.rows.map((row) => row.org_id).sort()).toEqual([ORG_ID, otherOrg].sort());
+    expect(db.__state.leads!.rows.map((row) => row.external_id)).toEqual([LEAD_EXTERNAL_ID, LEAD_EXTERNAL_ID]);
+  });
+
+  it("does not write when the explicit owner does not match the platform instance", async () => {
+    const db = makeFakeDb({
+      agent_instances: {
+        rows: [{ id: INSTANCE_ID, org_id: ORG_ID, role: "x_intern", status: "active" }],
+        error: null,
+      },
+      leads: { rows: [], error: null },
+      drafts: { rows: [], error: null },
+      approvals: { rows: [], error: null },
+    });
+    __setDbClientForTests(db);
+
+    const res = await postOutbound(createApp(), {
+      ...basePayload(),
+      owner: {
+        orgId: ORG_ID,
+        agentInstanceId: "00000000-0000-4000-8000-000000000999",
+      },
+    });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toMatchObject({ error: "no_active_instance" });
+
+    const fakeState = (db as unknown as { __state: Record<string, TableState> }).__state;
+    expect(fakeState.leads!.rows).toEqual([]);
+    expect(fakeState.drafts!.rows).toEqual([]);
+    expect(fakeState.approvals!.rows).toEqual([]);
