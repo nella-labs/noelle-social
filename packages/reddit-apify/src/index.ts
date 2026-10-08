@@ -598,3 +598,4 @@ export async function fetchRedditPostComments(args: {
   }
   out.sort(byVoteScore);
   return out.slice(0, limit);
+}
