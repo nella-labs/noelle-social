@@ -398,3 +398,203 @@ export {
 export {
   voyageContextEmbed,
   voyageContextEmbedQuery,
+  type VoyageContextEmbedOptions,
+} from "./voyageContextEmbed.js";
+export {
+  buildDenseIndex,
+  type DenseIndex,
+  type DenseResult,
+} from "./denseChunkIndex.js";
+
+// Content ingestion bridge — HMAC sign + POST the post-ideas/post-drafts wire
+// contract into noelle.* (the prod-scalable replacement for content-pipeline's
+// local-JSON store). Shared by the server workers and the `noelle content push`
+// operator/skills path. Also exposed at "@noelle/runtime/content-push" for
+// lean, backend-free imports.
+export {
+  signContentRequest,
+  pushPostIdeas,
+  pushPostDraft,
+  type SignedHeaders,
+  type ContentPlatform,
+  type PushInspirationRef,
+  type PushPostIdea,
+  type PushPostDraft,
+  type PushClientOpts,
+} from "./contentPush.js";
+
+// Pinned style source — pure name→handle resolution + chat-directive extraction
+// for the "write in this exact person's style" lever. Shared by api-vm (chat
+// resolution) and the intern workers. No DB / LLM deps.
+export {
+  normalizeStyleName,
+  resolveStyleSourceHandle,
+  extractStyleDirective,
+  readPinnedHandle,
+  readStyleExemplarKinds,
+  readFaithfulVoices,
+  readFaithfulVoiceWeights,
+  pickFaithfulVoice,
+  pinnedSelectConfig,
+  PIN_MIN_EXEMPLARS,
+  type StyleSourceRef,
+} from "./stylePin.js";
+
+// Account Feeder — the platform-agnostic style selector, the STYLE-block renderer,
+// the per-draft style-source attribution, and the corpus row / post-register types.
+// Shared by both interns (Lyra/LinkedIn, Vega/X) so there is ONE implementation,
+// not hand-mirrored copies. See packages/runtime/src/style{Select,Block,Types}.ts.
+export {
+  selectStyleExemplars,
+  styleCheer01,
+  makeSeededRng,
+  type StyleExemplar,
+  type StyleSelection,
+  type SelectStyleOptions,
+} from "./styleSelect.js";
+export {
+  renderStyleBlock,
+  buildStyleSource,
+  type StyleForPrompt,
+  type StyleExemplarForPrompt,
+} from "./styleBlock.js";
+export { DM_RUNGS, pickRung, type DmRung } from "./dmLadder.js";
+export {
+  countSentDmsToAuthor,
+  getRecentDmsToAuthor,
+  type DmAuthorArgs,
+  type RecentDmsArgs,
+} from "./dmLadderDb.js";
+export { loadVoiceSpec, voiceSpecBlock } from "./voiceSpec.js";
+export { upsertPlaybook, getFreshPlaybookAuthors, type PlaybookUpsert } from "./playbooksDb.js";
+export {
+  shardRoundRobin,
+  splitBudget,
+  shardStaggerDelayMs,
+  runWithConcurrency,
+} from "./shard.js";
+export {
+  qualifyByHeadline,
+  qualifyByProfileText,
+  icpGateConfigured,
+  type IcpHeadlineGate,
+  type IcpGateResult,
+} from "./icpGate.js";
+export {
+  OPENING_MOVES,
+  X_OPENING_MOVES,
+  pickOpeningMove,
+  renderOpeningMoveBlock,
+  type OpeningMove,
+} from "./openingMove.js";
+export {
+  getRecentRepliesToAuthor,
+  getRecentReplyPhrasings,
+  type PriorRepliesArgs,
+  type RecentPhrasingsArgs,
+} from "./priorReplies.js";
+export {
+  FORM_VARIANTS,
+  X_FORM_VARIANTS,
+  REDDIT_FORM_VARIANTS,
+  LIGHT_EXCLUDED_VARIANT_IDS,
+  SHAPES_WITH_FREE_OPENER,
+  SHAPES_BANNING_QUESTIONS,
+  STANCE_SHAPE_IDS,
+  DEFAULT_ROTATION_MEMORY,
+  TONE_FIRST_ENERGIES,
+  ENERGY_SHAPE_IDS,
+  TONE_FIRST_SHAPE_SHARE,
+  shapesForEnergy,
+  shapesExcludedForEnergy,
+  pickFormVariant,
+  createFormVariantRotation,
+  renderAssignedShapeBlock,
+  type FormVariant,
+  type FormVariantForPrompt,
+} from "./formVariants.js";
+export {
+  humanizeTypos,
+  pickTypoKind,
+  typoRateFromEnv,
+  TYPO_VARIANTS,
+  DEFAULT_TYPO_RATE,
+  type TypoKind,
+  type TypoVariant,
+  type HumanizeOptions,
+  type HumanizeResult,
+} from "./humanTypos.js";
+export {
+  GENZ_MARKERS,
+  DEFAULT_MARKER_RATE,
+  LOUD_BLOCKED_ENERGIES,
+  markersForEnergy,
+  pickGenZMarker,
+  renderGenZMarkerBlock,
+  createGenZMarkerRotation,
+  genzMarkerRateFromEnv,
+  type GenZMarker,
+  type MarkerTier,
+  type MarkerPoolOpts,
+} from "./genzMarkers.js";
+export { NO_HOUSE_SKELETON_RULE, houseSkeletonHits } from "./houseSkeleton.js";
+export {
+  polishReplyBody,
+  NO_PERIODS_RULE,
+  PLATFORM_CHAR_CAP,
+  type PolishResult,
+  type PolishOptions,
+} from "./replyPolish.js";
+export type { StyleExemplarRow, UltraProfileRow, PostRegister } from "./styleTypes.js";
+
+// Content media storage — one interface (put/delete), local-disk (self-host)
+// and GCS (prod) backends. Exposed at "@noelle/runtime/content-storage".
+export {
+  assertSafeKey,
+  extForMime,
+  mediaKey,
+  createLocalContentStorage,
+  createGcsContentStorage,
+  type ContentStorage,
+  type GcsContentOps,
+} from "./contentStorage.js";
+
+// Recurring scheduled run (0085_run_schedule.sql) — next-fire math + fire/skip
+// decision. Shared by the api-vm scheduler and the setRunSchedule save action.
+export {
+  computeNextRunAt,
+  planScheduledRun,
+  type ScheduledRunRow,
+  type ScheduledRunPlan,
+} from "./runSchedule.js";
+
+export {
+  notifyBudgetBlockedOnce,
+  type BudgetAlertDeps,
+  type BudgetAlertResult,
+} from "./budgetAlert.js";
+
+export {
+  createCodexCliBackend,
+  parseCodexUsage,
+  CODEX_CLI_MODEL,
+  CodexCliError,
+  CodexCliAuthError,
+  type CreateCodexCliBackendOptions,
+} from "./codexCliBackend.js";
+
+export { parseCodexError } from "./codexCliBackend.js";
+
+export {
+  getVoiceExemplars,
+  type VoiceExemplar,
+  type VoiceExemplarsArgs,
+} from "./priorReplies.js";
+
+export {
+  getRepliedPostSources,
+  type RepliedPostSource,
+  type RepliedPostSourcesArgs,
+} from "./ideationSources.js";
+
+export { renderVoiceExemplars } from "./voiceExemplars.js";
