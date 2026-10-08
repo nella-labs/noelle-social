@@ -198,3 +198,91 @@ export async function recheckPendingReplies(args: {
         priorRepliesToPerson: row.priorRepliesToPerson ?? history?.priorRepliesToPerson ?? [],
         recentReplies: row.recentReplies ?? history?.recentReplies ?? [],
         ...(row.platform === "x" ? { charLimit: 250 } : {}),
+        ...(light ? { allowCelebration: true } : {}),
+        ...(facts.imageCaption !== undefined ? { imageCaption: facts.imageCaption } : {}),
+      };
+      let verdict: DraftVerdict;
+      attempted++;
+      try {
+        verdict = await args.review({ candidate: row, draft, context });
+      } catch {
+        counts.unavailable++;
+        continue;
+      }
+      // verifyDrafts can fail open for the human queue. That synthetic result
+      // cannot authorize unattended sending, nor suppress a later retry.
+      if (verdict.judgeOk !== true || !verdict.judgeProvider || verdict.judgeProvider === "none") {
+        counts.unavailable++;
+        continue;
+      }
+      const meta: ReplyReviewMeta = {
+        pass: verdict.pass === true,
+        judgeOk: true,
+        judgeProvider: verdict.judgeProvider,
+        scores: verdict.scores,
+        reasons: verdict.reasons.slice(0, 8),
+        attempts: 0,
+      };
+      const marker: ReplyRecheckMarker = {
+        version: RECHECK_VERSION,
+        bodySha256: hash,
+        contextSha256: contextHash,
+        outcome: meta.pass ? "passed" : "rejected",
+        checkedAt: (args.now ?? (() => new Date()))().toISOString(),
+      };
+      if (!await args.store.save(row, body, meta, marker)) {
+        counts.stale++;
+        continue;
+      }
+      counts.reviewed++;
+      if (meta.pass) counts.passed++;
+      else counts.rejected++;
+    }
+    const last = rows[rows.length - 1]!;
+    if (after && last.approvalCreatedAt === after.approvalCreatedAt && last.approvalId === after.approvalId) {
+      throw new Error("Reply recheck cursor did not advance");
+    }
+    after = { approvalCreatedAt: last.approvalCreatedAt, approvalId: last.approvalId };
+    if (rows.length < PENDING_REPLY_PAGE_SIZE) break;
+  }
+  return counts;
+}
+
+/** Recheck uses the same judge route as each deployed writer. */
+export function configuredReplyJudgeRouting(
+  candidate: PendingReplyCandidate,
+  cheapX = process.env.NOELLE_DRAFTER_VERIFY_CHEAP === "1" ||
+    process.env.NOELLE_DRAFTER_VERIFY_CHEAP?.toLowerCase() === "true",
+): ModelRouting {
+  if (candidate.platform === "linkedin" || cheapX) return HAIKU_JUDGE;
+  const routing = resolveWorkerRouting("drafter", candidate.modelOverrides);
+  if (!routing) throw new Error("X drafter routing is unavailable");
+  return routing;
+}
+
+/** Jev remains primary; uncertainty goes through the writer's runtime route. */
+export function createConfiguredPendingReplyReviewer(opts: {
+  depsForPlatform: (platform: PendingReplyCandidate["platform"]) => CallAgentModelDeps;
+  callAgentModel?: typeof callAgentModel;
+  jevRun?: JevRun;
+  cheapX?: boolean;
+}): (input: { candidate: PendingReplyCandidate; draft: DraftToVerify; context: VerifyContext }) => Promise<DraftVerdict> {
+  const call = opts.callAgentModel ?? callAgentModel;
+  return ({ candidate, draft, context }) => verifyDrafts(
+    [draft], context,
+    async (system, prompt) => {
+      const result = await call({
+        bucket: "drafter-verify",
+        routing: configuredReplyJudgeRouting(candidate, opts.cheapX),
+        orgId: candidate.orgId,
+        instanceId: candidate.agentInstanceId,
+        worker: "drafter",
+        agentRole: candidate.platform === "linkedin" ? "linkedin_intern" : "x_intern",
+        system,
+        prompt,
+      }, opts.depsForPlatform(candidate.platform));
+      return result.text;
+    },
+    opts.jevRun ? { jevRun: opts.jevRun } : undefined,
+  );
+}
