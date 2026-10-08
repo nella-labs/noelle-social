@@ -398,3 +398,203 @@ describe("findCommentSubmit", () => {
   });
 
   it("never returns a thread Reply button when the real submit is absent", () => {
+    // Legacy comment thread below the main composer: the ONLY wordy buttons are
+    // per-comment Reply affordances inside comments-comment-item articles. The
+    // old bare document-order word scan grabbed the first one.
+    expect(
+      findCommentSubmit(
+        mount(
+          "<div class='comments-comment-box'>" +
+            "<div role='textbox' contenteditable='true'>draft text</div>" +
+            "</div>" +
+            "<article class='comments-comment-item'><p>Nice!</p><button type='button' aria-label='Reply'>Reply</button></article>" +
+            "<article class='comments-comment-item'><p>Agreed.</p><button type='button' aria-label='Reply'>Reply</button></article>",
+        ),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("findCommentSubmit — 2026 migrated UI (obfuscated classes, bare-'Comment' toggle)", () => {
+  // THE live bug (comment-failed:not-cleared wall): on the 2026 feed the
+  // action-bar toggle is labelled bare "Comment" (the possessive exclusion went
+  // dead) and precedes the composer, so the old document-order word scan
+  // returned the TOGGLE — the background clicked it once, nothing ever posted.
+  it("does NOT return the action-bar 'Comment' toggle on the real 2026 feed capture", () => {
+    const root = mount(fx("feed-2026-obfuscated.html"));
+    // The decoy IS present in the capture — the test is meaningful.
+    expect(root.querySelector("button[aria-label='Comment']")).not.toBeNull();
+    const hit = findCommentSubmit(root);
+    // Specifically: not the bare-'Comment' action-bar toggle…
+    expect(hit?.getAttribute("aria-label") ?? null).not.toBe("Comment");
+    // …and with no composer open on the feed there is nothing to submit at all.
+    expect(hit).toBeNull();
+  });
+
+  it("returns THE composer submit (in commentButtonSection) — not the toggle, not Reply", () => {
+    // The live 2026 submit is a type=button labelled by the WORD "Comment" as
+    // text, inside a commentButtonSection wrapper, with NO comment-small sprite.
+    const btn = findCommentSubmit(mount(fx("comment-box-2026.html")));
+    expect(btn).not.toBeNull();
+    expect(btn!.closest("[componentkey*='commentButtonSection']")).not.toBeNull(); // the real submit's wrapper
+    expect(btn!.textContent?.trim()).toBe("Comment");
+    expect(btn!.getAttribute("aria-label")).toBeNull(); // the toggle carries aria-label='Comment'
+    expect(btn!.querySelector("svg[id='comment-small']")).toBeNull(); // the toggle carries the sprite; the submit doesn't
+  });
+
+  it("returns null while the submit is disabled (toggle + Reply decoys present)", () => {
+    // The submit is disabled until typing registers. A null keeps the
+    // background's poll waiting for it to enable, instead of clicking a decoy.
+    const root = mount(fx("comment-box-2026.html"));
+    root.querySelector<HTMLButtonElement>("button[componentkey*='commentButtonSection']")!.disabled = true;
+    expect(findCommentSubmit(root)).toBeNull();
+  });
+
+  it("also finds a type='submit' variant of the composer submit", () => {
+    // Some migrated surfaces carry type=submit on the composer button — the
+    // anchored search must find it either way.
+    const root = mount(fx("comment-box-2026.html"));
+    root.querySelector<HTMLButtonElement>("button[componentkey*='commentButtonSection']")!.setAttribute("type", "submit");
+    const btn = findCommentSubmit(root);
+    expect(btn).not.toBeNull();
+    expect(btn!.closest("[componentkey*='commentButtonSection']")).not.toBeNull();
+  });
+
+  // ── Wrong-surface safety ──────────────────────────────────────────────────
+  // The messaging overlay (chat bubbles) persists across navigations and its
+  // Send button is type=submit: anything the comment flow "submits" there is a
+  // PRIVATE MESSAGE that clears the pane and reads as posted. These lock the
+  // two guards that make it unreachable: the box-anchor rejection and the
+  // mandatory word-gate (styling alone never qualifies a button).
+
+  it("never returns the chat overlay's Send when the composer is missing", () => {
+    const root = mount(
+      "<main><p>post body — composer not hydrated yet</p></main>" +
+        "<aside class='msg-overlay-list-bubble'><form class='msg-form'>" +
+        "<div role='textbox' contenteditable='true' aria-label='Write a message…'>typed here</div>" +
+        "<button type='submit' class='msg-form__send-button artdeco-button artdeco-button--primary'>Send</button>" +
+        "</form></aside>",
+    );
+    expect(findCommentSubmit(root)).toBeNull();
+  });
+
+  it("a bare type=submit 'Send' is rejected even outside a msg container (NONCOMMENT guard)", () => {
+    // The icon-only-submit relaxation accepts a following type=submit — but NOT
+    // when its name is a different action. 'Send' would post a DM; even with
+    // messaging classes obfuscated away from MESSAGING_SEL, the name guard keeps
+    // it out.
+    const root = mount(
+      "<div class='_0k3j'><div role='textbox' contenteditable='true'>typed comment</div>" +
+        "<button type='submit' class='_h4x8' aria-label='Send'>Send</button></div>",
+    );
+    expect(findCommentSubmit(root)).toBeNull();
+  });
+
+  it("an ICON-ONLY comment submit (type=submit, no submit word) IS found via the anchor", () => {
+    // The live wf=0 shape: composer editor followed by an unworded type=submit
+    // (icon-only, or aria like 'Add a comment'). Neither is in the exact word
+    // list, so the old word-only anchor missed it → submit-not-found wall.
+    const iconOnly = mount(
+      "<div class='_c9'><div role='textbox' contenteditable='true'>great point</div>" +
+        "<button type='button' class='_e' aria-label='Emoji'></button>" +
+        "<button type='submit' class='_sub'><svg viewBox='0 0 24 24'></svg></button></div>",
+    );
+    expect(findCommentSubmit(iconOnly)?.className).toBe("_sub");
+    const ariaLabelled = mount(
+      "<div class='_c9'><div role='textbox' contenteditable='true'>great point</div>" +
+        "<button type='submit' class='_sub2' aria-label='Add a comment'></button></div>",
+    );
+    expect(findCommentSubmit(ariaLabelled)?.className).toBe("_sub2");
+  });
+
+  it("worded submit still wins the tiebreak over an unworded type=submit (legacy unchanged)", () => {
+    // A worded 'Post' and an icon-only submit both follow the box → the worded
+    // one scores higher, so nothing about legacy/worded surfaces changes.
+    const root = mount(
+      "<div class='_c'><div role='textbox' contenteditable='true'>x</div>" +
+        "<button type='submit' class='_icon'></button>" +
+        "<button type='button' class='artdeco-button--primary _post'>Post</button></div>",
+    );
+    const hit = findCommentSubmit(root);
+    expect(hit?.textContent).toBe("Post");
+    expect(hit?.className).toContain("_post");
+  });
+
+  it("waits (null) on a disabled submit instead of escaping the climb to the chat overlay", () => {
+    // The enable-lag window: the real submit exists but hasn't enabled yet.
+    // The climb must stop at it — widening past it is what would reach decoys.
+    const root = mount(fx("comment-box-2026.html"));
+    root.querySelector<HTMLButtonElement>("button[componentkey*='commentButtonSection']")!.disabled = true;
+    root.insertAdjacentHTML(
+      "beforeend",
+      "<aside class='msg-overlay-list-bubble'><form class='msg-form'>" +
+        "<div role='textbox' contenteditable='true'></div>" +
+        "<button type='submit' class='msg-form__send-button artdeco-button--primary'>Send</button></form></aside>",
+    );
+    expect(findCommentSubmit(root)).toBeNull();
+  });
+
+  it("the action-bar toggle (comment-small sprite) is never returned as the submit", () => {
+    // Both the toggle and the submit read 'Comment'. The toggle is told apart
+    // by its comment-small sprite; the submit lives in commentButtonSection and
+    // has none. Disable the submit → the toggle must NOT be picked in its place.
+    const root = mount(fx("comment-box-2026.html"));
+    root.querySelector<HTMLButtonElement>("button[componentkey*='commentButtonSection']")!.disabled = true;
+    expect(findCommentSubmit(root)).toBeNull();
+  });
+
+  it("a toggle stripped to just a count span is still rejected (shape rule)", () => {
+    // Even with the sprite removed, a 'Comment'-aria button whose visible text
+    // is only a count is the action-bar affordance, never the submit.
+    const root = mount(fx("comment-box-2026.html"));
+    const toggle = [...root.querySelectorAll<HTMLElement>("button[aria-label='Comment']")]
+      .find((b) => b.querySelector("svg[id='comment-small']"))!;
+    toggle.querySelector("svg")!.remove(); // now only aria='Comment' + <span>10</span>
+    root.querySelector<HTMLButtonElement>("button[componentkey*='commentButtonSection']")!.disabled = true;
+    expect(findCommentSubmit(root)).toBeNull();
+  });
+
+  it("unwrapped thread Reply (plain .comments-section) never wins — submit disabled or absent", () => {
+    // The live capture's reply affordance sits in a plain div, not a
+    // replaceableComment/comment-item wrapper — the bare-'Reply' word rule is
+    // what keeps it out, not the wrapper heuristics.
+    const root = mount(fx("comment-box-2026.html"));
+    const item = root.querySelector<HTMLElement>("[componentkey='replaceableComment_1']")!;
+    item.removeAttribute("componentkey");
+    item.className = "comments-section";
+    const submit = root.querySelector<HTMLButtonElement>("button[componentkey*='commentButtonSection']")!;
+    submit.disabled = true;
+    expect(findCommentSubmit(root)).toBeNull(); // disabled → wait for it to enable
+    submit.remove();
+    expect(findCommentSubmit(root)).toBeNull(); // absent → still never the thread Reply
+  });
+
+  it("a submit-styled 'Reply' button still qualifies (reply-branch composer shape)", () => {
+    const root = mount(
+      "<div class='_c'><div role='textbox' contenteditable='true'>text</div>" +
+        "<button type='submit' class='_r'>Reply</button></div>",
+    );
+    expect(findCommentSubmit(root)?.textContent).toBe("Reply");
+  });
+
+  it("findCommentBox skips a chat pane that precedes the real composer", () => {
+    // If LinkedIn ever mounts the messaging overlay BEFORE the main content,
+    // the box search must step over it — not anchor typing (and the post-
+    // submit confirm reads) on a DM pane.
+    const root = mount(
+      "<aside class='msg-overlay-list-bubble'><form class='msg-form'>" +
+        "<div role='textbox' contenteditable='true' aria-label='Write a message…'></div>" +
+        "<button type='submit'>Send</button></form></aside>" +
+        "<div class='_9b8c7d6e'><div role='textbox' contenteditable='true' aria-label='Text editor for creating comment'></div>" +
+        "<button type='submit' class='_a1b2c3'>Comment</button></div>",
+    );
+    const box = findCommentBox(root);
+    expect(box?.getAttribute("aria-label")).toBe("Text editor for creating comment");
+    expect(findCommentSubmit(root)?.className).toBe("_a1b2c3");
+  });
+
+  it("never returns ANOTHER post's hook-less toggle when the composer has no submit at all", () => {
+    // Feed shape: post A's composer is open but its submit hasn't mounted;
+    // post B below carries a live-capture-shaped toggle (aria 'Comment',
+    // count-only text, zero SDUI hooks). It is wordy, enabled, and follows the
+    // box — the count-span shape check is what rejects it.
