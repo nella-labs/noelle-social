@@ -198,3 +198,203 @@ export function buildActionable(
               // the check is the cheap half of proving we opened the right
               // box — the belonging check does the load-bearing work either way.
               comment_author_name: lp.authorName ?? null,
+            }
+          : {}),
+      },
+    });
+  }
+  return { comments, dms };
+}
+
+/** Priority wake is reserved for Jev-qualified browser observations. */
+export function isPriorityReadyRow(row: JoinedRow): boolean {
+  return (row.draft_payload?.kind == null || row.draft_payload.kind === "reply")
+    && row.lead_payload?.source === "extension_observed"
+    && row.lead_payload.classifier?.provider === "jev";
+}
+
+/**
+ * Is this row one of the notifications actor's conversation replies?
+ *
+ * Both halves are required. `source='notification'` says it came from the
+ * sweep; a comment urn on external_id says we actually know WHICH comment to
+ * answer. Without the second, threading is impossible and the item must take
+ * the ordinary post-level path — where the dedup will (correctly) drop it.
+ */
+function isNotificationLead(r: JoinedRow): boolean {
+  const src = (r.lead_payload as { source?: string } | null)?.source;
+  if (src !== "notification") return false;
+  return /^urn:li:comment:\d+$/.test(String(r.lead_external_id ?? ""));
+}
+
+// Persistent dedup-by-link: drop any COMMENT whose post was already commented on.
+// Keyed on the LinkedIn activity URN carried on each item's target (derived from
+// the post URL by activityUrnFrom). Unlike the extension's in-memory per-run guard
+// (RunState.actionedUrls) and the after-markSent sibling-skip, this blocks a
+// re-comment across browser restarts, across a failed markSent, and across two
+// leads that resolve to the same post. Items with no derivable URN are left as-is
+// (nothing to dedup by link — rare). DMs are profile-targeted, never touched here.
+export function dedupeAlreadyCommented(
+  built: ActionableLinkedInResponse,
+  commentedUrns: ReadonlySet<string>,
+  /**
+   * Lead ids the dedup must NOT drop — the items that will be THREADED.
+   *
+   * Pass only items carrying `target.comment_urn`, i.e. ones the actuator will
+   * answer under a specific comment rather than adding to the post. That
+   * distinction is the whole safety property: the original version exempted
+   * every conversation reply on the reasoning that a second comment on the post
+   * was by design, which is true only when the answer is threaded — and the
+   * actuator could not thread, so it published five duplicate top-level
+   * comments on the operator's own threads.
+   *
+   * Scoped to lead ids (not urns) so exempting one conversation can never let
+   * an unrelated stale lead through on the same post.
+   */
+  exemptLeadIds?: ReadonlySet<string>,
+): ActionableLinkedInResponse {
+  if (commentedUrns.size === 0) return built;
+  const comments = built.comments.filter(
+    (c) =>
+      exemptLeadIds?.has(c.lead_id) ||
+      !(c.target.activity_urn && commentedUrns.has(c.target.activity_urn)),
+  );
+  return { comments, dms: built.dms };
+}
+
+// Pure + deterministic: decide whether to halt the LinkedIn send queue.
+// flagEnabled=false => never halt (escape hatch). A null count encodes a failed
+// challenge query => fail CLOSED (halt). No time/IO inside — the caller passes the
+// already-computed count so this stays unit-testable.
+export function shouldHaltForChallenge(opts: {
+  flagEnabled: boolean;
+  recentChallengeCount: number | null;
+}): boolean {
+  if (!opts.flagEnabled) return false;
+  return opts.recentChallengeCount == null || opts.recentChallengeCount > 0;
+}
+
+// Collapse the served queue to at most `cap` WRITES per author per day and drop
+// anyone already commented/DMed today. Rows MUST be newest-first (created_at desc);
+// only items that survived buildActionable are counted, so a dropped draft never
+// burns an author's slot. Matches BOTH lane keys (author_handle public id OR
+// author_id fsd id), mirroring countSentDmsToAuthor.
+export function capActionablePerAuthor(
+  built: ActionableLinkedInResponse,
+  rows: JoinedRow[],
+  args: { cap: number; writtenHandles: ReadonlySet<string>; writtenIds: ReadonlySet<string> },
+): ActionableLinkedInResponse {
+  const cap = Number.isFinite(args.cap) && args.cap >= 1 ? Math.floor(args.cap) : 1; // fail-safe → 1
+  const live = new Set<string>([...built.comments, ...built.dms].map((i) => i.approval_id));
+  const counts = new Map<string, number>();
+  const keep = new Set<string>();
+  for (const r of rows) {
+    if (!live.has(r.approval_id)) continue; // only count actually-served items
+    const handle = (r.lead_payload?.authorPublicId ?? r.author_handle) || null;
+    const id = r.author_id ?? null;
+    if ((handle && args.writtenHandles.has(handle)) || (id && args.writtenIds.has(id))) continue; // already actioned today
+    const key = id ?? handle ?? `lead:${r.lead_id}`; // unknown-author rows never merge
+    const used = counts.get(key) ?? 0;
+    if (used >= cap) continue;
+    counts.set(key, used + 1);
+    keep.add(r.approval_id);
+  }
+  return {
+    comments: built.comments.filter((i) => keep.has(i.approval_id)),
+    dms: built.dms.filter((i) => keep.has(i.approval_id)),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// X actuator (apps/x-actuator): the browser twin of the LinkedIn actuator for
+// x.com. Reply-only — the official X API refuses automated replies
+// (docs/reply-actuation-strategy.md), so the extension polls /api/actionable-x
+// and posts from the operator's own logged-in tab. X DMs are never auto-sent,
+// so there is no dm branch anywhere below.
+// ---------------------------------------------------------------------------
+
+type XLeadPayload = {
+  authorName?: string | null;
+  posted_at?: string | null;
+  source?: string;
+  classifier?: { judge?: string } | null;
+};
+export type XJoinedRow = {
+  approval_id: string;
+  draft_id: string;
+  lead_id: string;
+  draft_payload: DraftPayload | null;
+  lead_payload: XLeadPayload | null;
+  author_handle: string | null; // handle without @ (noelle.leads.author_handle)
+  external_id: string | null; // the tweet id (noelle.leads.external_id)
+  // noelle.approvals.auto_send_target_at: non-null ⇒ this pending approval is
+  // OWNED by the x-intern official-API autosend pipeline (drafter-tick stamps
+  // it; send-db claimAutoSendDue claims + posts it via the official API,
+  // deliberately NOT gated on auto_send_enabled). Stamped rows must NEVER be
+  // served to the browser actuator: two unattended senders over the same row =
+  // the same reply posted publicly twice (mark-sent idempotency only dedupes
+  // the DB, not the public post). The SQL query excludes these rows at the
+  // source; buildActionableX is the testable belt-and-braces. `Date` admitted
+  // alongside the driver's string form (timestamp columns can surface either).
+  auto_send_target_at: string | Date | null;
+};
+
+/** Priority wake is reserved for Jev-qualified browser observations with a real review. */
+export function isPriorityReadyXRow(row: XJoinedRow): boolean {
+  const dp = row.draft_payload;
+  return (dp?.kind == null || dp.kind === "reply")
+    && row.lead_payload?.source === "extension_observed"
+    && row.lead_payload.classifier?.judge === "jev"
+    && passesUnattendedReplyReview(dp?.verifier_meta);
+}
+
+// Pure: turns joined X rows into the actionable reply queue, mirroring
+// buildActionable. onOmit is called for every dropped item so callers can log
+// server-side. When blockExternalLinks is true, a reply whose body carries a
+// non-x.com/t.co link is withheld. No Date/process.env inside — unit-testable.
+export function buildActionableX(
+  rows: XJoinedRow[],
+  onOmit?: (reason: string, row: XJoinedRow) => void,
+  opts?: { blockExternalLinks?: boolean },
+): ActionableXResponse {
+  const replies: ActionableXResponse["replies"] = [];
+  for (const r of rows) {
+    const dp = r.draft_payload ?? {};
+    if (awaitingHumanReview(dp)) { onOmit?.("human-review-required", r); continue; }
+    const lp = r.lead_payload ?? {};
+    const body = readDraftBody(dp);
+    if (!body) { onOmit?.("empty-body", r); continue; }
+    // Partition guard (belt-and-braces with the SQL filter): an approval
+    // stamped auto_send_target_at belongs to the x-intern API-autosend
+    // pipeline. Serving it here would arm a SECOND unattended sender on the
+    // same approval → duplicate public reply once autosend claims + posts it
+    // (see XJoinedRow). Canonical omit reason: "autosend-owned".
+    if (r.auto_send_target_at != null) { onOmit?.("autosend-owned", r); continue; }
+    // Only "reply" (or null/undefined treated as reply) is actionable on X.
+    if (dp.kind !== "reply" && dp.kind != null) { onOmit?.("unsupported-kind", r); continue; }
+    const vm = dp.verifier_meta;
+    if (vm == null) { onOmit?.("verify-missing", r); continue; }
+    if (vm.pass !== true) { onOmit?.("verify-failed", r); continue; }
+    if (vm.judgeOk !== true) { onOmit?.("verify-no-valid-judge", r); continue; }
+    if (opts?.blockExternalLinks && bodyHasExternalLink(body)) { onOmit?.("external-link", r); continue; }
+    const tweetId = readXSourceId(r.external_id);
+    if (!tweetId) { onOmit?.("no-tweet-id", r); continue; } // cannot locate the tweet → omit
+    const rawHandle = typeof r.author_handle === "string" ? r.author_handle.trim().replace(/^@/, "") : "";
+    const handle = /^[A-Za-z0-9_]{1,15}$/.test(rawHandle) ? rawHandle : null;
+    // Handle-less permalinks still resolve (x.com/i/status/:id redirects).
+    const url = handle
+      ? `https://x.com/${handle}/status/${tweetId}`
+      : `https://x.com/i/status/${tweetId}`;
+    replies.push({
+      approval_id: r.approval_id,
+      draft_id: r.draft_id,
+      lead_id: r.lead_id,
+      kind: "reply",
+      body,
+      target: {
+        type: "post",
+        url,
+        tweet_id: tweetId,
+        author_handle: handle,
+        author_name: typeof lp.authorName === "string" ? lp.authorName.trim() || null : null,
+      },
