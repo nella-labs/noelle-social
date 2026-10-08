@@ -2398,3 +2398,203 @@ export async function reconcileContactsForOrg(orgId: string): Promise<void> {
     -- collapse to a single contact. X / Reddit have no such suffix and match
     -- exactly. Mirrors prettyHandle() in StyleSourceBadge.tsx.
     normed as (
+      select org_id, platform, handle, display_name, url,
+             case when platform = 'linkedin'
+                  then regexp_replace(handle, '-[0-9a-f]{6,}$', '')
+                  else handle end as norm_handle
+      from candidates
+    ),
+    dedup as (
+      -- One row per (org, platform, normalized handle). When the same person was
+      -- supplied under both a clean and a suffixed handle, prefer the clean
+      -- (shortest) one as the representative so the minted contact reads nicely.
+      select distinct on (org_id, platform, norm_handle)
+        org_id, platform, handle, norm_handle, display_name, url, gen_random_uuid() as new_id
+      from normed
+      order by org_id, platform, norm_handle, length(handle), display_name
+    ),
+    todo as (
+      select d.* from dedup d
+      where not exists (
+        select 1 from noelle.person_social_accounts a
+        where a.org_id = d.org_id and a.platform = d.platform
+          and case when d.platform = 'linkedin'
+                   then regexp_replace(lower(a.handle), '-[0-9a-f]{6,}$', '') = d.norm_handle
+                   else lower(a.handle) = d.handle end
+      )
+    ),
+    ins_persons as (
+      insert into noelle.persons (id, org_id, display_name)
+      select new_id, org_id, display_name from todo
+      returning id
+    )
+    insert into noelle.person_social_accounts (org_id, person_id, platform, handle, url)
+    select org_id, new_id, platform, handle, url from todo
+  `;
+
+  // Point any still-unlinked X watchlist rows at their freshly-minted person, so
+  // the detail page's "Watched by" can match on person_id as well as handle.
+  await sql`
+    update noelle.x_watchlist_people wp
+    set person_id = a.person_id
+    from noelle.person_social_accounts a
+    where wp.org_id = ${orgId} and wp.person_id is null
+      and a.org_id = wp.org_id and a.platform = 'x'
+      and lower(a.handle) = lower(wp.handle)
+  `;
+}
+
+/** Interaction rollup for one handle (from orgHandleStats). */
+export interface HandleInteractionStats {
+  repliesSent: number;
+  pendingReplies: number;
+  lastInteractionAt: string | null;
+}
+
+/** A contact's interaction + watch rollup, summed across all their handles. */
+export interface PersonRollup {
+  repliesSent: number;
+  pendingReplies: number;
+  lastInteractionAt: string | null;
+  watchedBy: string[];
+}
+
+/**
+ * Roll a contact's interaction stats + watchers up across every handle they're
+ * reachable on (X + LinkedIn), since both feed the same per-handle maps. Reply
+ * counts sum, lastInteractionAt takes the most recent, and watchers union
+ * (deduped) so an agent watching the same person on two platforms counts once.
+ * Pure so it can be unit-tested without a DB.
+ */
+export function rollUpPersonInteractions(
+  handleKeys: string[],
+  stats: Map<string, HandleInteractionStats>,
+  watchers: Map<string, string[]>,
+): PersonRollup {
+  let repliesSent = 0;
+  let pendingReplies = 0;
+  let lastInteractionAt: string | null = null;
+  const watchedBy = new Set<string>();
+  for (const key of handleKeys) {
+    const s = stats.get(key);
+    if (s) {
+      repliesSent += s.repliesSent;
+      pendingReplies += s.pendingReplies;
+      if (s.lastInteractionAt && (!lastInteractionAt || s.lastInteractionAt > lastInteractionAt)) {
+        lastInteractionAt = s.lastInteractionAt;
+      }
+    }
+    for (const agent of watchers.get(key) ?? []) watchedBy.add(agent);
+  }
+  return { repliesSent, pendingReplies, lastInteractionAt, watchedBy: [...watchedBy] };
+}
+
+/** All contacts in an org, with their social accounts + interaction rollup. */
+export async function listPersonsForOrg(orgId: string): Promise<PersonListItem[]> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+
+  const rows = await readSql<
+    Array<{
+      id: string;
+      display_name: string | null;
+      accounts: Array<{ platform: SocialPlatform; handle: string | null; url: string | null }>;
+    }>
+  >`
+    select
+      p.id,
+      p.display_name,
+      coalesce(
+        json_agg(
+          json_build_object('platform', a.platform, 'handle', a.handle, 'url', a.url)
+          order by a.platform
+        ) filter (where a.id is not null),
+        '[]'
+      ) as accounts
+    from noelle.persons p
+    left join noelle.person_social_accounts a on a.person_id = p.id
+    where p.org_id = ${orgId}
+    group by p.id, p.display_name
+  `;
+  const [stats, watchers] = await Promise.all([
+    orgHandleStats(orgId),
+    orgWatchersByHandle(orgId),
+  ]);
+  return rows
+    .map((r) => {
+      const accounts = Array.isArray(r.accounts) ? r.accounts : [];
+      const xHandle = accounts.find((a) => a.platform === "x")?.handle ?? null;
+      const linkedinHandle = accounts.find((a) => a.platform === "linkedin")?.handle ?? null;
+      // A contact can be reachable on several platforms; roll the interaction
+      // stats + watchers up across every linked handle so the row reflects all
+      // of them (X reply counts + LinkedIn watch, etc.), not just the X one.
+      const keys = accounts
+        .map((a) => a.handle?.toLowerCase())
+        .filter((h): h is string => Boolean(h));
+      const rollup = rollUpPersonInteractions(keys, stats, watchers);
+      return {
+        id: r.id,
+        displayName: personDisplayName(r.display_name, xHandle ?? linkedinHandle),
+        xHandle,
+        linkedinHandle,
+        platforms: accounts.map((a) => a.platform),
+        repliesSent: rollup.repliesSent,
+        pendingReplies: rollup.pendingReplies,
+        lastInteractionAt: rollup.lastInteractionAt,
+        watchedBy: rollup.watchedBy,
+      };
+    })
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
+/** One contact (id-scoped to the org) with its social accounts. */
+export async function getPersonForOrg(orgId: string, personId: string): Promise<PersonDetail | null> {
+  const sb = await createSupabaseServerClient();
+  const userId = await getRequiredUserId(sb);
+  await assertMember(orgId, userId);
+
+  const rows = await readSql<
+    Array<{
+      id: string;
+      display_name: string | null;
+      notes: string | null;
+      accounts: Array<{ platform: SocialPlatform; handle: string | null; url: string | null }>;
+    }>
+  >`
+    select
+      p.id,
+      p.display_name,
+      p.notes,
+      coalesce(
+        json_agg(
+          json_build_object('platform', a.platform, 'handle', a.handle, 'url', a.url)
+          order by a.platform
+        ) filter (where a.id is not null),
+        '[]'
+      ) as accounts
+    from noelle.persons p
+    left join noelle.person_social_accounts a on a.person_id = p.id
+    where p.id = ${personId} and p.org_id = ${orgId}
+    group by p.id, p.display_name, p.notes
+    limit 1
+  `;
+  const r = rows[0];
+  if (!r) return null;
+  const accounts = Array.isArray(r.accounts) ? r.accounts : [];
+  const xHandle = accounts.find((a) => a.platform === "x")?.handle ?? null;
+  const linkedinHandle = accounts.find((a) => a.platform === "linkedin")?.handle ?? null;
+  return {
+    id: r.id,
+    displayName: personDisplayName(r.display_name, xHandle ?? linkedinHandle),
+    notes: r.notes,
+    accounts,
+    xHandle,
+    linkedinHandle,
+  };
+}
+
+/** One agent that has a contact on its always-reply watchlist. */
+export interface PersonWatcher {
+  /**
+   * Which watchlist this row lives on. 'x' rows are editable inline (objective
