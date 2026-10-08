@@ -198,3 +198,11 @@ describe("applyReplyEmojiPolicy", () => {
       NO_EMOJI_POST,
       R,
     );
+    expect(out.find((d) => d.kind === "reply")!.body).toBe("brutal");
+    expect(out.find((d) => d.kind === "dm")!.body).toBe("hey \u{1F480}");
+  });
+
+  it("is a no-op on an empty input", () => {
+    expect(applyReplyEmojiPolicy([], NO_EMOJI_POST)).toEqual([]);
+  });
+});

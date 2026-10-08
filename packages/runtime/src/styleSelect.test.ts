@@ -198,3 +198,195 @@ describe("selectStyleExemplars — variety", () => {
       // per-lead-seeded variety noise.
     });
     return res?.exemplars[0]?.body;
+  }
+
+  it("variety=0 picks the same exemplar regardless of lead text (deterministic)", async () => {
+    const a = await topFor("lead one", 0);
+    const b = await topFor("a completely different lead", 0);
+    const c = await topFor("yet another", 0);
+    expect(a).toBeDefined();
+    expect(b).toBe(a);
+    expect(c).toBe(a);
+  });
+
+  it("high variety changes the pick across different lead texts", async () => {
+    const leads = [
+      "lead alpha",
+      "lead bravo",
+      "charlie post",
+      "delta delta",
+      "echo echo echo",
+      "foxtrot here",
+      "golf post text",
+      "hotel hotel",
+    ];
+    const picks = new Set<string>();
+    for (const l of leads) {
+      const t = await topFor(l, 1);
+      if (t) picks.add(t);
+    }
+    // With max variety + 8 distinct seeds over a 12-item pool, the picks must
+    // spread across more than one exemplar (a deterministic selector would yield
+    // exactly one). This is the "variety changes the pick per lead" assertion.
+    expect(picks.size).toBeGreaterThan(1);
+  });
+
+  it("the seeded PRNG is deterministic per seed but differs across seeds", () => {
+    const r1 = makeSeededRng("seed-x");
+    const r2 = makeSeededRng("seed-x");
+    const r3 = makeSeededRng("seed-y");
+    const a = r1();
+    const b = r2();
+    expect(a).toBe(b); // same seed → same stream
+    // different seed → (almost surely) a different first draw
+    expect(r3()).not.toBe(a);
+    // values are in [0,1)
+    expect(a).toBeGreaterThanOrEqual(0);
+    expect(a).toBeLessThan(1);
+  });
+});
+
+describe("selectStyleExemplars — minPerformancePercentile floor", () => {
+  it("excludes below-floor exemplars from the output", async () => {
+    // 10 candidates with engagement 0..9. A 60th-percentile floor keeps roughly
+    // the top ~40% (those with strictly fewer-lower neighbours past the cut).
+    const candidates = Array.from({ length: 10 }, (_, i) =>
+      row({ external_id: `c${i}`, body: `body ${i}`, like_count: i, comment_count: 0 }),
+    );
+    const res = await selectStyleExemplars("lead", candidates, NO_PROFILES, {
+      enabled: true,
+      config: { maxStyleExemplars: 10, varietyTemperature: 0, minPerformancePercentile: 60 },
+    });
+    expect(res).not.toBeNull();
+    const bodies = (res?.exemplars ?? []).map((e) => e.body);
+    // The very lowest performers (engagement 0,1,2) must be floored out.
+    expect(bodies).not.toContain("body 0");
+    expect(bodies).not.toContain("body 1");
+    expect(bodies).not.toContain("body 2");
+    // The top performer survives.
+    expect(bodies).toContain("body 9");
+  });
+
+  it("a 100 floor with a flat-engagement pool floors everything → null", async () => {
+    // All equal engagement → percent_rank is 0 for all → nothing clears a 100
+    // floor → fail-open null.
+    const candidates = Array.from({ length: 5 }, (_, i) =>
+      row({ external_id: `c${i}`, like_count: 5, comment_count: 0 }),
+    );
+    const res = await selectStyleExemplars("lead", candidates, NO_PROFILES, {
+      enabled: true,
+      config: { maxStyleExemplars: 3, minPerformancePercentile: 100 },
+    });
+    expect(res).toBeNull();
+  });
+
+  it("a 0 floor (default) keeps the whole pool eligible", async () => {
+    const candidates = Array.from({ length: 4 }, (_, i) =>
+      row({ external_id: `c${i}`, like_count: i }),
+    );
+    const res = await selectStyleExemplars("lead", candidates, NO_PROFILES, {
+      enabled: true,
+      config: { maxStyleExemplars: 4, varietyTemperature: 0, minPerformancePercentile: 0 },
+    });
+    expect(res?.exemplars).toHaveLength(4);
+  });
+});
+
+describe("selectStyleExemplars — styleNotes", () => {
+  it("attaches matched accounts' ultra-profile notes", async () => {
+    const candidates = [row({ external_id: "a", body: "hook body", account_handle: "guru" })];
+    const profiles: UltraProfileRow[] = [
+      {
+        account_handle: "guru",
+        voice_summary: "punchy and direct",
+        tone: "dry",
+        structure_notes: "one-liners, no fluff",
+        hook_patterns: ["starts with a bold claim"],
+        signature_phrases: ["here's the thing"],
+        top_topics: ["devtools"],
+      },
+    ];
+    const res = await selectStyleExemplars("lead", candidates, profiles, {
+      enabled: true,
+      config: { maxStyleExemplars: 1, varietyTemperature: 0 },
+    });
+    expect(res?.styleNotes).toContain("punchy and direct");
+    expect(res?.styleNotes).toContain("here's the thing");
+  });
+
+  it("returns empty styleNotes when no ultra profile matches the chosen account", async () => {
+    const candidates = [row({ external_id: "a", account_handle: "unknown-acct" })];
+    const res = await selectStyleExemplars("lead", candidates, NO_PROFILES, {
+      enabled: true,
+      config: { maxStyleExemplars: 1, varietyTemperature: 0 },
+    });
+    expect(res).not.toBeNull();
+    expect(res?.styleNotes).toBe("");
+  });
+});
+
+describe("selectStyleExemplars — post-register cheer bias", () => {
+  // The SAME pool + input order; only postRegister differs. A calm analytical
+  // exemplar (best fit, low engagement) and a cheery one (worse fit, high
+  // engagement). Celebration must surface the cheery one; neutral must surface
+  // the calm one (an analytical reply should not learn its form from "omg!!!").
+  const calm = row({
+    external_id: "calm",
+    body: "the retainer-first move is the tell every time",
+    like_count: 0,
+    comment_count: 0,
+    account_handle: "k",
+  });
+  const cheery = row({
+    external_id: "cheery",
+    body: "omg congrats this is amazing!!! 🥳",
+    like_count: 100,
+    comment_count: 0,
+    account_handle: "k",
+  });
+
+  it("celebration surfaces the CHEERING exemplar", async () => {
+    const res = await selectStyleExemplars("we just shipped!!", [calm, cheery], NO_PROFILES, {
+      enabled: true,
+      config: { maxStyleExemplars: 1, varietyTemperature: 0 },
+      postRegister: "celebration",
+    });
+    expect(res?.exemplars[0]?.body).toBe(cheery.body);
+  });
+
+  it("neutral surfaces the CALM exemplar (penalizes cheeriness)", async () => {
+    const res = await selectStyleExemplars(
+      "here's why most pipelines degrade",
+      [calm, cheery],
+      NO_PROFILES,
+      {
+        enabled: true,
+        config: { maxStyleExemplars: 1, varietyTemperature: 0 },
+        postRegister: "neutral",
+      },
+    );
+    expect(res?.exemplars[0]?.body).toBe(calm.body);
+  });
+
+  it("omitting postRegister preserves the legacy fit-led pick (no cheer term)", async () => {
+    // Legacy blend (W_FIT 0.6 > W_PERF 0.4): the best-fit calm exemplar leads.
+    const res = await selectStyleExemplars("any lead", [calm, cheery], NO_PROFILES, {
+      enabled: true,
+      config: { maxStyleExemplars: 1, varietyTemperature: 0 },
+    });
+    expect(res?.exemplars[0]?.body).toBe(calm.body);
+  });
+});
+
+describe("styleCheer01", () => {
+  it("scores cheering writing high and calm writing ~0", () => {
+    expect(styleCheer01("omg congrats this is amazing!!! 🥳")).toBeGreaterThan(0.5);
+    expect(styleCheer01("YAYYYY YOU'RE DONE!!!!! 🥳🥳🥳")).toBeGreaterThan(0.5);
+    expect(styleCheer01("the retainer-first move is the tell every time")).toBe(0);
+  });
+
+  it("is clamped to [0,1] and handles empty input", () => {
+    expect(styleCheer01("CONGRATS!!! AMAZING!!! HUGE!!! LETS GO!!! 🎉🥳🙌")).toBeLessThanOrEqual(1);
+    expect(styleCheer01("")).toBe(0);
+  });
+});
