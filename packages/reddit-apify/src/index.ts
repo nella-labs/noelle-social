@@ -198,3 +198,203 @@ interface ApifyRedditComment {
   dataType?: unknown;
   type?: unknown;
 }
+
+function asNumber(v: unknown): number | null {
+  if (v == null || (typeof v === "string" && !v.trim())) return null;
+  const n = typeof v === "string" ? Number(v) : v;
+  return typeof n === "number" && Number.isFinite(n) ? n : null;
+}
+
+/** Strip a leading "t3_" (Reddit's link/post fullname prefix) from an id. */
+function stripT3(id: string): string {
+  return id.replace(/^t3_/, "");
+}
+
+/** Reddit numeric source timestamps are Unix seconds; unknown remains empty. */
+function toISO(...candidates: unknown[]): string {
+  for (const value of candidates) {
+    const measured = typeof value === "number"
+      ? readSourceEpochTimestamp(value, "seconds") : readSourceTimestamp(value);
+    if (measured !== null) return measured;
+  }
+  return "";
+}
+
+/** Known signed measurements precede unknown; stable sort retains unknown order. */
+function byVoteScore(a: RedditComment, b: RedditComment): number {
+  return (b.score ?? -Infinity) - (a.score ?? -Infinity) || 0;
+}
+
+/** Build the canonical reddit URL from a permalink (path) or an absolute URL. */
+function permalinkToUrl(permalink: string): string {
+  const p = permalink.trim();
+  if (/^https?:\/\//i.test(p)) return p;
+  return `https://www.reddit.com${p.startsWith("/") ? "" : "/"}${p}`;
+}
+
+/** A string http(s) URL (trimmed), else null. Accepts a {url} object too. */
+function asHttpUrl(v: unknown): string | null {
+  const s = typeof v === "string" ? v : (v as { url?: unknown } | null)?.url;
+  return typeof s === "string" && /^https?:\/\//i.test(s.trim()) ? s.trim() : null;
+}
+
+/** First array among the args, or [] — for coalescing nested-comment field names. */
+function firstArray(...vals: unknown[]): unknown[] {
+  for (const v of vals) if (Array.isArray(v)) return v;
+  return [];
+}
+
+/** Whether a URL points at an image or a reddit gallery (to salvage post.url). */
+function looksLikeImageOrGallery(u: string): boolean {
+  return (
+    /\.(?:jpe?g|png|gif|webp|bmp)(?:\?|#|$)/i.test(u) ||
+    /(?:^|\/\/)(?:i|preview|g)\.redd\.it\//i.test(u) ||
+    /i\.imgur\.com\//i.test(u) ||
+    /reddit\.com\/gallery\//i.test(u)
+  );
+}
+
+/**
+ * Pull every post-media image URL off a raw item, coalesced + deduped — mirrors
+ * @noelle/linkedin-apify's extractImages. Reads previewImages / galleryData[].url
+ * / galleryImages / mediaUrl / thumbnail, and finally the post url itself when it
+ * looks like an image or gallery. Pure + FAIL-OPEN: anything malformed (non-array,
+ * missing url, non-string, "self"/"default" thumbnails) is silently skipped.
+ */
+function extractImages(item: ApifyRedditItem): string[] {
+  const out: string[] = [];
+  const push = (v: unknown) => {
+    const u = asHttpUrl(v);
+    if (u && !out.includes(u)) out.push(u);
+  };
+  for (const el of firstArray(item.previewImages)) push(el);
+  for (const el of firstArray(item.galleryData)) push(el); // [{ url }]
+  for (const el of firstArray(item.galleryImages)) push(el);
+  push(item.mediaUrl);
+  push(item.thumbnail); // "self"/"default"/"nsfw" fail asHttpUrl → skipped
+  const rawUrl = asHttpUrl(item.url ?? item.link);
+  if (rawUrl && looksLikeImageOrGallery(rawUrl)) push(rawUrl);
+  return out;
+}
+
+/** Coalesce a comment author to a bare handle (no u/), from a string or object. */
+function commentAuthorHandle(c: ApifyRedditComment): string {
+  const strip = (s: string) => s.replace(/^\/?u\//i, "").trim();
+  if (typeof c.author === "string") return strip(c.author);
+  if (c.author && typeof c.author === "object") {
+    const o = c.author as { username?: unknown; name?: unknown };
+    if (typeof o.username === "string") return strip(o.username);
+    if (typeof o.name === "string") return strip(o.name);
+  }
+  if (typeof c.authorName === "string") return strip(c.authorName);
+  return "";
+}
+
+/**
+ * Map one raw comment (nested or standalone) into RedditComment; null when there
+ * is no body. DEFENSIVELY coalesces every field across the actor's unverified
+ * spellings and NEVER throws (fail-open). The `body` stays UNTRUSTED text.
+ */
+export function normalizeRedditComment(raw: unknown): RedditComment | null {
+  if (!raw || typeof raw !== "object") return null;
+  const c = raw as ApifyRedditComment;
+  const body = (
+    (typeof c.body === "string" && c.body) ||
+    (typeof c.text === "string" && c.text) ||
+    (typeof c.bodyText === "string" && c.bodyText) ||
+    ""
+  ).trim();
+  if (!body) return null;
+  const score = readSourceVoteScore(c.score, c.upVotes, c.ups);
+  const permalinkRaw = (
+    (typeof c.permalink === "string" && c.permalink) ||
+    (typeof c.postUrl === "string" && c.postUrl) ||
+    (typeof c.url === "string" && c.url) ||
+    ""
+  ).trim();
+  const idRaw = c.id != null ? String(c.id) : c.commentId != null ? String(c.commentId) : "";
+  return {
+    id: idRaw.replace(/^t1_/, ""),
+    body,
+    score,
+    author: commentAuthorHandle(c),
+    permalink: permalinkRaw ? permalinkToUrl(permalinkRaw) : "",
+  };
+}
+
+/** Bare parent post id (t3_ stripped) a standalone comment item belongs to, or "". */
+function commentParentPostId(c: ApifyRedditComment): string {
+  const raw =
+    (typeof c.link_id === "string" && c.link_id) ||
+    (typeof c.linkId === "string" && c.linkId) ||
+    (typeof c.postId === "string" && c.postId) ||
+    (typeof c.parentPostId === "string" && c.parentPostId) ||
+    (typeof c.parentId === "string" && c.parentId) ||
+    "";
+  return raw.replace(/^t3_/, "");
+}
+
+/** True ONLY when an item explicitly declares itself a comment (dataType/type). */
+function isStandaloneCommentItem(raw: unknown): boolean {
+  if (!raw || typeof raw !== "object") return false;
+  const o = raw as { dataType?: unknown; type?: unknown };
+  const disc = String(o.dataType ?? o.type ?? "").toLowerCase();
+  return disc === "comment" || disc === "t1";
+}
+
+/** Bare post id (t3_ stripped) for a raw post item — mirrors normalizeRedditPost. */
+function rawPostId(item: ApifyRedditItem): string {
+  return String(item.id ?? item.name ?? "").replace(/^t3_/, "");
+}
+
+export function normalizeRedditPost(
+  raw: unknown,
+  opts?: {
+    /** Cap on how many top comments to keep (default 8). */
+    commentsPerPost?: number;
+    /** Standalone comment rows grouped to this post by the client (separate-items mode). */
+    extraComments?: unknown[];
+  },
+): RedditPost | null {
+  if (!raw || typeof raw !== "object") return null;
+  const item = raw as ApifyRedditItem;
+  const rawId = String(item.id ?? item.name ?? "");
+  const id = rawId ? stripT3(rawId) : "";
+  const title = (item.title ?? "").trim();
+  // Need an id + a title or there's nothing to act on.
+  if (!id || !title) return null;
+
+  const body = (item.selfText ?? item.selftext ?? item.body ?? item.text ?? "").trim();
+
+  const permalink = item.permalink ?? "";
+  const url = permalink ? permalinkToUrl(permalink) : "";
+
+  // On a link post, `url`/`link` points at the external target. On a self post it
+  // usually mirrors the permalink, so only surface it when it's a real http(s) URL
+  // and not the same as our canonical reddit URL.
+  let externalUrl: string | undefined;
+  const rawUrl = (item.url ?? item.link ?? "").toString().trim();
+  if (/^https?:\/\//i.test(rawUrl) && rawUrl !== url) externalUrl = rawUrl;
+
+  const subredditRaw = (item.subreddit ?? item.subredditName ?? "").toString().trim();
+  const subreddit = subredditRaw.replace(/^\/?r\//i, "");
+
+  const createdAt = toISO(item.createdAt, item.created, item.createdUtc, item.created_utc);
+
+  const author =
+    typeof item.author === "string"
+      ? item.author
+      : item.author?.name ?? item.author?.username ?? item.username ?? "";
+
+  const ratio = asNumber(item.upvoteRatio ?? item.upvote_ratio);
+
+  // Media images — coalesced defensively; omit the key when none (never []).
+  const images = extractImages(item);
+
+  // Top comments — nested (common case) plus any standalone rows the client
+  // grouped to this post. Normalize, drop empties, sort by score desc, slice.
+  const commentsPerPost = opts?.commentsPerPost ?? 8;
+  const rawComments: unknown[] = [
+    ...firstArray(item.comments, item.topComments, item.commentList),
+    ...(opts?.extraComments ?? []),
+  ];
