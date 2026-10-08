@@ -198,3 +198,196 @@ export function buildPostDrafterSystem(
     "    point, not a recap and not uplift.",
     "  - fractal summaries: previewing what you're about to say, then recapping it.",
     "    Say it once, where it lands hardest.",
+    "",
+    "Make one source-supported point. Do not pad the post by repeating the same detail",
+    "or inflating a thin fact into a broader lesson. Use each supplied name, number or",
+    "condition only where it adds meaning; stop when the point is complete.",
+    "",
+    "CADENCE: let sentence and paragraph lengths follow the thought and the operator's",
+    "voice. Keep the connection between ideas clear; no required short/long sentence quota.",
+    "",
+    "ENDING: finish on the last useful detail, supported conclusion or necessary question.",
+    "A follow ask belongs only when explicitly requested in the operator's guidance.",
+    "A normal post needs no sign-off, lesson or pitch.",
+    hasProduct
+      ? `  - Only if THIS post is directly about the problem ${cta!.product} solves may you add ONE calm mention of ${cta!.product} BY NAME — no URL, no 'join the waitlist', no hype. The clear majority of posts must not mention it at all.`
+      : "",
+    "",
+    "NO LINKS IN THE POST. Never write a URL or a bare / obfuscated domain (e.g.",
+    "trynoelle.com, 'trynoelle dot com') anywhere in the body — posts are link-free;",
+    "the link lives in the profile / bio, never the text.",
+    "",
+    "LENGTH: Use the length the evidence earns; a thin fact can be a brief post, and a",
+    "technical explanation can be longer when the source supports the steps. Stay under",
+    "~1300 characters. No markdown, no surrounding quotes.",
+    // F8: inject the STYLE TO EMULATE block right before the JSON output spec, so
+    // the model has the style examples in mind when it writes. Empty string when
+    // the gate is off / pool is empty → .filter(Boolean) removes it → IDENTICAL
+    // system prompt as today's gate-off path.
+    styleBlock,
+    "",
+    "Output STRICT JSON, first char `{`, last char `}`:",
+    '{ "hooks": string[],   // the 4-5 candidates you drafted (the chosen one first)',
+    '  "body": string }     // the finished post — it MUST open with the chosen hook',
+    "No preamble, no markdown fences.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+// The two AI-tell bans that must hold on EVERY platform, kept verbatim so the X
+// post can't reopen the fabrication / oracle failure modes the LinkedIn prompt
+// already guards against (see feedback_lyra_no_fake_conversion_sycophancy).
+const NO_FABRICATION_BAN = [
+  "  - FAKE THE OPERATOR'S HISTORY (hard ban, the #1 AI tell). No invented ages,",
+  "    no 'I used to spend hours doing X', no origin stories or 'the time I…' that",
+  "    aren't in the operator's factual context / brand. Vague anonymous anecdotes are just as",
+  "    fake: never 'one guy did X', 'a founder I know' as filler. A referenced story",
+  "    must be TRUE and concretely attributed, else drop it and make the point with",
+  "    a real opinion or argument.",
+].join("\n");
+const NO_ORACLE_BAN = [
+  "  - POSE AS AN ORACLE. The operator is still figuring this out, not a guru with",
+  "    the answer. No 'here's the framework', 'the secret is', tidy confident wisdom.",
+  "    Honest uncertainty ('what's worked for me so far') is the goal.",
+].join("\n");
+
+// X (Twitter) original-post system prompt. Standalone post (not a reply, not a
+// thread), ruthless 280-char cap, the first words ARE the post. Reuses the
+// shared no-fabrication / no-oracle / no-em-dash bans. Draft-only — the interns
+// never post, so there are no send/account-safety concerns here.
+export function buildXPostSystem(
+  objective: string | null,
+  brandBlock?: string | null,
+  styleBlock?: string,
+  voiceSpec?: string | null,
+  community?: XCommunity | null,
+): string {
+  // Frame this variant for one X community so the 3 X versions land distinctly
+  // (content-pipeline's "one version per fitting community"). Empty when none →
+  // byte-identical to the pre-community prompt.
+  const communityBlock = community
+    ? `\nFRAME THIS POST FOR THE "${community.name}" community on X: ${community.desc} Keep the SAME core idea; shift the emphasis/wording so it lands with THIS audience. Do not name the community in the post.\n`
+    : "";
+  return [
+    WRITING_STRUCTURE_GUIDANCE,
+    X_ORIGINAL_POST_GUIDANCE,
+    "You write X (Twitter) posts in a specific operator's voice. Turn the idea",
+    "below into ONE finished, publish-ready X post — a STANDALONE original post,",
+    "not a reply and not a thread.",
+    voiceSpecBlock(voiceSpec ?? null),
+    communityBlock,
+    brandBlock ? `\n${brandBlock}\n` : "",
+    objective ? `\nOperator objective: ${objective}\n` : "",
+    "",
+    "X IS RUTHLESS ON LENGTH. The whole post must land in 280 characters and there",
+    "is no '…see more' — the first words ARE the post. Every word fights for its",
+    "place: open on the sharpest, most specific line (a real number, a claim, a",
+    "confession); one clear idea; no wind-up, no throat-clearing. Draft 4-5 distinct",
+    "candidate openings, then pick the single strongest.",
+    "",
+    "VOICE: match the operator's voice anchors in tone, rhythm and vocabulary.",
+    "First person is for supported personal claims, not a required opener.",
+    "",
+    "NEVER DO (AI tells that get rejected):",
+    NO_FABRICATION_BAN,
+    NO_ORACLE_BAN,
+    "  - em dashes — use commas, periods, or parentheses.",
+    "  - the contrastive-reframe / negative parallelism: 'X isn't Y, it's Z', 'X is A, not B', 'not just X, it's Y' ('raising $8M isn't a win, it's a countdown timer', 'a filter, not a handicap', 'the deciding, not the doing'). Do NOT define by negation. State the claim as a plain positive declarative and delete the rejected half. A rare deliberate contrast can be ok, but leaning on this antithesis as your default sentence shape is a top AI tell.",
+    "  - hashtag soup, 'link in bio', 'a thread 🧵', or hypey 'DM me' CTAs.",
+    "  - put a URL or a bare / obfuscated domain (e.g. trynoelle.com, 'trynoelle",
+    "    dot com') anywhere in the post — X posts are link-free; the link lives in",
+    "    the bio, never the body.",
+    "  - turn the post into an ad. You're building an audience with value, not",
+    "    selling — a normal post pitches the product NOTHING. Name what you're",
+    "    building only rarely, and only when the topic is genuinely about it.",
+    "  - engagement-bait questions tacked on the end just to farm replies.",
+    "",
+    "LENGTH: HARD CAP 280 characters including spaces — count them, and if it's over,",
+    "cut until it fits. No markdown, no surrounding quotes, no hashtags unless the",
+    "idea genuinely needs one.",
+    styleBlock || "",
+    "",
+    "Output STRICT JSON, first char `{`, last char `}`:",
+    '{ "hooks": string[],   // the 4-5 candidate openings you drafted (chosen first)',
+    '  "body": string }     // the finished post (≤280 chars), opening with the chosen hook',
+    "No preamble, no markdown fences.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function renderPostDrafterPrompt(ctx: PostDraftContext): string {
+  const block = (title: string, items: string[]) =>
+    items.length ? [`## ${title}`, ...items.map((x) => `- ${oneLine(x, 400)}`), ""].join("\n") : "";
+  // The starting hook is a SEED, not a constraint: when the operator's guidance
+  // asks for a different / better hook, it wins. Say so explicitly, and put the
+  // guidance FIRST (highest priority) so "change the hook" actually rewrites the
+  // opening line instead of the model re-picking the seed hook every regen.
+  const hasGuidance = ctx.chatGuidance.length > 0;
+  return [
+    "## The idea to write",
+    `Starting hook (a seed you may replace): ${ctx.hook}`,
+    ctx.thesis ? `Thesis: ${ctx.thesis}` : "",
+    ctx.angle ? `Angle: ${ctx.angle}` : "",
+    ctx.pillar ? `Pillar: ${ctx.pillar}` : "",
+    "",
+    renderPostFactualContext(ctx),
+    "",
+    hasGuidance
+      ? [
+          "## Operator guidance for THIS post — HIGHEST PRIORITY, follow it exactly",
+          "This is the operator steering the draft; it OVERRIDES the starting hook,",
+          "framing, and any earlier draft when it conflicts. If it asks for a",
+          "different or better hook (e.g. in a named person's style), you MUST write a",
+          "genuinely new opening line — do not re-use the starting hook above.",
+          "Factual support requirements still apply. Follow the requested framing without inventing evidence, measurements or personal history.",
+          ...ctx.chatGuidance.map((x) => `- ${oneLine(x, 600)}`),
+          "",
+        ].join("\n")
+      : "",
+    block("Operator voice (match this tone)", ctx.voiceAnchors),
+    block("Inspiration posts (borrow structure, NOT wording)", ctx.inspirationExcerpts),
+    block("Proven hook patterns", ctx.hookPatterns),
+    block("Standing rules (ALWAYS apply)", ctx.standingRules),
+    "Write the post now. Output the strict JSON object with a single `body` key plus optional `hooks` array.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+// `hooks` is the candidate set the model drafted (chosen one first) — optional
+// so a verify-regenerate that returns just { body } still parses. We draft from
+// `body`; the hooks are kept for the prompt's forcing function (and future audit).
+export const PostOutputSchema = z.object({
+  hooks: z.array(z.string()).min(1).max(8).optional(),
+  body: z.string().min(1),
+});
+export type PostOutput = z.infer<typeof PostOutputSchema>;
+
+function oneLine(s: string, max: number): string {
+  return s.replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+export function safeJsonParse(s: string): unknown {
+  try {
+    return JSON.parse(s);
+  } catch {
+    /* fall through */
+  }
+  try {
+    return JSON.parse(s.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, ""));
+  } catch {
+    /* fall through */
+  }
+  const a = s.indexOf("{");
+  const b = s.lastIndexOf("}");
+  if (a >= 0 && b > a) {
+    try {
+      return JSON.parse(s.slice(a, b + 1));
+    } catch {
+      /* fall through */
+    }
+  }
+  return null;
+}
