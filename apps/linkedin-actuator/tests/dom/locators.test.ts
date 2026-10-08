@@ -398,3 +398,83 @@ describe("locateReaction (varied reactions from the open flyout)", () => {
 describe("locatePostLike (reply-also-likes)", () => {
   it("locates the post's like button on the open post page", () => {
     document.body.innerHTML = fx("feed-post.html"); // has an unliked React Like button
+    stubRect(30, 40);
+    const res = locatePostLike(document.body);
+    expect(res.ok).toBe(true);
+    expect(res.rect).toEqual({ x: 30, y: 40, width: 40, height: 20 });
+  });
+
+  it("skips when the post is already liked", () => {
+    document.body.innerHTML = "<button aria-label='React Like to X' aria-pressed='true'>Like</button>";
+    const res = locatePostLike(document.body);
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("already-liked");
+  });
+
+  it("skips when there is no like button", () => {
+    document.body.innerHTML = "<div>no like here</div>";
+    const res = locatePostLike(document.body);
+    expect(res.ok).toBe(false);
+    expect(res.skipReason).toBe("no-like-button");
+  });
+});
+
+describe("locateLikeTarget stale-rect discipline (scroll first, measure after)", () => {
+  // Regression (mirrors the X actuator's like-locator.test.ts): every rect
+  // locateLikeTarget returns — the like rect AND observed.seeMoreRect — must be
+  // measured AFTER its own scrollIntoView. The in-view filter admits posts up
+  // to 1.4*viewport below the fold, so centering the like button can move the
+  // page by hundreds of px; the loop fires a trusted CDP click straight at
+  // seeMoreRect, so a pre-scroll measurement lands on a different post.
+  const PRE_TOP = 900;
+  const SCROLL_DELTA = 600;
+  const SEE_MORE_OFFSET = 40;
+  const LIKE_OFFSET = 80;
+  let scrolled = false;
+
+  function offsetFor(el: HTMLElement): number {
+    if (el.classList.contains("feed-shared-inline-show-more-text__see-more-less-toggle")) return SEE_MORE_OFFSET;
+    if (/React Like/i.test(el.getAttribute("aria-label") ?? "")) return LIKE_OFFSET;
+    return 0;
+  }
+
+  beforeEach(() => {
+    scrolled = false;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      const y = PRE_TOP + offsetFor(this) - (scrolled ? SCROLL_DELTA : 0);
+      return { x: 100, y, width: 40, height: 20, top: y, left: 100, right: 140, bottom: y + 20, toJSON: () => ({}) } as DOMRect;
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      writable: true,
+      value: () => { scrolled = true; },
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+  });
+
+  it("measures seeMoreRect AFTER scrollIntoView — never a pre-scroll rect", () => {
+    document.body.innerHTML = fx("long-post.html");
+    const res = locateLikeTarget(document.body, { preferWatchlist: false, watchlistNames: [] }, makeRng(1));
+    expect(res.ok).toBe(true);
+    expect(scrolled).toBe(true);
+    expect(res.observed?.isTruncated).toBe(true);
+    const seeMoreRect = res.observed?.seeMoreRect as { y: number } | undefined;
+    expect(seeMoreRect).toBeDefined();
+    // Post-scroll coordinates; a pre-scroll measurement would report y=940.
+    expect(seeMoreRect!.y).toBe(PRE_TOP + SEE_MORE_OFFSET - SCROLL_DELTA);
+    expect(seeMoreRect!.y).not.toBe(PRE_TOP + SEE_MORE_OFFSET);
+  });
+
+  it("the like rect and seeMoreRect agree on the same (post-scroll) viewport", () => {
+    document.body.innerHTML = fx("long-post.html");
+    const res = locateLikeTarget(document.body, { preferWatchlist: false, watchlistNames: [] }, makeRng(1));
+    expect(res.ok).toBe(true);
+    const seeMoreRect = res.observed?.seeMoreRect as { y: number };
+    expect(res.rect!.y - seeMoreRect.y).toBe(LIKE_OFFSET - SEE_MORE_OFFSET);
+    expect(res.rect!.y).toBe(PRE_TOP + LIKE_OFFSET - SCROLL_DELTA);
+  });
+});
