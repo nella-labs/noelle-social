@@ -198,3 +198,32 @@ describe("current Reddit registered tick post-submit lifecycle", () => {
     expect(f.state!.commentPool).toHaveLength(1);
     expect(f.state!.commentPool[0]!.tries).toBe(1);
     expect(f.calls.filter(call => call.path.includes("mark-sent"))).toHaveLength(0);
+  });
+  it.each(["empty", "late"] as const)("records an observed %s composer locally before mark-sent", async mode => {
+    f.mode = mode; await tick();
+    expect(f.submits).toBe(1);
+    expect(f.probes).toBe(mode === "late" ? 9 : 1);
+    expect(f.state!.done.comments).toBe(1);
+    expect(f.state!.doneDraftIds).toEqual([ids.draft]);
+    expect(f.state!.actionedKeys).toEqual(["t3_abc123"]);
+    expect(f.order.indexOf("persist")).toBeLessThan(f.order.indexOf("mark-sent"));
+  });
+  it("does not replay confirmed success when every server receipt fails", async () => {
+    f.sentFailure = true; f.activityFailure = true;
+    await tick();
+    expect(f.submits).toBe(1);
+    expect(f.calls.filter(call => call.path.includes("mark-sent"))).toHaveLength(3);
+    f.now += 30 * 60_000;
+    f.state!.actions[1]!.atMs = f.now - 1;
+    await tick();
+    expect(f.submits).toBe(1);
+    expect(f.state!.done.comments).toBe(1);
+  });
+  it("keeps positively removed targets terminal without a submit", async () => {
+    f.mode = "removed"; await tick();
+    expect(f.submits).toBe(0);
+    expect(f.state!.done.comments).toBe(0);
+    expect(f.state!.doneDraftIds).toEqual([ids.draft]);
+    expect(f.calls.filter(call => call.path.includes("mark-skipped"))).toHaveLength(1);
+  });
+});
