@@ -198,3 +198,135 @@ export function ClipDetailModal({
   instanceId,
   onClose,
 }: {
+  clip: VideoClipRow;
+  orgSlug: string;
+  instanceId: string;
+  onClose: () => void;
+}) {
+  const [detail, setDetail] = useState<VideoClipDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  useEffect(() => {
+    let live = true;
+    setLoading(true);
+    loadVideoClipDetail({ orgSlug, instanceId, clipId: clip.id })
+      .then((r) => {
+        if (live && r.ok) setDetail(r.clip);
+      })
+      .finally(() => live && setLoading(false));
+    return () => {
+      live = false;
+    };
+  }, [clip.id, orgSlug, instanceId]);
+
+  const rm = reachMultiple(clip.views, clip.author_follower_count);
+  const embed = embedSrc(clip.platform, clip.url, clip.external_id);
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 100,
+        background: "rgba(20,16,8,0.55)",
+        backdropFilter: "blur(2px)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20,
+      }}
+    >
+      <div
+        className="card clay-flat"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "min(920px, 100%)",
+          maxHeight: "90vh",
+          padding: 0,
+          overflow: "hidden",
+          display: "grid",
+          gridTemplateColumns: "minmax(0, 320px) 1fr",
+        }}
+      >
+        {/* Left: the reel itself (9:16 embed), or thumbnail fallback. */}
+        <div style={{ background: "#0d0a06", position: "relative", minHeight: 420 }}>
+          {embed ? (
+            <iframe
+              title={`@${clip.author_handle} reel`}
+              src={embed}
+              allow="autoplay; encrypted-media; clipboard-write"
+              allowFullScreen
+              style={{ width: "100%", height: "100%", minHeight: 420, border: 0, display: "block" }}
+            />
+          ) : clip.thumb_url ? (
+            // Raw <img>: clip.thumb_url is an arbitrary remote host, not a configured
+                // next/image remotePattern.
+            <img src={clip.thumb_url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+          ) : null}
+          <a
+            href={clip.url}
+            target="_blank"
+            rel="noreferrer"
+            className="btn btn-sm"
+            style={{ position: "absolute", bottom: 10, left: 10, opacity: 0.92 }}
+          >
+            Open on {clip.platform === "tiktok" ? "TikTok" : "Instagram"} ↗
+          </a>
+        </div>
+
+        {/* Right: header, stats, teardown. Scrolls independently. */}
+        <div style={{ padding: "18px 20px", overflowY: "auto", maxHeight: "90vh" }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--ink)" }}>@{clip.author_handle}</div>
+              {clip.caption ? (
+                <p style={{ fontSize: 13, color: "var(--ink-muted)", marginTop: 5, lineHeight: 1.45 }}>{clip.caption}</p>
+              ) : null}
+            </div>
+            <button type="button" className="btn btn-sm" onClick={onClose} aria-label="Close" style={{ flexShrink: 0 }}>
+              ✕
+            </button>
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              gap: 22,
+              alignItems: "center",
+              marginTop: 14,
+              paddingBottom: 14,
+              borderBottom: "0.5px solid var(--rule)",
+            }}
+          >
+            <Stat label="views" value={fmtCount(clip.views)} />
+            <Stat label="likes" value={fmtCount(clip.likes)} />
+            <Stat label="comments" value={fmtCount(clip.comments)} />
+            <div style={{ marginLeft: "auto" }}>
+              <ReachBadge multiple={rm} views={clip.views} followers={clip.author_follower_count} size="sm" />
+              {rm != null ? (
+                <div style={{ ...MONO, fontSize: 9, marginTop: 2, color: REACH_TONE_COLOR[reachTone(rm)] }}>
+                  {rm >= 1 ? "views ≥ followers" : "views < followers"}
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          {loading ? (
+            <p style={{ fontSize: 13, color: "var(--ink-soft)", marginTop: 18 }}>Loading teardown…</p>
+          ) : (
+            <Teardown teardown={detail?.teardown} transcript={detail?.transcript ?? null} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
