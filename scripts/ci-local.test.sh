@@ -156,34 +156,75 @@ echo "$PUSH_HEAD" | run_in_tmp ./scripts/githooks/pre-push >/dev/null 2>&1
 check "no-ops when ci-local.sh is absent" 0 $?
 
 # --- main never gets the weaker gate -----------------------------------------
-# main deploys itself (post-commit -> `noelle sync`, autoupdate fast-forwards it
-# every ~10 min), and ci.yml validates a push to main WITHOUT --affected. Local
-# commits ahead of origin/main would otherwise send it down the affected path,
-# giving the riskiest push the weakest gate. The run below fails later for want
-# of a pnpm workspace; all we assert is which scope it chose.
+# Local checks on main retain full validation when HEAD is ahead of the base.
+# Stubbed pnpm records scope and task admission without running workspace tasks.
 SCOPE="$(mktemp -d)"
 git -C "$SCOPE" init -q -b main
 git -C "$SCOPE" config user.email t@t.t; git -C "$SCOPE" config user.name t
 mkdir -p "$SCOPE/scripts"
 cp "$HERE/ci-local.sh" "$SCOPE/scripts/ci-local.sh"
+mkdir -p "$SCOPE/bin"
+cat > "$SCOPE/bin/pnpm" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then echo 10.28.0; exit 0; fi
+printf '%s\n' "$*" >> "$CI_LOCAL_TEST_LOG"
+if [ "${1:-}" = exec ] && [ "${2:-}" = turbo ]; then
+  exit "${CI_LOCAL_TEST_TURBO_EXIT:-0}"
+fi
+STUB
+chmod +x "$SCOPE/bin/pnpm"
+scope_ci() {
+  ( cd "$SCOPE" && PATH="$SCOPE/bin:$PATH" CI_LOCAL_TEST_LOG="$SCOPE/commands" \
+    bash ./scripts/ci-local.sh "$@" )
+}
 echo a > "$SCOPE/a"; git -C "$SCOPE" add -A; git -C "$SCOPE" commit -qm one
 # A second commit so HEAD is ahead of any base — the exact shape that used to
 # select --affected.
 echo b > "$SCOPE/b"; git -C "$SCOPE" add -A; git -C "$SCOPE" commit -qm two
 git -C "$SCOPE" branch -f origin-main HEAD~1
 
-scope_out="$( cd "$SCOPE" && bash ./scripts/ci-local.sh --skip-install --base origin-main 2>&1 )"
+scope_out="$(scope_ci --skip-install --base origin-main 2>&1)"
 case "$scope_out" in
   *"on main"*) ok "main is validated in full, not --affected" ;;
   *) bad "main did not take the full-validation path" ;;
 esac
 
 git -C "$SCOPE" checkout -q -b feature
-scope_out="$( cd "$SCOPE" && bash ./scripts/ci-local.sh --skip-install --base origin-main 2>&1 )"
+scope_out="$(scope_ci --skip-install --base origin-main 2>&1)"
 case "$scope_out" in
   *"on main"*) bad "a feature branch took main's full-validation path" ;;
   *) ok "a branch still uses the affected path" ;;
 esac
+
+# Capture task admission without starting workspace tasks.
+: > "$SCOPE/commands"
+scope_ci --full --skip-install >/dev/null 2>&1
+check "full gate succeeds with stubbed tools" 0 $?
+if grep -Fxq 'exec turbo run typecheck lint build test --concurrency=2' "$SCOPE/commands"; then
+  ok "full gate admits at most two workspace tasks"
+else
+  bad "full gate must bound workspace task admission to two"
+fi
+grep -Fxq 'lint:sst' "$SCOPE/commands" && ok "full gate retains lint:sst" || bad "full gate omitted lint:sst"
+grep -Fxq 'lint:reply-variation' "$SCOPE/commands" && ok "full gate retains reply guard" || bad "full gate omitted reply guard"
+
+: > "$SCOPE/commands"
+scope_ci --affected --base origin-main --skip-install >/dev/null 2>&1
+check "affected gate succeeds with stubbed tools" 0 $?
+if grep -Fxq 'exec turbo run typecheck lint build test --concurrency=2 --affected' "$SCOPE/commands"; then
+  ok "affected gate admits at most two workspace tasks"
+else
+  bad "affected gate must bound workspace task admission to two"
+fi
+
+: > "$SCOPE/commands"
+CI_LOCAL_TEST_TURBO_EXIT=7 scope_ci --full --skip-install >/dev/null 2>&1
+check "bounded task gate propagates failure" 7 $?
+if grep -q '^lint:' "$SCOPE/commands"; then
+  bad "repository guards ran after task gate failure"
+else
+  ok "task gate failure stops later steps"
+fi
 rm -rf "$SCOPE"
 
 [ $fail -eq 0 ] && echo "ALL PASS" || echo "SOME FAILED"
