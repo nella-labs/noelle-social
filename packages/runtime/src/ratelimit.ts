@@ -198,3 +198,171 @@ export class UpstashTokenBucket implements RateLimit {
       // value; never set allowed=false on infra error.
       console.warn(
         "[ratelimit.upstash] request failed; failing open:",
+        err instanceof HttpBodyError ? err.code : "request_error",
+      );
+      return failOpen();
+    }
+
+    const result = (parsed as { result?: unknown })?.result;
+    if (!Array.isArray(result) || result.length !== 3) return failOpen();
+    const [allowedRaw, remainingRaw, retryRaw] = result as [unknown, unknown, unknown];
+    if ((allowedRaw !== 0 && allowedRaw !== 1) || typeof remainingRaw !== "number" ||
+        !Number.isSafeInteger(remainingRaw) || remainingRaw < 0 || typeof retryRaw !== "number" ||
+        !Number.isSafeInteger(retryRaw) || retryRaw < -1 || (allowedRaw === 1 && retryRaw !== 0)) return failOpen();
+    const allowed = allowedRaw === 1;
+    const remaining = remainingRaw;
+    const retryAfterMs = Math.max(0, retryRaw);
+    return { allowed, remaining, retryAfterMs: allowed ? 0 : retryAfterMs };
+  }
+}
+
+// -- factory ---------------------------------------------------------------
+
+export type RateLimitDriver = "memory" | "upstash";
+
+export function getRateLimit(
+  opts: TokenBucketOptions,
+  driver?: RateLimitDriver,
+): RateLimit {
+  const d =
+    driver ??
+    (process.env.NOELLE_RATELIMIT_DRIVER as RateLimitDriver | undefined) ??
+    "memory";
+  switch (d) {
+    case "memory":
+      return new MemoryTokenBucket(opts);
+    case "upstash": {
+      const url = process.env.UPSTASH_REDIS_REST_URL;
+      const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+      if (!url || !token) {
+        throw new Error(
+          "getRateLimit(upstash): UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN required",
+        );
+      }
+      return new UpstashTokenBucket({ ...opts, url, token });
+    }
+    default: {
+      const exhaustive: never = d;
+      throw new Error(`Unknown NOELLE_RATELIMIT_DRIVER: ${String(exhaustive)}`);
+    }
+  }
+}
+
+// -- enforce() helper + 429 envelope ---------------------------------------
+
+/**
+ * One-call enforcement primitive. Builds (or reuses) a token bucket for the
+ * given `(bucket, opts)` pair, takes `cost` tokens against `key`, and returns
+ * a discriminated decision the caller can map straight into a transport-
+ * appropriate response.
+ *
+ * We memoize the bucket instance per `(driver, bucket, capacity, refill)` so
+ * repeated `enforce()` calls in the same process share state. Without this,
+ * a route handler creating a new MemoryTokenBucket per request would leak
+ * memory and never actually rate limit.
+ */
+export interface EnforceOptions extends TokenBucketOptions {
+  /**
+   * Logical bucket name — used in the 429 envelope so the client can tell
+   * which limit it tripped. Also part of the in-process memoization key.
+   * Convention: `<scope>:<resource>` e.g. `app:api:user`, `api:org:write`.
+   */
+  bucket: string;
+  /** Token cost of this op. Default 1. */
+  cost?: number;
+  /** Override driver selection per-call (defaults to env / "memory"). */
+  driver?: RateLimitDriver;
+}
+
+export type EnforceResult =
+  | { allowed: true; remaining: number; bucket: string }
+  | {
+      allowed: false;
+      remaining: 0;
+      retryAfterMs: number;
+      bucket: string;
+    };
+
+const limiterRegistry = new Map<string, RateLimit>();
+
+function registryKey(driver: RateLimitDriver, opts: EnforceOptions): string {
+  return [
+    driver,
+    opts.bucket,
+    String(opts.capacity),
+    String(opts.refillPerSecond),
+  ].join("|");
+}
+
+function getOrCreateLimiter(opts: EnforceOptions): RateLimit {
+  const driver: RateLimitDriver =
+    opts.driver ??
+    (process.env.NOELLE_RATELIMIT_DRIVER as RateLimitDriver | undefined) ??
+    "memory";
+  const k = registryKey(driver, opts);
+  let l = limiterRegistry.get(k);
+  if (!l) {
+    l = getRateLimit({ capacity: opts.capacity, refillPerSecond: opts.refillPerSecond }, driver);
+    limiterRegistry.set(k, l);
+  }
+  return l;
+}
+
+/** Test-only: forget memoized limiter instances. */
+export function _resetRateLimitRegistryForTests(): void {
+  limiterRegistry.clear();
+}
+
+export async function enforce(
+  key: string,
+  opts: EnforceOptions,
+): Promise<EnforceResult> {
+  const limiter = getOrCreateLimiter(opts);
+  const decision = await limiter.take(key, opts.cost ?? 1);
+  if (decision.allowed) {
+    return { allowed: true, remaining: decision.remaining, bucket: opts.bucket };
+  }
+  return {
+    allowed: false,
+    remaining: 0,
+    retryAfterMs: decision.retryAfterMs,
+    bucket: opts.bucket,
+  };
+}
+
+/**
+ * Standard 429 envelope. Returns a plain object so each transport (Next,
+ * Hono, Astro) can adapt it without us pulling a framework dep in here.
+ */
+export interface RateLimitedResponse {
+  status: 429;
+  headers: Record<string, string>;
+  body: {
+    error: "rate_limited";
+    detail: string;
+    bucket: string;
+    retry_after_ms: number;
+  };
+}
+
+export function rateLimitedResponse(args: {
+  bucket: string;
+  retryAfterMs: number;
+}): RateLimitedResponse {
+  const retrySec = Math.max(1, Math.ceil(args.retryAfterMs / 1000));
+  return {
+    status: 429,
+    headers: {
+      "Retry-After": String(retrySec),
+      "X-RateLimit-Bucket": args.bucket,
+      "X-RateLimit-Retry-After-Ms": String(args.retryAfterMs),
+      "content-type": "application/json",
+    },
+    body: {
+      error: "rate_limited",
+      detail: `Rate limit hit for ${args.bucket}. Retry after ${retrySec}s.`,
+      bucket: args.bucket,
+      retry_after_ms: args.retryAfterMs,
+    },
+  };
+}
