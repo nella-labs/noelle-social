@@ -398,3 +398,116 @@ const EnvSchema = z.object({
   // Run the reply verifier + regenerate loop. Default on so new replies carry
   // a genuine review before the actuator considers unattended sending.
   NOELLE_DRAFTER_VERIFY: boolFlag.default("1"),
+  // Max regenerate attempts on a failed verdict before queueing the best try.
+  NOELLE_DRAFTER_VERIFY_RETRIES: z.coerce.number().int().min(0).max(3).default(3),
+  // Voice floor (0-1). After the verifier + retries, a reply whose voice score
+  // is below this is DROPPED (lead skipped 'low-voice') instead of served — the
+  // operator would rather get nothing than a generic, cookie-cutter comment.
+  // 0 disables the gate. Default 0.65 (pass bar is 0.7, so this drops the
+  // clearly-generic ones while letting borderline drafts through).
+  NOELLE_DRAFTER_VOICE_FLOOR: z.coerce.number().min(0).max(1).default(0.65),
+  // Unattended auto-send: when ON, force the post-draft verifier to run (so drafts
+  // are graded) and raise the voice floor to >=0.7 so the api-vm actuator gate
+  // (LINKEDIN_UNATTENDED_AUTOSEND in apps/api-vm) has non-zero yield. Purely RAISES
+  // the quality bar; the LinkedIn drafter never sends, so it cannot cause a post.
+  // Default OFF. NOTE: the flag name is reused across two separate env schemas
+  // (api-vm + linkedin-intern) — one controls the actuator gate, the other the
+  // drafter; set both to fully enable unattended LinkedIn auto-send.
+  LINKEDIN_UNATTENDED_AUTOSEND: boolFlag,
+  // Voice variety: per lead, randomly assign a "register" (ultra-short / hype /
+  // slang / punchy / normal) and inject it into the comment-drafting prompt so
+  // comments vary in length + energy across the feed instead of converging on one
+  // shape (see lib/register.ts). Default OFF → byte-identical drafts; the operator
+  // enables it at deploy. Applies to both the substantial and light comment paths;
+  // the DM / intro-DM / DM-request paths are untouched. Mirrors x-intern.
+  NOELLE_DRAFTER_VARIETY: boolFlag,
+  // Per-person memory: how many of the replies Lyra already sent/queued to a
+  // post's author to inject into the comment prompt ("do not repeat these"), so
+  // she stops re-saying the same take every time a connection posts. 0 disables
+  // it (byte-identical to today). Default 3.
+  LINKEDIN_DRAFTER_SENT_TOPK: z.coerce.number().int().min(0).default(3),
+  // Global phrasing memory: how many of Lyra's most recent replies across the
+  // WHOLE feed (all authors) to inject as an avoid-list AND to enforce diversity
+  // against in the verifier, so the last N replies stay varied instead of
+  // converging on one template. 0 disables both legs (byte-identical to today).
+  // Default 20 (operator: "make sure the 20 last replies are nothing alike").
+  LINKEDIN_DRAFTER_RECENT_PHRASINGS_TOPK: z.coerce.number().int().min(0).default(20),
+  // ---- Account Feeder style injection (F6; all default OFF) ----------------
+  // Inject high-performing HUMAN style exemplars (account_style_posts, kind=
+  // 'comment') into the reply drafter's SYSTEM prompt so comments imitate the
+  // FORM (rhythm/hooks/sentence-shape/tone) of real writers the operator admires
+  // — never their content, never the length rules (see lib/style-select.ts +
+  // prompts.ts STYLE block). Selection is performance-weighted x fit with a
+  // varietyTemperature knob (read from the instance's account_feeder_config).
+  // Default OFF → no STYLE block, drafts byte-identical to today; fail-open
+  // everywhere (no corpus / no Voyage key / any error ⇒ drafts as today).
+  NOELLE_DRAFTER_STYLE: boolFlag,
+  // Candidate-pool size: how many style exemplars to LOAD per tick (once, reused
+  // across the tick's leads) before per-lead fit+performance ranking trims them
+  // to maxStyleExemplars. Bigger pool = better fit headroom, slightly bigger
+  // rerank call. Default 60 (matches the feeder's extract corpus cap). Only used
+  // when NOELLE_DRAFTER_STYLE is on.
+  NOELLE_DRAFTER_STYLE_POOL: z.coerce.number().int().min(1).max(500).default(60),
+  // Use the F4b DENSE/hybrid ranker (pgvector embeddings + RRF) for style fit
+  // instead of the F4a rerank-only path. Dormant until the corpus is embedded
+  // (migration 0052 + backfill); fails open to rerank-only, then to input order.
+  // Read by the style selector (lib/style-select.ts). Default OFF.
+  NOELLE_DRAFTER_DENSE: boolFlag,
+  // Voyage-rerank the VAULT GROUNDING anchors (voice + knowledge). The KB ranks
+  // lexically (BM25); when on, the drafter pulls a wider BM25 pool and reranks it
+  // to the final topK with rerank-2.5 so grounding picks semantically-relevant
+  // anchors, not just keyword hits. Read by lib/grounding.ts via drafter args.
+  // Fail-open to the BM25 order (no key / error). Default OFF (byte-identical).
+  NOELLE_DRAFTER_GROUNDING_RERANK: boolFlag,
+  // ---- Account Feeder post-style injection (F8; default OFF) ----------------
+  // Inject high-performing HUMAN post exemplars (account_style_posts, kind=
+  // 'post') into the POST-DRAFTER system prompt so generated posts imitate the
+  // FORM (structure, hooks, opening move, rhythm, length) of real posts the
+  // operator admires — never their content/topics; no-fabrication rules
+  // reinforced. Selection is performance-weighted x fit (selectStyleExemplars,
+  // kind='post'). Default OFF → no STYLE block, posts byte-identical to today;
+  // fail-open everywhere (no corpus / no Voyage key / any error ⇒ drafts as today).
+  NOELLE_POST_STYLE: boolFlag,
+  // Candidate-pool size for the POST style exemplar pool (mirrors
+  // NOELLE_DRAFTER_STYLE_POOL for the reply drafter). Loaded once per post-drafter
+  // tick, reused across all ideas in the batch. Default 60.
+  NOELLE_POST_STYLE_POOL: z.coerce.number().int().min(1).max(500).default(60),
+  // Tiered multi-lead batching for LIGHT leads (F6b). When ON + the instance's
+  // account_feeder_config.batchLightLeads is true (default), light leads that are
+  // NOT Opus-eligible are grouped into a single batched drafter call (one call per
+  // tick instead of one per lead), cutting LLM cost for the cheap lane. Each lead
+  // still gets its OWN per-lead STYLE block, postText, and style anchors — no
+  // context is shared across leads. On ANY parse failure or count mismatch, the
+  // batch falls back to per-lead single calls (today's behaviour) so no lead is
+  // dropped or cross-wired. High-value leads (Opus-eligible, watchlist priority)
+  // remain single-call, quality-protected.
+  // Default OFF → behaviour byte-identical to today. Enable at deploy to cut cost.
+  NOELLE_DRAFTER_BATCH: boolFlag,
+  // Vision caption fallback. When no BYO org `gemini-api-key` is configured (the
+  // self-host case), caption post images via Vertex Gemini using the worker's
+  // attached service account / ADC instead — so the drafter still "sees" charts,
+  // screenshots, and memes with NO extra key. Default ON (mirrors the Vertex
+  // engine fallback the registry already uses); set 0 to force text-only drafting.
+  NOELLE_VERTEX_ENABLED: boolFlag.default("1"),
+  // Vertex region for the ADC vision caption (and any Vertex engine fallback).
+  VERTEX_LOCATION: z.string().default("us-central1"),
+  // Last-resort image understanding: caption the post image(s) via a vision-
+  // capable Claude on AWS Bedrock (PAID; the CLI subscription can't caption
+  // images). Default OFF now — the global Gemini key + Vertex cover vision on the
+  // self-host box, so image posts never silently bill AWS. Set 1 to opt back in.
+  NOELLE_VISION_BEDROCK: boolFlag.default(""),
+});
+
+export type Env = z.infer<typeof EnvSchema>;
+
+let cached: Env | undefined;
+
+export function loadEnv(): Env {
+  if (cached) return cached;
+  cached = EnvSchema.parse(process.env);
+  return cached;
+}
+
+export function resetEnvForTests() {
+  cached = undefined;
+}
