@@ -198,3 +198,27 @@ it("shares overlapping checks for the same tuple", async () => {
   const second = ready.ensure("org", "kind", check);
   try {
     gate.resolve();
+    await Promise.all([first, second]);
+    expect(check).toHaveBeenCalledOnce();
+  } finally {
+    gate.resolve();
+    await Promise.allSettled([first, second]);
+  }
+});
+
+it.each(["reset", "clear"] as const)("does not restore readiness after pending %s", async operation => {
+  const ready = createReadyCache(), gate = deferred(), started = deferred();
+  const first = ready.ensure("org", "kind", async () => { started.resolve(); await gate.promise; });
+  await started.promise;
+  try {
+    if (operation === "reset") ready.reset("org", "kind"); else ready.clear();
+    gate.resolve();
+    await first;
+    const next = vi.fn(async () => {});
+    await ready.ensure("org", "kind", next);
+    expect(next).toHaveBeenCalledOnce();
+  } finally {
+    gate.resolve();
+    await first;
+  }
+});

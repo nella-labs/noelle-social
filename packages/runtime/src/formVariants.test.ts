@@ -598,3 +598,26 @@ describe("renderAssignedShapeBlock", () => {
 describe("SHAPES_WITH_FREE_OPENER", () => {
   it("names only shapes that exist in the X pool", () => {
     const ids = new Set(X_FORM_VARIANTS.map((v) => v.id));
+    for (const id of SHAPES_WITH_FREE_OPENER) expect(ids.has(id)).toBe(true);
+  });
+
+  it("excludes every shape that prescribes its own opener", () => {
+    // These three name how the reply STARTS, so an opening-move directive on top
+    // would be a second, contradicting instruction.
+    for (const id of ["HOOK_THEN_LINE", "OBSERVE_ASK", "DETAIL_ZOOM"]) {
+      expect(SHAPES_WITH_FREE_OPENER).not.toContain(id);
+    }
+  });
+
+  it("excludes every shape too short to have a distinct opening", () => {
+    for (const id of ["MICRO", "ONE_SHORT", "QUESTION_ONLY"]) {
+      expect(SHAPES_WITH_FREE_OPENER).not.toContain(id);
+    }
+  });
+
+  it("still leaves a meaningful share of leads (not a token lane)", () => {
+    const share = X_FORM_VARIANTS.filter((v) => SHAPES_WITH_FREE_OPENER.includes(v.id))
+      .reduce((a, v) => a + v.weight, 0);
+    expect(share).toBeGreaterThan(0.25);
+  });
+});
