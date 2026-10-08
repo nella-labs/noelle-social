@@ -198,3 +198,203 @@ Safety by construction: every archetype is a weight vector over the **same six p
 
 ### Self-reload on deploy (no edge://extensions click)
 
+Edge loads the unpacked extension from `apps/linkedin-actuator/dist-unpacked` (untracked; ignored). The package `build` script refreshes that dir from `.output/chrome-mv3` on every build, so each merge-driven deploy (`noelle sync` runs `pnpm -r build`) puts fresh bits at the load path and the self-reload below actually picks them up.
+
+`wxt build` embeds a build stamp in the bundle and writes the same stamp to `.output/chrome-mv3/build-stamp.json`. Token-authed `GET /api/actuator/extension-build` serves the on-disk stamp (fail-soft `null` when unreadable; path override `NOELLE_LINKEDIN_EXT_STAMP_PATH`). On the 5-minute alarm the extension compares stamps and calls `chrome.runtime.reload()` when a newer build landed, which re-reads the unpacked dir. Never during a run; one attempt per served stamp, so a machine whose unpacked copy is not synced to the served build (e.g. the laptop) tries once and stays quiet instead of looping. Works independently of the autonomy checkboxes, so every merge-driven deploy reaches the browser on its own.
+
+### Pacing fits the window (short windows included)
+
+The plan derives its inter-action gap from the window: the typical gap is the smaller of the operator's session tempo (150–280s) and `window ÷ (action count)`, floored at a ~40s human minimum. This keeps a short run from the old failure mode where a fixed multi-hour gap overflowed the window — the first ~half did nothing, then everything clamped to the window end and fired at once.
+
+- A lone burst (short windows) anchors at the **window open**, not its midpoint, so the first action fires within seconds, not ~50% of the way in.
+- If more actions are requested than can fit the window at a human pace, the overflow is **dropped and logged as a shortfall** (a `ClampNote`), never squeezed in or piled at the end. Requesting 90 actions in 30 min posts what fits (~40) and reports the rest — lengthen the window or lower the targets to raise the ceiling.
+- Warm-up (read-before-acting) is capped at 10% of the window, so a 30-min run isn't eaten by up to ~4 min of warm-up.
+- **Occasional "stepped-away" pause.** On top of the tempo gap, ~1 action in 5 (at random) gets an extra **0–300 s (0–5 min)** added to its gap — a one-off distraction, not a tempo change (it's kept out of the AR(1) autocorrelation and never compounds). This keeps the gap distribution heavy-tailed like a real person who occasionally steps away, and it only widens spacing (overflow past the window is dropped + logged, never clustered). The pause is capped at 5% of the window, so multi-hour runs get the full 0–5 min while a short 30-min run isn't back-loaded by a single 5-min gap. Tunable via `EXTRA_PAUSE_PROB` / `EXTRA_PAUSE_MAX_MS` in `src/lib/scheduler.ts`.
+
+---
+
+## Ambient browsing
+
+During idle gaps between bursts, or while waiting on comment supply, the extension runs ambient behavior so the tab looks like a human reading — mostly scrolling and expanding "…more"; since the 2026-07-23 quiet re-tune the wait is deliberately **read-heavy, not like-heavy**:
+
+- **Idle-liking — a rare like in the wait (Run/auto mode only).** While nothing is due, the actor occasionally slips a real feed-like into the gap. Each idle-like uses the same read-then-click machinery as a scheduled like (find a hydrated feed post, read it, sometimes expand "…more", then a trusted click). It is **slow-paced** (a rolling ~5 min minimum gap, ×1–1.8 jitter ⇒ roughly one like per 5–9 min of waiting; was ~45–80 s before the re-tune), **curfew-gated** (via the shared write-curfew switch), and **budget-bounded**: idle-likes count against `s.done.likes` and only fire while `done < targets.likes`, so total likes (idle + scheduled) never exceed the plan's cap-bounded like budget — a scheduled like slot the idle-likes already covered is skipped (`like-budget-met`). **Drain mode never idle-likes**: the idle top-up used to share the drain plan's budget and race ahead of it (stacking ~10 likes before a reply); now the gap's planned like slots (see *Drain gap patterns* — usually 0–1) are the only likes between replies, and the wait is ambient browsing alone.
+- **Primary — slow scroll + read.** Trusted `wheel` scrolling down the feed at a human pace with dwell pauses on posts and occasional small back-scrolls. No interactions counted against targets.
+- **Read-actions — expand "…more" + open comments.** A real reader doesn't only scroll: they expand truncated posts and open the discussion under a post to read it. So the ambient loop also, at a paced rate, moves the cursor to a truncated post's "…see more" toggle and clicks it (then reads the fuller text), and opens a post's comments — preferring the social-counts "N comments" link, which expands the thread **without** focusing the composer — then reads a few. The choice now **leans toward expanding "…more"** (the dominant read-action) so the actor actively opens posts while waiting. Both are **read-only** (trusted CDP click via the same motion engine as likes) and **non-counted** against the like/comment/DM targets. They only fire on posts actually in the viewport; when nothing suitable is in view the tick downgrades to a plain scroll. Controlled by **Ambient read-actions** in options (default ON — more read behavior lowers the behavioral signature; it never posts).
+- **Occasional — navigate-away-and-back.** With low probability, visits a profile or the notifications tab, dwells, then returns to the feed. Rate-limited so it stays rare.
+
+Ambient actions are jittered and separate from the action targets. The read-actions are additionally **cooldown-paced** (a rolling ~20–40 s minimum gap, jittered) so they cluster like real reading instead of firing on every ~4 s idle tick; the cooldown advances only when an action actually happens (a downgraded-to-scroll attempt does not burn it).
+
+Every ambient tick **first re-asserts the feed** (the same `ensureOnFeed` guard the likes use). Without it, a reply/DM or a mis-landed click that left the tab on a profile turned the idle browse into an endless scroll of *that profile's own* activity cards (`findFeedPosts` matches them), so the actor looked busy while liking nothing — the run appeared to "die" on a profile page. See **Feed likes + zero-likes diagnostics** below.
+
+---
+
+## Feed likes + zero-likes diagnostics
+
+Standalone feed likes (the scheduled `like` actions, distinct from the reply-coupled like each comment also lands) are hardened against the ways they historically produced zero likes — and against a like click that navigated the tab *off the feed onto a profile*:
+
+- **Off-feed tab.** A standalone like only works on `/feed/`. The tab gets left off the feed several ways: a comment (non-drain mode) leaves it on a post permalink, a DM lands it on a `/in/` profile, or the operator drives it away. One shared guard — `ensureOnFeed` — now runs before **every** feed-scoped action: scheduled likes, idle-likes, **and the ambient browse**. It pulls the tab back to `/feed/` whenever it isn't already there (drain mode also returns to the feed after each reply, and DMs return to the feed after sending). Previously only the like path had this guard, so the ambient browse would keep scrolling whatever profile the tab had wandered onto.
+- **Tab hijack.** The run **pins the tab it started on** (`RunState.tabId`) and reuses it every tick; it only re-picks a tab (preferring one actually on `/feed/`) if the pinned tab was closed. Before pinning, the tab was re-chosen every tick as the *first* `linkedin.com/*` tab, so an operator's own `/in/` profile tab that merely sorted first could silently hijack actuation.
+- **Stale-rect click after "…more".** Expanding a truncated post grows it **in place**, shifting the like button down; lazy-loaded media does the same. The like used to click the rect measured *before* the read, which now landed in the post **body** — sometimes on an `@mention` (→ a profile, same tab) or an external link (→ a new tab) — navigating off the feed *and* missing the like. The like button is now **re-located immediately before the click**, so the click lands on the current button.
+- **Container-markup drift.** LinkedIn renames feed-post container classes/attrs regularly; when every known container selector misses, `findFeedPosts` falls back to deriving posts from their **"React Like" buttons** — for each Like button it climbs to the post-sized container that wraps exactly it. The reaction button's `aria-label` is far more stable than the container class, so likes survive a feed redesign that would otherwise strand them at `posts=0`.
+
+**Reading a like skip in `noelle.linkedin_activity`.** A skipped like logs `no-likeable-post(posts=P,withBtn=B,btns=N,path=/…)`:
+
+| Field | Meaning |
+|---|---|
+| `posts` | feed cards `findFeedPosts` found (incl. the drift fallback) |
+| `withBtn` | of those, how many exposed a Like button |
+| `btns` | **React Like buttons anywhere on the page** — `0` ⇒ the feed wasn't loaded (or the button label itself drifted); `>0` with `posts=0` is unexpected (the fallback should have recovered them) |
+| `path` | `location.pathname` — anything other than `/feed/` means the like fired off the feed |
+
+So `btns=0,path=/feed/` ⇒ the feed genuinely had no visible posts (scroll/hydration or a label change); `btns>0` ⇒ investigate the container fallback; `path≠/feed/` ⇒ the `ensureOnFeed` guard didn't take (now rare: the guard runs before likes *and* the ambient browse, and the tab is pinned to the run).
+
+### Reaction variety (not every like is a 👍)
+
+A real person doesn't only tap Like — they Celebrate a launch, Support a hard update, react Insightful to a good teardown. So the actuator **varies the reaction** on every like it lands (both the scheduled/idle feed-likes and the like each reply couples), with an inclination toward **Like, Support, and applause (Celebrate)**:
+
+- **The mix.** `pickReaction` (`src/lib/reactions.ts`) draws a reaction from a weighted table. Defaults (relative %): **Like 70, Celebrate 10, Support 10, Love 4, Insightful 4, Funny 2** — so ~70% stay a plain Like and the ~30% tail is dominated by Support + Celebrate, exactly the "inclined" three. Reactions are keyed by LinkedIn's Voyager enum (`LIKE / PRAISE / EMPATHY / APPRECIATION / INTEREST / ENTERTAINMENT`); `PRAISE` is the 👏 applause reaction and `EMPATHY` is the 🫶 support one.
+- **How it lands.** A plain Like is a single trusted click on the Like button (unchanged, dominant path). For a non-Like pick, the background **hovers** the Like button (`Cdp.hover` — the same motion engine as a click, minus the press, held ~0.65–1.15 s so LinkedIn reveals the six-reaction flyout), then `locateReaction` finds the chosen reaction button (by its `data-reaction-type`, falling back to the visible label inside the `.reactions-menu`) and clicks it.
+- **Never costs a like.** If the flyout doesn't open or the reaction can't be located, it **falls back to a plain Like** on the still-hovered button — so introducing variety never turns a would-be like into a no-op. The delivered reaction rides the `like` activity event's `reaction` field and shows in the panel (`reacted Celebrate to Jane (3/40)`); it is accepted by the server schema but not yet persisted to a column.
+- **Tunable.** `reactionWeights` in the actuator config overrides any per-type weight (a `0` disables a reaction; all-zero ⇒ always a plain Like), so an operator who wants only Like + Support can pin the rest to 0 without touching code.
+
+---
+
+## Architecture
+
+```
+Lyra (Lima VM)                  api-vm (Lima)                     Chrome MV3 extension (operator browser, linkedin.com tab)
+discovery→profiler→drafter  →   noelle.approvals          ◄─GET── background service worker  ── SCHEDULER / brain
+   (unchanged, draft-only)      (status='pending')        ──POST►   • fetches queue, builds plan
+                                noelle.linkedin_activity            • chrome.alarms dispatches actions
+                                                                    • batch-POSTs telemetry
+                                                                            │
+                                                                            ▼
+                                                                  content script (linkedin.com) ── HANDS
+                                                                    • locateLikeTarget / locateCommentBox
+                                                                    • navigateToPost / locateProfileMessageButton
+                                                                    • detectChallenge
+                                                                    • selectors.ts (single source of DOM truth)
+                                                                            │
+                                                                  floating control panel (injected UI)
+                                                                    • Run / STOP, live log, counters vs targets
+```
+
+API endpoints the extension uses:
+
+| Endpoint | Role |
+|---|---|
+| `GET /api/actionable-linkedin?instanceId=<id>` | Returns the approved work queue — `{comments:[...], dms:[...]}`. (New) |
+| `POST /api/linkedin-activity` | Telemetry: like/comment/dm/skip events. Writes to `noelle.linkedin_activity`. (New) |
+| `POST /api/drafts/:id/approve-dm` | Greenlights a specific DM for sending (sets `dm_send_approved=true`); DMs only fire after this. Actuator-token guarded. (New) |
+| `POST /api/actuator/mark-sent/:approvalId` | Records the approval as sent after the extension posts to LinkedIn. Actuator-token-guarded. `:approvalId` is the `approval_id` from the queue response (not the `draft_id`). The extension forces `sent_via:'extension'`. (New) |
+
+The extension source lives at `apps/linkedin-actuator/`. Entrypoints: `entrypoints/background.ts` (scheduler brain), `entrypoints/content.ts` (locators), `entrypoints/panel.ts` (floating UI), `entrypoints/options.html` (config). Built with `wxt` (MV3 ergonomics) — output at `.output/chrome-mv3/`.
+
+---
+
+## Operate
+
+### Load the extension
+
+1. Build the extension (from the repo root):
+   ```bash
+   pnpm --filter @noelle/linkedin-actuator build
+   ```
+2. In Chrome, go to `chrome://extensions` → enable **Developer mode** → **Load unpacked** → select `apps/linkedin-actuator/.output/chrome-mv3/`.
+
+### Set options
+
+Open the extension's **Options** page (from `chrome://extensions` → Details → Extension options) and fill in:
+
+| Field | Value |
+|---|---|
+| API base URL | Lima tunnel URL (e.g. `https://<tunnel-host>`) or `https://api.trynoelle.com` for prod |
+| Bearer token | The static actuator token (Lima: `NOELLE_ACTUATOR_TOKEN`; prod: your Noelle dashboard JWT — see Prod port below) |
+| Instance ID | Your Lyra instance UUID (from the dashboard URL on the Lyra agent page) |
+| Daily cap — likes | Hard ceiling, default 120 |
+| Daily cap — comments | Hard ceiling, default 80 |
+| Daily cap — DMs | Hard ceiling, default 10 |
+| Watchlist preference | Ratio for preferring watchlist connections in the like feed (0–1, default 0.7) |
+| Deep-night taper | On/off; if on, action density drops in a configurable overnight window (default 1am–6am local) |
+| Ambient read-actions | On/off (default **on**); while idle-browsing, expand "…more" and open comments to read. Read-only, non-counted, cooldown-paced. Turn off to revert to scroll-only ambient |
+
+### Keep the machine awake
+
+The extension dispatches actions via `chrome.alarms` — it works while Chrome is open but will pause if the machine sleeps. Keep the machine awake for the run:
+
+```bash
+# macOS: prevent sleep, display sleep, idle, and disk sleep
+caffeinate -dimsu
+```
+
+On Linux/Windows, disable automatic sleep in system settings for the duration of the run.
+
+### Run
+
+1. Open `https://www.linkedin.com` in a tab (must be the logged-in account).
+2. Open the floating panel (extension icon or keyboard shortcut).
+3. Set **Window** (hours), **Target comments**, **Target likes**. DMs appear as a read-only count (all approved DMs are greenlit — see [DM approval](#dm-approval) below).
+4. Press **Run**, or **Drain all approvals**, or **Full automatic** (below).
+5. The Chrome "Noelle Actuator is debugging this browser" banner appears — this is expected.
+6. Watch the panel's ready-reply count, run state, and error alert.
+7. Press **STOP** at any time to halt immediately and detach CDP (banner disappears).
+
+> **Renamed 2026-07-26.** The panel now reads **Auto** (was "Full automatic"),
+> **Manual Auto** (was "Drain all approvals"), and adds **Auto notifications**.
+> The manual `Run` button and the Window/Comments/Likes inputs were removed —
+> `startRun` still exists for the lights-out auto-start, it just has no manual
+> surface. The underlying commands are unchanged, so the table below still
+> applies under the new labels. See `docs/notifications-actor.md`.
+
+### Run vs Drain vs Full automatic (three buttons)
+
+| Button | Cmd | Overnight posting-curfew | Use it when |
+|---|---|---|---|
+| **Run** | `startRun` | off | A one-shot windowed session (spread N comments/likes over H hours). |
+| **Drain all approvals** | `startDrain` | **off** — writes at any hour | You're present and want the inbox cleared *now*, including at night if you just approved replies. Persistent (watches for new approvals). Unchanged. |
+| **Full automatic** | `startFullAuto` | **on** — 1am–9am local | Set-and-forget. Same persistent drain as "Drain all approvals" but it **holds comments/DMs during your sleep window** (1am–9am, `CURFEW_START_HOUR`/`CURFEW_END_HOUR` in `src/lib/curfew.ts`). Ambient browsing (plus the gap's occasional scheduled likes) continues overnight so the session still looks alive; held posts fire from 9am. |
+
+**Why two drain buttons.** "Drain all approvals" is deliberately curfew-free — the operator chose the hour, so a night approval goes out at night. "Full automatic" is the safe leave-it-running mode: because it's unattended, it must not post at 3am, so it defers comments/DMs across the night and resumes in the morning. The overnight posting-curfew is **also** applied to every unattended auto-start path (daily auto-start, lights-out auto-drain, stall-recovery) — those pass `{ curfew: true }` regardless of the button. Manual **Run** and **Drain** never curfew. The curfew is a single switch (`isWriteCurfew(atMs, enabled)`), enforced by the runtime hard-floor in `tickOnce` (posts only — `isPost`); the per-run `curfewEnabled` flag on `RunState` is what turns it on.
+
+**Reply-coupled like is no longer 100%.** Every reply also reacts to the post it opened ("a human likes what they engage with"). Because a *perfectly* consistent reply→like pairing is itself a tell, the reaction is now skipped on a small, drifting fraction of replies — starts at **2%**, re-rolled uniformly in **[1%, 5%] every 123 replies** (`src/lib/like-skip.ts`, drift state persisted on `RunState.likeSkip`). Feed likes are unaffected.
+
+**Group-post feed-like fix.** `ensureOnFeed` now uses the strict `isHomeFeedUrl` (home feed only) instead of the permissive `isFeedUrl`, so a run whose tab is parked on a post permalink (`/feed/update/urn:li:groupPost:…`) is pulled back to the real feed before a feed-like — instead of repeatedly whiffing `no-likeable-post(...path=/feed/update/urn:li:groupPost:…)` on the stuck permalink. `isFeedUrl` stays permissive for `chooseActuatorTab` (never abandon a pinned tab).
+
+---
+
+## Lima self-host setup
+
+Apply once before the first run:
+
+**1. Apply the migration:**
+```bash
+# Inside the Lima VM
+limactl shell default
+psql -U postgres "$NOELLE_DATABASE_URL" -f /path/to/noelle/infra/cloudsql/schema/0054_linkedin_activity.sql
+```
+
+**2. Set env vars** in `~/.noelle/.env` (Lima VM, mode 0600):
+```bash
+NOELLE_ACTUATOR_TOKEN=<a long random secret you choose>
+NOELLE_ACTUATOR_ORG_ID=<your org uuid, e.g. 3e9367d0-...>
+```
+
+**3. Restart api-vm** to pick up the new vars:
+```bash
+pm2 restart ecosystem.config.cjs --only noelle-api
+```
+
+**4. In the extension options,** set the API base URL to the Lima tunnel host and the bearer token to the value of `NOELLE_ACTUATOR_TOKEN`.
+
+---
+
+## DM approval
+
+DMs are **fail-closed**: `GET /api/actionable-linkedin` only includes a DM in its response when that approval has been explicitly greenlit via:
+
+```
+POST /api/drafts/:id/approve-dm
+Authorization: Bearer <token>
+```
+
+Without this call, `dms` is empty and zero DMs are sent. This is the default. A dashboard "Approve DM" button is a fast-follow UI improvement; until it ships, approve individual DMs via the API directly or curl:
