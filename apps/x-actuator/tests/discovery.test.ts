@@ -198,3 +198,100 @@ describe("X browser discovery pacing", () => {
     let fetches = 0;
     const result = await discoveryNavigationTarget({
       nowMs: now, lastSelectedMs: now - 60_000, randomRoll: 0.99,
+      cachedTarget: pendingTarget,
+      fetchTarget: async () => { fetches++; return { kind: "profile" as const, handle: "jackfriks" }; },
+      cacheTarget: async (target: unknown) => { pendingTarget = target; },
+      discardCachedTarget: async () => { pendingTarget = null; },
+      onCacheFailure: () => { throw new Error("unexpected cache failure"); },
+    });
+    expect(result).toBeNull();
+    expect(pendingTarget).toBeNull();
+    expect(fetches).toBe(0);
+  });
+
+  it("does not navigate to a fetched target when its retry cache cannot be stored", async () => {
+    let warned = false;
+    const result = await discoveryNavigationTarget({
+      nowMs: Date.parse("2026-09-22T16:00:00Z"), lastSelectedMs: null, randomRoll: 0.99,
+      cachedTarget: null,
+      fetchTarget: async () => ({ kind: "profile", handle: "jackfriks" }),
+      cacheTarget: async () => { throw new Error("storage unavailable"); },
+      discardCachedTarget: async () => {},
+      onCacheFailure: () => { warned = true; },
+    });
+    expect(result).toBeNull();
+    expect(warned).toBe(true);
+  });
+
+  it("commits the completed visit and pending-cache clear together", async () => {
+    const writes: Array<{ completedAtMs: number; pendingTarget: null }> = [];
+    await stampCompletedDiscoveryTarget({
+      outcome: "navigate", targetUrl: "https://x.com/jackfriks", completedAtMs: 123,
+      commitVisit: async (record: { completedAtMs: number; pendingTarget: null }) => { writes.push(record); },
+      onStampFailure: () => { throw new Error("unexpected commit failure"); },
+    });
+    expect(writes).toEqual([{ completedAtMs: 123, pendingTarget: null }]);
+  });
+
+  it("keeps the actor running if the completed-visit stamp cannot be stored", async () => {
+    let warned = false;
+    await stampCompletedDiscoveryTarget({
+      outcome: "navigate", targetUrl: "https://x.com/jackfriks", completedAtMs: 123,
+      commitVisit: async () => { throw new Error("storage unavailable"); },
+      onStampFailure: () => { warned = true; },
+    });
+    expect(warned).toBe(true);
+  });
+
+  it("keeps a queued reply while discovery waits and resumes at 4 of 5", () => {
+    const now = 1_000_000;
+    const state = emptyDrain(now);
+    state.commentPool.push({ approvalId: "approval-1", draftId: "draft-1", body: "Ready", url: "https://x.com/a/status/123" });
+    state.actions.push({ kind: "comment", atMs: now + 60_000, executed: false });
+    expect(discoveryBrowseDecision({ enabled: true, lastReadMs: now - 90_000, nowMs: now, available: 0 })).toBe("full");
+    expect(discoveryBrowseDecision({ enabled: true, lastReadMs: now - 90_000, nowMs: now, available: null })).toBe("unavailable");
+    expect(discoveryBrowseDecision({ enabled: true, lastReadMs: now - 89_999, nowMs: now, available: 1 })).toBe("waiting");
+    expect(discoveryBrowseDecision({ enabled: true, lastReadMs: now - 90_000, nowMs: now, available: 1 })).toBe("browse");
+    expect(discoveryBrowseDecision({ enabled: false, lastReadMs: now, nowMs: now, available: null })).toBe("browse");
+    expect(state.commentPool).toHaveLength(1);
+    expect(state.actions[0]?.executed).toBe(false);
+  });
+
+  it("submits no more than the open slots and keeps overflow for later", () => {
+    const posts = Array.from({ length: 14 }, (_, i) => ({ tweetId: String(i), url: `https://x.com/a/status/${i}`, text: `Post ${i}`, authorHandle: "a" }));
+    expect(observationBatch(posts, 0)).toEqual([]);
+    expect(observationBatch(posts, 1).map((p) => p.tweetId)).toEqual(["0"]);
+    expect(observationBatch(posts, 5).map((p) => p.tweetId)).toEqual(["0", "1", "2", "3", "4"]);
+    expect(observationBatch(posts, 12)).toHaveLength(12);
+    expect(observationBatch(posts, 13)).toHaveLength(12);
+  });
+
+  it("wakes a caught-up drain at the next paced slot and deduplicates the approval", () => {
+    const now = 1_000_000;
+    const state = emptyDrain(now);
+    state.lastProgressMs = now - 20_000;
+    expect(integratePriorityReady(state, ready, now, makeRng(7))).toBe(1);
+    const nextReply = state.actions.find((action) => action.kind === "comment")!;
+    expect(nextReply.atMs).toBeGreaterThanOrEqual(now + 43_000);
+    expect(nextReply.atMs).toBeLessThanOrEqual(now + 49_000);
+    expect(state.commentPool).toHaveLength(1);
+    const slots = state.actions.length;
+    expect(integratePriorityReady(state, ready, now + 1000, makeRng(8))).toBe(0);
+    expect(state.actions).toHaveLength(slots);
+  });
+
+  it("does not add a second navigation or write path while a slot is pending", () => {
+    const now = 1_000_000;
+    const state = emptyDrain(now);
+    state.actions.push({ kind: "comment", atMs: now + 30_000, executed: false });
+    expect(integratePriorityReady(state, ready, now, makeRng(7))).toBe(1);
+    expect(state.actions).toHaveLength(1);
+    expect(state.commentPool).toHaveLength(1);
+  });
+
+  it("blocks a browser submit when the permanent claim is denied or its response is lost", async () => {
+    expect(await claimReplyBeforeSubmit({ claimReply: async () => ({ claimed: true }) }, "a")).toBe(true);
+    expect(await claimReplyBeforeSubmit({ claimReply: async () => ({ claimed: false }) }, "a")).toBe(false);
+    expect(await claimReplyBeforeSubmit({ claimReply: async () => { throw new Error("connection lost"); } }, "a")).toBe(false);
+  });
+});
