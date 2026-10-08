@@ -1598,3 +1598,203 @@ export function parseApifyTokens(raw: string): { tokens: string[]; rejected: num
     }
     if (seen.has(f)) continue;
     seen.add(f);
+    tokens.push(f);
+  }
+  return { tokens, rejected };
+}
+
+/** Outcome of a bulk add: how many new rows, how many were already in the pool. */
+export interface ApifyBulkAddResult {
+  added: number;
+  alreadyPresent: number;
+}
+
+/**
+ * Add many Apify tokens at once, each landing as SPARE (`in_use = false`) so the
+ * agents don't touch them until the operator promotes one. Re-pasting a token that's
+ * already in the pool re-arms its exhausted/invalid flags but does NOT change its
+ * in-use bucket (so you can't accidentally demote a live token by re-pasting it).
+ * One transaction. Caller is responsible for parsing/auth; pass already-clean tokens.
+ */
+export async function addApifyConnectionsBulk(
+  orgId: string,
+  tokens: string[],
+): Promise<ApifyBulkAddResult> {
+  let added = 0;
+  let alreadyPresent = 0;
+  if (tokens.length === 0) return { added, alreadyPresent };
+  await sql.begin(async (tx) => {
+    for (const token of tokens) {
+      const label = token.length >= 8 ? `${token.slice(0, 4)}…${token.slice(-4)}` : "apify token";
+      const existing = await tx<Array<{ id: string }>>`
+        select id from noelle.connections
+        where org_id = ${orgId} and kind = 'apify' and active and secret = ${token}
+        limit 1
+      `;
+      if (existing[0]) {
+        await tx`
+          update noelle.connections
+          set exhausted_at = null, retry_at = null, invalid_at = null, updated_at = now()
+          where id = ${existing[0].id}
+        `;
+        alreadyPresent++;
+      } else {
+        await tx`
+          insert into noelle.connections (org_id, kind, label, secret, active, in_use)
+          values (${orgId}, 'apify', ${label}, ${token}, true, false)
+        `;
+        added++;
+      }
+    }
+  });
+  return { added, alreadyPresent };
+}
+
+/**
+ * Move a token between the IN-USE and SPARE buckets — the manual promote/demote.
+ * `inUse = true` puts it into the agents' rotation; `false` parks it. Org-scoped so
+ * an id from another org can't be flipped. Spend history + exhausted/invalid flags
+ * are untouched. Idempotent.
+ */
+export async function setApifyConnectionInUse(
+  orgId: string,
+  credentialId: string,
+  inUse: boolean,
+): Promise<void> {
+  await sql`
+    update noelle.connections set in_use = ${inUse}, updated_at = now()
+    where id = ${credentialId} and org_id = ${orgId} and kind = 'apify' and active
+  `;
+}
+
+/**
+ * Remove a token from the org's Apify pool. Soft (active = false) so its spend
+ * history (llm_calls.credential_id → connections) survives. Scoped by org so an id
+ * from another org can't be touched.
+ */
+export async function removeApifyConnection(orgId: string, credentialId: string): Promise<void> {
+  await sql`
+    update noelle.connections set active = false, updated_at = now()
+    where id = ${credentialId} and org_id = ${orgId} and kind = 'apify'
+  `;
+}
+
+/** An org Apify token WITH its secret — server-only (the secret never leaves the server). */
+export interface ApifyConnectionSecret {
+  id: string;
+  label: string;
+  /** The raw token. NEVER return this to the client. */
+  secret: string;
+  /** Currently marked invalid (invalid_at not null) — the resurrect-on-alive target. */
+  invalid: boolean;
+}
+
+/**
+ * Load the org's ACTIVE Apify connections INCLUDING their secrets, for server-side
+ * health-checking (the Test / Test-all actions). Mirrors listApifyConnections'
+ * try-order but adds `secret` (and an `invalid` flag) — so it must stay server-only
+ * and its result must never be returned to the client. Auth is enforced by the
+ * caller (the action authorize() path); this is a plain DB read.
+ */
+export async function listApifyConnectionSecrets(orgId: string): Promise<ApifyConnectionSecret[]> {
+  const rows = await readSql<
+    Array<{ id: string; label: string; secret: string; invalid: boolean }>
+  >`
+    select id, label, secret, (invalid_at is not null) as invalid
+    from noelle.connections
+    where org_id = ${orgId} and kind = 'apify' and active
+    order by (invalid_at is null and (exhausted_at is null or retry_at <= now())) desc,
+             invalid_at asc nulls first, exhausted_at asc nulls first, created_at asc
+  `;
+  return rows.map((r) => ({ id: r.id, label: r.label, secret: r.secret, invalid: r.invalid }));
+}
+
+/**
+ * Resurrect a token wrongly retired by a transient 401: clear invalid_at (and its
+ * exhausted_at/retry_at siblings) so it re-enters the worker rotation cleanly.
+ * Called from the Test action when checkApifyToken proves an invalid-marked token
+ * is actually alive. Org-scoped; idempotent.
+ */
+export async function clearApifyConnectionInvalid(orgId: string, credentialId: string): Promise<void> {
+  await sql`
+    update noelle.connections
+    set invalid_at = null, exhausted_at = null, retry_at = null, updated_at = now()
+    where id = ${credentialId} and org_id = ${orgId} and kind = 'apify'
+      and (invalid_at is not null or exhausted_at is not null)
+  `;
+}
+
+export interface AgentActivityEvent {
+  when: string;
+  verb: string;
+  what: string;
+  cents: number | null;
+  model: string | null;
+  /** Live X permalink for a 'sent' row — Vega's reply on X. Null otherwise. */
+  url: string | null;
+}
+
+/**
+ * Recent activity for a single agent instance. Unions `noelle.llm_calls`
+ * (one row per LLM invocation by any worker acting on this agent's role),
+ * `noelle.approvals` (human decisions), and — for the X intern only —
+ * `noelle.worker_runs` (heartbeat rows from each worker tick).
+ *
+ * Why worker_runs is in here: previously a discovery cycle that found
+ * zero new tweets, or a drafter cycle that hit a code-path error before
+ * reaching the LLM, left no llm_calls row. The feed went silent and the
+ * founder saw nothing. With the worker_runs union, each tick shows up
+ * as "06:30 · swept · 0 rows" so silent-but-running is distinguishable
+ * from silent-because-broken.
+ *
+ * worker_runs is folded in only when `inst.role === 'x_intern'` because
+ * the table is global (no `org_id`) and 0.0.1 only has one real x-intern.
+ * For other agent roles, including them would attribute global ops noise
+ * to an unrelated role.
+ *
+ * Tenancy guard piggybacks on `getAgentInstance(instanceId)`, which calls
+ * `assertOrgMember` after fetching the row.
+ */
+export async function listRecentActivityForInstance(
+  instanceId: string,
+  limit = 12,
+): Promise<AgentActivityEvent[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+
+  const includeWorkerRuns = inst.role === "x_intern";
+
+  const rows = await readSql<Array<{
+    when_: string;
+    verb: string;
+    what: string;
+    cents: number | null;
+    model: string | null;
+    sent_url: string | null;
+    sent_external_id: string | null;
+    author_handle: string | null;
+  }>>`
+    select * from (
+      select
+        l.started_at        as when_,
+        case l.worker
+          when 'drafter'    then 'drafted'
+          when 'classifier' then 'classified'
+          when 'discovery'  then 'discovered'
+          when 'send'       then 'sent'
+          else l.worker
+        end                                       as verb,
+        -- NEVER surface the engine (bedrock/vertex/codex) to users. The what
+        -- column is unused for llm_call verbs (rowActivityFor hardcodes the
+        -- detail); model is the raw id, cleaned to a user-safe name in the map.
+        ''                                        as what,
+        l.cents                                   as cents,
+        l.model                                   as model,
+        null::text                                as sent_url,
+        null::text                                as sent_external_id,
+        null::text                                as author_handle
+      from noelle.llm_calls l
+      where l.org_id = ${inst.org_id} and l.agent_role = ${inst.role}
+      union all
+      select
+        a.decided_at                              as when_,
