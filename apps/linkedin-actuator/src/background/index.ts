@@ -798,3 +798,203 @@ async function likeAFeedPost(
     // Re-locate the like button immediately before clicking. The rect captured
     // before the read goes STALE: expanding "…more" grows the post in place, and
     // lazy-loaded media above it shifts it down — so the pre-read coordinates now
+    // land in the post BODY (an @mention → a profile, an external link → a new
+    // tab), which navigates the tab off the feed AND misses the like. Clicking a
+    // freshly-measured rect is what keeps the actuator on the feed. Fall back to
+    // the pre-read rect only if the re-locate misses.
+    let clickLoc: LikeLoc = loc;
+    const fresh = await send<LikeLoc>(tabId, { cmd: "locateLike", preferWatchlist, watchlistNames: [] }).catch(() => null);
+    if (fresh?.ok && fresh.x != null && fresh.y != null) clickLoc = fresh;
+    throwIfAborted(runAbort.signal); // STOP during the re-locate → don't land the like
+    const reaction = await reactWithVariety(tabId, rectFrom(clickLoc), cfg, rng);
+    s.done.likes++;
+    events.push({ type: "like", activity_urn: clickLoc.observed?.activity_urn, author_name: clickLoc.observed?.author_name, reaction, at });
+    return true;
+  }
+  events.push({ type: "skip", reason: loc?.skipReason ?? "like-failed", at });
+  return false;
+}
+
+// Serialize ticks so the content-script-driven loop can't overlap with the
+// alarm-driven one (overlap would double-read/write state).
+let ticking = false;
+async function tick() {
+  if (ticking) return;
+  ticking = true;
+  try {
+    await restoreRunAfterWorkerRestart();
+    if (stopped()) return;
+    await tickOnce();
+  } finally {
+    ticking = false;
+    if (priorityRetryAfterTick) {
+      priorityRetryAfterTick = false;
+      setTimeout(() => void tick(), 0);
+    }
+  }
+}
+
+async function tickOnce() {
+  const s = await loadState();
+  const cfg = await getConfig();
+  if (!s || !cfg || s.status !== "running") return;
+  // Stale-run guard: if a newer run started or STOP fired since this state was
+  // written, our epoch is no longer current — bail without acting or saving so a
+  // superseded/stopped run can't spring back to life.
+  const myEpoch = s.epoch ?? 0;
+  if (myEpoch !== (await currentEpoch())) return;
+  const now = Date.now();
+  if (!withinWindow(s.startMs, s.windowHours, now)) {
+    // A persistent drain never times out on its window — roll it forward and keep
+    // ticking so it can watch for new approvals. Every other run ends here.
+    if (drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0)) {
+      s.windowHours = (now - s.startMs) / 3600_000 + DRAIN_WATCH_WINDOW_H;
+    } else {
+      await endRun("idle");
+      return;
+    }
+  }
+
+  // Reuse the run's pinned tab while it is still open; only re-pick (preferring a
+  // feed tab) if it was closed. This stops the loop from silently following
+  // whichever linkedin tab sorts first onto a profile — the core of the hijack.
+  const tabId = await findLinkedInTab(s.tabId);
+  if (tabId == null) return; // no tab → pause; resume next tick
+  if (s.tabId !== tabId) s.tabId = tabId; // pin (or re-pin after the old tab closed)
+  await cdp.attach(tabId).catch(() => {}); // idempotent-ish; re-attach if a detach happened
+
+  const api = new ActuatorApi(cfg);
+  const rng = makeRng((now & 0xffffffff) >>> 0);
+  await maybeReplenish(s, api, now, rng);
+
+  // challenge guard
+  const ch = await send<{ observed?: { challenge?: boolean } }>(tabId, { cmd: "detectChallenge" }).catch(() => null);
+  if (ch?.observed?.challenge) {
+    await endRun("halted-challenge");
+    await api.logActivity(s.sessionId, [{ type: "skip", reason: "challenge", at: new Date(now).toISOString() }]).catch(() => {});
+    return;
+  }
+
+  const wake = pendingPriority;
+  if (wake) {
+    pendingPriority = null;
+    if (wake.epoch === myEpoch && wake.instanceId === cfg.instanceId && await browserDiscoveryEnabled()) {
+      integratePriorityReady(s, wake.comments, now, rng);
+    }
+  }
+
+  const idx = dueActionIndex(s.actions, now);
+  if (idx < 0) {
+    // Persistent drain: when every slot is done, keep re-checking the server queue
+    // (paced, ~DRAIN_WATCH_POLL_MS) so approvals made after the inbox emptied get
+    // fresh slots and go out with no re-click. maybeExtendDrain appends slots +
+    // bumps drainRounds only when supply exists; an empty check is a no-op.
+    if (
+      drainShouldKeepWaiting(s.mode, s.drainRounds ?? 0) &&
+      s.actions.every((a) => a.executed) &&
+      now - (s.lastDrainWatchMs ?? 0) >= DRAIN_WATCH_POLL_MS
+    ) {
+      s.lastDrainWatchMs = now;
+      await maybeExtendDrain(s, api, now, rng);
+    }
+
+    // Nothing due. While it waits, the actor stays lively with ambient browsing
+    // (scroll / expand "…more" / read a thread). Likes are NOT part of the wait
+    // in drain mode — the gap's planned like slots are the only likes there
+    // (2026-07-23: the idle top-up shared the plan's budget and raced ahead of
+    // it, stacking ~10 likes before a reply; the operator prefers a visibly
+    // idle wait). Run/auto mode still slips a rare like toward its budget,
+    // paced in minutes, not seconds.
+    const idleLike = shouldIdleLike({
+      doneLikes: s.done.likes,
+      targetLikes: s.targets.likes,
+      inCurfew: isWriteCurfew(now),
+      sinceLastIdleLikeMs: now - (s.lastIdleLikeMs ?? 0),
+      minGapMs: IDLE_LIKE_MIN_GAP_MS * rng.float(1, 1.8),
+      inDrain: s.mode === "drain",
+    });
+    // The notifications sweep rides the idle branch: a run flagged
+    // `notifications` spends one of its waits, every ~10-20 min, reading the
+    // notifications page instead of ambient-browsing. Checking notifications IS
+    // ambient behavior, so this costs no extra behavioral surface — and the
+    // leads it files come back as approvals that THIS run then comments.
+    //
+    // ORDER MATTERS (chooseIdleActivity owns it): the sweep is decided BEFORE the
+    // supply gate, because the sweep is what CREATES this run's supply. Gating it
+    // on "we already have something to send" deadlocks the feature in its normal
+    // starting state — Auto notifications clicked with an empty approval queue.
+    const activity = chooseIdleActivity({
+      sweepDue: notificationSweepDue({
+        enabled: s.notifications === true,
+        sinceLastSweepMs: now - (s.lastNotifSweepMs ?? 0),
+        minGapMs: SWEEP_MIN_GAP_MS * rng.float(1, 2),
+      }),
+      // SUPPLY GATE: with nothing to send (both pools empty) a live run goes QUIET —
+      // no idle-likes, no ambient browsing. Without this, a run whose pipeline had
+      // run dry still burned engagement every tick: 2026-07-20 Lyra logged 346 likes
+      // against 3 comments in a day, 359/43 the day before. The watch-poll above
+      // still runs, so the moment an approval lands the run picks it up and the
+      // normal in-gap liking resumes.
+      pipelineDry: pipelineIsDry(s.commentPool.length, s.dmPool.length),
+      idleLike,
+    });
+    if (activity === "quiet") {
+      const store: Record<string, unknown> = await chrome.storage.session.get(DRY_DISCOVERY_KEY).catch(() => ({}));
+      const lastRead = Number(store[DRY_DISCOVERY_KEY] ?? 0);
+      if (now - lastRead >= DRY_DISCOVERY_POLL_MS && !stopped() && await browserDiscoveryEnabled()) {
+        await chrome.storage.session.set({ [DRY_DISCOVERY_KEY]: now }).catch(() => {});
+        await ambientBrowse(s, cfg, tabId, rng, now);
+        s.lastEvent = "reading for new posts — no likes while the pipeline is empty";
+      } else {
+        s.lastEvent = "nothing to send — idle (no likes while the pipeline is empty)";
+      }
+      await saveIfCurrent(s);
+      return;
+    }
+    if (activity === "sweep") {
+      s.lastNotifSweepMs = now; // pace off the attempt, so a broken sweep can't spin
+      const out = await runNotificationSweep(tabId, {
+        cdp, rng, sleep, send, api, instanceId: cfg.instanceId, wpm: s.persona.wpm,
+        navigate: async (id, url) => {
+          // Epoch-guard every navigation: a STOP or a superseding run must never
+          // find its tab yanked to /notifications by a sweep that outlived it.
+          // Checked twice: navigateTab clears the composer first, which can take
+          // a couple of seconds, so the guard is re-run right before the actual
+          // navigation (a STOP landing inside that window used to slip through).
+          if (myEpoch !== (await currentEpoch())) return;
+          await navigateTab(id, url, rng, async () => myEpoch === (await currentEpoch())).catch(() => {});
+          await waitTabComplete(id);
+        },
+        stopped,
+      }).catch((e): SweepOutcome => ({
+        fresh: 0, accepted: 0, skipped: 0,
+        detail: isAbortError(e) ? "stopped" : `sweep-failed: ${e instanceof Error ? e.message : String(e)}`,
+      }));
+      // Say WHY a sweep found nothing — "nothing new" covered three different
+      // states and made a broken sweep look identical to a quiet one.
+      // TELEMETRY. Every sweep outcome is written to the activity table, so a
+      // sweep that finds nothing is diagnosable from SQL instead of requiring
+      // the operator to be watching the panel at the right moment. This is the
+      // gap that made the first two rounds of this bug guesswork.
+      await api
+        .logActivity(s.sessionId, [
+          {
+            type: "skip",
+            reason: `sweep:${out.detail ?? (out.fresh > 0 ? `ingested-${out.accepted}` : `read-${out.harvested ?? 0}-none-new`)}`.slice(0, 200),
+            at: new Date(now).toISOString(),
+          } as LinkedInActivityEvent,
+        ])
+        .catch(() => {});
+      s.lastEvent = out.detail
+        ? `notifications: ${out.detail}`
+        : out.fresh === 0
+          ? out.harvested
+            ? `notifications: read ${out.harvested} cards, none are new replies to you`
+            : "notifications: page rendered NO notification cards — selectors may have drifted"
+          : `notifications: ${out.accepted} queued for drafting (${out.skipped} already known)`;
+    } else if (activity === "like") {
+      s.lastIdleLikeMs = now; // pace off the attempt, not just a hit (the scan is costly)
+      const events: LinkedInActivityEvent[] = [];
+      const at = new Date(now).toISOString();
+      try {
+        await likeAFeedPost(tabId, s, cfg, rng, events, at);
