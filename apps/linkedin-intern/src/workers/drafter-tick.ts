@@ -1798,3 +1798,203 @@ interface DraftCommonArgs {
   /** Opus with the ordinary instance writer preserved as its fallback. */
   opusRepairRouting: ModelRouting;
   runner: CodexRunner;
+  postOutbound: (body: OutboundIn) => Promise<{ id: string; approval_id: string }>;
+  markStatus: (args: { leadId: string; status: "drafted" | "errored" | "skipped"; meta?: Record<string, unknown> }) => Promise<void>;
+  log: Logger;
+  /** Post-draft verifier (off by default). Applies to both substantial + light. */
+  verify?: {
+    enabled: boolean;
+    retries: number;
+    makeCalls: VerifierCallFactory;
+    /**
+     * Voice floor (0-1). When the verifier ran and the best attempt's voice
+     * score is BELOW this after all retries, the draft is DROPPED (lead skipped
+     * with skip_reason='low-voice') instead of served — the operator would
+     * rather get nothing than a generic, cookie-cutter comment. 0/undefined =
+     * no gate (legacy: serve the best attempt with the verdict attached).
+     */
+    voiceFloor?: number;
+  };
+  /**
+   * The "ASSIGNED REGISTER FOR THIS REPLY" block (lib/register.ts), or undefined
+   * when voice variety is off. Injected into the comment-drafting prompt; the DM
+   * is excluded by the block's own wording.
+   */
+  registerBlock?: string;
+  /**
+   * The standalone "THIS REPLY'S ASSIGNED SHAPE" block (@noelle/runtime
+   * formVariants), for a lead whose shape could NOT be rendered inside the
+   * faithful style block. Mutually exclusive with registerBlock: both claim
+   * authority over reply length, and two length rules in one prompt is how a
+   * shaped draft gets squeezed back to the default band.
+   */
+  shapeBlock?: string;
+  /**
+   * Whether a shape was assigned at all, inline or standalone. The user prompt's
+   * closing length line keys off this — it is the LAST line the model reads, so
+   * a fixed char band there silently outranks any shape above it.
+   */
+  shapeAssigned?: boolean;
+  /**
+   * The "OPENING MOVE FOR THIS REPLY" block (lib/opening-move.ts), or undefined
+   * when voice variety is off. Varies how the comment opens; DM excluded by the
+   * block's own wording.
+   */
+  openingMoveBlock?: string;
+  /** The gen-z "SPOKEN REGISTER" marker block, or undefined when no marker was offered. */
+  genzBlock?: string;
+  /** Reply bodies already sent/queued to this author (do-not-repeat memory). [] when none. */
+  priorReplies?: string[];
+  /** Recent reply bodies across the whole feed (global avoid-list for openers/phrasings). [] when none. */
+  recentPhrasings?: string[];
+  /** Explicit MCP reply request metadata. These drafts are always human-reviewed. */
+  replyRequest?: ReplyRequestMeta | null;
+  /**
+   * Per-lead Account Feeder STYLE selection (F6), or null when style is off / no
+   * selection was made. Threaded into buildDrafterSystem so the SYSTEM prompt
+   * carries the STYLE block. Null → byte-identical to today.
+   */
+  style?: StyleForPrompt | null;
+  /**
+   * Active Pattern Breaker rules (noelle.pattern_rules) for this instance.
+   * Injected into the drafter SYSTEM prompt so it breaks the operator's
+   * over-used structures, AND passed to the verifier as dynamicBannedPatterns
+   * (phrase rules hard-zero, structure rules tank voice). [] when none / off.
+   */
+  patternRules?: DynamicPattern[];
+}
+
+type DraftWriter = { engine: string; model: string };
+
+/**
+ * Shared post-draft VERIFIER + regenerate loop for both the substantial and
+ * light paths. Off by default; when enabled, grade the drafts against the
+ * grounding context and, on a failing verdict, regenerate with the critique
+ * appended (up to `verify.retries`), keeping the best-scoring attempt. A
+ * failed-then-best draft is still queued — the verdict rides along for the
+ * human. Fail-open throughout. Returns the best drafts payload + the verdict
+ * meta to attach to the outbound (null when the verifier didn't run).
+ *
+ * `regenerate(fixPrompt, useOpus)` re-runs the drafter with the critique
+ * appended and returns the re-parsed drafts with the writer that produced them
+ * (or null on a parse/skip miss), so the selected draft keeps its provenance.
+ *
+ * NOTE on charLimit: LinkedIn has no hard per-reply character cap like X's 250,
+ * so we OMIT charLimit — the format check only flags em-dashes / choppiness, not
+ * length. (Tight-reply length is a prompt-level preference, not a verifier gate.)
+ */
+async function runVerifyLoop<T>(args: {
+  initial: T;
+  initialWriter: DraftWriter;
+  toDrafts: (d: T) => DraftToVerify[];
+  regenerate: (fixPrompt: string, useOpus: boolean) => Promise<{ draft: T; writer: DraftWriter } | null>;
+  basePrompt: string;
+  ctx: VerifyContext;
+  calls: VerifierCall[];
+  retries: number;
+  leadId: string;
+  traceSource?: string;
+  traceRedactions?: string[];
+  log: Logger;
+}): Promise<{ best: T; bestWriter: DraftWriter; meta: NonNullable<OutboundIn["verifierMeta"]> }> {
+  const { initial, toDrafts, regenerate, basePrompt, ctx, calls, retries, leadId, log } = args;
+  const trace = privateReviewTraceEnabled(leadId, args.traceSource) ? [] as PrivateReviewAttempt[] : null;
+  const record = async (attempt: number, drafts: DraftToVerify[], verdict: DraftVerdict) => {
+    if (!trace) return;
+    trace.push({ attempt, drafts, verdict });
+    try {
+      await writePrivateReviewTrace({
+        leadId,
+        source: args.traceSource,
+        attempts: trace,
+        redactions: args.traceRedactions ?? [],
+      });
+    } catch {
+      log.warn({ leadId }, "private review trace write failed");
+    }
+  };
+  // Score EVERY graded dimension, including novelty (per-person repetition) and
+  // diversity (feed-wide sameness). Omitting them meant a draft that failed ONLY
+  // on repetition was regenerated, the rewrite fixed the repetition, and then the
+  // fix was discarded because `total` had not improved — so the repetitive
+  // original shipped, defeating the memory Lyra feeds the verifier. Both are 1.0
+  // when there is no history, so a no-memory lead ranks exactly as before.
+  const total = (v: DraftVerdict) =>
+    v.scores.voice +
+    v.scores.grounding +
+    v.scores.relevance +
+    v.scores.format +
+    v.scores.novelty +
+    v.scores.diversity;
+  let best = initial;
+  let bestWriter = args.initialWriter;
+  const initialDrafts = toDrafts(initial);
+  let bestVerdict = await verifyTiered(initialDrafts, ctx, calls);
+  await record(0, initialDrafts, bestVerdict);
+  let attempts = 0;
+  while (!bestVerdict.pass && attempts < retries) {
+    attempts++;
+    const fix = bestVerdict.fix ?? "make the comments more specific, grounded, and on-voice";
+    // Only the final genuinely rejected browser rewrite gets the stronger
+    // writer and a shape override. Earlier retries and legacy leads keep their
+    // existing prompts and routing.
+    const useOpus = args.traceSource === "extension_observed"
+      && bestVerdict.judgeOk === true
+      && attempts === retries;
+    const browserRepair = args.traceSource === "extension_observed"
+      ? " Keep every if/may/could claim conditional as in the source; keep separate anecdotes separate from claimed causes. Use a capital letter at the start while preserving natural voice and the NO FULL STOPS rule."
+      : "";
+    const finalBrowserRepair = useOpus
+      ? "\n\nFINAL BROWSER REPAIR — In the JSON body, write one compact comment in the operator's natural rhythm, with one grounded point. Keep the source specific by naming a concrete post detail, and leave hypothetical claims conditional. Keep separate anecdotes separate from claimed causes. The learned voice and pattern rules still apply: avoid the particular habits named in the review feedback, antithesis (X, not Y), and comma-joined run-ons. Keep the assigned shape unless the review feedback identifies a conflict. Capitalize the start; NO FULL STOPS. Do not invent the operator's personal experience. Keep accurate char_count and the same strict JSON shape."
+      : "";
+    const fixPrompt = `${basePrompt}\n\nREVIEW FEEDBACK — an editor rejected the previous attempt: ${fix}\nRewrite all comments (and the DM if present) to fix this.${browserRepair} Keep the exact strict JSON output shape.${finalBrowserRepair}`;
+    let candidate: { draft: T; writer: DraftWriter } | null = null;
+    try {
+      // Spend the stronger writer only after a real rejected browser verdict
+      // persists to the final retry. A judge outage never triggers escalation.
+      candidate = await regenerate(fixPrompt, useOpus);
+    } catch (e) {
+      log.warn({ leadId, err: (e as Error).message }, "verifier regenerate failed; keeping best so far");
+      break;
+    }
+    if (!candidate) break;
+    const candidateDrafts = toDrafts(candidate.draft);
+    const verdict = await verifyTiered(candidateDrafts, ctx, calls);
+    await record(attempts, candidateDrafts, verdict);
+    // Always adopt a PASSING candidate: the loop only runs while bestVerdict is
+    // failing, so a pass is strictly better regardless of the raw sums.
+    if (verdict.pass || total(verdict) > total(bestVerdict)) {
+      best = candidate.draft;
+      bestWriter = candidate.writer;
+      bestVerdict = verdict;
+    }
+    if (verdict.pass) break;
+  }
+  log.info(
+    { leadId, pass: bestVerdict.pass, attempts, scores: bestVerdict.scores },
+    "draft verified",
+  );
+  return {
+    best,
+    bestWriter,
+    meta: toOutboundVerifierMeta(bestVerdict, attempts),
+  };
+}
+
+/**
+ * SUBSTANTIAL draft: tiered angle count (T1→3 empathetic/technical/contrarian,
+ * T2→2 empathetic/technical, T3→1 empathetic) plus a DM ONLY for T1.
+ * Returns true when a draft was posted, false otherwise.
+ */
+async function draftSubstantial(args: DraftCommonArgs & { tier: "T1" | "T2" | "T3" }): Promise<boolean> {
+  const { lead, tier, postText, payload, anchors, knowledgeAnchors, imageCaption, personDirective, commentDigest, brand, instance, routing, runner, postOutbound, markStatus, log, verify, registerBlock, shapeBlock, shapeAssigned, openingMoveBlock, genzBlock, priorReplies, recentPhrasings, replyRequest, style, postRegister, faithful } = args;
+  const allowedAngles = TIER_ANGLES[tier];
+  // The browser lane sends one reply without a human choosing among variants.
+  // Its verifier verdict must belong to that exact outbound body, not to a set
+  // containing companion angles or a DM that never enters the reply queue.
+  const singleReply = (payload as { source?: string }).source === "extension_observed";
+  const voiceReferences = voiceReferencesForReply({ anchors, style, browserReply: singleReply, faithful, sentReplies: args.voiceExemplars });
+  const wantDm = !singleReply && !replyRequest && tier === "T1" && (instance.dm_autodraft_enabled ?? false);
+  const repliesToReview = <T extends { angle: "empathetic" | "technical" | "contrarian"; body: string }>(drafts: T[]): T[] => {
+    const selected = singleReply
+      ? drafts.filter((draft) => allowedAngles.includes(draft.angle)).slice(0, 1)
