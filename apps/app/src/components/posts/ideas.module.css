@@ -1,0 +1,30 @@
+.startGrid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 18px; margin-bottom: 24px; }
+.startPanel { display: flex; flex-direction: column; padding: 24px; border: 1px solid var(--rule); border-radius: 22px; background: var(--paper); }
+.ownPanel { background: color-mix(in srgb, var(--accent-soft) 40%, var(--paper)); }
+.panelHeading { display: flex; align-items: center; gap: 11px; }
+.panelHeading h3 { margin: 0; font-size: 16px; font-weight: 500; letter-spacing: -.03em; }
+.headingIcon { width: 36px; height: 36px; display: grid; place-items: center; color: var(--accent); background: var(--accent-soft); border-radius: 50%; }
+.description { margin: 15px 0 20px; max-width: 51ch; font-size: 12px; line-height: 1.65; color: var(--ink-muted); }
+.panelActions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: auto; }
+.generateActions { display: inline-flex; align-items: center; gap: 9px; }
+.stepper { display: inline-flex; align-items: center; height: 38px; border: 1px solid var(--rule); border-radius: 100px; background: var(--paper-2); }
+.stepper button { width: 31px; height: 36px; border: 0; border-radius: 50%; display: grid; place-items: center; background: transparent; color: var(--ink-muted); cursor: pointer; }
+.stepper button:disabled { opacity: .4; cursor: default; }
+.stepper span { width: 26px; text-align: center; font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.ownActions { display: flex; align-items: center; gap: 8px; margin-top: auto; }
+.seedInput { flex: 1; min-width: 0; height: 38px; padding: 0 12px; border: 1px solid var(--rule); border-radius: 11px; background: var(--paper); font-family: var(--body); font-size: 12px; color: var(--ink); }
+.filterBar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }
+.search { display: flex; align-items: center; gap: 8px; flex: 1 1 220px; min-width: 180px; padding: 0 14px; height: 42px; border: 1px solid var(--rule); border-radius: 100px; color: var(--ink-muted); background: var(--paper); }
+.search input { border: 0; background: transparent; min-width: 0; width: 100%; height: 100%; font-family: var(--body); font-size: 12px; color: var(--ink); }
+.search input:focus { outline: none; }
+.search:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.categories { display: flex; gap: 5px; flex-wrap: wrap; }
+.categories button { padding: 9px 13px; border: 1px solid var(--rule); border-radius: 100px; background: var(--paper); font-family: var(--body); font-size: 11px; color: var(--ink-muted); cursor: pointer; text-transform: capitalize; }
+.categories .categoryActive { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+.ideaGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(310px, 100%), 1fr)); gap: 18px; }
+.ideaCard { display: flex; flex-direction: column; padding: 24px; border: 1px solid var(--rule); border-radius: 22px; background: var(--paper); }
+.ideaHook { margin: 8px 0 0; font-size: 19px; font-weight: 500; line-height: 1.45; letter-spacing: -.035em; }
+.ideaCardActions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; padding-top: 22px; }
+.seedInput:focus-visible, .stepper button:focus-visible, .categories button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 900px) { .startGrid { grid-template-columns: 1fr; } }
+@media (max-width: 480px) { .startPanel, .ideaCard { padding: 18px; } .ownActions { align-items: stretch; flex-direction: column; } .seedInput { flex: auto; width: 100%; } }
