@@ -198,3 +198,30 @@ describe.skipIf(!url)("feeder view scope (dedicated PostgreSQL)", () => {
   );
   test("legacy unassigned lead remains coherent for the selected approval instance", async () => {
     await styledDraft(ownLi);
+    await sql`update noelle.leads set agent_instance_id=null`;
+    expect(await ownProfile()).toMatchObject({
+      draftsUsed: 1,
+      totalStyledDrafts: 1,
+      avgWeight: 0.75,
+    });
+  });
+  test("contradictory approval draft/lead binding contributes no style use", async () => {
+    await styledDraft(ownLi);
+    const [otherLead] =
+      await sql`insert into noelle.leads(external_id,org_id,agent_instance_id,platform,payload) values (${randomUUID()},${ownOrg},${ownLi},'linkedin','{}') returning id`;
+    await sql`update noelle.approvals set lead_id=${otherLead!.id}`;
+    expect(await ownProfile()).toMatchObject({
+      draftsUsed: 0,
+      totalStyledDrafts: 0,
+      avgWeight: null,
+    });
+  });
+  test("unassigned legacy heartbeat cannot override the current instance request", async () => {
+    await sql`update noelle.agent_instances set account_feeder_run_requested_at=now() where id=${ownLi}`;
+    await sql`insert into noelle.worker_runs(worker,instance_id) values ('linkedin_feeder',null)`;
+    expect(await getFeederRunStatus(ownLi)).toMatchObject({
+      state: "requested",
+      lastStartedAt: null,
+    });
+  });
+});
