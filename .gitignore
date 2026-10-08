@@ -1,0 +1,75 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# testing
+coverage/
+.nyc_output/
+
+# next.js
+.next/
+out/
+
+# turbo
+.turbo/
+
+# astro
+.astro/
+
+# production
+build/
+dist/
+.output/
+.wxt/
+
+# misc
+.DS_Store
+*.pem
+.env*.local
+.env
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# supabase
+supabase/.branches/
+supabase/.temp/
+
+# editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# claude code — ignore local worktree state, but track repo-wide settings
+.claude/worktrees/
+.claude/cache/
+.claude/logs/
+.claude/scheduled_tasks.lock
+
+# OS
+Thumbs.db
+
+# local-only working notes — reapply drafts, support-case copies, paste targets.
+# anything you don't want shipped goes here.
+.private/
+openclaw-vm.env
+
+# deploy stamp — build artifact written by `noelle deploy`, ships to the VM, never source
+.noelle-deployed
+
+# Playwright MCP local artifacts
+.playwright-mcp/
