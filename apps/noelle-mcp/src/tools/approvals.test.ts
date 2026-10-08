@@ -198,3 +198,53 @@ it("does not route LinkedIn approvals through the X send path", async () => {
     [
       {
         lead_id: "lead-li",
+        status: "pending",
+        kind: "reply",
+        draft_id: "draft-li",
+        external_id: "123",
+        body: "LinkedIn reply",
+        platform: "linkedin",
+      },
+    ],
+  ]);
+  Object.assign(ctx, { apiConfigured: () => true, apiFetch });
+
+  const result = await approvalsModule.handle(
+    "noelle_send_draft",
+    { approvalId: "approval-li" },
+    ctx,
+  );
+
+  expect(result?.isError).toBe(true);
+  expect(result?.content[0]?.text).toContain("only queues or sends X drafts");
+  expect(apiFetch).not.toHaveBeenCalled();
+});
+
+it("describes API send results as accepted, not definitely posted", async () => {
+  const apiFetch = vi.fn().mockResolvedValue({ status: "accepted" });
+  const { ctx } = makeCtx([
+    [
+      {
+        lead_id: "lead-x",
+        status: "pending",
+        kind: "reply",
+        draft_id: "draft-x",
+        external_id: "123",
+        body: "X reply",
+        platform: "x",
+      },
+    ],
+  ]);
+  Object.assign(ctx, { apiConfigured: () => true, apiFetch });
+
+  const result = await approvalsModule.handle(
+    "noelle_send_draft",
+    { approvalId: "approval-x" },
+    ctx,
+  );
+
+  const body = result?.content[0]?.text ?? "";
+  expect(result?.isError).not.toBe(true);
+  expect(body).toContain("accepted");
+  expect(body).not.toContain("has been posted");
+});

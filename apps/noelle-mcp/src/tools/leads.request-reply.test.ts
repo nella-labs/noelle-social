@@ -198,3 +198,143 @@ describe("reply request MCP tools", () => {
 
     const body = result?.content[0]?.text ?? "";
     expect(body).toContain("review_pending");
+    expect(body).toContain("review: pending");
+    expect(body).not.toContain("completed");
+  });
+
+  it("reports failed verifier drafts as needs_review, not completed", async () => {
+    const { ctx } = makeCtx([
+      [{ ...lead, payload: { ...lead.payload, reply_request: { request_key: "manual-1" } } }],
+      [{
+        a_id: "approval-li",
+        a_status: "pending",
+        kind: "reply",
+        body: "Draft with a failed verifier result",
+        review_pass: false,
+        review_reasons: ["too generic"],
+        review_attempts: "2",
+      }],
+    ]);
+
+    const result = await leadsModule.handle(
+      "noelle_get_reply_request_status",
+      { leadId: "lead-li", requestKey: "manual-1" },
+      ctx,
+    );
+
+    const body = result?.content[0]?.text ?? "";
+    expect(body).toContain("needs_review");
+    expect(body).toContain("review: fail");
+    expect(body).not.toContain("completed");
+  });
+
+  it("refuses to overwrite a different in-flight reply request on the same lead", async () => {
+    const { ctx, queries } = makeCtx([
+      [
+        {
+          ...lead,
+          status: "classified",
+          payload: {
+            ...lead.payload,
+            reply_requested: true,
+            reply_request: { request_key: "old-key" },
+          },
+        },
+      ],
+    ]);
+
+    const result = await leadsModule.handle(
+      "noelle_request_reply",
+      { leadId: "lead-li", requestKey: "new-key" },
+      ctx,
+    );
+
+    expect(result?.isError).toBe(true);
+    expect(result?.content[0]?.text).toContain("already has an in-flight reply request");
+    expect(queries.some((q) => q.text.includes("update noelle.leads"))).toBe(false);
+  });
+
+  it("detects a competing in-flight request when the guarded update loses the race", async () => {
+    const { ctx, queries } = makeCtx([
+      [{ ...lead, status: "classified", payload: { ...lead.payload } }],
+      [],
+      [{
+        ...lead,
+        status: "classified",
+        payload: { reply_requested: true, reply_request: { request_key: "other-key" } },
+      }],
+    ]);
+
+    const result = await leadsModule.handle(
+      "noelle_request_reply",
+      { leadId: "lead-li", requestKey: "new-key" },
+      ctx,
+    );
+
+    expect(result?.isError).toBe(true);
+    expect(result?.content[0]?.text).toContain("other-key");
+    expect(queries.find((q) => q.text.includes("update noelle.leads"))?.text).toContain(
+      "coalesce(payload->>'reply_requested', 'false') <> 'true'",
+    );
+  });
+
+  it("rejects request keys over the outbound 200 character contract", async () => {
+    const { ctx } = makeCtx([]);
+
+    const result = await leadsModule.handle(
+      "noelle_request_reply",
+      { leadId: "lead-li", requestKey: "x".repeat(201) },
+      ctx,
+    );
+
+    expect(result?.isError).toBe(true);
+    expect(result?.content[0]?.text).toContain("requestKey must be 200 characters or fewer");
+  });
+
+  it("rejects waitSeconds outside the 0..45 second tool contract", async () => {
+    const { ctx } = makeCtx([[lead]]);
+
+    const result = await leadsModule.handle(
+      "noelle_request_reply",
+      { leadId: "lead-li", waitSeconds: 60 },
+      ctx,
+    );
+
+    expect(result?.isError).toBe(true);
+    expect(result?.content[0]?.text).toContain("waitSeconds must be between 0 and 45");
+  });
+
+  it("advertises local idempotent draft-queue annotations on the new tools", () => {
+    const request = leadsModule.tools.find((tool) => tool.name === "noelle_request_reply");
+    const status = leadsModule.tools.find(
+      (tool) => tool.name === "noelle_get_reply_request_status",
+    );
+    expect(request?.annotations).toMatchObject({
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+    expect(status?.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: false });
+    expect(status?.inputSchema.properties).toMatchObject({
+      waitSeconds: expect.objectContaining({ type: "number" }),
+    });
+  });
+  it("refuses a new key while the worker owns the lead", async () => {
+    const { ctx, queries } = makeCtx([[{
+      ...lead, status: "drafting", payload: { ...lead.payload, reply_request: { request_key: "owned" } },
+    }]]);
+    const result = await leadsModule.handle("noelle_request_reply", { leadId: lead.id, requestKey: "replacement" }, ctx);
+    expect(result?.isError).toBe(true);
+    expect(result?.content[0]?.text).toContain("already being processed");
+    expect(queries.some((q) => q.text.includes("update noelle.leads"))).toBe(false);
+  });
+
+  it("does not report a newer failure for an unknown older request", async () => {
+    const { ctx } = makeCtx([[{
+      ...lead, status: "errored", payload: { ...lead.payload, reply_request: { request_key: "latest" } },
+    }], []]);
+    const result = await leadsModule.handle("noelle_get_reply_request_status", { leadId: lead.id, requestKey: "old" }, ctx);
+    expect(result?.content[0]?.text).toContain("request_not_found");
+  });
+
+});
