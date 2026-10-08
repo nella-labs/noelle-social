@@ -1998,3 +1998,203 @@ export async function getAutoSendUsage(
   };
 }
 
+export interface SentApprovalRow {
+  approvalId: string;
+  draftId: string;
+  leadId: string;
+  decidedAt: string | null;
+  decidedBy: string | null;
+  /** true when `decided_by = 'auto-send'`. */
+  autoSent: boolean;
+  /**
+   * How the reply reached X, as three distinct states the UI can label:
+   *  - "auto":      the send worker auto-posted it (decided_by = 'auto-send').
+   *  - "dashboard": you clicked Send in the inbox; Noelle posted it via your X
+   *                 token and captured the real tweet id (so it has a link).
+   *  - "manual_x":  you posted it yourself on X by hand, then marked it sent —
+   *                 no captured tweet id unless you pasted the link.
+   */
+  sendMethod: "auto" | "dashboard" | "manual_x";
+  postedAt: string | null;
+  /** Live X URL — present iff send worker wrote sent_external_id back. */
+  postUrl: string | null;
+  authorHandle: string | null;
+  bodyPreview: string | null;
+  charCount: number | null;
+}
+
+/**
+ * Recently-sent approvals for an agent instance. Includes the live X URL
+ * (built from `drafts.sent_external_id` if not already in payload) so the
+ * agent panel can render "Posted to X →" deeplinks instead of asking the
+ * operator to take it on faith. Ordered newest-first by `decided_at`.
+ */
+export async function listRecentSentForInstance(
+  instanceId: string,
+  limit = 12,
+): Promise<SentApprovalRow[]> {
+  const inst = await getAgentInstance(instanceId);
+  if (!inst) return [];
+  const rows = await readSql<
+    Array<{
+      approval_id: string;
+      draft_id: string;
+      lead_id: string;
+      decided_at: string | null;
+      decided_by: string | null;
+      sent_external_id: string | null;
+      posted_at: string | null;
+      lead_payload: unknown;
+      draft_payload: unknown;
+    }>
+  >`
+    select
+      a.id                        as approval_id,
+      a.draft_id                  as draft_id,
+      a.lead_id                   as lead_id,
+      a.decided_at                as decided_at,
+      a.decided_by                as decided_by,
+      d.sent_external_id          as sent_external_id,
+      d.posted_at                 as posted_at,
+      l.payload                   as lead_payload,
+      d.payload                   as draft_payload
+    from noelle.approvals a
+    left join noelle.drafts d on d.id = a.draft_id
+    left join noelle.leads  l on l.id = d.lead_id
+    where a.agent_instance_id = ${inst.id}
+      and a.status = 'sent'
+    order by a.decided_at desc nulls last, a.updated_at desc
+    limit ${limit}
+  `;
+  return rows.map((r) => {
+    const lead = leadPayload({ payload: r.lead_payload } as NoelleLead);
+    const draft = draftPayload({ payload: r.draft_payload } as NoelleDraft);
+    const body = bodyForSelectedAngle(draft);
+    const handle = lead.author_handle ?? null;
+    const postUrl = sentReplyUrl({
+      sentUrl: draft.sent_url,
+      sentExternalId: r.sent_external_id,
+      authorHandle: handle,
+    });
+    // A hand-posted (mark-sent) reply is tagged either by the 'manual:' tweet-id
+    // sentinel or payload.sent_via='manual'. Anything else with a human decider
+    // is a dashboard send (real tweet id captured → has a link).
+    const autoSent = r.decided_by === "auto-send";
+    const sentVia = (r.draft_payload as { sent_via?: unknown } | null)?.sent_via;
+    const manualX =
+      sentVia === "manual" || (r.sent_external_id?.startsWith("manual:") ?? false);
+    const sendMethod: SentApprovalRow["sendMethod"] = autoSent
+      ? "auto"
+      : manualX
+        ? "manual_x"
+        : "dashboard";
+    return {
+      approvalId: r.approval_id,
+      draftId: r.draft_id,
+      leadId: r.lead_id,
+      decidedAt: r.decided_at,
+      decidedBy: r.decided_by,
+      autoSent,
+      sendMethod,
+      postedAt: r.posted_at,
+      postUrl,
+      authorHandle: handle,
+      bodyPreview: body ? truncate(body, 240) : null,
+      charCount: draft.char_count ?? (body ? body.length : null),
+    };
+  });
+}
+
+function truncate(s: string, n: number): string {
+  if (s.length <= n) return s;
+  return s.slice(0, n - 1).trimEnd() + "…";
+}
+
+const normHandle = (h: string) => h.trim().toLowerCase().replace(/^@/, "");
+
+// ── Watchlist person relationship view ──────────────────────────────────────
+
+export interface WatchlistProfileView {
+  handle: string;
+  summary: string | null;
+  topics: string[];
+  tone: string | null;
+  engagementNotes: string | null;
+  postsAnalyzed: number;
+  generatedAt: string | null;
+}
+
+export interface PersonStats {
+  postsSeen: number;
+  repliesSent: number;
+  pendingReplies: number;
+  lastInteractionAt: string | null;
+  topTopics: string[];
+}
+
+export interface PersonInteraction {
+  approvalId: string;
+  status: string;
+  decidedAt: string | null;
+  kind: string | null;
+  bodyPreview: string | null;
+  /** Full draft text (un-truncated) — used to copy/send a parked DM. */
+  body: string | null;
+  /** Recipient's numeric X id (leads.author_id) — opens the X DM composer. */
+  recipientId: string | null;
+  /**
+   * The ORIGINAL post the reply/DM is queued against (the lead's tweet). Built
+   * from `leads.external_id` + `leads.author_handle` — both present the moment
+   * discovery writes the lead, so this resolves for `pending` rows too. This is
+   * the link the reviewer actually wants ("the post with a reply ready"). NULL
+   * only when the lead row or its author handle is missing.
+   */
+  sourcePostUrl: string | null;
+  /**
+   * The LIVE reply once Vega has posted it (`drafts.sent_external_id`). NULL for
+   * pending/skipped rows and for manually-dispatched replies.
+   */
+  postUrl: string | null;
+}
+
+/**
+ * Build the x.com permalink for a post from its author handle + tweet id.
+ * Used for both the source post (`leads.external_id`) and the sent reply
+ * (`drafts.sent_external_id`). Returns null when either piece is missing or the
+ * id is a `manual:` sentinel (hand-posted, no real tweet id).
+ */
+function xPostUrl(handle: string | null | undefined, tweetId: string | null | undefined): string | null {
+  if (!handle || !tweetId) return null;
+  if (tweetId.startsWith("manual:")) return null;
+  return `https://x.com/${handle}/status/${tweetId}`;
+}
+
+/**
+ * Shape one joined approval row into a `PersonInteraction`. Used by the
+ * org-scoped `listPersonInteractionsForOrg` reader so the source/reply URL logic
+ * lives in exactly one place.
+ */
+function toPersonInteraction(r: {
+  approval_id: string;
+  status: string;
+  decided_at: string | null;
+  sent_external_id: string | null;
+  lead_external_id: string | null;
+  lead_author_handle: string | null;
+  lead_author_id: string | null;
+  lead_payload: unknown;
+  draft_payload: unknown;
+}): PersonInteraction {
+  const lead = leadPayload({ payload: r.lead_payload } as NoelleLead);
+  const draft = draftPayload({ payload: r.draft_payload } as NoelleDraft);
+  const body = bodyForSelectedAngle(draft);
+  // Prefer the columns (always populated by discovery) over the jsonb payload,
+  // which doesn't carry post_id/external_id.
+  const authorHandle = r.lead_author_handle ?? lead.author_handle ?? null;
+  const sourcePostUrl =
+    lead.originalPostUrl ?? xPostUrl(authorHandle, r.lead_external_id);
+  const postUrl = draft.sent_url ?? xPostUrl(authorHandle, r.sent_external_id);
+  return {
+    approvalId: r.approval_id,
+    status: r.status,
+    decidedAt: r.decided_at,
