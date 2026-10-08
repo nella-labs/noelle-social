@@ -198,3 +198,203 @@ export function findCommentBox(root: ParentNode): HTMLElement | null {
     ];
     const editor = candidates.find((el) =>
       el.getAttribute("contenteditable")?.trim().toLowerCase() !== "false" && notMessaging(el));
+    if (editor) return editor;
+  }
+
+  return (
+    Array.from(root.querySelectorAll<HTMLElement>("div[role='textbox'][contenteditable='true']")).find(notMessaging) ??
+    Array.from(root.querySelectorAll<HTMLElement>(".comments-comment-box [contenteditable='true']")).find(notMessaging) ??
+    null
+  );
+}
+
+/** Strip invisible rich-editor residue before comparing or reading its body. */
+export function normalizeEditorText(text: string): string {
+  return text.replace(/[\u200B\uFEFF]/g, "").trim();
+}
+
+/**
+ * The current text inside the comment composer, trimmed (zero-width spaces the
+ * editor leaves are stripped). Returns null when there is no composer at all.
+ * The background reads this after a submit to CONFIRM the comment landed:
+ * LinkedIn clears the composer on a successful post, so a still-populated box
+ * means the comment did NOT go through (an off-viewport button the click missed,
+ * or a submit that never fired).
+ */
+export function commentBoxText(root: ParentNode): string | null {
+  const box = findCommentBox(root);
+  if (!box) return null;
+  // Strip zero-width space / BOM the rich editor can leave behind, so an
+  // otherwise-cleared box reads as empty.
+  return normalizeEditorText(box.textContent ?? "");
+}
+
+// ── Comment submit ──────────────────────────────────────────────────────────
+// The 2026 redesign broke every unanchored way of finding the submit: class
+// names are obfuscated hashes (no BEM), the action-bar comment TOGGLE was
+// relabeled from "Comment on <name>'s post" to bare "Comment" (killing the
+// possessive exclusion), and the toggle PRECEDES the composer in document
+// order — so a document-wide word scan returned the toggle, the background
+// clicked it once, nothing posted, and every attempt logged
+// comment-failed:not-cleared. The search is now ANCHORED to the composer box
+// and a decoy can only lose: if nothing qualifies we return null, which keeps
+// the background's 6s poll waiting (correct for the 2026 submit, disabled
+// until typing registers) and ends in a diagnosable submit-not-found instead
+// of a wrong click.
+
+const SUBMIT_WORD = /^(post comment|comment|post|reply)$/i;
+const isSubmitWord = (s: string) => SUBMIT_WORD.test(s.trim());
+
+/** Exact-word match on aria-label OR text. The 2026 toggle's textContent is
+ * label + count span ('Comment10' — misses the word list) but its aria-label
+ * 'Comment' hits; toggles are rejected by the exclusions below, never by
+ * hoping the count span breaks the word match. */
+function submitWordy(el: HTMLElement): boolean {
+  return isSubmitWord(el.getAttribute("aria-label") ?? "") || isSubmitWord(el.textContent ?? "");
+}
+
+/** Submit-styled: legacy primary/BEM classes, or an explicit type=submit (the
+ * migrated FEED composer carries it; the post-permalink surface may not, so
+ * primary is never REQUIRED on the anchored pass). */
+function submitPrimary(el: HTMLElement): boolean {
+  return /artdeco-button--primary|__submit-button/i.test(el.className) || el.getAttribute("type") === "submit";
+}
+
+/** The action-bar comment TOGGLE (opens the composer, never posts). Legacy
+ * kept a possessive label; the 2026 toggle is bare "Comment" and is identified
+ * by its SDUI hooks instead — data-view-name, the componentkey button-section
+ * wrapper, and the comment-small sprite icon. All cheap, checked defensively
+ * in parallel so partial markup drift doesn't reopen the decoy channel. */
+function toggleLike(el: HTMLElement): boolean {
+  if (/on .+'s post/i.test(el.getAttribute("aria-label") ?? "")) return true;
+  if (el.getAttribute("data-view-name") === "feed-comment-button") return true;
+  // The action-bar toggle carries the comment-bubble sprite (svg#comment-small).
+  // The composer SUBMIT does NOT — its label is the word "Comment" as text. This
+  // is the reliable discriminator on the live 2026 permalink.
+  //
+  // NOTE: do NOT treat `componentkey*="commentButtonSection"` as a toggle
+  // signal. The live DOM proves the opposite — `commentButtonSection` is the
+  // wrapper around the real composer SUBMIT, so excluding it (as this code once
+  // did) discarded the very button we needed and produced the wf=0 wall.
+  if (el.querySelector("svg #comment-small, svg[id='comment-small'], use[href*='comment-small']") !== null) return true;
+  // Shape check: a button that is wordy only via aria-label while its visible
+  // content is just a count ("10", "1,024", "1.2K") is the action-bar
+  // affordance — the real submit shows the word itself, never a count.
+  const ownText = (el.textContent ?? "").trim();
+  return /^\d[\d,.]*[kKmM]?$/.test(ownText) && isSubmitWord(el.getAttribute("aria-label") ?? "");
+}
+
+// Thread reply affordances live inside per-comment items on both eras (2026
+// SDUI wraps each in [componentkey^=replaceableComment]; legacy uses
+// comments-comment-item/-entity classes). The composer submit never does —
+// this is what keeps enabled bare "Reply" buttons out of every pass. But the
+// live 2026 capture shows the wrappers are NOT guaranteed (its reply affordance
+// sits in a plain .comments-section div), so bare "Reply" is additionally
+// rejected by anchoredWordy below unless the button is submit-styled.
+const COMMENT_ITEM_SEL =
+  "[componentkey^='replaceableComment'], [class*='comments-comment-item'], [class*='comments-comment-entity']";
+
+function submitDisabled(el: HTMLElement): boolean {
+  // `.disabled` only exists on real <button>s; aria-disabled covers role=button.
+  return (el as HTMLButtonElement).disabled === true || el.getAttribute("aria-disabled") === "true";
+}
+
+/** Shared candidate filter for every pass: a real (or ARIA) button that is
+ * enabled, not the action-bar toggle, not part of an existing comment, and
+ * not inside the messaging overlay. */
+function submitEligible(el: HTMLElement): boolean {
+  if (submitDisabled(el)) return false;
+  if (toggleLike(el)) return false;
+  if (el.closest(MESSAGING_SEL) !== null) return false;
+  return el.closest(COMMENT_ITEM_SEL) === null;
+}
+
+function submitCandidates(scope: ParentNode): HTMLElement[] {
+  return Array.from(scope.querySelectorAll<HTMLElement>("button, [role='button']")).filter(submitEligible);
+}
+
+/** Word-gate for the anchored pass. Mandatory — submit-styling (type=submit /
+ * primary classes) is only ever a TIEBREAKER, never a qualifier on its own,
+ * because the chat overlay's Send button is type=submit: without the word
+ * requirement the climb could hand a comment to a private-message pane. Bare
+ * "Reply" is the label of thread reply affordances (hook-less on live 2026
+ * captures), never the main composer's submit, so it only qualifies when the
+ * button is also submit-styled. */
+function anchoredWordy(el: HTMLElement): boolean {
+  if (!submitWordy(el)) return false;
+  const bareReply =
+    /^reply$/i.test((el.getAttribute("aria-label") ?? "").trim()) ||
+    /^reply$/i.test((el.textContent ?? "").trim());
+  return !bareReply || submitPrimary(el);
+}
+
+export interface CommentSubmitHit {
+  el: HTMLElement;
+  /** Which pass found it (composer:<hops> | bem | global-primary) — rides
+   * locateCommentSubmit's observed.via into the failure diagnostics. */
+  via: string;
+}
+
+export function findCommentSubmitInfo(root: ParentNode): CommentSubmitHit | null {
+  // findCommentBox never returns a messaging textbox, so the anchor — like
+  // every candidate below — is guaranteed to live outside the chat overlay.
+  const box = findCommentBox(root);
+
+  // 1) Composer-anchored: climb from the box up to 6 ancestors and take the
+  //    FIRST level that yields a candidate. A candidate must FOLLOW the box in
+  //    document order (the submit renders after the editor, the action-bar
+  //    toggle precedes it — position has survived every redesign) and be either
+  //    WORDY (anchoredWordy) or an explicit `type=submit`. The type=submit
+  //    branch is what catches the 2026 permalink's ICON-ONLY submit (live rows
+  //    showed wf=0 / all>0 — a composer with worded buttons only for the toggle,
+  //    and the real submit carrying no submit word). It is safe because the DM
+  //    "Send" (also type=submit) is already excluded by MESSAGING_SEL, toggles
+  //    by toggleLike, and thread replies by COMMENT_ITEM_SEL; a wrong click here
+  //    can at worst not-clear (recoverable), never send a DM. Worded still wins
+  //    the tiebreak, so legacy/worded surfaces behave exactly as before. Never
+  //    widen past a hit, and stop at a <form>. A level holding only a DISABLED
+  //    would-be submit returns null (wait for enable; widening would reach
+  //    decoys).
+  if (box) {
+    const follows = (el: HTMLElement) =>
+      (box.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    // An icon-only / non-worded submit qualifies only via an explicit
+    // type=submit AND only when its accessible name isn't a DIFFERENT action —
+    // 'Send'/'Message'/'Connect'/… are type=submit buttons that must never be
+    // clicked by the comment flow (the DM Send especially). This keeps the
+    // icon-only comment submit reachable without reopening the send channel even
+    // if messaging classes get obfuscated out of MESSAGING_SEL.
+    const NONCOMMENT = /\b(send|message|invite|connect|follow|unfollow|share|repost|save|submit cv|apply)\b/i;
+    const commentSubmitTyped = (el: HTMLElement) => {
+      if (el.getAttribute("type") !== "submit") return false;
+      const name = `${el.getAttribute("aria-label") ?? ""} ${el.textContent ?? ""}`;
+      return !NONCOMMENT.test(name);
+    };
+    const wanted = (el: HTMLElement) =>
+      (anchoredWordy(el) || commentSubmitTyped(el)) && follows(el) && !toggleLike(el) &&
+      el.closest(COMMENT_ITEM_SEL) === null && el.closest(MESSAGING_SEL) === null;
+    let scope: HTMLElement | null = box.parentElement;
+    for (let hops = 1; scope && hops <= 6; hops++) {
+      const wouldBe = Array.from(scope.querySelectorAll<HTMLElement>("button, [role='button']")).filter(wanted);
+      const enabled = wouldBe.filter((el) => !submitDisabled(el));
+      if (enabled.length > 0) {
+        // Prefer worded, then explicit type=submit, then primary-styled;
+        // querySelectorAll order keeps first-in-document among equals.
+        const score = (el: HTMLElement) =>
+          (anchoredWordy(el) ? 4 : 0) + (el.getAttribute("type") === "submit" ? 2 : 0) + (submitPrimary(el) ? 1 : 0);
+        const best = enabled.reduce((a, b) => (score(b) > score(a) ? b : a));
+        return { el: best, via: `composer:${hops}` };
+      }
+      if (wouldBe.length > 0) return null; // disabled submit at this level: wait, never widen
+      if (scope.tagName === "FORM") break;
+      scope = scope.parentElement;
+    }
+  }
+
+  // 2) Legacy BEM submit (state suffixes like __submit-button--cr) — but only
+  //    when it passes the filter: the old unconditional pass-0 returned a
+  //    DISABLED BEM submit and the click silently no-oped.
+  for (const el of Array.from(root.querySelectorAll<HTMLElement>("button[class*='comments-comment-box__submit-button']"))) {
+    if (submitEligible(el)) return { el, via: "bem" };
+  }
+
