@@ -398,3 +398,54 @@ describe("scrapeFollowers (person discovery)", () => {
       displayName: "A Candidate",
       bio: "founder, devtools",
       followers: 1200,
+    });
+  });
+
+  it("tolerates the actor's key-casing variants", async () => {
+    const { fetchImpl } = fakeApify([
+      { screen_name: "@Other", id_str: "7", displayname: "Other", rawDescription: "building things", followers_count: 30 },
+    ]);
+    const c = createApifyXClient({ token: "t", fetchImpl });
+    const { people } = await c.scrapeFollowers({ seedHandles: ["seed"], maxUsers: 5 });
+    expect(people[0]).toMatchObject({ handle: "other", id: "7", bio: "building things", followers: 30 });
+  });
+
+  it("keeps an absent bio as NULL, never an empty string", async () => {
+    // null means UNKNOWN to the ICP gate; "" would read as a real empty bio.
+    const { fetchImpl } = fakeApify([person({ description: "   " })]);
+    const c = createApifyXClient({ token: "t", fetchImpl });
+    const { people } = await c.scrapeFollowers({ seedHandles: ["seed"], maxUsers: 5 });
+    expect(people[0]!.bio).toBeNull();
+  });
+
+  it("drops the seed accounts themselves and de-dupes across seed lists", async () => {
+    const { fetchImpl } = fakeApify([person({ userName: "seed" }), person(), person()]);
+    const c = createApifyXClient({ token: "t", fetchImpl });
+    const { people } = await c.scrapeFollowers({ seedHandles: ["seed"], maxUsers: 10 });
+    expect(people.map((p) => p.handle)).toEqual(["cand"]);
+  });
+
+  it("caps the returned people at maxUsers", async () => {
+    const many = Array.from({ length: 50 }, (_, i) => person({ userName: `u${i}`, id: String(i) }));
+    const { fetchImpl } = fakeApify(many);
+    const c = createApifyXClient({ token: "t", fetchImpl });
+    const { people } = await c.scrapeFollowers({ seedHandles: ["seed"], maxUsers: 7 });
+    expect(people).toHaveLength(7);
+  });
+
+  it("spends NOTHING when there are no seeds or the cap is zero", async () => {
+    const { fetchImpl, calls } = fakeApify([person()]);
+    const c = createApifyXClient({ token: "t", fetchImpl });
+    expect(await c.scrapeFollowers({ seedHandles: [], maxUsers: 5 })).toEqual({ people: [], resultCount: 0 });
+    expect(await c.scrapeFollowers({ seedHandles: ["seed"], maxUsers: 0 })).toEqual({ people: [], resultCount: 0 });
+    expect(calls).toHaveLength(0); // no actor run was started at all
+  });
+
+  it("floors the actor's list size at its 200 minimum", async () => {
+    const { fetchImpl, calls } = fakeApify([person()]);
+    const c = createApifyXClient({ token: "t", fetchImpl });
+    await c.scrapeFollowers({ seedHandles: ["seed"], maxUsers: 5 });
+    const body = calls.find((x) => x.body)!.body as { maxFollowers: number };
+    expect(body.maxFollowers).toBe(200);
+  });
+});
