@@ -598,3 +598,15 @@ export const acknowledgePatternAlert = withRateLimit(
   { capacity: 60, refillPerSecond: 1, cost: 1 },
   async (input: PatternAlertActionInput): Promise<PatternAlertActionResult> => {
     const parsed = PatternAlertActionInput.parse(input);
+    try {
+      const res = await noelleFetch<{ status: string }>(
+        `/api/pattern-alerts/${encodeURIComponent(parsed.alertId)}/acknowledge`,
+        { method: "POST", body: {} },
+      );
+      revalidatePath(`/app/${parsed.orgSlug}/approvals`);
+      return { ok: true, status: res.status };
+    } catch (e) {
+      return patternError(e);
+    }
+  },
+);
