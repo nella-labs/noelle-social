@@ -398,3 +398,194 @@ const EnvSchema = z.object({
   // Engagement-tiered model escalation (ported from Lyra). A lead whose post has
   // real traction is drafted by the smarter, costlier model:
   //   useOpus = likes > X_OPUS_LIKES || (replies > X_OPUS_REPLIES && !comment_bait)
+  // The REPLIES trigger is suppressed for engagement-bait posts, whose reply
+  // count is inflated with junk rather than real discussion — otherwise a
+  // comment-farming giveaway would reliably buy itself the expensive model.
+  // 0 on both disables escalation entirely (every lead on the base model).
+  // Higher than Lyra's 80/30 because X engagement counts run larger.
+  X_OPUS_LIKES: z.coerce.number().int().nonnegative().default(150),
+  X_OPUS_REPLIES: z.coerce.number().int().nonnegative().default(40),
+  // Self-curating watchlist: max keyword authors auto-promoted to the always-on
+  // watchlist per run (0 disables the feature). An author qualifies once it has
+  // produced WATCHLIST_AUTOPROMOTE_MIN_DRAFTED drafted leads. Runs at most hourly
+  // per instance inside the discovery tick.
+  WATCHLIST_AUTOPROMOTE_MAX: z.coerce.number().int().min(0).default(5),
+  WATCHLIST_AUTOPROMOTE_MIN_DRAFTED: z.coerce.number().int().min(1).default(2),
+  // Watch-lane per-person re-poll cooldown (hours), ported from Lyra's
+  // LINKEDIN_WATCHLIST_REPOLL_HOURS (#441). When > 0, a watchlist person's
+  // handle is polled at most once per window (in-memory per-process state; a
+  // pm2 restart costs one extra full sweep). Targeting handles + the keyword
+  // lane are never gated, and a handle that is BOTH a targeting handle and a
+  // watchlist person stays ungated so watchlisting someone never throttles
+  // existing targeting coverage. Default 0 = gate OFF (byte-identical: every
+  // tick polls every handle, exactly as today) — X's watchlist feeds PRIORITY
+  // leads with a fast reply loop, so pick the window deliberately (1-2h saves
+  // most of the Apify spend without visibly delaying watched-account replies).
+  //
+  // Now defaults to 2h (was 0 = OFF, i.e. the gate shipped inert and never once
+  // fired in production). Vega's watchlist has no dual-role targeting handles,
+  // so every watch person was re-polled on EVERY tick — the single largest
+  // avoidable draw on a token pool that is currently fully exhausted. 2h is
+  // deliberately tighter than Lyra's 4h because X's reply loop is faster; a
+  // watched post is seen at most 2h late, against an Apify budget that
+  // otherwise runs dry and stops discovery entirely.
+  X_WATCHLIST_REPOLL_HOURS: z.coerce.number().nonnegative().default(2),
+
+  // ── Grounded-drafting pipeline. See docs/grounded-drafting.md. NOELLE_VOICE_DIRS
+  //    (above) already scopes voice retrieval; these add the knowledge pass +
+  //    verifier + few-shot. Parsed with parseIncludeDirs, same as NOELLE_VOICE_DIRS. ──
+  // Scope a SECOND, knowledge retrieval pass to these subdirs (product /
+  // positioning / ICP, e.g. "01-business,04-automation-contexts"). When set, the
+  // drafter grounds factual claims in retrieved operator knowledge instead of
+  // model priors. Empty → the knowledge pass is skipped entirely.
+  NOELLE_KNOWLEDGE_DIRS: z.string().optional(),
+  // How many knowledge chunks to retrieve in the second pass.
+  NOELLE_DRAFTER_KNOWLEDGE_TOPK: z.coerce.number().int().min(0).default(4),
+  // Distill gathered context into one compact brief (one cheap LLM call/lead).
+  NOELLE_DRAFTER_BRIEF: boolFlag,
+  // Every new reply needs a genuine review before the browser can send it.
+  // An explicit false disables ordinary verification and keeps those drafts
+  // out of the unattended queue; observed leads still force review.
+  NOELLE_DRAFTER_VERIFY: boolFlag.default("1"),
+  // Max regenerate attempts on a failed verdict before queueing the best try.
+  NOELLE_DRAFTER_VERIFY_RETRIES: z.coerce.number().int().min(0).max(3).default(3),
+  // Same voice floor as LinkedIn after bounded review retries. 0 disables it.
+  NOELLE_DRAFTER_VOICE_FLOOR: z.coerce.number().min(0).max(1).default(0.65),
+  // Fail-CLOSED unattended auto-send gate. When on, an auto-post requires a
+  // GENUINE passing verifier verdict (verify must have run, the judge must have
+  // actually returned, every dimension must clear the bar). Verify disabled,
+  // judge unavailable, or a failing verdict ⇒ HOLD the reply for manual approval
+  // (never auto-send on uncertainty). Default OFF ⇒ auto-send behaves exactly as
+  // today. Only affects auto_send_enabled instances; the manual path is untouched.
+  NOELLE_X_AUTOSEND_REQUIRE_VERIFY: boolFlag,
+  // Route the post-draft verifier JUDGE through the cheap Haiku tier
+  // (judgeRouting) instead of the drafter's own Sonnet/Opus routing. The judge
+  // only grades against a rubric; the drafter itself stays on Sonnet/Opus.
+  // Default OFF → judge uses xInternRouting(inst), byte-identical to today.
+  NOELLE_DRAFTER_VERIFY_CHEAP: boolFlag,
+  // Few-shot from past SENT/EDITED drafts (the self-improvement signal). When on,
+  // recent sent replies (preferring the human-edited body) are injected as
+  // "replies that worked" exemplars.
+  NOELLE_DRAFTER_EXAMPLES: boolFlag,
+  NOELLE_DRAFTER_EXAMPLES_TOPK: z.coerce.number().int().min(0).default(3),
+  // Reply-diversity gate: before queueing, drop reply variants that are
+  // near-duplicates of a recent SENT reply (trigram-Jaccard) or read as AI-slop.
+  // Default OFF + fail-open (no priors leaves drafting unchanged). See
+  // lib/reply-diversity.ts and docs/reply-actuation-strategy.md (Phase 2).
+  NOELLE_REPLY_DIVERSITY_GATE: boolFlag,
+  NOELLE_REPLY_DIVERSITY_TOPK: z.coerce.number().int().min(0).default(50),
+  // Reply MEMORY (the prompt-side complement to the post-hoc diversity gate
+  // above). Both default to a non-zero topK because, unlike the gate, they are
+  // pure additions to the prompt + verifier context: with no history the blocks
+  // are omitted and drafting is byte-identical. Mirrors Lyra's
+  // LINKEDIN_DRAFTER_SENT_TOPK / _RECENT_PHRASINGS_TOPK.
+  //  - SENT_TOPK: how many replies already sent to THIS author to show the
+  //    drafter as a do-not-repeat list (also the verifier's novelty corpus).
+  //  - RECENT_PHRASINGS_TOPK: how many recent replies feed-wide to show as an
+  //    opener/phrasing avoid-list (also the verifier's diversity corpus).
+  // 0 disables either one.
+  X_DRAFTER_SENT_TOPK: z.coerce.number().int().min(0).default(3),
+  X_DRAFTER_RECENT_PHRASINGS_TOPK: z.coerce.number().int().min(0).default(20),
+  // Voice variety: per lead, randomly assign a "register" (ultra-short / hype /
+  // slang / punchy / normal) and inject it into the reply-drafting prompt so
+  // replies vary in length + energy across the feed instead of converging on one
+  // shape (see lib/register.ts). Default OFF → byte-identical drafts; the operator
+  // enables it at deploy. Only the reply drafting gets a register — the DM /
+  // intro-DM / DM-request paths are untouched.
+  NOELLE_DRAFTER_VARIETY: boolFlag,
+  // Post-energy mirroring (default OFF). When on, the drafter detects each post's
+  // ENERGY (celebration / joke / hot_take / vent / question / analytical) and (a)
+  // picks an energy-aware register when variety is on — HYPE only on a celebration,
+  // DEADPAN on a joke, never snark on a question — and (b) injects a one-line "POST
+  // ENERGY" hint so the reply MIRRORS the post: answer satire with satire, not
+  // philosophy. Off/unset → blind register + celebration/neutral style only,
+  // byte-identical to today. See packages/runtime/src/register.ts.
+  NOELLE_DRAFTER_ENERGY: boolFlag,
+  // Sibling-comment "read the room" fetch (default OFF). When on, the drafter pulls
+  // the top OTHER replies on each post (via the conversation_id operator on the SAME
+  // rotating Apify pool discovery uses, ~$0.004/lead, fail-open) and injects a digest
+  // so the reply mirrors the room's energy and never echoes a take already made.
+  // Off/unset → no fetch, no block, byte-identical. See packages/runtime/src/commentDigest.ts.
+  NOELLE_DRAFTER_COMMENT_ENERGY: boolFlag,
+  // Max sibling replies to fetch + show per lead when NOELLE_DRAFTER_COMMENT_ENERGY
+  // is on. Keeps the Apify per-result cost + the prompt bounded. Default 12.
+  NOELLE_DRAFTER_COMMENT_MAX: z.coerce.number().int().min(1).max(50).default(12),
+  // Prompt-injection fence (default OFF). When on, the untrusted post text (and
+  // vision caption) is wrapped in <post_by_author> delimiters with a data-not-
+  // instructions guard so a hostile post cannot steer Vega's autosent reply.
+  // Off/unset → byte-identical prompt. See docs/x-account-safety.md.
+  NOELLE_DRAFTER_FENCE: boolFlag,
+  // Master auto-enable for autosend quality levers. When ON, any instance with
+  // auto_send_enabled=true gets voice-variety + the reply-diversity gate even if
+  // their individual env flags are off. Default OFF → behavior is exactly today's
+  // (each lever governed only by its own flag). See lib/autosend-quality.ts.
+  NOELLE_AUTOSEND_QUALITY_AUTOENABLE: boolFlag,
+  // ---- Account Feeder style injection (F4; default OFF) ---------------------
+  // Inject high-performing HUMAN reply exemplars (account_style_posts,
+  // kind='comment') into the reply drafter's SYSTEM prompt so replies imitate the
+  // FORM (rhythm/hooks/sentence-shape/tone) of real writers the operator admires
+  // — never their content, never the length rules. Selection is
+  // performance-weighted x fit (selectStyleExemplars). Default OFF → no STYLE
+  // block, drafts byte-identical to today; fail-open everywhere (no corpus / no
+  // Voyage key / any error ⇒ drafts as today). Read by name in the selector.
+  NOELLE_DRAFTER_STYLE: boolFlag,
+  // Candidate-pool size: how many style exemplars to LOAD per tick (once, reused
+  // across the tick's leads) before per-lead fit+performance ranking trims them.
+  // Bigger pool = better fit headroom, slightly bigger rerank call. Default 60
+  // (matches the feeder's extract corpus cap). Only used when NOELLE_DRAFTER_STYLE
+  // is on.
+  NOELLE_DRAFTER_STYLE_POOL: z.coerce.number().int().min(1).max(500).default(60),
+  // Use the F4b DENSE/hybrid ranker (pgvector embeddings + RRF) for style fit
+  // instead of the rerank-only path. Dormant until the corpus is embedded; fails
+  // open to rerank-only, then to input order. Read by name in the selector.
+  // Default OFF.
+  NOELLE_DRAFTER_DENSE: boolFlag,
+  // ── Pattern Breaker (cross-post anti-slop; default OFF) ─────────────────────
+  // Ported from Lyra (LINKEDIN_PATTERN_BREAKER). When ON, the drafter worker
+  // periodically audits the operator's last-N SENT replies + published posts for
+  // over-used structural habits, persists each as an active noelle.pattern_rules
+  // row + an operator alert, and the drafter/verifier consume the active rules
+  // (system-prompt "break these patterns" block + verifier soft/hard penalties).
+  // MUST stay default OFF: auto-learned rules directly reshape replies that
+  // autosend can post unattended to a real logged-in X account — flip it only
+  // with the dashboard Pattern Breaker panel (the off switch) in view. The
+  // PATTERN_BREAKER_* tuning knobs are shared names with Lyra on purpose (same
+  // analyzer, same defaults); only the master flag is per-platform. See
+  // docs/pattern-breaker.md.
+  X_PATTERN_BREAKER: boolFlag,
+  // How often the (heavy) analysis pass re-audits the corpus, per instance. The
+  // cheap refine-queue drain runs every drafter tick regardless.
+  PATTERN_BREAKER_INTERVAL_MS: z.coerce.number().int().positive().default(6 * 60 * 60_000),
+  // Minimum matches within a window for a habit to be flagged.
+  PATTERN_BREAKER_MIN_FREQUENCY: z.coerce.number().int().positive().default(3),
+  // Minimum share of a window (0..1) for a habit to count as over-used.
+  PATTERN_BREAKER_MIN_RATIO: z.coerce.number().min(0).max(1).default(0.3),
+  // Max recent posts loaded as the analysis corpus.
+  PATTERN_BREAKER_MAX_POSTS: z.coerce.number().int().positive().default(100),
+  // Image understanding fallback: when the org has no Gemini key (the self-host
+  // case — and Vertex user-ADC is dead on Lima), caption the post's image(s) via
+  // a vision-capable Claude on AWS Bedrock (the same creds the classifier uses),
+  // so the drafter can actually SEE and address the image. Default OFF now — it
+  // is PAID AWS Bedrock (the claude-cli subscription can't caption images), and
+  // the global Gemini key covers vision on the self-host box. Set to "1" to opt
+  // back in. No-op (fails open to "") when no AWS creds are present.
+  NOELLE_VISION_BEDROCK: z
+    .string()
+    .optional()
+    .default("")
+    .transform((v) => v === "1" || v.toLowerCase() === "true"),
+});
+
+export type Env = z.infer<typeof EnvSchema>;
+
+let cached: Env | undefined;
+
+export function loadEnv(): Env {
+  if (cached) return cached;
+  cached = EnvSchema.parse(process.env);
+  return cached;
+}
+
+export function resetEnvForTests() {
+  cached = undefined;
+}
