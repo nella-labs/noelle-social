@@ -198,3 +198,203 @@ export function replyBoxText(root: ParentNode): string | null {
   if (!box) return null;
   // Strip zero-width space / BOM the rich editor can leave behind, so an
   // otherwise-cleared box reads as empty.
+  return (box.textContent ?? "").replace(/[\u200B\uFEFF]/g, "").trim();
+}
+
+// ── Reply submit ────────────────────────────────────────────────────────────
+// Ported from the LinkedIn actuator's composer-anchored submit search (#406/
+// #407/#442). The bare testid pair alone is a single point of failure: one
+// testid rename = a silent wall of `reply-failed` with zero diagnostics, and
+// the old shape happily returned a DISABLED tweetButton (X keeps it disabled
+// until the editor model registers text, so clicking it is a silent no-op
+// phantom). The search is fail-safe: if nothing qualifies we return null,
+// which keeps the background's poll waiting (correct for a submit that is
+// disabled until typing registers) and ends in a diagnosable submit-not-found
+// instead of a wrong click.
+
+const SUBMIT_WORD = /^(reply|post)$/i;
+const isSubmitWord = (s: string) => SUBMIT_WORD.test(s.trim());
+
+/** Exact-word match on aria-label OR text — the real submit shows the word
+ * itself ("Reply" / "Post"); action-bar icons show a count (or nothing). */
+function submitWordy(el: HTMLElement): boolean {
+  return isSubmitWord(el.getAttribute("aria-label") ?? "") || isSubmitWord(el.textContent ?? "");
+}
+
+// The DM drawer (bottom-right messages pane) persists across navigations and
+// holds its own composer + a type=submit-shaped Send button. X DMs are
+// contractually MANUAL-ONLY (see content/index.ts): a reply typed or
+// "submitted" there would go out as a PRIVATE MESSAGE, so the box search
+// (findReplyBox's dmComposerTextInput exclusion) AND every submit candidate
+// reject anything inside it.
+export const DM_SEL =
+  "[data-testid='DMDrawer'], [data-testid='dmComposerTextInput'], [data-testid='dmComposerSendButton']";
+
+// The left-nav compose affordance opens the NEW-POST modal — wordy ("Post")
+// but never the reply submit. It precedes <main> in document order, so the
+// FOLLOWING check already excludes it; the testid exclusion is a cheap second
+// lock in case X reorders the shell.
+const NAV_COMPOSE_SEL = "[data-testid='SideNav_NewTweet_Button'], a[href='/compose/post']";
+
+/** The action-bar reply ICON (opens the composer, never posts). Discriminated
+ * by its testid plus a hook-independent SHAPE rule: a button that is wordy
+ * only via aria-label while its visible text is empty or just a count ("12",
+ * "1.2K") is the per-tweet affordance — the real submit shows the word itself. */
+function replyToggleLike(el: HTMLElement): boolean {
+  if (el.getAttribute("data-testid") === "reply") return true;
+  if (el.closest("[data-testid='reply']") !== null) return true;
+  const ownText = (el.textContent ?? "").trim();
+  return (ownText === "" || /^\d[\d,.]*[kKmM]?$/.test(ownText)) && isSubmitWord(el.getAttribute("aria-label") ?? "");
+}
+
+function submitDisabled(el: HTMLElement): boolean {
+  // `.disabled` only exists on real <button>s; aria-disabled covers role=button.
+  return (el as HTMLButtonElement).disabled === true || el.getAttribute("aria-disabled") === "true";
+}
+
+export interface ReplySubmitHit {
+  el: HTMLElement;
+  /** Which pass found it (testid:<tid> | composer:<hops>) — rides
+   * locateCommentSubmit's observed.via into the failure diagnostics. */
+  via: string;
+}
+
+export function findReplySubmitInfo(root: ParentNode): ReplySubmitHit | null {
+  // 1) Testid fast path, ENABLED only. LIVE-TUNE: 'tweetButtonInline' is the
+  //    inline composer's button (timeline / thread pages); 'tweetButton' is the
+  //    modal composer's. A disabled hit returns null — the caller's poll waits
+  //    for the editor model to register text and enable it; widening toward
+  //    decoys is never the right move (#407: clicking a disabled submit is a
+  //    silent no-op phantom).
+  for (const tid of ["tweetButtonInline", "tweetButton"] as const) {
+    const el = root.querySelector<HTMLElement>(`button[data-testid='${tid}']`);
+    if (!el || el.closest(DM_SEL) !== null) continue;
+    if (submitDisabled(el)) return null;
+    return { el, via: `testid:${tid}` };
+  }
+
+  // 2) Composer-anchored fallback (#442): climb from the reply box up to 6
+  //    ancestors and take the FIRST level that yields a candidate. A candidate
+  //    must FOLLOW the box in document order (the submit renders after the
+  //    editor; the action-bar reply icon and the left-nav compose button
+  //    precede it — position outlives testid/label drift) and be either WORDY
+  //    (exact "Reply"/"Post") or an explicit type=submit whose accessible name
+  //    isn't a DIFFERENT action ('Send'/'Message'/… must never be clicked by
+  //    the reply flow — the DM Send especially). Never widen past a hit; a
+  //    level holding only a DISABLED would-be submit returns null (wait for
+  //    enable). Candidates inside a tweet article are per-tweet affordances,
+  //    never the composer's submit.
+  const box = findReplyBox(root);
+  if (!box) return null;
+  const follows = (el: HTMLElement) =>
+    (box.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  const NONREPLY = /\b(send|message|dm|follow|subscribe|share|repost|retweet|like|bookmark|grok|schedule|draft)\b/i;
+  const replySubmitTyped = (el: HTMLElement) => {
+    if (el.getAttribute("type") !== "submit") return false;
+    const name = `${el.getAttribute("aria-label") ?? ""} ${el.textContent ?? ""}`;
+    return !NONREPLY.test(name);
+  };
+  const wanted = (el: HTMLElement) =>
+    (submitWordy(el) || replySubmitTyped(el)) && follows(el) && !replyToggleLike(el) &&
+    el.closest(DM_SEL) === null && el.closest(NAV_COMPOSE_SEL) === null &&
+    el.closest("article[data-testid='tweet']") === null;
+  let scope: HTMLElement | null = box.parentElement;
+  for (let hops = 1; scope && hops <= 6; hops++) {
+    const wouldBe = Array.from(scope.querySelectorAll<HTMLElement>("button, [role='button']")).filter(wanted);
+    const enabled = wouldBe.filter((el) => !submitDisabled(el));
+    if (enabled.length > 0) {
+      // Prefer worded, then explicit type=submit; querySelectorAll order keeps
+      // first-in-document among equals.
+      const score = (el: HTMLElement) =>
+        (submitWordy(el) ? 4 : 0) + (el.getAttribute("type") === "submit" ? 2 : 0);
+      const best = enabled.reduce((a, b) => (score(b) > score(a) ? b : a));
+      return { el: best, via: `composer:${hops}` };
+    }
+    if (wouldBe.length > 0) return null; // disabled submit at this level: wait, never widen
+    if (scope.tagName === "FORM") break;
+    scope = scope.parentElement;
+  }
+  return null;
+}
+
+/** The reply submit, or null. Kept as the simple-shape accessor; the info
+ * variant carries the `via` pass for diagnostics. */
+export function findReplySubmit(root: ParentNode): HTMLElement | null {
+  // Delegates to the info variant, which preserves the disabled→null guard
+  // (a disabled tweetButton is a phantom submit) and the DM-drawer exclusion.
+  return findReplySubmitInfo(root)?.el ?? null;
+}
+
+/**
+ * True when the opened permalink is a dead reply target: the tweet was deleted
+ * ("This post was deleted by the post author."), the author protects their
+ * posts ("These posts are protected."), the account is gone, or the route 404s
+ * ("Hmm...this page doesn't exist."). No composer will ever render for this
+ * account, so the actuator DROPS the draft (and marks it skipped server-side)
+ * instead of retrying the dead permalink on every slot.
+ *
+ * A positive here feeds a DURABLE server write (markSkipped flips a valid
+ * pending approval to status='skipped'), so the signal is structurally gated —
+ * whole-document phrase matching alone false-positives on healthy pages:
+ *   1. `[data-testid='error-detail']` (X's dedicated error/interstitial
+ *      container) is trusted unconditionally — it never renders on a healthy
+ *      permalink.
+ *   2. The phrase probe is trusted ONLY when NO `article[data-testid='tweet']`
+ *      exists on the page. A rendered tweet article means the target is alive:
+ *      the exact interstitial phrase also appears inside embedded quote cards
+ *      of deleted tweets (an everyday repliable target) and in ordinary reply
+ *      prose ("this tweet has been deleted"), both of which render tweet
+ *      articles — X's dead-target interstitial never does.
+ * A false NEGATIVE here is safe: the composer locate fails, the draft retries
+ * under the MAX_ACTION_TRIES cap, and no durable write fires.
+ * LIVE-TUNE: English-only phrases, like isPromoted.
+ */
+export function isPostUnavailable(root: ParentNode): boolean {
+  // Structural signal: X's error/interstitial container. Trusted as-is.
+  if (root.querySelector("[data-testid='error-detail']") !== null) return true;
+  // Any rendered tweet article ⇒ the page has live content; a phrase hit would
+  // be a quote-card tombstone or prose, NOT the dead-target interstitial.
+  if (root.querySelector("article[data-testid='tweet']") !== null) return false;
+  const el = root instanceof Element ? root : (root as Document).body ?? null;
+  const text = (el?.textContent ?? "").replace(/\s+/g, " ");
+  // ['’]? — X renders typographic apostrophes ("doesn’t"), match both.
+  return [
+    /this (?:post|tweet) was deleted by the (?:post|tweet) author/i,
+    /these posts are protected/i,
+    /this (?:post|tweet) (?:is )?unavailable/i,
+    /this account doesn['’]?t exist/i,
+    /this page doesn['’]?t exist/i,
+    /account suspended/i,
+  ].some((re) => re.test(text));
+}
+
+/**
+ * The reply icon in a tweet's action bar, or null. Ambient (read-only) decoy
+ * affordance: a human scrolling the feed regularly opens the discussion under a
+ * tweet. On X this opens the reply composer (a modal on the timeline) rather
+ * than merely expanding a thread — the loop only reads and dismisses, never
+ * types. LIVE-TUNE: button[data-testid='reply']; restricted-reply tweets keep
+ * the icon but disable it, and a disabled icon is not a usable affordance.
+ */
+export function findReplyAffordance(tweet: Element): HTMLElement | null {
+  const btn = tweet.querySelector<HTMLElement>("button[data-testid='reply']");
+  if (!btn) return null;
+  if (btn.hasAttribute("disabled") || btn.getAttribute("aria-disabled") === "true") return null;
+  return btn;
+}
+
+/** True if the tweet exposes a usable reply affordance. */
+export function hasReplies(tweet: Element): boolean {
+  return findReplyAffordance(tweet) !== null;
+}
+
+/**
+ * Returns the long-tweet "Show more" expander, or null. LIVE-TUNE: testid
+ * first; the text fallback is anchored so "Show more replies" never matches.
+ */
+export function findSeeMore(tweet: Element): HTMLElement | null {
+  const primary = tweet.querySelector<HTMLElement>("[data-testid='tweet-text-show-more-link']");
+  if (primary) return primary;
+
+  // Fallback: exact text match on link/button-shaped elements inside the tweet.
+  for (const el of Array.from(tweet.querySelectorAll<HTMLElement>("a, button, [role='link'], [role='button']"))) {
