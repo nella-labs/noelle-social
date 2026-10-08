@@ -198,3 +198,203 @@ export interface Database {
           draft_id: string;
           lead_id: string;
           status: string;
+          decided_at: string | null;
+          decided_by: string | null;
+          skip_reason: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          org_id: string;
+          agent_instance_id: string;
+          draft_id: string;
+          lead_id: string;
+          status?: string;
+          decided_at?: string | null;
+          decided_by?: string | null;
+          skip_reason?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          org_id?: string;
+          agent_instance_id?: string;
+          draft_id?: string;
+          lead_id?: string;
+          status?: string;
+          decided_at?: string | null;
+          decided_by?: string | null;
+          skip_reason?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "approvals_org_id_fkey";
+            columns: ["org_id"];
+            referencedRelation: "organizations";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "approvals_agent_instance_id_fkey";
+            columns: ["agent_instance_id"];
+            referencedRelation: "agent_instances";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "approvals_draft_id_fkey";
+            columns: ["draft_id"];
+            referencedRelation: "drafts";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "approvals_lead_id_fkey";
+            columns: ["lead_id"];
+            referencedRelation: "leads";
+            referencedColumns: ["id"];
+          }
+        ];
+      };
+      org_spend_month: {
+        Row: {
+          org_id: string;
+          month: string;
+          bucket: string;
+          cents: number;
+          updated_at: string;
+        };
+        Insert: {
+          org_id: string;
+          month: string;
+          bucket: string;
+          cents?: number;
+          updated_at?: string;
+        };
+        Update: {
+          org_id?: string;
+          month?: string;
+          bucket?: string;
+          cents?: number;
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "org_spend_month_org_id_fkey";
+            columns: ["org_id"];
+            referencedRelation: "organizations";
+            referencedColumns: ["id"];
+          }
+        ];
+      };
+      vaults: {
+        Row: {
+          id: string;
+          org_id: string;
+          nella_workspace_id: string;
+          storage_bucket: string;
+          storage_prefix: string;
+          status: "provisioning" | "active" | "paused" | "errored";
+          wizard_stage: "light" | "medium" | "rich" | null;
+          last_synced_at: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          org_id: string;
+          nella_workspace_id: string;
+          storage_bucket?: string;
+          storage_prefix: string;
+          status?: "provisioning" | "active" | "paused" | "errored";
+          wizard_stage?: "light" | "medium" | "rich" | null;
+          last_synced_at?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          org_id?: string;
+          nella_workspace_id?: string;
+          storage_bucket?: string;
+          storage_prefix?: string;
+          status?: "provisioning" | "active" | "paused" | "errored";
+          wizard_stage?: "light" | "medium" | "rich" | null;
+          last_synced_at?: string | null;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "vaults_org_id_fkey";
+            columns: ["org_id"];
+            referencedRelation: "organizations";
+            referencedColumns: ["id"];
+          }
+        ];
+      };
+      vault_anchor_usage: {
+        Row: {
+          id: string;
+          org_id: string;
+          draft_id: string | null;
+          agent_role: string;
+          anchor_paths: string[];
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          org_id: string;
+          draft_id?: string | null;
+          agent_role: string;
+          anchor_paths: string[];
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          org_id?: string;
+          draft_id?: string | null;
+          agent_role?: string;
+          anchor_paths?: string[];
+          created_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "vault_anchor_usage_org_id_fkey";
+            columns: ["org_id"];
+            referencedRelation: "organizations";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "vault_anchor_usage_draft_id_fkey";
+            columns: ["draft_id"];
+            referencedRelation: "drafts";
+            referencedColumns: ["id"];
+          }
+        ];
+      };
+      vault_wizard_answers: {
+        Row: {
+          org_id: string;
+          stage_completed: "light" | "medium" | "rich";
+          answers: Json;
+          updated_at: string;
+        };
+        Insert: {
+          org_id: string;
+          stage_completed: "light" | "medium" | "rich";
+          answers?: Json;
+          updated_at?: string;
+        };
+        Update: {
+          org_id?: string;
+          stage_completed?: "light" | "medium" | "rich";
+          answers?: Json;
+          updated_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "vault_wizard_answers_org_id_fkey";
+            columns: ["org_id"];
+            isOneToOne: true;
