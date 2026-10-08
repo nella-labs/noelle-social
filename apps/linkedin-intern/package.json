@@ -1,0 +1,32 @@
+{
+  "name": "@noelle/linkedin-intern",
+  "version": "0.0.1-alpha.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@noelle/agents": "workspace:*",
+    "@noelle/contracts": "workspace:*",
+    "@noelle/linkedin-apify": "workspace:*",
+    "@noelle/linkedin-client": "workspace:*",
+    "@noelle/runtime": "workspace:*",
+    "@noelle/secrets": "workspace:*",
+    "@noelle/types": "workspace:*",
+    "@noelle/worker-runtime": "workspace:*",
+    "postgres": "^3.4.0",
+    "undici": "^6.21.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  }
+}
