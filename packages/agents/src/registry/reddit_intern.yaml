@@ -1,0 +1,30 @@
+id: reddit_intern
+display_name: "Reddit Growth Intern"
+short_description: "Drafts thoughtful, on-brand replies to in-ICP threads in your watched subreddits. You approve each one."
+icon: "reddit"
+default_model:
+  primary:
+    engine: vertex
+    model: claude-sonnet-4-6
+  fallback:
+    engine: bedrock
+    model: claude-sonnet-4-6
+default_bucket: drafter
+default_budget_cap_cents: 10000
+tools:
+  - nella.search
+  - leads.claim
+  - drafts.post
+hireable: true
+single_instance_per_org: false
+# Skill-to-agent routing facet (docs/agent-model.md § "Capability routing").
+# Optional + dormant: no consumer is on by default. Orion owns Reddit replies.
+capability:
+  handles:
+    - engagement.reply.reddit
+  surfaces:
+    - agent_chat
+  intent_examples:
+    - "draft a reply to this Reddit thread"
+    - "respond to a post in one of my watched subreddits"
+    - "write an on-brand Reddit comment"
