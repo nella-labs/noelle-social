@@ -398,3 +398,177 @@ const StartAllInput = z.object({
 });
 const StopAllInput = z.object({
   orgSlug: z.string().min(1),
+  instanceId: z.string().uuid(),
+});
+
+async function authorizeOrg(orgSlug: string) {
+  const user = await getCurrentUser();
+  if (!user) return { kind: "unauthenticated" as const };
+  try {
+    const org = await getOrgBySlug(orgSlug);
+    if (!org) return { kind: "not_found" as const };
+    return { kind: "ok" as const, org };
+  } catch (err) {
+    if (err instanceof OrgMembershipError) return { kind: "forbidden" as const };
+    throw err;
+  }
+}
+
+/**
+ * Start the whole pipeline: activate the instance, turn every worker on, stamp
+ * pipeline_started_at (anchors the "since you turned it on" counts), and — if a
+ * goalTarget is given — open a goal-run (the drafter then raises its effective
+ * cap to the target and the pipeline auto-pauses once N approvals are produced).
+ * Org-scoped UPDATE (the org_id match is the IDOR guard).
+ */
+export async function startAll(
+  input: z.infer<typeof StartAllInput>,
+): Promise<{ ok: true } | { ok: false; error: { code: string; message: string } }> {
+  const parsed = StartAllInput.safeParse(input);
+  if (!parsed.success) return { ok: false, error: { code: "bad_input", message: parsed.error.message } };
+  const { orgSlug, instanceId, goalTarget, runConfig } = parsed.data;
+  const auth = await authorizeOrg(orgSlug);
+  if (auth.kind !== "ok") return { ok: false, error: { code: auth.kind, message: auth.kind } };
+
+  const goal = goalTarget ?? null;
+  // Stamp the per-run override (or clear any stale one) so the discovery worker
+  // reads run_config merged over the saved default for this run. Pass the object
+  // through sql.json (NOT JSON.stringify) — postgres.js JSON-encodes a jsonb-bound
+  // param itself, so a pre-stringified value would be double-encoded into a jsonb
+  // *string* the reader can't parse. null → SQL NULL (clears the override).
+  const runConfigParam = runConfig && Object.keys(runConfig).length > 0 ? sql.json(runConfig) : null;
+  // Stamp last_goal_started_at on every goal-run START and never clear it, so the
+  // inbox's "Last batch" filter can still find the run's output after the goal
+  // auto-pauses (which nulls goal_started_at). coalesce keeps the prior value on a
+  // no-goal start. See infra/cloudsql/schema/0027_last_goal_started_at.sql.
+  const goalStartedAt = goal != null ? new Date() : null;
+  const rows = await sql<{ id: string }[]>`
+    update noelle.agent_instances
+    set status = 'active',
+        discovery_enabled = true, classifier_enabled = true,
+        drafter_enabled = true,
+        pipeline_started_at = now(),
+        goal_target = ${goal},
+        goal_started_at = ${goalStartedAt},
+        last_goal_started_at = coalesce(${goalStartedAt}, last_goal_started_at),
+        run_config = ${runConfigParam},
+        updated_at = now()
+    where id = ${instanceId} and org_id = ${auth.org.id} and role in ${sql(INTERN_ROLES)}
+      and status in ('active', 'paused')
+    returning id
+  `;
+  if (rows.length === 0) return { ok: false, error: { code: "not_found", message: "Agent instance not found." } };
+  revalidatePath(AGENT_PAGE_ROUTE, "page");
+  return { ok: true };
+}
+
+/** Stop the whole pipeline: pause the instance and clear any goal-run. */
+export async function stopAll(
+  input: z.infer<typeof StopAllInput>,
+): Promise<{ ok: true } | { ok: false; error: { code: string; message: string } }> {
+  const parsed = StopAllInput.safeParse(input);
+  if (!parsed.success) return { ok: false, error: { code: "bad_input", message: parsed.error.message } };
+  const { orgSlug, instanceId } = parsed.data;
+  const auth = await authorizeOrg(orgSlug);
+  if (auth.kind !== "ok") return { ok: false, error: { code: auth.kind, message: auth.kind } };
+
+  const rows = await sql<{ id: string }[]>`
+    update noelle.agent_instances
+    set status = 'paused', goal_target = null, goal_started_at = null,
+        run_config = null, updated_at = now()
+    where id = ${instanceId} and org_id = ${auth.org.id} and role in ${sql(INTERN_ROLES)}
+      and status in ('active', 'paused')
+    returning id
+  `;
+  if (rows.length === 0) return { ok: false, error: { code: "not_found", message: "Agent instance not found." } };
+  revalidatePath(AGENT_PAGE_ROUTE, "page");
+  return { ok: true };
+}
+
+const SetRunScheduleInput = z.object({
+  orgSlug: z.string().min(1),
+  instanceId: z.string().uuid(),
+  schedule: RunScheduleSchema,
+});
+
+/**
+ * Save (or update) the recurring scheduled run for an intern instance
+ * (0085_run_schedule.sql). Stores the schedule config and stamps the next fire
+ * time the api-vm scheduler triggers on. A disabled schedule is still stored (so
+ * the form remembers the operator's mode/time) but its next_at is null, so
+ * nothing fires. Org-scoped UPDATE; the org_id match is the IDOR guard.
+ *
+ * A firing does exactly what startAll does — this action never starts a run
+ * itself, it only arms the timer that will.
+ */
+export async function setRunSchedule(
+  input: z.infer<typeof SetRunScheduleInput>,
+): Promise<{ ok: true } | { ok: false; error: { code: string; message: string } }> {
+  const parsed = SetRunScheduleInput.safeParse(input);
+  if (!parsed.success) return { ok: false, error: { code: "bad_input", message: parsed.error.message } };
+  const { orgSlug, instanceId, schedule } = parsed.data;
+  const auth = await authorizeOrg(orgSlug);
+  if (auth.kind !== "ok") return { ok: false, error: { code: auth.kind, message: auth.kind } };
+
+  // null next_at when disabled (computeNextRunAt returns null), so an off schedule
+  // is inert; an on schedule gets its first fire time immediately so the panel can
+  // show "Next run" without waiting for a scheduler tick.
+  const nextAt = computeNextRunAt(schedule, new Date());
+  const rows = await sql<{ id: string }[]>`
+    update noelle.agent_instances
+    set run_schedule = ${sql.json(schedule)},
+        run_schedule_next_at = ${nextAt},
+        updated_at = now()
+    where id = ${instanceId} and org_id = ${auth.org.id} and role in ${sql(INTERN_ROLES)}
+    returning id
+  `;
+  if (rows.length === 0) return { ok: false, error: { code: "not_found", message: "Agent instance not found." } };
+  revalidatePath(AGENT_PAGE_ROUTE, "page");
+  return { ok: true };
+}
+
+const PauseAllInput = z.object({ orgSlug: z.string().min(1) });
+
+/**
+ * Global pause: clear master sending, reply, autonomous and X API write
+ * consent on every supported intern in this org, in one UPDATE.
+ * Deliberately asymmetric: there is NO resumeAll — re-arming is per-intern so a pause
+ * cannot be casually undone. Org-scoped; org_id match is the IDOR guard.
+ * Only ever writes `false`, so it can never fail OPEN into more sending.
+ *
+ * No feature flag on purpose: the "flag-gate every change, default OFF" rule
+ * targets paths that could INCREASE sending. This action can only decrease it,
+ * so gating a panic valve off-by-default would hide it exactly when it's
+ * needed. No try/catch swallow, either: a thrown SQL error must surface as
+ * "we could not confirm sending was off" (operator retries), never a false
+ * "paused" — the only fail direction is toward safety.
+ */
+export async function pauseAllSending(
+  input: z.infer<typeof PauseAllInput>,
+): Promise<{ ok: true; paused: number } | { ok: false; error: { code: string; message: string } }> {
+  const parsed = PauseAllInput.safeParse(input);
+  if (!parsed.success) return { ok: false, error: { code: "bad_input", message: parsed.error.message } };
+  const { orgSlug } = parsed.data;
+  const auth = await authorizeOrg(orgSlug);
+  if (auth.kind !== "ok") return { ok: false, error: { code: auth.kind, message: auth.kind } };
+
+  // Include master-only and API-only rows: original posts use those switches
+  // independently of reply consent. Repeated calls count only changed rows.
+  const rows = await sql<{ id: string }[]>`
+    update noelle.agent_instances
+    set send_enabled = false, reply_send_enabled = false,
+        auto_send_enabled = false, x_api_write_enabled = false, updated_at = now()
+    where org_id = ${auth.org.id}
+      and role in ${sql(INTERN_ROLES)}
+      and (send_enabled = true or reply_send_enabled = true
+        or auto_send_enabled = true or x_api_write_enabled = true)
+    returning id
+  `;
+  // Revalidate every affected surface: the agent page route PATTERN (all
+  // slug+uuid variants), the org chart, and the approvals page the button
+  // lives on, so each reflects the new OFF state without a hard reload.
+  revalidatePath(AGENT_PAGE_ROUTE, "page");
+  revalidatePath(`/app/${orgSlug}/org-chart`);
+  revalidatePath(`/app/${orgSlug}/approvals`);
+  return { ok: true, paused: rows.length };
+}

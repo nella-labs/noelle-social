@@ -1,0 +1,26 @@
+.grid { display: grid; grid-template-columns: minmax(0,1.15fr) minmax(0,1fr); align-items: start; gap: 22px; }
+.grid > * { min-width: 0; }
+.grid :global(.tweet) { padding: 26px; border: 1px solid var(--rule); border-radius: 22px; box-shadow: none; }
+.grid :global(.tweet-body) { font-size: 15px; line-height: 1.8; overflow-wrap: anywhere; }
+.grid :global(.tweet-h-handle), .grid :global(.tweet-meta) { font-family: var(--body); font-size: 12px; }
+.grid :global(.tweet-meta) { flex-wrap: wrap; padding-top: 16px; border-top: 1px solid var(--rule); }
+.panel { padding: 24px; border: 1px solid var(--rule); border-radius: 22px; background: var(--paper); }
+.panel :global(.eyebrow) { font-family: var(--body); text-transform: none; letter-spacing: 0; color: var(--ink); font-size: 13px; font-weight: 600; line-height: 1.5; }
+.panel :global(.angle-stack) { gap: 12px; }
+.panel :global(.angle) { padding: 18px; border: 1px solid var(--rule); border-radius: 16px; background: var(--paper-2); box-shadow: none; }
+.panel :global(.angle:hover) { border-color: var(--ink-muted); box-shadow: none; }
+.panel :global(.angle.selected) { border-color: var(--accent); background: var(--accent-soft); box-shadow: none; }
+.panel :global(.angle h4) { font-family: var(--body); font-size: 12px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--ink); }
+.panel :global(.angle h4 .num) { display: grid; place-items: center; min-width: 24px; height: 24px; border-radius: 50px; background: var(--paper); color: var(--accent); font-size: 10px; }
+.panel :global(.angle .text) { font-size: 14px; line-height: 1.75; overflow-wrap: anywhere; }
+.panel :global(.angle-foot) { color: var(--ink-muted); font-size: 11px; flex-wrap: wrap; }
+.panel textarea { padding: 14px; border-radius: 13px; background: var(--paper); }
+.panel :global(.action-bar-phone) { padding-top: 18px; border-top: 1px solid var(--rule); }
+.panel :global(.action-bar-primary) { flex-wrap: wrap; }
+@media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+@media (max-width: 768px) {
+  .panel { padding: 18px 16px; border-radius: 18px; }
+  .grid :global(.tweet) { padding: 20px 18px; border-radius: 18px; }
+  .panel :global(.angle) { padding: 16px; }
+  .panel :global(.angle h4) { flex-wrap: wrap; }
+}
