@@ -398,3 +398,203 @@ describe("visible LinkedIn post extraction", () => {
     button.getBoundingClientRect = () => DOMRect.fromRect({ x: 20, y: 30, width: 40, height: 20 });
     const item = harvestVisiblePosts(root)[0]!;
     expect(locateDiscoveryPostMenu(root, item.fingerprint).ok).toBe(true);
+
+    const result = readDiscoveryMenuShareUrn(root);
+    expect(result).toMatchObject({ ok: false, skipReason: "embed-link-not-found" });
+    expect(result.diagnostic).toContain("target=expanded:true/popup:menu/controls:menu");
+    expect(result.diagnostic).toContain("targetAnchors=header:feed|body:posts");
+    expect(result.diagnostic).toContain("|3:div/menu:a/copy-link/li:feed/update/*");
+    for (const privateValue of ["Jane", "Doe", "7506985844398911488", "1111111111111111111", "https://"]) {
+      expect(result.diagnostic).not.toContain(privateValue);
+    }
+  });
+
+  it("uses only the newly opened outside post menu despite cited and pre-existing links", () => {
+    const { root, button } = startOutsideMenuRead();
+    button.setAttribute("aria-expanded", "true");
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><div role="button">Save</div>
+      <a href="https://www.linkedin.com/feed/update/urn:li:activity:7506985844398911488/">Copy link</a>
+    </div>`);
+    expect(readDiscoveryMenuShareUrn(root)).toEqual({ ok: true, urn: "urn:li:activity:7506985844398911488" });
+  });
+
+  it("keeps a clicked Copy link menu unresolved without a canonical URL", () => {
+    const { root, button } = startOutsideMenuRead();
+    button.setAttribute("aria-expanded", "true");
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><div role="button">Save</div>
+      <div data-clipboard-text="private-opaque-value"><span>Copy link</span></div>
+      <a href="https://evil.example/feed/update/urn:li:activity:7506985844398911488/">Foreign link</a>
+    </div>`);
+    const result = readDiscoveryMenuShareUrn(root);
+    expect(result).toMatchObject({ ok: false, skipReason: "embed-link-not-found" });
+    expect(result.diagnostic).toContain("newOutside=1:save|copy-link/link:none/attrs:href|dc");
+    for (const privateValue of ["Ada", "7506985844398911488", "1111111111111111111", "https://"]) {
+      expect(result.diagnostic).not.toContain(privateValue);
+    }
+  });
+
+  it("reports a Copy-only outside menu without treating the control as a post URL", () => {
+    const { root, button } = startOutsideMenuRead();
+    button.setAttribute("aria-expanded", "true");
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><span>Copy link</span></div>`);
+    const result = readDiscoveryMenuShareUrn(root);
+    expect(result).toMatchObject({ ok: false, skipReason: "embed-link-not-found" });
+    expect(result.diagnostic).toContain("newOutside=1:copy-link/link:none/attrs:none");
+  });
+
+  it("locates only the Copy link control in the matched card's newly opened menu", () => {
+    const { root, button } = startOutsideMenuRead();
+    button.setAttribute("aria-expanded", "true");
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><div>Save</div><div id="copy"><span>Copy link</span></div></div>`);
+    const target = root.querySelector<HTMLElement>("#copy span")!;
+    target.getBoundingClientRect = () => DOMRect.fromRect({ x: 50, y: 80, width: 70, height: 24 });
+    expect(locateDiscoveryCopyLink(root)).toMatchObject({ ok: true, rect: { x: 50, y: 80, width: 70, height: 24 } });
+  });
+
+  it("locates a newly mounted Copy link in the roleless interop shadow overlay", () => {
+    const { root } = startOutsideMenuRead();
+    const shadow = root.querySelector("#interop-outlet")!.shadowRoot!;
+    shadow.innerHTML = `<section><div>Save</div><div id="shadow-copy"><span>Copy link</span></div></section>`;
+    const target = shadow.querySelector<HTMLElement>("#shadow-copy span")!;
+    target.getBoundingClientRect = () => DOMRect.fromRect({ x: 60, y: 90, width: 80, height: 20 });
+    expect(locateDiscoveryCopyLink(root)).toMatchObject({ ok: true, rect: { x: 60, y: 90, width: 80, height: 20 } });
+  });
+
+  it("locates the live Copy link to post paragraph when a persistent menu updates after the matched click", () => {
+    const { root, button } = startOutsideMenuRead();
+    const menu = root.querySelectorAll("[role='menu']")[2]!;
+    button.setAttribute("aria-expanded", "true");
+    menu.innerHTML = `<div role="menuitem"><div><div><p>Save</p></div></div></div>
+      <div role="menuitem" id="live-copy"><div><div><p>Copy link to post</p></div></div></div>`;
+    // The live feed can also mount an unrelated role menu during this click.
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><a href="/feed/">Other</a></div>`);
+    const target = root.querySelector<HTMLElement>("#live-copy")!;
+    target.getBoundingClientRect = () => DOMRect.fromRect({ x: 70, y: 90, width: 90, height: 24 });
+    expect(locateDiscoveryCopyLink(root)).toMatchObject({ ok: true, rect: { x: 70, y: 90, width: 90, height: 24 } });
+  });
+
+  it("does not use an unchanged Copy link in an unrelated persistent menu", () => {
+    const { root, button } = startOutsideMenuRead();
+    const menu = root.querySelectorAll("[role='menu']")[2]!;
+    menu.innerHTML = `<div role="menuitem"><div><div><p>Save</p></div></div></div>
+      <div role="menuitem"><div><div><p>Copy link to post</p></div></div></div>`;
+    // This menu existed at selection time in the real browser. Re-select to
+    // snapshot its actions before the matched button expands.
+    const candidate = harvestVisiblePosts(root).find((post) => post.authorHandle === "ada")!;
+    expect(locateDiscoveryPostMenu(root, candidate.fingerprint).ok).toBe(true);
+    button.setAttribute("aria-expanded", "true");
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><a href="/feed/">Other</a></div>`);
+    expect(locateDiscoveryCopyLink(root)).toMatchObject({ ok: false });
+  });
+
+  it("does not use a changed persistent menu when the matched button did not expand", () => {
+    const { root } = startOutsideMenuRead();
+    const menu = root.querySelectorAll("[role='menu']")[2]!;
+    menu.innerHTML = `<div role="menuitem"><div><div><p>Save</p></div></div></div>
+      <div role="menuitem"><div><div><p>Copy link to post</p></div></div></div>`;
+    expect(locateDiscoveryCopyLink(root)).toMatchObject({ ok: false });
+  });
+
+  it("does not treat a hidden Save action as proof of the opened post menu", () => {
+    const { root, button } = startOutsideMenuRead();
+    button.setAttribute("aria-expanded", "true");
+    const menu = root.querySelectorAll("[role='menu']")[2]!;
+    menu.innerHTML = `<div hidden role="menuitem"><p>Save</p></div>
+      <div role="menuitem" id="unrelated-copy"><p>Copy link to post</p></div>`;
+    root.querySelector<HTMLElement>("#unrelated-copy")!.getBoundingClientRect = () =>
+      DOMRect.fromRect({ x: 70, y: 90, width: 90, height: 24 });
+    expect(locateDiscoveryCopyLink(root)).toMatchObject({ ok: false });
+  });
+
+  it("rejects two persistent menus updated with Copy link controls during one click", () => {
+    const { root, button } = startOutsideMenuRead();
+    button.setAttribute("aria-expanded", "true");
+    for (const menu of Array.from(root.querySelectorAll("[role='menu']")).slice(1)) {
+      menu.innerHTML = `<div role="menuitem"><div><div><p>Save</p></div></div></div>
+        <div role="menuitem"><div><div><p>Copy link to post</p></div></div></div>`;
+    }
+    expect(locateDiscoveryCopyLink(root)).toMatchObject({ ok: false, skipReason: "ambiguous-open-menu" });
+  });
+
+  it("refuses a pre-existing or ambiguous Copy link menu", () => {
+    const { root, button } = startOutsideMenuRead();
+    expect(locateDiscoveryCopyLink(root)).toMatchObject({ ok: false });
+    button.setAttribute("aria-expanded", "true");
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><div>Save</div><div>Copy link</div></div>
+      <div role="menu"><div>Save</div><div>Copy link</div></div>`);
+    expect(locateDiscoveryCopyLink(root)).toMatchObject({ ok: false, skipReason: "ambiguous-open-menu" });
+  });
+
+  it("reports only bounded action counts and roles when Copy link location fails", () => {
+    const { root, button } = startOutsideMenuRead();
+    button.setAttribute("aria-expanded", "true");
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><a href="/in/private-author/">Private author</a></div>
+      <div role="menu" hidden><a href="/in/hidden-author/">Hidden author</a></div>`);
+    const result = locateDiscoveryCopyLink(root) as { ok: boolean; skipReason?: string; diagnostic?: string };
+    expect(result).toMatchObject({ ok: false, skipReason: "not-post-menu" });
+    expect(result.diagnostic).toMatch(/^expanded=true;totalMenus=5;menus=4;opened=1;updated=0;save=1;copy=0;menuitems=0;pageSave=1;pageCopy=0;pageMenuitems=0;outlet=open;outletControls=8$/);
+    expect(result.diagnostic).not.toContain("private");
+  });
+
+  it("rejects conflicting activity links in the newly opened post menu", () => {
+    const { root, button } = startOutsideMenuRead();
+    button.setAttribute("aria-expanded", "true");
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><button>Save</button>
+      <a href="/feed/update/urn:li:activity:7506985844398911488/">One</a>
+      <a href="/posts/other-activity-4444444444444444444-AbCd">Another</a>
+    </div>`);
+    expect(readDiscoveryMenuShareUrn(root)).toMatchObject({ ok: false, skipReason: "ambiguous-menu-activity" });
+  });
+
+  it("rejects two newly opened Save menus or a button that never opened", () => {
+    const { root, button } = startOutsideMenuRead();
+    expect(readDiscoveryMenuShareUrn(root)).toMatchObject({ ok: false, skipReason: "embed-link-not-found" });
+    button.setAttribute("aria-expanded", "true");
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><button>Save</button>
+      <a href="/feed/update/urn:li:activity:7506985844398911488/">Copy link</a>
+    </div>`);
+    root.insertAdjacentHTML("beforeend", `<div role="menu"><button>Save</button>
+      <a href="/feed/update/urn:li:activity:5555555555555555555/">Copy link</a>
+    </div>`);
+    expect(readDiscoveryMenuShareUrn(root)).toMatchObject({ ok: false, skipReason: "ambiguous-open-menu" });
+  });
+
+  it("uses a newly mounted menu even when aria-expanded is absent or unchanged", () => {
+    for (const prior of [null, "false"] as const) {
+      const { root } = startOutsideMenuRead(prior);
+      root.insertAdjacentHTML("beforeend", `<div role="menu"><button>Save</button>
+        <a href="/feed/update/urn:li:activity:7506985844398911488/">Copy link</a>
+      </div>`);
+      expect(readDiscoveryMenuShareUrn(root)).toEqual({ ok: true, urn: "urn:li:activity:7506985844398911488" });
+    }
+  });
+
+  it("uses a newly mounted shadow menu when aria-expanded does not toggle", () => {
+    const { root } = startOutsideMenuRead("false");
+    root.querySelector("#interop-outlet")!.shadowRoot!.querySelector("section")!
+      .insertAdjacentHTML("beforeend", `<div role="menu"><button>Save</button>
+        <a href="/feed/update/urn:li:activity:7506985844398911488/">Copy link</a>
+      </div>`);
+    expect(readDiscoveryMenuShareUrn(root)).toEqual({ ok: true, urn: "urn:li:activity:7506985844398911488" });
+  });
+
+  it("includes actions inside a nested open shadow menu", () => {
+    const root = mount(`<main><div id="interop-outlet"></div></main>`);
+    const outer = root.querySelector("#interop-outlet")!.attachShadow({ mode: "open" });
+    outer.innerHTML = `<section><div id="nested-menu"></div></section>`;
+    outer.querySelector("#nested-menu")!.attachShadow({ mode: "open" }).innerHTML =
+      `<button aria-label="Save Jane Doe's post">Private</button><button>Report this post</button>`;
+    const diagnostic = readDiscoveryMenuShareUrn(root).diagnostic!;
+    expect(diagnostic).toContain("button/other/save/none");
+    expect(diagnostic).toContain("button/other/report/none");
+    expect(diagnostic).not.toContain("Jane");
+  });
+
+  it("excludes hidden and offscreen outside menu candidates", () => {
+    const root = mount(`<main>
+      <div id="interop-outlet"></div>
+      <div role="menu" style="display:none"><button>Share</button></div>
+      <div role="dialog" id="offscreen"><button>Report</button></div>
+      <div role="menu"><button>Save</button></div>
+    </main>`);
+    const offscreen = root.querySelector<HTMLElement>("#offscreen")!;
