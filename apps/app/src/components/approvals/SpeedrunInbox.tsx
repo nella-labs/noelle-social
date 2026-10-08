@@ -198,3 +198,95 @@ export function SpeedrunInbox({
           ...prev,
           [id]: res.error.message || "Couldn't skip — retry",
         }));
+      }
+    });
+  };
+
+  if (total === 0) {
+    return filteredEmpty ? (
+      <div className={styles.empty}>
+        No drafts match these filters.{" "}
+        <Link href={clearHref} style={{ color: "var(--accent)" }}>
+          Clear filters
+        </Link>{" "}
+        to speed through the rest of the queue.
+      </div>
+    ) : (
+      <div className={styles.empty}>
+        Nothing to speed through right now. New drafts land here as the
+        intern produces them.
+      </div>
+    );
+  }
+
+  // Skipped cards always leave the list (no "show skipped" here — review them
+  // via the Status → Skipped filter). Sent cards hide unless "Show sent".
+  const visible = drafts.filter(
+    (d) => !skipped.has(d.id) && (hideSent ? !sent.has(d.id) : true),
+  );
+
+  return (
+    <div className={styles.inbox}>
+      <div className={styles.progress}
+      >
+        <div className={styles.progressLabel}
+        >
+          {remaining} of {total} remaining
+        </div>
+        <div className="bar-track" style={{ flex: 1, height: 6 }}>
+          <div className="bar-fill acc" style={{ width: `${progress}%` }} />
+        </div>
+        <button
+          type="button"
+          className="btn btn-sm btn-ghost"
+          onClick={() => setHideSent((v) => !v)}
+          disabled={sentCount === 0}
+        >
+          {hideSent ? `Show sent (${sentCount})` : "Hide sent"}
+        </button>
+      </div>
+
+      <div className={styles.list}>
+        {visible.map((d, i) => (
+          <SpeedrunRow
+            key={d.id}
+            d={d}
+            n={i + 1}
+            pickedId={picks[d.id] ?? null}
+            onPick={(angleId) =>
+              setPicks((p) => ({ ...p, [d.id]: angleId }))
+            }
+            isSent={sent.has(d.id)}
+            error={errors[d.id] ?? null}
+            onMarkSent={(angleId) => markSent(d.id, angleId)}
+            onSend={() => sendNow(d.id)}
+            onSkip={() => skip(d.id)}
+            fullReviewHref={`${basePath}/${d.id}${filterQuery}`}
+            platform={platform}
+            orgSlug={orgSlug}
+          />
+        ))}
+      </div>
+
+      <div className={styles.guide}
+      >
+        <span className="serif" style={{ fontSize: 18, color: "var(--ink)" }}>
+          How this works
+        </span>
+        <span>
+          Speedrun mode skips the full review screen. The intern drafts three
+          angles — pick one, hit{" "}
+          <b style={{ color: "var(--ink)", fontFamily: "var(--mono)" }}>Copy</b>,
+          paste into {platformName}, then{" "}
+          <b style={{ color: "var(--ink)", fontFamily: "var(--mono)" }}>
+            Mark sent
+          </b>
+          . That records the reply as sent and clears it from the queue (it
+          does <i>not</i> re-post to {platformName}{" "}
+          — you already did). Review past sends with the{" "}
+          <b style={{ color: "var(--ink)" }}>Status</b> filter.
+        </span>
+      </div>
+    </div>
+  );
+}
