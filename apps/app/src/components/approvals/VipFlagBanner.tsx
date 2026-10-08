@@ -198,3 +198,110 @@ export function VipFlagBanner({
           alignItems: "center",
           flexWrap: "wrap",
         }}
+      >
+        {signal.add_to_watchlist && watchlistRef ? (
+          added ? (
+            <span className="tag tag-ok" style={{ fontSize: 11.5 }}>
+              On watchlist ✓
+            </span>
+          ) : (
+            <button
+              type="button"
+              className="btn btn-sm"
+              onClick={onAddWatchlist}
+              disabled={pending}
+              style={{ background: GOLD, color: "#fff", borderColor: GOLD }}
+              title={`Track ${authorLabel} on the watchlist so the agent keeps engaging them`}
+            >
+              {pending ? "Adding…" : "★ Add to watchlist"}
+            </button>
+          )
+        ) : null}
+        {signal.dm_soon ? (
+          <span
+            className="tag"
+            style={{ fontSize: 11, color: GOLD, borderColor: `color-mix(in oklch, ${GOLD} 45%, var(--rule))` }}
+          >
+            worth a DM soon
+          </span>
+        ) : null}
+        {profileUrl ? (
+          <a
+            href={profileUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn btn-sm btn-ghost"
+            style={{ textDecoration: "none" }}
+            title="Open their profile to send a DM by hand"
+          >
+            Open profile ↗
+          </a>
+        ) : null}
+        {error ? (
+          <span className="tag" style={{ color: "var(--danger)", fontSize: 11 }}>
+            {error}
+          </span>
+        ) : null}
+      </div>
+
+      {/* The precomputed genuine intro DM — a real question / coffee-chat ask, no
+          pitch. Copy it and send it from their profile. */}
+      {dm ? (
+        <div style={{ marginTop: 12 }}>
+          <div
+            className="eyebrow"
+            style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 8 }}
+          >
+            <span>Suggested intro DM · no pitch</span>
+            <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+              {dmError ? (
+                <span className="tag" style={{ color: "var(--danger)", fontSize: 11 }}>
+                  {dmError}
+                </span>
+              ) : null}
+              {approvalId ? (
+                parked ? (
+                  <span className="tag tag-ok" style={{ fontSize: 11 }}>
+                    Parked in DMs ✓
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    onClick={onParkDm}
+                    disabled={dmPending}
+                    title="Park this DM in the inbox (DMs On) to send when you're ready"
+                  >
+                    {dmPending ? "Parking…" : "Park in DMs"}
+                  </button>
+                )
+              ) : null}
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => copy(dm, "__vip_dm__")}
+                title="Copy this DM to send from their profile"
+              >
+                {copiedKey === "__vip_dm__" ? "Copied ✓" : "Copy DM"}
+              </button>
+            </div>
+          </div>
+          <div
+            style={{
+              fontSize: 13.5,
+              lineHeight: 1.55,
+              color: "var(--ink)",
+              background: "var(--paper)",
+              border: "0.5px solid var(--rule)",
+              borderRadius: 8,
+              padding: "10px 12px",
+              whiteSpace: "pre-wrap",
+            }}
+          >
+            {dm}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
