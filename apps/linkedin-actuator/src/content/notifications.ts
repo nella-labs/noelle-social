@@ -198,3 +198,203 @@ function cardsIn(root: ParentNode): Element[] {
     // LIVE-TUNE: a REPLY card's headline links to
     // `/feed/?highlightedUpdateUrn=…`, NOT `/feed/update/…`. The first version
     // required the latter, so it matched only the impressions cards and found
+    // ZERO actual replies — the LinkedIn sweep harvested nothing. Accept any
+    // headline anchor, which is what actually identifies a notification card.
+    const cards = found.filter((el) => el.querySelector(NOTIFICATION_LINK_SEL));
+    // Keep only the INNERMOST matches. At the bare `article`/`li` fallback
+    // levels a wrapper element also "contains a notification link" — it
+    // contains all of them — so the list can come back as one container plus
+    // the real cards nested inside it. That container harvests as a chimera: it
+    // takes its identity (name, publicId, urn, external_id) from the first card
+    // and, since the fields are read independently, can take its TIMESTAMP from
+    // a different one — then dedups the real card away by external_id. A stale
+    // reply wearing a fresh card's age is exactly what the window must prevent.
+    // "Contains another card" only counts when that inner element is itself a
+    // plausible card — it has its own headline anchor. Without that guard, a
+    // real card holding any incidental notification link (a nested "see more")
+    // would be discarded as a non-leaf in favour of a headline-less fragment,
+    // and the harvest would silently drop to zero.
+    const isCardLike = (el: Element) =>
+      el.querySelector("a.nt-card__headline") !== null || el.querySelector(".nt-card__headline") !== null;
+    const leaves = cards.filter((c) => !cards.some((o) => o !== c && c.contains(o) && isCardLike(o)));
+    if (leaves.length > 0) return leaves;
+  }
+  return [];
+}
+
+/**
+ * The COMMENT the card is about — the text we are answering.
+ *
+ * LIVE-TUNE, and the subtle part. A real card's body is:
+ *   <button class="artdeco-card …">
+ *     <div class="nt-card__text--2-line-large … t-black">   <- THE COMMENT
+ *     <hr>
+ *     <div class="nt-card-content__body--secondary">
+ *       <div class="nt-card-content__body-text …">          <- the ORIGINAL POST
+ *
+ * The first version took the LONGEST leaf text, which on any real card is the
+ * original post (often 1000+ chars) rather than the comment — so the drafter
+ * would have been answering our own post instead of the person. The comment is
+ * the body text that is NOT inside `.nt-card-content__body--secondary`.
+ */
+/**
+ * Text that is LinkedIn's own furniture, not a human being.
+ *
+ * The notifications page renders control links inside the card region, and
+ * "Change notification preferences" was harvested three times as somebody's
+ * comment — then ingested, then drafted. Lyra was seconds from queueing a
+ * thoughtful reply to a settings link. A reply lane must never treat page
+ * chrome as a person.
+ */
+const UI_CHROME = [
+  /^change notification preferences$/i,
+  /^manage (your )?notifications?$/i,
+  /^see all( notifications)?$/i,
+  /^turn off this notification$/i,
+  /^view all$/i,
+  /^show more results?$/i,
+  /^load more$/i,
+  /^dismiss$/i,
+  /^undo$/i,
+];
+
+/** Is this snippet page furniture rather than something a human wrote? */
+export function isUiChrome(text: string): boolean {
+  const t = (text ?? "").replace(/\s+/g, " ").trim();
+  if (!t) return false;
+  return UI_CHROME.some((re) => re.test(t));
+}
+
+export function cardSnippet(card: Element, headline: string): string {
+  const normalized = headline.replace(/\s+/g, " ").trim();
+  // Exclude the headline SUBTREE, not just text equal to the headline: the
+  // headline anchor itself carries `nt-card__text--word-wrap`, so it matches
+  // the body-text selector and — because its raw text still includes the
+  // .visually-hidden "Unread notification." that cardHeadline strips — an
+  // equality check against the headline does not catch it.
+  const candidates = Array.from(
+    card.querySelectorAll<HTMLElement>(".nt-card__text--2-line-large, .nt-card__text--word-wrap"),
+  ).filter(
+    (el) => !el.closest(".nt-card-content__body--secondary") && !el.closest(".nt-card__headline"),
+  );
+  for (const el of candidates) {
+    const t = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+    if (!t || t.length < 3) continue;
+    if (normalized.includes(t)) continue; // that's the headline itself
+    return t;
+  }
+  // Drift fallback: longest leaf that isn't the headline, a timestamp, or the
+  // secondary post-context block.
+  let best = "";
+  for (const el of Array.from(card.querySelectorAll<HTMLElement>("p, span, div"))) {
+    if (el.children.length > 0) continue; // leaf text only
+    if (el.closest(".nt-card-content__body--secondary")) continue;
+    if (el.closest(".nt-card__headline")) continue;
+    const t = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+    if (!t || t.length < 3) continue;
+    if (normalized.includes(t)) continue;
+    if (/^\d+\s*(m|h|d|w|mo|y)$/i.test(t)) continue; // "3h" timestamps
+    if (t.length > best.length) best = t;
+  }
+  return best;
+}
+
+/**
+ * The ORIGINAL POST text a card quotes underneath the comment, or "".
+ * Free conversation context: `.nt-card-content__body-text` inside the
+ * secondary block is the post the comment sits on.
+ */
+export function cardPostContext(card: Element): string {
+  const el = card.querySelector<HTMLElement>(
+    ".nt-card-content__body--secondary .nt-card-content__body-text",
+  );
+  return (el?.textContent ?? "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The card's headline text — the line that says what happened.
+ *
+ * LIVE-TUNE: the real class is `nt-card__headline` on the <a>, NOT the guessed
+ * `nt-card__text--headline` (which matches nothing). The anchor also contains a
+ * `.visually-hidden` "Unread notification." paragraph that must be dropped, and
+ * a `[class*='headline']` fallback would otherwise also match the settings
+ * dropdown's `nt-card-settings-dropdown-item__headline` entries.
+ */
+export function cardHeadline(card: Element): string {
+  const el =
+    card.querySelector(".nt-card__headline") ??
+    card.querySelector(".nt-card__text--headline") ??
+    card.querySelector("a[class*='headline']") ??
+    card;
+  const clone = el.cloneNode(true) as Element;
+  for (const hidden of Array.from(clone.querySelectorAll(".visually-hidden"))) hidden.remove();
+  return (clone.textContent ?? "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Only notifications from the last 12 hours are eligible.
+ *
+ * The seen-ring alone answers the wrong question. It is per-install and starts
+ * empty, so a fresh profile's first sweep happily answers whatever is oldest on
+ * the page — and a notifications list runs back days. Replying to a
+ * two-day-old comment is necro-engagement: the thread has moved on and the
+ * answer reads as a bot working through a backlog. Twelve hours covers a
+ * normal night's sleep with room to spare, so a reply that lands at 1am is
+ * still answerable well past 9am rather than having aged out while nobody was
+ * watching.
+ */
+export const MAX_AGE_MINUTES = 720;
+
+/**
+ * Relative-age text → minutes. Unlike X (which renders a machine-readable
+ * <time datetime>), LinkedIn only ever renders the rendered-for-humans form:
+ * "6h", "2h", "1d", "3w". So we parse what the card says.
+ *
+ * Order matters: "mo" (months) has to be tested before "m" (minutes) or every
+ * "3mo" would read as three minutes and a quarter-old notification would look
+ * fresh. Anything unrecognised is null, never a guess.
+ */
+/**
+ * Every rule is anchored at BOTH ends. That is not tidiness, it is the whole
+ * safety property: a start-anchored `/^(\d+)\s*s/` happily reads the Spanish
+ * "3 sem" (three WEEKS) as three seconds, and `/^(\d+)\s*m/` reads "1 mes"
+ * (one MONTH) as one minute. Both land at ~0 minutes — "just now" — so a
+ * months-old thread would sail through the window and get answered.
+ *
+ * The harvest itself is language-independent (it keys on the
+ * `highlightedUpdateType` param, not on prose), so the sweep really does run on
+ * a non-English UI even though the rest of the actuator's selectors are
+ * English. Anchoring makes every unrecognised form null — skip, never a guess.
+ */
+const AGE_UNITS: ReadonlyArray<readonly [RegExp, number]> = [
+  [/^(\d+)\s*mo(?:s|nths?)?(?:\s+ago)?$/i, 43_200], // months — MUST precede minutes
+  [/^(\d+)\s*(?:s|secs?|seconds?)(?:\s+ago)?$/i, 0],
+  [/^(\d+)\s*(?:m|mins?|minutes?)(?:\s+ago)?$/i, 1],
+  [/^(\d+)\s*(?:h|hrs?|hours?)(?:\s+ago)?$/i, 60],
+  [/^(\d+)\s*(?:d|days?)(?:\s+ago)?$/i, 1_440],
+  [/^(\d+)\s*(?:w|wks?|weeks?)(?:\s+ago)?$/i, 10_080],
+  [/^(\d+)\s*(?:y|yrs?|years?)(?:\s+ago)?$/i, 525_600],
+];
+
+/**
+ * Subtrees that hold HUMAN-WRITTEN text: the comment snippet and the quoted
+ * post. The structural fallback must never read an age out of these — "5 min"
+ * is an ordinary thing for somebody to reply, and reading it as the card's age
+ * would make a two-day-old comment look five minutes old.
+ */
+const HUMAN_TEXT_SEL =
+  ".nt-card-content__body, .nt-card-content__body-text, .nt-card__text--word-wrap, [class*='body-text']";
+
+/** Parse LinkedIn's relative age text into minutes. null when unreadable. */
+export function ageMinutesFromText(text: string | null | undefined): number | null {
+  const t = (text ?? "").replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  if (/^now$/i.test(t) || /^just now$/i.test(t)) return 0;
+  for (const [re, unit] of AGE_UNITS) {
+    const m = re.exec(t);
+    if (m) return Number(m[1]) * unit;
+  }
+  return null;
+}
+
+/**
