@@ -398,3 +398,75 @@ Authorization: Bearer <token>
 ```
 
 Without this call, `dms` is empty and zero DMs are sent. This is the default. A dashboard "Approve DM" button is a fast-follow UI improvement; until it ships, approve individual DMs via the API directly or curl:
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  "$BASE/api/drafts/<draft-id>/approve-dm"
+```
+
+---
+
+## Prod port to `api.trynoelle.com`
+
+The extension and all three endpoints are built for both environments. The port is **config-only**:
+
+1. **Base URL:** in the extension options, change to `https://api.trynoelle.com`.
+2. **Auth:** swap the static bearer token for the Supabase JWT the dashboard already issues. The only code-bearing delta is in the extension's `src/lib/auth.ts` module (token acquisition); the request/response shapes, content script, scheduler, selectors, and data model are identical. On the server side, replace `requireActuatorToken` on the three actuator routes with `requireUserJwt` (the existing middleware used by all other dashboard-facing routes). No other server-side changes are needed.
+
+The three endpoints live in `apps/api-vm` which already serves both Lima and `api.trynoelle.com` — there is no separate prod server to port to.
+
+---
+
+## Tuning levers
+
+All levers are config (options page or env) — no code changes required:
+
+| Lever | Where | Effect |
+|---|---|---|
+| Window length | Panel (hours) | Spreads actions wider — the primary volume-reduction lever |
+| Target comments | Panel | Lower to reduce comment volume (comments are higher-risk than likes) |
+| Target likes | Panel | Lower to reduce like volume |
+| Daily caps | Options page | Hard backstop ceilings regardless of targets |
+| Deep-night taper | Options page | Reduces density in the overnight window; disabling gives flat density across 24h |
+| Overnight posting-curfew | `src/lib/curfew.ts` `CURFEW_START_HOUR`/`CURFEW_END_HOUR` (default 1→9 local) | The window "Full automatic" + every unattended auto-start hold comments/DMs in (scheduled gap-likes keep going). Manual Run/Drain ignore it. Handles both same-day (1→9) and midnight-wrapping (23→6) windows |
+| Reply-coupled like skip | `src/lib/like-skip.ts` `LIKE_SKIP_BASE`/`_MIN`/`_MAX`/`_REROLL_EVERY` (2% base, [1%,5%] every 123) | Fraction of replies that DON'T also react to the post — breaks the 100% reply→like tell |
+| Watchlist preference ratio | Options page | Higher = more likes go to watched connections before anyone else |
+| Reaction mix | `reactionWeights` config, defaults in `src/lib/reactions.ts` | Per-reaction weights for varied reactions (default: Like 70 / Celebrate 10 / Support 10 / Love 4 / Insightful 4 / Funny 2). `0` disables a reaction; all-zero ⇒ always a plain Like |
+| Ambient read-actions | Options page (`ambientReadActions`, default on) | Expand "…more" + open comments while idle-browsing. Read-only, non-counted. Off = scroll-only ambient |
+| Ambient read cooldown | `src/background/index.ts` `AMBIENT_READ_MIN_GAP_MS` (default 20 s, ×1–2 jitter) | Minimum spacing between read-actions so they cluster like real reading |
+| Read-action mix | `src/background/ambient.ts` `chooseAmbient` weights (expand-leaning) | Share of allowed idle ticks that expand "…more" / open comments / navigate (rest scroll) |
+| Idle-liking cadence | `src/background/index.ts` `IDLE_LIKE_MIN_GAP_MS` (default 5 min, ×1–1.8 jitter) | Minimum spacing between likes slipped into the wait between actions — **Run/auto mode only; drain mode never idle-likes** (`shouldIdleLike` `inDrain` gate); bounded by the like budget + curfew |
+| Replenishment poll interval | `src/background/replenish.ts` `POLL_INTERVAL_MS` | How often it checks for newly-approved comments (default ~7 min jittered) |
+| Stepped-away pause | `src/lib/scheduler.ts` `EXTRA_PAUSE_PROB` (0.2) / `EXTRA_PAUSE_MAX_MS` (300 s, capped at 5% of window) | Chance and size of the occasional 0–5 min extra gap layered on top of the tempo gap |
+
+**Honest note on volume:** targets like 80 comments / 120 likes in 8 hours are high (≈ 1 comment every 6 min, 1 like every 4 min). The burst-and-idle clustering and jitter make the *shape* human, but **sustained high volume is still the dominant ban risk.** When in doubt, lengthen the window and lower the targets. See `docs/x-account-safety.md` for the analogous X reasoning.
+
+---
+
+## Manual smoke (operator-run)
+
+This checklist requires a live LinkedIn session and a running Lima api-vm. Run it yourself at low volume after the Lima setup above.
+
+1. **Apply the migration and set env vars** (see Lima setup). Verify with:
+   ```bash
+   curl -H "Authorization: Bearer $TOKEN" \
+     "$BASE/api/actionable-linkedin?instanceId=$INSTANCE"
+   ```
+   Should return `{"comments":[...],"dms":[]}` (empty if Lyra has no pending approvals yet).
+
+2. **Load the unpacked extension.** Fill in options: API base URL, token, instance ID. Leave caps at defaults.
+
+3. **Open `linkedin.com`** (logged in). Open the floating panel.
+
+4. **Set window=1h, comments=1, likes=2.** Press **Run**. Confirm Chrome shows the "Noelle Actuator is debugging this browser" banner (CDP attached).
+
+5. **Watch the panel.** Confirm:
+   - One like fires with visible mouse movement and a real click (human spacing).
+   - One comment appears on the correct post (the comment text matches the approved body), the approval flips to `sent` (`sent_via='extension'`), and a `noelle.linkedin_activity` row exists (`SELECT * FROM noelle.linkedin_activity ORDER BY created_at DESC LIMIT 5;`).
+
+6. **Supply test.** Set comments=5 with only 1 approved. Confirm it posts the 1 comment, then idles/defers — the panel log shows a `comment-awaiting-supply` skip event — and ambient browsing continues in the background. Approve a second draft from the Lyra inbox; confirm it fires on a subsequent tick (no burst, human-spaced).
+
+7. **Ambient browsing.** During the idle gap between bursts, confirm slow scroll events fire (the feed advances without a click). With **Ambient read-actions** on (default), also confirm that over a few minutes the cursor occasionally moves to a truncated post's "…see more" and clicks it (the post expands, then dwells), and that it occasionally opens a post's comments and reads them — spaced out, not every tick. Optionally check that the extension occasionally navigates to notifications and returns.
+
+8. **STOP mid-run.** Press STOP. Confirm it halts immediately and the "Noelle Actuator is debugging this browser" banner disappears (CDP detached). No further actions fire.
