@@ -198,3 +198,70 @@ export function ObjectiveCard({
               alignItems: "baseline",
               justifyContent: "space-between",
               gap: 8,
+            }}
+          >
+            <div className="eyebrow">Actively hunting for</div>
+            {targetingHref ? (
+              <Link href={targetingHref} className="btn btn-sm">
+                Edit targeting →
+              </Link>
+            ) : null}
+          </div>
+          <TargetingSummary targeting={targeting} />
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+function TargetingSummary({
+  targeting,
+}: {
+  targeting: { handles: string[]; keywords: string[] };
+}) {
+  const chips = [
+    ...targeting.handles.map((h) => ({ key: `h:${h}`, label: `@${h}` })),
+    ...targeting.keywords.map((k) => ({ key: `k:${k}`, label: k })),
+  ];
+  if (chips.length === 0) {
+    return (
+      <div style={{ marginTop: 8, fontSize: 12.5, color: "var(--ink-muted)" }}>
+        Nothing yet — add handles or keywords so it has something to watch.
+      </div>
+    );
+  }
+  const shown = chips.slice(0, SUMMARY_LIMIT);
+  const overflow = chips.length - shown.length;
+  return (
+    <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 6 }}>
+      {shown.map((c) => (
+        <span
+          key={c.key}
+          style={{
+            padding: "4px 9px",
+            borderRadius: 999,
+            background: "var(--paper-2)",
+            boxShadow: "0 0 0 0.5px var(--rule)",
+            fontFamily: "var(--mono)",
+            fontSize: 11.5,
+            color: "var(--ink-2)",
+          }}
+        >
+          {c.label}
+        </span>
+      ))}
+      {overflow > 0 ? (
+        <span
+          style={{
+            padding: "4px 9px",
+            fontFamily: "var(--mono)",
+            fontSize: 11.5,
+            color: "var(--ink-soft)",
+          }}
+        >
+          +{overflow} more
+        </span>
+      ) : null}
+    </div>
+  );
+}
