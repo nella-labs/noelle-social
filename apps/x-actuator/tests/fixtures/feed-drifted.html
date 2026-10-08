@@ -1,0 +1,32 @@
+<!-- Timeline markup after a wrapper drift: NO article[data-testid='tweet']
+     anywhere — every container element/testid renamed (xyz-*). Only the action
+     buttons (data-testid like/reply) and the inner content testids survive, so
+     tweets must be recovered by climbing from their like buttons. The second
+     tweet is an ad (visible Ad label) and must STILL be detected as promoted
+     on the climbed container. -->
+<div class="xyz-timeline">
+  <div class="xyz-cell">
+    <div class="xyz-tweet">
+      <div data-testid="User-Name"><span>Alice</span> <span>@alice</span></div>
+      <a href="/alice/status/1801000000000000001"><time datetime="2026-07-01T09:00:00.000Z">9:00 AM</time></a>
+      <div data-testid="tweetText" lang="en">a real tweet that survived the wrapper drift</div>
+      <div class="xyz-actions">
+        <button data-testid="reply" aria-label="Reply"></button>
+        <button data-testid="like" aria-label="Like"></button>
+      </div>
+    </div>
+  </div>
+  <div class="xyz-cell">
+    <div class="xyz-tweet">
+      <div data-testid="placementTracking">
+        <div data-testid="User-Name"><span>BrandCo</span> <span>@brandco</span> <span>Ad</span></div>
+        <a href="/brandco/status/1801000000000000009"><time datetime="2026-07-01T09:01:00.000Z">9:01 AM</time></a>
+        <div data-testid="tweetText" lang="en">buy our thing</div>
+      </div>
+      <div class="xyz-actions">
+        <button data-testid="reply" aria-label="Reply"></button>
+        <button data-testid="like" aria-label="Like"></button>
+      </div>
+    </div>
+  </div>
+</div>
