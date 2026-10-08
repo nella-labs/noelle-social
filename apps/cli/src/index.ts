@@ -198,3 +198,203 @@ async function cmdInit(args: Args): Promise<number> {
       return 2;
     }
     config.llmProvider = provider as LlmProvider;
+  }
+  config.operator.email = str(args.flags, "email") ?? config.operator.email;
+  config.operator.name = str(args.flags, "name") ?? config.operator.name;
+  config.operator.sub = str(args.flags, "sub") ?? config.operator.sub;
+  config.orgSlug = str(args.flags, "org") ?? config.orgSlug;
+  if (str(args.flags, "port-app")) config.ports.app = Number(str(args.flags, "port-app"));
+  if (str(args.flags, "port-api")) config.ports.apiVm = Number(str(args.flags, "port-api"));
+  if (bool(args.flags, "workers")) config.workersEnabled = true;
+  if (str(args.flags, "vault-dir")) config.vaultDir = expandHome(str(args.flags, "vault-dir")!);
+  if (str(args.flags, "voice-dirs")) config.voiceDirs = str(args.flags, "voice-dirs")!;
+  if (str(args.flags, "budget-cents"))
+    config.budgetCapCents = Number(str(args.flags, "budget-cents"));
+
+  const pgFlag = str(args.flags, "pg");
+  if (pgFlag === "docker" || pgFlag === "native") config.postgres.mode = pgFlag as PostgresMode;
+  else config.postgres.mode = (await hasContainerRuntime()) ? "docker" : "native";
+  ui.info(`postgres mode: ${config.postgres.mode}`);
+  ui.info(`llm provider: ${config.llmProvider}`);
+
+  const secrets = loadOrCreateSecrets(p);
+  const chosen = collectProviderEnv(config.llmProvider, process.env);
+  // Bake in the chosen provider's creds PLUS every other worker cred present in
+  // the env (X cookies, Bedrock/Vertex, gemini, any NOELLE_SECRET_*), so a
+  // single `export …; noelle init` wires the whole worker pool.
+  const providerEnv = { ...chosen.env, ...collectWorkerCredsEnv(process.env) };
+  const missing = chosen.missing;
+
+  // --- Provision Postgres ---
+  ui.step("Provisioning Postgres");
+  const adminUrl = adminUrlFor(config, secrets);
+  if (config.postgres.mode === "docker") {
+    const runtime = await detectContainerRuntime();
+    if (!runtime) {
+      ui.err(
+        "Container mode selected but no docker/nerdctl daemon is reachable. Start one or re-run with --pg native.",
+      );
+      return 1;
+    }
+    ui.info(`container runtime: ${runtime}`);
+    await ensureContainerPostgres({
+      runtime,
+      config,
+      rootPassword: secrets.rootPassword,
+      pgdataDir: p.pgdata,
+      log: (m) => ui.info(m),
+    });
+  } else {
+    ui.info(
+      `native mode — using superuser ${process.env.NOELLE_PG_SUPERUSER_URL ? "NOELLE_PG_SUPERUSER_URL" : `postgres@127.0.0.1:${config.postgres.port}`}`,
+    );
+  }
+  try {
+    await waitForPostgres(adminUrl, 90_000);
+    ui.ok("Postgres is accepting connections");
+  } catch (err) {
+    ui.err(String(err));
+    if (config.postgres.mode === "native") {
+      ui.warn(
+        "Install + start Postgres 16, then set NOELLE_PG_SUPERUSER_URL and re-run `noelle init`.",
+      );
+      ui.warn(
+        platform() === "darwin"
+          ? "  brew install postgresql@16 && brew services start postgresql@16"
+          : "  sudo apt-get install -y postgresql-16 && sudo systemctl enable --now postgresql",
+      );
+    }
+    return 1;
+  }
+
+  // --- Schema + seed ---
+  ui.step("Applying schema");
+  const applied = await applyMigrations({
+    adminUrl,
+    schemaDir: schemaDir(repoRoot),
+    log: (m) => ui.info(m),
+  });
+  ui.ok(`applied ${applied.length} migration(s)`);
+  await setAppPassword(adminUrl, secrets.appPassword);
+  await seedOperator({ adminUrl, config, log: (m) => ui.info(m) });
+  ui.ok(`operator ${config.operator.email} seeded into org "${config.orgSlug}"`);
+
+  // --- Mint JWT + write env + ecosystem ---
+  ui.step("Writing configuration");
+  const databaseUrl = composeAppUrl(config, secrets.appPassword);
+  const operatorJwt = await mintOperatorJwt({
+    secret: secrets.jwtSecret,
+    sub: config.operator.sub,
+    email: config.operator.email,
+  });
+  const env = composeEnv({
+    config,
+    databaseUrl,
+    jwtSecret: secrets.jwtSecret,
+    gateCookieSecret: secrets.gateCookieSecret,
+    hmacSecret: secrets.hmacSecret,
+    cronSecret: secrets.cronSecret,
+    operatorJwt,
+    version: VERSION,
+    heartbeatDir: p.heartbeats,
+    providerEnv,
+    tunnelHostname: config.tunnel.hostname,
+  });
+  writeEnvFile(p.envFile, env);
+  ui.ok(`wrote ${p.envFile}`);
+  writeEcosystem({ config, repoRoot, paths: p });
+  ui.ok(`wrote ${p.ecosystem}`);
+  saveConfig(config);
+
+  if (missing.length > 0) {
+    ui.warn(`LLM provider "${config.llmProvider}" is missing creds: ${missing.join(", ")}`);
+    ui.warn(
+      "Set them in your shell and re-run `noelle init`, or add to ~/.noelle/.env. (Not needed for the v1 dashboard.)",
+    );
+  }
+
+  ui.plain();
+  ui.ok("Init complete. Next: `noelle up` then open http://127.0.0.1:" + config.ports.app);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// migrate
+// ---------------------------------------------------------------------------
+async function cmdMigrate(): Promise<number> {
+  const repoRoot = findRepoRoot();
+  const p = ensureHome();
+  const config = loadConfig();
+  if (!config) {
+    ui.err("No config found. Run `noelle init` first.");
+    return 1;
+  }
+  const secrets = loadOrCreateSecrets(p);
+  const adminUrl = adminUrlFor(config, secrets);
+  await waitForPostgres(adminUrl, 30_000);
+  const applied = await applyMigrations({
+    adminUrl,
+    schemaDir: schemaDir(repoRoot),
+    log: (m) => ui.info(m),
+  });
+  await setAppPassword(adminUrl, secrets.appPassword);
+  await seedOperator({ adminUrl, config, log: (m) => ui.info(m) });
+  ui.ok(`migrate complete (${applied.length} files)`);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// up
+// ---------------------------------------------------------------------------
+async function cmdUp(args: Args): Promise<number> {
+  const repoRoot = findRepoRoot();
+  const p = ensureHome();
+  const config = loadConfig();
+  if (!config) {
+    ui.err("No config found. Run `noelle init` first.");
+    return 1;
+  }
+  const secrets = loadOrCreateSecrets(p);
+
+  ui.step("Starting Postgres");
+  if (config.postgres.mode === "docker") {
+    const runtime = await detectContainerRuntime();
+    if (!runtime) {
+      ui.err("No docker/nerdctl runtime reachable to start Postgres.");
+      return 1;
+    }
+    await ensureContainerPostgres({
+      runtime,
+      config,
+      rootPassword: secrets.rootPassword,
+      pgdataDir: p.pgdata,
+      log: (m) => ui.info(m),
+    });
+  }
+  const adminUrl = adminUrlFor(config, secrets);
+  if (config.postgres.mode === "native") {
+    // Native Postgres is owned by launchd/brew, not this CLI — but an unclean
+    // shutdown can wedge it forever behind a stale postmaster.pid (the pid it
+    // records gets recycled by an unrelated process after reboot, so Postgres
+    // refuses to start and the brew KeepAlive loop never recovers). Probe
+    // first: a healthy service is never touched.
+    const quickOk = await waitForPostgres(adminUrl, 3_000).then(
+      () => true,
+      () => false,
+    );
+    if (!quickOk) {
+      ui.warn("Postgres not answering — attempting native recovery (stale lock + service kick)");
+      await recoverNativePostgres({ log: (m) => ui.info(m) });
+    }
+  }
+  await waitForPostgres(adminUrl, 90_000);
+  ui.ok("Postgres ready");
+
+  ui.step("Applying schema (idempotent)");
+  await applyMigrations({ adminUrl, schemaDir: schemaDir(repoRoot), log: () => {} });
+  await setAppPassword(adminUrl, secrets.appPassword);
+  await seedOperator({ adminUrl, config, log: () => {} });
+  ui.ok("schema up to date");
+
+  ui.step("Building");
+  await buildPackages(repoRoot);
