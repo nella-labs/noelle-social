@@ -798,3 +798,203 @@ describe("POST /api/drafts/:id/save-edit", () => {
         /edited_body/i.test(JSON.stringify(c.values)),
     );
     expect(wroteEdit).toBe(true);
+    const editCall = calls.find((c) => /update noelle\.drafts/i.test(c.text));
+    // A semantic verdict for the old body must never authorize the edited text.
+    expect(editCall?.text).toContain("-'verifier_meta'");
+    expect(editCall?.text).toContain("-'reply_recheck'");
+    // ...and never flips the approval to sent/skipped (it's not a decision).
+    const flippedStatus = calls.some(
+      (c) =>
+        /update noelle\.approvals/i.test(c.text) &&
+        /status = '(sent|skipped|deferred)'/i.test(c.text),
+    );
+    expect(flippedStatus).toBe(false);
+  });
+
+  it("400s on an empty body", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-edit",
+        org_id: "org-1",
+        draft_id: "draft-edit",
+        lead_id: "lead-edit",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: null,
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-edit/save-edit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("409s when the draft was already actioned (sent/skipped)", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-sent",
+        org_id: "org-1",
+        draft_id: "draft-sent",
+        lead_id: "lead-sent",
+        status: "sent",
+        decided_at: "2026-01-15T10:30:00.000Z",
+        lead_external_id: null,
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-sent/save-edit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "too late" }),
+    });
+    expect(res.status).toBe(409);
+  });
+
+  it("404s when the approval id is unknown", async () => {
+    const fakeSql = makeFakeSql({ approval: null, siblingIds: [] });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/unknown/save-edit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "anything" }),
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /api/drafts/:id/skip", () => {
+  it("skips a standalone DM approval directly", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "dm-approval",
+        org_id: "org-1",
+        draft_id: "dm-draft",
+        lead_id: "dm-lead",
+        status: "pending",
+        decided_at: null,
+        lead_external_id: null,
+        draft_kind: "dm",
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/dm-approval/skip", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason: "not sending this DM" }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({approval_id:"dm-approval",status:"skipped"});
+  });
+});
+
+describe("POST /api/drafts/bulk-skip", () => {
+  it("skips the selected leads' reply angles and returns the distinct lead count", async () => {
+    // bulkSkipIds = the lead_ids the whole-lead UPDATE reports back (one per
+    // skipped reply angle); the route dedupes to distinct leads. Two leads here,
+    // with a repeat to prove the dedupe (3 angle-rows → 2 leads).
+    const fakeSql = makeFakeSql({
+      approval: null,
+      siblingIds: [],
+      bulkSkipIds: ["lead-A", "lead-A", "lead-B"],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/bulk-skip", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        org_id: "00000000-0000-0000-0000-0000000000a1",
+        approval_ids: [
+          "00000000-0000-0000-0000-0000000000b1",
+          "00000000-0000-0000-0000-0000000000b2",
+        ],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { skipped_count: number };
+    expect(json.skipped_count).toBe(2); // distinct leads, not the 3 angle-rows
+  });
+
+  it("400s on a malformed body (no approval_ids)", async () => {
+    const fakeSql = makeFakeSql({ approval: null, siblingIds: [] });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/bulk-skip", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ org_id: "00000000-0000-0000-0000-0000000000a1" }),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("POST /api/drafts/:id/unskip", () => {
+  it("returns a skipped approval to pending", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-skipped",
+        org_id: "org-1",
+        draft_id: "draft-x",
+        lead_id: "lead-x",
+        status: "skipped",
+        decided_at: "2026-06-10T00:00:00.000Z",
+        lead_external_id: null,
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-skipped/unskip", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { approval_id: string; status: string };
+    expect(json.status).toBe("pending");
+
+    const unskipUpdate = (fakeSql as unknown as { __calls: SqlCall[] }).__calls.find(
+      (call) => /update noelle\.approvals a/i.test(call.text),
+    );
+    expect(unskipUpdate?.text).toMatch(/decided_by\s+is\s+distinct\s+from/i);
+    expect(unskipUpdate?.text).toMatch(/a\.org_id\s*=/i);
+    expect(unskipUpdate?.values).toContain("org-1");
+  });
+
+  it("does not restore a reply rejected by automatic review", async () => {
+    const fakeSql = makeFakeSql({
+      approval: {
+        id: "appr-auto-rejected",
+        org_id: "org-1",
+        draft_id: "draft-auto-rejected",
+        lead_id: "lead-x",
+        status: "skipped",
+        decided_at: "2026-09-20T00:00:00.000Z",
+        decided_by: "automatic-review",
+        lead_external_id: null,
+      },
+      siblingIds: [],
+    });
+    const app = await buildApp({ sql: fakeSql });
+
+    const res = await app.request("/api/drafts/appr-auto-rejected/unskip", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "automatic_review_rejected" });
