@@ -798,3 +798,203 @@ describe("findSaveButton (SAVE-ONLY, never a vote)", () => {
 
 describe("findSaveMenuItem (open overflow menu — exact 'Save' word, never Saved/Unsave)", () => {
   it("finds the Save menuitem by exact word", () => {
+    const root = mount(`
+      <div role="menu">
+        <div role="menuitem">Share</div>
+        <div role="menuitem">Save</div>
+        <div role="menuitem">Hide</div>
+      </div>`);
+    const item = findSaveMenuItem(root)!;
+    expect(item).toBeTruthy();
+    expect((item.textContent ?? "").trim()).toBe("Save");
+  });
+  it("never matches 'Saved' or 'Unsave' (the already-saved states)", () => {
+    const root = mount(`
+      <div role="menu">
+        <div role="menuitem">Saved</div>
+        <div role="menuitem">Unsave</div>
+      </div>`);
+    expect(findSaveMenuItem(root)).toBeNull();
+  });
+  it("prefers the stable data-action-bar-action='save' hook when present", () => {
+    const root = mount(`
+      <div role="menu">
+        <button data-action-bar-action="save" aria-label="Save">Save post</button>
+      </div>`);
+    const item = findSaveMenuItem(root)!;
+    expect(item.getAttribute("data-action-bar-action")).toBe("save");
+  });
+  it("returns null when no menu is open", () => {
+    expect(findSaveMenuItem(mount(`<div>no menu here</div>`))).toBeNull();
+  });
+});
+
+describe("findFeedSaveTarget (first/ random NOT-already-saved post)", () => {
+  it("old Reddit: returns the first post whose save link is available", () => {
+    const root = mount(`
+      <div class="thing link saved" data-fullname="t3_a"><form class="save-button"><a href="#">save</a></form></div>
+      <div class="thing link" data-fullname="t3_b"><form class="save-button"><a href="#">save</a></form></div>`);
+    const found = findFeedSaveTarget(root, "old")!;
+    expect(found).toBeTruthy();
+    expect(found.post.getAttribute("data-fullname")).toBe("t3_b"); // skipped the already-saved t3_a
+  });
+  it("old Reddit: null when every post is already saved", () => {
+    const root = mount(`<div class="thing link saved"><form class="save-button"><a href="#">save</a></form></div>`);
+    expect(findFeedSaveTarget(root, "old")).toBeNull();
+  });
+  it("new Reddit: skips an already-saved post and returns the next saveable one (shadow iteration)", () => {
+    document.body.innerHTML = "";
+    newPostWithSave({ saved: true, id: "t3_a" });
+    newPostWithSave({ saved: false, id: "t3_b" });
+    const found = findFeedSaveTarget(document.body, "new")!;
+    expect(found).toBeTruthy();
+    expect(found.post.getAttribute("id")).toBe("t3_b");
+  });
+});
+
+// Drifted markup: EVERY feed-post container selector misses (the tag/attrs were
+// renamed to xyz-*), but the upvote affordances survive in the light DOM. Post
+// containers must be recovered by climbing from those buttons (ports the
+// linkedin/x findFeedPosts drift fallback) so a live `posts=0` skip can't happen
+// while upvote buttons plainly exist (the state countUpvoteButtons only DETECTS).
+const DRIFTED_NEW = `
+  <div class="xyz-feed">
+    <div class="xyz-card">
+      <article class="xyz-post" xyz-id="t3_aaa">
+        <h3>post one survived the wrapper drift</h3>
+        <div class="xyz-actions">
+          <button data-action-bar-action="upvote" aria-pressed="false">Upvote</button>
+          <button data-action-bar-action="downvote" aria-pressed="false">Downvote</button>
+        </div>
+      </article>
+    </div>
+    <div class="xyz-card">
+      <article class="xyz-post" xyz-id="t3_bbb">
+        <h3>post two is already upvoted</h3>
+        <div class="xyz-actions">
+          <button data-action-bar-action="upvote" aria-pressed="true">Upvote</button>
+          <button data-action-bar-action="downvote" aria-pressed="false">Downvote</button>
+        </div>
+      </article>
+    </div>
+  </div>`;
+
+const DRIFTED_OLD = `
+  <div class="xyz-oldfeed">
+    <div class="xyz-thing" data-fullname="t3_o1">
+      <div class="xyz-mid"><div class="arrow up"></div><div class="arrow down"></div></div>
+    </div>
+    <div class="xyz-thing" data-fullname="t3_o2">
+      <div class="xyz-mid"><div class="arrow up upmod"></div><div class="arrow down"></div></div>
+    </div>
+  </div>`;
+
+describe("findFeedPosts — drift-resistant fallback (container tag/attrs renamed)", () => {
+  it("new Reddit: recovers feed posts from their upvote buttons when shreddit-post is gone", () => {
+    const root = mount(DRIFTED_NEW);
+    expect(document.querySelectorAll("shreddit-post").length).toBe(0); // the primary selector finds nothing…
+    const posts = findFeedPosts(root, "new"); // …but the fallback climbs from the 2 light-DOM upvote buttons.
+    expect(posts).toHaveLength(2);
+    // Each climbed container is post-sized: it wraps exactly one upvote affordance.
+    for (const p of posts) expect(countUpvoteButtons(p, "new")).toBe(1);
+  });
+
+  it("new Reddit: findFeedUpvoteTarget still resolves an upvotable (not already-pressed) post via the fallback", () => {
+    const root = mount(DRIFTED_NEW);
+    const found = findFeedUpvoteTarget(root, "new")!;
+    expect(found).toBeTruthy();
+    expect(found.el.getAttribute("data-action-bar-action")).toBe("upvote"); // NEVER 'downvote'
+    expect(found.el.getAttribute("aria-pressed")).toBe("false"); // skipped the already-upvoted post
+  });
+
+  it("old Reddit: recovers feed posts from their up arrows when .thing.link is gone", () => {
+    const root = mount(DRIFTED_OLD);
+    expect(document.querySelectorAll(".thing.link").length).toBe(0);
+    const posts = findFeedPosts(root, "old");
+    expect(posts).toHaveLength(2); // both the fresh AND the already-upvoted post are feed posts
+    for (const p of posts) expect(countUpvoteButtons(p, "old")).toBe(1);
+  });
+
+  it("old Reddit: findFeedUpvoteTarget resolves the un-modded arrow via the fallback (never the down arrow)", () => {
+    const root = mount(DRIFTED_OLD);
+    const found = findFeedUpvoteTarget(root, "old")!;
+    expect(found).toBeTruthy();
+    expect(found.el.className).toContain("up");
+    expect(found.el.className).not.toContain("down");
+    expect(found.el.className).not.toContain("upmod"); // skipped the already-upvoted post
+  });
+
+  it("does NOT fire the fallback when the container selector matches (healthy markup keeps shreddit-post)", () => {
+    document.body.innerHTML = "";
+    newPostWithUpvote({ id: "t3_a" });
+    newPostWithUpvote({ id: "t3_b" });
+    const posts = findFeedPosts(document.body, "new");
+    expect(posts).toHaveLength(2);
+    for (const p of posts) expect(p.tagName.toLowerCase()).toBe("shreddit-post");
+  });
+});
+
+// ── Challenge / throttle detection ───────────────────────────────────────────
+
+describe("detectChallenge", () => {
+  it("HARD throttle: 'you're doing that too much' in an alert region halts", () => {
+    const root = mount(`<div class="ratelimit">You're doing that too much. Try again in 5 minutes.</div>`);
+    expect(detectChallenge(root)).toEqual({ challenge: true, kind: "throttle" });
+  });
+
+  it("HARD verify: a human-verification wall (no real content) halts", () => {
+    const root = mount(`<div class="interstitial">Please verify you are human to continue.</div>`);
+    expect(detectChallenge(root)).toEqual({ challenge: true, kind: "verify" });
+  });
+
+  it("TRANSIENT js-challenge (title 'just a moment') is NOT a hard challenge", () => {
+    const root = mount(`<shreddit-post author="a" score="1" id="t3_x"></shreddit-post>`);
+    expect(detectChallenge(root, { title: "Just a moment..." })).toEqual({ challenge: false, kind: "jschallenge" });
+  });
+
+  it("TRANSIENT js-challenge (js_challenge=1 in url) is NOT a hard challenge", () => {
+    const root = mount(`<div></div>`);
+    expect(detectChallenge(root, { url: "https://www.reddit.com/?js_challenge=1" })).toEqual({
+      challenge: false,
+      kind: "jschallenge",
+    });
+  });
+
+  it("TRANSIENT js-challenge (reputation-recaptcha element) is NOT a hard challenge", () => {
+    const root = mount(`<reputation-recaptcha></reputation-recaptcha>`);
+    expect(detectChallenge(root)).toEqual({ challenge: false, kind: "jschallenge" });
+  });
+
+  it("a clean thread is no challenge", () => {
+    const root = mount(NEW_POST + NEW_COMMENTS);
+    expect(detectChallenge(root, { title: "How we hit 10k MRR : r/SaaS" })).toEqual({ challenge: false });
+  });
+
+  it("SAFETY: throttle text inside a POST BODY does NOT false-trip a halt", () => {
+    const root = mount(`
+      <shreddit-post author="a" score="1" id="t3_x">
+        <div slot="text-body"><div class="md">a mod once told me "you're doing that too much" lol, try again in 5 minutes he said</div></div>
+      </shreddit-post>`);
+    expect(detectChallenge(root)).toEqual({ challenge: false });
+  });
+
+  // ── Structural signals (ports #406): vendor iframes + interstitial routes ──
+
+  it("STRUCTURAL: an hCaptcha vendor iframe halts even with no matching prose", () => {
+    const root = mount(`<div><iframe src="https://newassets.hcaptcha.com/captcha/v1/frame"></iframe></div>`);
+    expect(detectChallenge(root)).toEqual({ challenge: true, kind: "verify" });
+  });
+
+  it("STRUCTURAL: a Google reCAPTCHA vendor iframe halts", () => {
+    const root = mount(`<div><iframe src="https://www.google.com/recaptcha/api2/anchor?k=x"></iframe></div>`);
+    expect(detectChallenge(root)).toEqual({ challenge: true, kind: "verify" });
+  });
+
+  it("STRUCTURAL: a verification interstitial ROUTE halts (anchored to path start)", () => {
+    const root = mount(`<div>some unrecognized wording</div>`);
+    expect(detectChallenge(root, { url: "https://www.reddit.com/verification/step1" })).toEqual({
+      challenge: true,
+      kind: "verify",
+    });
+  });
+
