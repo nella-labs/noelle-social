@@ -198,3 +198,43 @@ Every Apify actor run is recorded to `noelle.llm_calls` with `engine='apify'` (t
 **In-use vs spare buckets (migration `0058`).** Tokens carry an `in_use` flag splitting the pool in two: **in use** (`in_use = true`) is the live rotation the agents pull from; **spare** (`in_use = false`) is a parked holding bucket no worker ever touches. The Connections card has a **bulk paste box** — drop in many tokens at once (one-per-line / comma / space separated; `parseApifyTokens` trims, de-dupes, drops fragments `< 12` chars) and they all land as **spare**. Promote the ones you want with **Move to in use** (and demote with **Move to spare**); both flip `in_use` via `setApifyConnectionInUse` without disturbing spend history or exhausted/invalid state. `listApifyTokens` filters `in_use = true`, so a spare token is invisible to the resolver — and the same shared pool feeds Lyra, Orion, and Vega (all three `listApifyTokens` queries gained the filter). If **no** token is in use the resolver falls back to the env token, exactly as when the pool is empty.
 
 **Fallback + exhaustion (migrations `0040`/`0041`).** The resolver returns a *rotating* client (`apify-rotating.ts`): each call tries the **available** tokens in order and when one returns a token-fatal error it rotates to the next, transparently and mid-tick, recording *why* by HTTP status: a **403 "Monthly usage hard limit exceeded"** benches the token until its **real billing-cycle reset** — probed live from `/v2/users/me/limits` → `monthlyUsageCycle.endAt` (+1h buffer), so it re-enters rotation the moment Apify refills the $5 instead of a flat +30d guess; only when the probe can't report a cycle (or on a **402** payment error) does it fall back to `DEFAULT_RETRY_COOLDOWN_DAYS` (~30d). A **401 "token not valid"** is **verified before retiring** (`checkApifyToken`): a single transient 401 (a throttle during a burst) used to permanently kill a perfectly good token, so now the token is health-checked first — only a probe that *also* 401s sets `invalid_at` (genuinely wrong / deleted / **banned**); an alive/inconclusive probe gets a short 1-day cooldown instead. An invalid token is **excluded from the pool the instant it's flagged** (`listApifyTokens` filters `invalid_at is null`, so it leaves every worker's candidate set *and* the pool count immediately — repeated 401s from a banned account on one IP are an abuse signal that endangers the rest of the pool) and rendered **"invalid · replace"** in the UI, until the operator re-pastes a good one. A token is **available** again once `retry_at <= now()`, so it re-enters rotation on its own billing date even while other tokens still work — it then either succeeds (its `exhausted_at`/`retry_at` clear) or re-cools for another window. Still-cooling tokens are *skipped*, not retried, so no 403 calls are wasted; the resolver passes the full pool size so the error is accurate. When **every** token is spent (or all cooling) the discovery worker records `worker_runs.error` (the Pipeline panel shows the Discovery row as **errored: all N Apify tokens exhausted…** instead of a silent "stalled") and fires a **Pushover** ping (`pushover-user-key` / `pushover-token`, once per episode — re-armed when a token works again). Transient 429 rate-limits are *not* token-fatal: they bubble and defer to the next tick. The Connections card shows each token's status + its **retries `<date>`** when cooling.
+
+**Goal stall-guard.** A goal-run ("get N **replies** ready") auto-pauses not only when it reaches N but also when it makes **zero progress for `LINKEDIN_GOAL_STALL_MIN`** (default 2h) — so a target larger than the watchlist can produce (e.g. 20 from 17 quiet people) can't poll Apify forever. The pause log says `stalled` vs `reached`. Both the progress count and the stall clock count **reply leads only** (`drafts.payload.kind='reply'`), so a trickle of intro DMs can neither "reach" the target nor reset the stall clock.
+
+## Connection follow-up (on-demand)
+
+A one-shot operator tool for the moment you **just connected** with someone and want to build a *genuine* relationship, not pitch them. You name the person; Lyra scrapes their recent posts + the comments they've authored on other people's posts (the same read-only Apify actors the profiler uses — no `li_at`, no session risk), reuses any profile she already wrote for them, and generates a **connection brief**:
+
+- **Common ground** — real shared ground / why they're worth knowing, grounded in their actual work.
+- **Talking points** — specific, concrete things from their posts/comments worth referencing.
+- **Genuine questions** — a list of curious, specific questions a real peer would ask (the point of the tool).
+- **A follow-up DM** — one warm, first-person note, no pitch/product/link, in the same anti-slop voice as the intro DM (no em-dashes, no "Curious:", no buzzwords; `stripEmDashes` + `stripDisallowedEmoji` are the hard backstops, and one plainer regeneration fires if the DM still trips a phrase tell).
+
+It's **draft-only** like everything Lyra does: it prints to the terminal, you copy the DM and send it by hand. Nothing is queued or auto-sent, and it never touches LinkedIn directly (Apify only).
+
+Run it on the Lima VM (the residential egress). Two equivalent ways:
+
+```bash
+# via the noelle CLI (loads ~/.noelle/.env for you)
+noelle lyra followup https://www.linkedin.com/in/kaia-tham
+noelle lyra followup kaia-tham --posts 25 --json
+
+# or the native worker gesture (the one-shot loads ~/.noelle/.env itself)
+cd apps/linkedin-intern && ./run.sh followup --person /in/kaia-tham
+```
+
+The person accepts a full profile URL, an `/in/<slug>` path, or a bare slug (normalised by `linkedinPublicId`, the same helper the Watchlist add uses). Flags: `--posts N` (default 20, max 50), `--comments N` (default 12, max 40; `0` skips authored comments), `--json` for machine-readable output. Code: `apps/linkedin-intern/src/workers/followup.ts` (one-shot entrypoint) + `src/lib/followup.ts` (prompt, schema, anti-slop scrub — unit-tested).
+
+**Model + cost.** The brief rides **Opus** (`opusOverrideRouting(linkedinInternRouting(inst))`): `claude -p` first when the claude-cli backend is selected, Bedrock Opus otherwise, falling back to the instance's normal model (Sonnet) only if Opus is unavailable — the same high-quality path as the VIP/intro DM, and just one LLM call per run so cost is negligible. The Apify `profilePosts` + `profile-comments` fetches are metered to `noelle.llm_calls` (`engine='apify'`, `worker='followup'`) exactly like the profiler, so they appear on the **Spend** page's Apify column and never draw down the LLM budget cap.
+
+**Prereqs.** Needs the worker built (`noelle up --workers`, or `pnpm --filter @noelle/linkedin-intern build`), an Apify token (dashboard → Connections → Data sources), and a `linkedin_intern` instance (created by `noelle migrate`). If the person posts rarely and has authored no comments, there's nothing to ground on and the command says so instead of inventing a brief.
+
+## Operate (Lima VM)
+
+1. Put a fresh `li_at` in `~/.noelle/.env` (see above).
+2. Apply migrations: `noelle migrate` (the `0027`–`0029` files are picked up by the ledger). Confirm: `select role,status from noelle.agent_instances where role='linkedin_intern';` → `Lyra`.
+3. Seed the watchlist on the agent's **Watchlist** page: add each connection by LinkedIn URL / `/in/<slug>` / bare slug (with an optional per-person objective), or bulk-seed via the connection import. Optionally pre-set a saved discovery default (window + engagement floors) under Configure agent → Discovery; per-run overrides come from the Pipeline panel's "Tailor this run".
+4. Start workers: they're in the generated `ecosystem.config.cjs` as `noelle-linkedin-{discovery,profiler,drafter}`. `pm2 start ecosystem.config.cjs` (or `pm2 restart` after an env change).
+5. Drafts land in the approvals inbox → copy → send on LinkedIn by hand → **Mark sent**.
+
+If `li_at` dies: discovery/profiler log a `LinkedInAuthError`; drop a fresh token and `pm2 restart noelle-linkedin-discovery noelle-linkedin-profiler`.

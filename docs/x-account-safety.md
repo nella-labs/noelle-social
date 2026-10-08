@@ -198,3 +198,53 @@ What changed in `apps/x-actuator/src/lib/scheduler.ts` + `background/`:
   uniform cadence they exist to break.
 - **`IDLE_LIKE_MIN_GAP_MS` 45s → 5 min**, matching Lyra. Volume is unchanged
   (idle-likes stay budget-bounded); the same likes spread over more wall clock.
+- **X-specific:** the SHORT band floor goes **1s → 20s**. 6.2% of planned gaps
+  were under 10 seconds — the tightest of the three actuators (Lyra floors at
+  60s, Orion at 240s).
+
+**Why this cannot speed the account up.** A cooldown gap draws from the NORMAL
+band only, so making cooldown modal is monotonically slowing. Verified rather
+than assumed, because the standing lesson from #471/#497 is that reshaping a
+distribution shifts its mean even when the floor and ceiling look intact: gap
+duration rose 65.0s → 75.1s (median 67.9 → 77.2) and session span rose 12.4 →
+14.1 min (median 12.4 → 14.1). **Mean and median both rose on both axes**, so no
+archetype got faster on any dimension. `tests/drain.test.ts` asserts this
+directly against a simulated pre-re-tune baseline.
+
+---
+
+## 11. Concurrent multi-token discovery (sharding)
+
+`NOELLE_APIFY_MAX_CONCURRENCY` (default **1 = off**) sets how many Apify runs may
+be in flight in one discovery tick. The token pool is split round-robin into that
+many **disjoint** shards, and each shard gets its own rotating client over its own
+tokens.
+
+**Disjointness is the whole safety argument.** If two concurrent shards could
+hold the same token, running them in parallel would simply rate-limit that token
+twice as fast — the opposite of the goal. `shardRoundRobin` partitions, so every
+available token lands in exactly one shard. Asserted directly in
+`apps/x-intern/src/lib/apify-shard-resolver.test.ts`.
+
+Other properties worth knowing before raising it:
+
+- **Capped by real supply.** Shards are `min(requested, availableTokens)`. Asking
+  for 8 against 3 usable tokens yields 3, never 8 sharing.
+- **A thin slice does not page.** A shard raises "all exhausted" when ITS tokens
+  are spent; the operator is only paged when EVERY shard says so. Otherwise the
+  other shards did real work and the run stays `ok` with a warning.
+- **Each shard walks its own ring**, so it gets its own source cursor
+  (`instance:mode:sN`). Sharing one would make shard N resume at another shard's
+  offset and re-poll the wrong sources. At concurrency 1 the original cursor key
+  is kept, so nothing is orphaned.
+- **The tick budget is shared and wall-clock**, so shards burn it in parallel
+  rather than in series — that is the throughput win. The rate bucket is also
+  shared, because it paces the ACCOUNT, not the token.
+- **Starts are staggered** (`X_DISCOVERY_SHARD_STAGGER_MS`, default 1.5s) so N
+  tokens do not all egress at the same instant from one box. Only the starts are
+  spread; the shards still overlap.
+
+Default 1 because it shipped into a starved pool, where concurrency buys nothing
+and the wall-clock budget already bounds the tick. Raise it once several tokens
+are reliably available — that is the point at which serialisation, not supply, is
+the bottleneck.
