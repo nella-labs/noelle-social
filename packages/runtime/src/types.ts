@@ -198,3 +198,12 @@ export type AgentManifest = {
   default_bucket: string;
   default_budget_cap_cents: number;
   tools: string[];
+  hireable: boolean;
+  single_instance_per_org?: boolean;
+  /**
+   * Optional skill-to-agent routing facet. Optional ⇒ every existing manifest
+   * validates byte-identically. See {@link AgentCapability} and the router in
+   * `@noelle/agents` (`packages/agents/src/router.ts`).
+   */
+  capability?: AgentCapability;
+};
