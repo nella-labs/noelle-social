@@ -198,3 +198,127 @@ export interface SweepOutcome {
  * The distinction that matters is between the three remaining zeroes, which
  * used to render identically. This string is what the panel shows and what
  * lands in noelle.linkedin_activity.reason, so it is the first thing anybody
+ * debugging "Lyra answered nothing" reads. Blaming the recency window for a
+ * seen-ring zero — the STEADY STATE, since an answered reply sits on the page
+ * for hours and every sweep re-reads it — would be a lie repeated every ten
+ * minutes at exactly the moment someone is trying to diagnose something.
+ */
+export function describeEmptySweep(args: {
+  /** Cards the page rendered AT ALL — replies or not. */
+  harvested: number;
+  ages: { recent: number; stale: number; undated: number };
+}): string | undefined {
+  // Derived, never passed in: a caller that disagreed with its own buckets is
+  // how the first version printed "3 replies, none within Nh (0 older, 0
+  // undated)". Deriving the total makes that line unrepresentable.
+  const candidates = args.ages.recent + args.ages.stale + args.ages.undated;
+  if (args.harvested === 0) return undefined; // "page rendered NO cards"
+  if (candidates === 0) return undefined; // "read N cards, none are new replies"
+  const hours = MAX_AGE_MINUTES / 60;
+  if (args.ages.undated === candidates) {
+    return `no readable timestamp on any of ${candidates} replies — time-ago markup may have changed`;
+  }
+  if (args.ages.recent === 0) {
+    return `${candidates} replies, none within ${hours}h (${args.ages.stale} older, ${args.ages.undated} undated)`;
+  }
+  // The ring records what we INGESTED, not what we answered — a lead can die
+  // downstream (triage, a verifier gate, an error) without a single word
+  // reaching the person. "handled" was a claim the sweep cannot support, and it
+  // was wrong in practice: "that one that says already handled is not handled".
+  return `${args.ages.recent} replies within ${hours}h, all already ingested (nothing new to file)`;
+}
+
+async function harvestWithRetry<T>(
+  tabId: number,
+  send: Send,
+  sleep: Sleep,
+  attempts = 4,
+): Promise<{ items: T[]; cards: number; contacted: boolean; lastError?: string }> {
+  let contacted = false;
+  let cards = 0;
+  let lastError: string | undefined;
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) await sleep(1200 * i); // 1.2s, 2.4s, 3.6s — the list is async
+    try {
+      const r = await send<{ ok: boolean; items: T[]; cards?: number }>(tabId, {
+        cmd: "harvestNotifications",
+      });
+      contacted = true;
+      const items = r?.items ?? [];
+      // Keep the best card count we have seen: a later attempt that renders
+      // fewer cards should not erase evidence that the page DID render.
+      cards = Math.max(cards, r?.cards ?? items.length);
+      // Replies present ⇒ done. Zero on an early attempt is far more likely to
+      // be a half-rendered list than a genuinely empty inbox, so keep asking.
+      if (items.length > 0) return { items, cards, contacted };
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+  }
+  return { items: [], cards, contacted, ...(lastError ? { lastError } : {}) };
+}
+
+export async function runNotificationSweep(
+  tabId: number,
+  deps: SweepDeps,
+): Promise<SweepOutcome> {
+  const { rng, sleep, send, api, cdp, wpm, navigate, stopped } = deps;
+
+  await navigate(tabId, NOTIFICATIONS_URL);
+  if (stopped()) return { fresh: 0, accepted: 0, skipped: 0, detail: "stopped" };
+  await sleep(rng.float(1400, 2800)); // let the list hydrate
+
+  // Read the page like a person: a scroll or two with dwells between.
+  const passes = rng.int(1, 2);
+  for (let i = 0; i < passes; i++) {
+    if (stopped()) break;
+    await sleep(readingDwellMs(rng, Math.round(rng.normal(44, 20)), {}, wpm));
+    await cdp.wheel(tabId, { x: 500, y: 420 }, Math.round(rng.float(420, 1100)), rng, sleep);
+  }
+
+  const probe = await harvestWithRetry<HarvestedNotification>(tabId, send, sleep);
+  const harvested = probe.items;
+  if (!probe.contacted) {
+    // The page never answered. Say so — this used to be reported as an empty
+    // inbox, which is the single most misleading thing the sweep could do.
+    return {
+      fresh: 0, accepted: 0, skipped: 0, harvested: 0,
+      detail: `notifications page did not respond${probe.lastError ? ` (${probe.lastError})` : ""} — will retry next sweep`,
+    };
+  }
+
+  const store = await chrome.storage.local.get(SEEN_KEY);
+  const seen = (store[SEEN_KEY] as string[] | undefined) ?? [];
+  const fresh = selectRepliesToMe(harvested, { seen, max: MAX_PER_SWEEP });
+  const ages = ageBuckets(harvested, MAX_AGE_MINUTES);
+  // Every card the page rendered, not just the replies — see countNotificationCards.
+  const cards = Math.max(probe.cards, harvested.length);
+
+  // Keep the notifications page open when no fresh replies are eligible.
+  if (fresh.length === 0) {
+    const detail = describeEmptySweep({ harvested: cards, ages });
+    return {
+      fresh: 0,
+      accepted: 0,
+      skipped: 0,
+      harvested: cards,
+      ...(detail ? { detail } : {}),
+    };
+  }
+
+  const nowIso = new Date().toISOString();
+  const items = fresh.map((f) => toInboundItem(f, nowIso));
+  const res = await api
+    .postInboundReplies({ instanceId: deps.instanceId, platform: "linkedin", items })
+    .catch((e: unknown) => ({ error: e instanceof Error ? e.message : String(e) }) as const);
+  if ("error" in res) {
+    return { fresh: fresh.length, accepted: 0, skipped: 0, detail: `ingest-failed: ${res.error}` };
+  }
+
+  // Only remember what the server actually took a decision on. An item that
+  // never reached api-vm stays unseen so the next sweep retries it.
+  await chrome.storage.local.set({
+    [SEEN_KEY]: mergeSeen(seen, items.map((i) => i.external_id), SEEN_CAP),
+  });
+  return { fresh: fresh.length, accepted: res.accepted, skipped: res.skipped };
+}
