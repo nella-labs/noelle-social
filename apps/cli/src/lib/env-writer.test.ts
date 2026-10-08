@@ -198,3 +198,56 @@ describe("upsertEnvKey", () => {
 
   it("replaces just the target key, preserving comments/order/other keys", () => {
     const p = envFile("# header comment\nA=1\nNOELLE_LOCAL_OPERATOR_JWT=old.jwt.value\nB=two words no quotes broken\n");
+    upsertEnvKey(p, "NOELLE_LOCAL_OPERATOR_JWT", "new.jwt.value");
+    expect(readFileSync(p, "utf8")).toBe(
+      "# header comment\nA=1\nNOELLE_LOCAL_OPERATOR_JWT=new.jwt.value\nB=two words no quotes broken\n",
+    );
+    expect(readEnvFile(p).NOELLE_LOCAL_OPERATOR_JWT).toBe("new.jwt.value");
+  });
+
+  it("appends when the key is absent and quotes values that need it", () => {
+    const p = envFile("A=1\n");
+    upsertEnvKey(p, "NEW_KEY", "a b");
+    expect(readFileSync(p, "utf8")).toBe('A=1\nNEW_KEY="a b"\n');
+    expect(readEnvFile(p).NEW_KEY).toBe("a b");
+  });
+
+  it("creates the file when missing and keeps 0600 perms", () => {
+    const p = envFile();
+    upsertEnvKey(p, "ONLY", "v");
+    expect(readEnvFile(p).ONLY).toBe("v");
+    expect(statSync(p).mode & 0o777).toBe(0o600);
+  });
+
+  it("replaces every duplicate assignment so no stale value wins on read", () => {
+    const p = envFile("# keep\nTOKEN=old\nA=1\nTOKEN=stale\n");
+    upsertEnvKey(p, "TOKEN", "fresh");
+    expect(readEnvFile(p)).toEqual({ TOKEN: "fresh", A: "1" });
+    expect(readFileSync(p, "utf8").match(/^TOKEN=/gm)).toHaveLength(1);
+  });
+
+  it("round-trips multiline values and escape sequences through the actual generated ecosystem", () => {
+    const p = envFile();
+    const expected = { PRIVATE_PEM: "first\nsecond\r\nlast", LITERAL: String.raw`path\n\t\end`, QUOTED: 'a "quote" and #hash' };
+    writeEnvFile(p, expected);
+    expect(readEnvFile(p)).toEqual(expected);
+    const module = { exports: {} as { apps?: { env: Record<string, string> }[] } };
+    runInNewContext(generateEcosystem({
+      config: defaultConfig(), repoRoot: "/fixture-repo", paths: { ...paths(), envFile: p },
+    }), { module, require: () => ({ existsSync: () => true, readFileSync: () => readFileSync(p, "utf8") }) });
+    expect(module.exports.apps?.[0]?.env).toMatchObject(expected);
+  });
+
+  it("replaces a legacy multiline assignment without retaining its old continuation", () => {
+    const p = envFile('TOKEN="old\ncontinued"\nA=1\nTOKEN=stale\n');
+    upsertEnvKey(p, "TOKEN", "new\nvalue");
+    expect(readEnvFile(p)).toEqual({ TOKEN: "new\nvalue", A: "1" });
+    expect(readFileSync(p, "utf8")).not.toContain("continued");
+  });
+
+  it("rejects a key containing another assignment", () => {
+    const p = envFile("A=1\n");
+    expect(() => upsertEnvKey(p, "TOKEN\nINJECTED", "v")).toThrow();
+    expect(readEnvFile(p)).toEqual({ A: "1" });
+  });
+});
