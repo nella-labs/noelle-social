@@ -998,3 +998,203 @@ async function tickOnce() {
       const at = new Date(now).toISOString();
       try {
         await likeAFeedPost(tabId, s, cfg, rng, events, at);
+      } catch (e) {
+        if (!isAbortError(e)) throw e; // STOP mid-like → fall through to the STOP-race guard below
+      }
+      await api.logActivity(s.sessionId, events).catch(() => {});
+    } else {
+      // A healthy content receiver never reaches the missing-receiver handoff.
+      // Check only at this existing serialized, paced drain browse slot; an
+      // in-flight send, timed Run, or queued DM is never interrupted.
+      const receiverSlotIsCurrent = async () => {
+        if (stopped() || myEpoch !== (await currentEpoch()) || await remoteStopped() ||
+            !(await browserDiscoveryEnabled())) return false;
+        const probe = await send<{ observed?: { challenge?: boolean } }>(
+          tabId, { cmd: "detectChallenge" },
+        ).catch(() => null);
+        return probe?.observed?.challenge === false;
+      };
+      const reloaded = await handoffBuildAtHealthyBrowse({
+        mode: s.mode, ambientBrowseSlot: true,
+        discoveryEnabled: await browserDiscoveryEnabled(),
+        lastReadMs: s.lastDiscoveryReadMs ?? 0, nowMs: now,
+        receiverHealthy: ch?.observed?.challenge === false,
+        isCurrent: receiverSlotIsCurrent,
+        checkNewBuild: () => checkSelfReload({ receiverSlotIsCurrent }),
+      });
+      if (reloaded) return;
+      await ambientBrowse(s, cfg, tabId, rng, now);
+    }
+    // STOP race: a stop/halt may have landed during the (now longer) idle
+    // like/ambient read — don't resurrect the run by writing "running" back over it.
+    const cur = await loadState();
+    if (cur && cur.status !== "running") return;
+    const nextAt = Math.min(...s.actions.filter((a) => !a.executed).map((a) => a.atMs));
+    const inSec = Number.isFinite(nextAt) ? Math.max(0, Math.round((nextAt - now) / 1000)) : 0;
+    // A sweep already wrote its own outcome line — don't clobber it with the
+    // generic idle text, or the panel would never show what the sweep found.
+    if (activity !== "sweep") {
+      s.lastEvent = activity === "like" ? `liked while waiting — next action in ~${inSec}s` : `browsing — next action in ~${inSec}s`;
+    }
+    await saveIfCurrent(s);
+    return;
+  }
+
+  const action = s.actions[idx]!;
+  const events: LinkedInActivityEvent[] = [];
+  const at = new Date(now).toISOString();
+  const windowEndMs = s.startMs + s.windowHours * 3600_000;
+  const isWrite = action.kind === "like" || action.kind === "comment" || action.kind === "dm";
+
+  // Discovery has its own optional local quiet window. When it is enabled it
+  // overrides the run's legacy Auto curfew, including a run already in flight.
+  // Likes and browsing continue while comments/DMs wait for the next slot.
+  const isPost = action.kind === "comment" || action.kind === "dm";
+  const writeGate = isPost
+    ? await discoveryWriteGate(chrome.storage.local, now, s.curfewEnabled === true)
+    : { held: false };
+  if (writeGate.held) {
+    const d = deferLater(action, now, windowEndMs, rng);
+    action.atMs = d.atMs;
+    events.push({ type: "skip", reason: "curfew", at });
+    s.lastEvent = writeGate.message ?? "comments/DMs paused";
+    await saveIfCurrent(s);
+    await api.logActivity(s.sessionId, events).catch(() => {});
+    return;
+  }
+
+  // Warm-up: for the first warmupSuppressMs of the session, no writes — arrive,
+  // scroll, and read first (a human doesn't fire the instant they land). Defer
+  // the slot, run a short ambient browse, then skip.
+  if (isWrite && now - s.startMs < s.warmupSuppressMs) {
+    const d = deferLater(action, now, windowEndMs, rng);
+    action.atMs = d.atMs;
+    await ambientBrowse(s, cfg, tabId, rng, now);
+    // STOP race during the (now longer) warm-up read.
+    const cur = await loadState();
+    if (cur && cur.status !== "running") return;
+    events.push({ type: "skip", reason: "warming-up", at });
+    s.lastEvent = "warming up — reading first";
+    await saveIfCurrent(s);
+    await api.logActivity(s.sessionId, events).catch(() => {});
+    return;
+  }
+
+  // STOP (or a superseding Run) may have landed during the awaits above
+  // (replenish, challenge probe). Re-check the epoch before touching LinkedIn so
+  // a just-stopped run never fires one last action.
+  if (myEpoch !== (await currentEpoch())) return;
+
+  try {
+    if (action.kind === "like") {
+      // Bound total likes to the session budget: idle-likes (fired in the waits)
+      // and scheduled like slots share s.done.likes, so once the budget is met the
+      // idle-likes have already delivered this slot's like — skip it rather than
+      // over-liking past the cap.
+      if (s.done.likes >= s.targets.likes) {
+        events.push({ type: "skip", reason: "like-budget-met", at });
+      } else {
+        await likeAFeedPost(tabId, s, cfg, rng, events, at);
+      }
+      action.executed = true;
+    } else if (action.kind === "comment" || action.kind === "dm") {
+      const pool = action.kind === "comment" ? s.commentPool : s.dmPool;
+      const item = pool.shift();
+      if (!item) {
+        // supply-aware: defer this slot later in the window, do NOT execute
+        const d = deferLater(action, now, s.startMs + s.windowHours * 3600_000, rng);
+        action.atMs = d.atMs;
+        events.push({ type: "skip", reason: `${action.kind}-awaiting-supply`, at });
+      } else if (action.kind === "comment" && postDedupKey(item.url) && (s.actionedUrls ?? []).includes(postDedupKey(item.url)!)) {
+        // Per-post guard: already commented on this post this session. Lyra can
+        // queue >1 draft for one post; two comments on a single post reads as
+        // spam. Keyed on the activity URN (postDedupKey) so two drafts whose URLs
+        // differ only cosmetically still collapse. The server's persistent
+        // dedup-by-link (migration 0084) covers the cross-session case; this is
+        // the fast in-run guard. Drop the extra draft (mark done) not post it.
+        s.doneDraftIds.push(item.draftId);
+        action.executed = true;
+        events.push({ type: "skip", reason: "duplicate-post", at });
+      } else if (!(await isApprovalStillActionable(api, action.kind, item.approvalId)) || stopped() || myEpoch !== (await currentEpoch())) {
+        // A missing queue item may be behind a temporary send gate OR already
+        // decided elsewhere. Check its tenant-scoped approval state before
+        // restoring it, and never mutate a superseded run after the awaits.
+        if (stopped() || myEpoch !== (await currentEpoch())) return;
+        const withheld = await classifyWithheldApproval(api, item.approvalId);
+        if (stopped() || myEpoch !== (await currentEpoch())) return;
+        if (withheld.kind === "drop") {
+          if (withheld.terminal) s.doneDraftIds.push(item.draftId);
+          action.executed = true;
+          events.push({ type: "skip", reason: `${action.kind}-approval-${withheld.reason}`, at });
+        } else if (restoreWithheldItem(pool, item, true)) {
+          action.atMs = deferLater(action, now, s.startMs + s.windowHours * 3600_000, rng).atMs;
+          events.push({ type: "skip", reason: `${action.kind}-server-withheld`, at });
+        } else {
+          // A still-pending approval can also be omitted permanently by a
+          // verifier or dedup filter. Stop local retries; queue polling can
+          // load it again if the server later serves it.
+          action.executed = true;
+          events.push({ type: "skip", reason: `${action.kind}-server-withheld-dropped`, at });
+        }
+      } else {
+        const res = action.kind === "comment"
+          ? await doComment(tabId, item, rng, s.persona.wpm, () => claimCommentForSend(api, item.approvalId))
+          : await doDm(tabId, item, rng, s.persona.wpm);
+        if (res.kind === "claim-unavailable") {
+          pool.unshift(item);
+          action.atMs = deferLater(action, now, s.startMs + s.windowHours * 3600_000, rng).atMs;
+          events.push({ type: "skip", reason: "comment-claim-unavailable", at });
+        } else if (res.kind === "claim-denied") {
+          s.doneDraftIds.push(item.draftId);
+          action.executed = true;
+          events.push({ type: "skip", reason: "comment-already-claimed", at });
+        } else if (res.kind === "unavailable") {
+          // Permanent: the target can never be commented on from this account —
+          // either the post is gone ("This post cannot be displayed") or comments
+          // are restricted to connections ("Only connections can comment on this
+          // post"). Either way no composer will ever render. DROP the draft (mark
+          // done locally) so it isn't re-served this session — the old path
+          // unshifted it to the front of the pool, so the SAME permalink was
+          // retried on every slot, monopolizing the queue and thrashing the tab.
+          // Do NOT markSent — nothing was posted. The specific cause rides in
+          // res.detail (post-unavailable | comment-restricted) for the skip reason.
+          s.doneDraftIds.push(item.draftId);
+          action.executed = true;
+          const detail = res.detail ?? "post-unavailable";
+          const reason = `${action.kind}-${detail}`;
+          // Also mark it skipped SERVER-SIDE so the queue stops re-serving this
+          // permalink on every FUTURE run. The local drop only lasts the session;
+          // the approval otherwise stays 'pending' forever (markSent never fires
+          // for a post that can't be commented), so each new run re-navigates to
+          // it and drops it again — the "falling here over and over" the operator
+          // saw. Best-effort: a failure just means it's re-served next session.
+          await api.markSkipped(item.approvalId, reason).catch(() => {});
+          events.push({ type: "skip", reason, at });
+        } else if (res.kind === "ok") {
+          // Record the send LOCALLY *before* the network-fragile markSent, so a
+          // transient "Failed to fetch" (e.g. api-vm restart) can't drop the
+          // record and cause the draft to be re-served — and re-posted. markSent
+          // is then retried best-effort; if it never confirms we still don't
+          // re-post (the draft is in doneDraftIds), we just log it for reconcile.
+          s.doneDraftIds.push(item.draftId);
+          action.executed = true;
+          if (action.kind === "comment") {
+            s.done.comments++;
+            const dk = postDedupKey(item.url);
+            if (dk) (s.actionedUrls ??= []).push(dk);
+          } else {
+            s.done.dms++;
+          }
+          s.lastProgressMs = now; // a landed post = progress; the stall detector reads this
+          const marked = await markSentWithRetry(api, item.approvalId);
+          // Stamp the post's activity URN onto the comment activity row. This is
+          // the durable dedup-by-link record: it's written at post time (this
+          // logActivity call is independent of markSent), so it survives a failed
+          // markSent, and the queue (0084) filters future pulls against it so this
+          // post is never commented on again.
+          const evt: LinkedInActivityEvent = { type: action.kind, at, approval_id: item.approvalId };
+          if (action.kind === "comment") {
+            const urn = activityUrnFrom(item.url);
+            if (urn) evt.activity_urn = urn;
+          }
+          events.push(evt);
