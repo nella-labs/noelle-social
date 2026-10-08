@@ -198,3 +198,63 @@ describe("handleTokenFatal — verify before invalidating", () => {
 
     await handleTokenFatal(depsFor(), "cred-4", 403, "tok_capped", "org-1");
 
+    // 403 now probes the account's real billing cycle (free, no spend).
+    expect(checkApifyToken).toHaveBeenCalledWith("tok_capped");
+    expect(db.markApifyTokenInvalid).not.toHaveBeenCalled();
+    const call = vi.mocked(db.markApifyTokenExhausted).mock.calls[0]!;
+    expect(call[1]).toBe("cred-4");
+    // retry_at = cycle end + 1h buffer, NOT a flat +30d.
+    const expected = Date.parse("2026-07-19T23:59:59.999Z") + 60 * 60 * 1000;
+    expect((call[2] as { retryAt: Date }).retryAt.getTime()).toBe(expected);
+  });
+
+  it("403 but the probe can't report a cycle => exhausted with the default cooldown", async () => {
+    const { checkApifyToken } = await import("@noelle/linkedin-apify");
+    const db = await import("./connections-db.js");
+    vi.mocked(checkApifyToken).mockReset();
+    vi.mocked(db.markApifyTokenExhausted).mockClear();
+    vi.mocked(checkApifyToken).mockResolvedValue({ alive: true, httpStatus: 200 });
+
+    await handleTokenFatal(depsFor(), "cred-4b", 403, "tok_capped2", "org-1");
+
+    // No cycleEndAt → fall back to the default (empty opts → 30d in the DB layer).
+    expect(db.markApifyTokenExhausted).toHaveBeenCalledWith(expect.anything(), "cred-4b", {});
+  });
+
+  it("402 (payment) => exhausted, NO health-check, default cooldown", async () => {
+    const { checkApifyToken } = await import("@noelle/linkedin-apify");
+    const db = await import("./connections-db.js");
+    vi.mocked(checkApifyToken).mockReset();
+    vi.mocked(db.markApifyTokenInvalid).mockClear();
+    vi.mocked(db.markApifyTokenExhausted).mockClear();
+
+    await handleTokenFatal(depsFor(), "cred-5", 402, "tok_pay", "org-1");
+
+    expect(checkApifyToken).not.toHaveBeenCalled();
+    expect(db.markApifyTokenInvalid).not.toHaveBeenCalled();
+    expect(db.markApifyTokenExhausted).toHaveBeenCalledWith(expect.anything(), "cred-5");
+  });
+});
+
+
+describe("resolved reactive credential scope", () => {
+  it("binds the actual resolver organization and captured stored key to its fatal callback", async () => {
+    const db = await import("./connections-db.js");
+    const { checkApifyToken } = await import("@noelle/linkedin-apify");
+    const rotation = await import("./apify-rotating.js");
+    vi.mocked(checkApifyToken).mockResolvedValue({ alive: false, httpStatus: 401 });
+    vi.mocked(db.markApifyTokenInvalid).mockClear();
+    vi.mocked(rotation.createRotatingApifyClient).mockClear();
+    const resolve = createApifyPoolResolver({
+      sql: makeSql([[tok("captured-id", " captured-key ")]]),
+      secrets: { get: vi.fn() }, apifyTokenSecretId: "fixture", log,
+    });
+    await resolve("actual-org");
+    const callback = vi.mocked(rotation.createRotatingApifyClient).mock.calls[0]?.[0].onTokenFatal;
+    expect(callback).toBeTypeOf("function");
+    callback!("captured-id", 401, " captured-key ");
+    await vi.waitFor(() => expect(db.markApifyTokenInvalid).toHaveBeenCalledWith(expect.anything(), {
+      orgId: "actual-org", credentialId: "captured-id", token: " captured-key ",
+    }));
+  });
+});
