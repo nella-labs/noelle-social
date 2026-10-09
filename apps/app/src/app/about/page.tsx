@@ -24,7 +24,7 @@ export default function AboutPage() {
     name: PUBLIC_PRODUCT.name, description: PUBLIC_PRODUCT.description,
     applicationCategory: "BusinessApplication", operatingSystem: "Web, macOS, Linux",
     url: `${PUBLIC_PRODUCT.site}/about`, codeRepository: PUBLIC_PRODUCT.source,
-    license: "https://www.apache.org/licenses/LICENSE-2.0",
+    license: PUBLIC_PRODUCT.links.license,
   };
   return (
     <PublicShell>
@@ -44,7 +44,7 @@ export default function AboutPage() {
           {FEATURES.map((feature) => <article className={styles.feature} key={feature.title}><feature.icon size={22} aria-hidden /><h2>{feature.title}</h2><p>{feature.detail}</p></article>)}
         </section>
         <section className={styles.community}>
-          <div><span className={styles.kicker}>MAKE IT YOURS</span><h2>A workspace you can use,<br />understand, and improve.</h2><p>Self-host Noelle, adapt the workflows, report an issue, or contribute a focused change. The source is available under Apache 2.0.</p></div>
+          <div><span className={styles.kicker}>MAKE IT YOURS</span><h2>A workspace you can use,<br />understand, and improve.</h2><p>Self-host Noelle, adapt the workflows, report an issue, or contribute a focused change. The source is available under {PUBLIC_PRODUCT.license}.</p></div>
           <nav aria-label="Project resources">
             {PUBLIC_PRODUCT.guides.map((guide) => <a href={guide.href} key={guide.href}>{guide.label} <ArrowUpRight size={15} aria-hidden /></a>)}
             <Link href="/">Open an existing workspace <ArrowUpRight size={15} aria-hidden /></Link>

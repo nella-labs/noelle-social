@@ -16,7 +16,7 @@ export function PublicShell({ children }: { children: React.ReactNode }) {
         </nav>
       </header>
       {children}
-      <footer className={styles.footer}><span>Noelle · Social growth workspace</span><a href={PUBLIC_PRODUCT.links.license}>Apache 2.0</a><a href={PUBLIC_PRODUCT.links.documentation}>Documentation</a></footer>
+      <footer className={styles.footer}><span>Noelle · Social growth workspace</span><a href={PUBLIC_PRODUCT.links.license}>{PUBLIC_PRODUCT.license}</a><a href={PUBLIC_PRODUCT.links.documentation}>Documentation</a></footer>
     </div>
   );
 }

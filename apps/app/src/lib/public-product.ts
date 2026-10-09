@@ -3,6 +3,7 @@ const sourceFile = (path: string) => `${SOURCE}/blob/HEAD/${path}`;
 
 export const PUBLIC_PRODUCT = {
   name: "Noelle",
+  license: "MIT",
   description: "An open-source workspace for social engagement, content planning, audience relationships, and measured results.",
   source: SOURCE,
   site: "https://app.trynoelle.com",
