@@ -20,7 +20,7 @@
     "@modelcontextprotocol/sdk": "^1.26.0",
     "@noelle/contracts": "workspace:*",
     "@noelle/runtime": "workspace:*",
-    "zod": "^3.23.8"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",

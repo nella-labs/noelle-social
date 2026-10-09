@@ -415,7 +415,7 @@
     "openai": "^6.10.0",
     "postgres": "^3.4.0",
     "re2js": "2.8.6",
-    "zod": "^3.23.8",
+    "zod": "^4.6.5",
     "@noelle/process": "workspace:*"
   },
   "devDependencies": {
