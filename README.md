@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/banner.png" alt="Noelle" width="100%" />
+</p>
+
 # Noelle
 
 An open source workspace for social growth on X, LinkedIn, Reddit and video channels.
