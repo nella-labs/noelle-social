@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="900" viewBox="0 0 2400 900" role="img" aria-label="Noelle">
+  <title>Noelle</title>
+  <desc>Noelle logo in an atmospheric light field.</desc>
+  <defs>
+    <filter id="soft-light" x="-100%" y="-100%" width="300%" height="300%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="65" />
+    </filter>
+    <filter id="edge-light" x="-100%" y="-100%" width="300%" height="300%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="9" />
+    </filter>
+    <filter id="grain" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.72" numOctaves="3" stitchTiles="stitch" />
+      <feColorMatrix type="matrix" values="0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .032 0" />
+    </filter>
+    <linearGradient id="ground" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#17130F" />
+      <stop offset=".55" stop-color="#211711" />
+      <stop offset="1" stop-color="#100F0C" />
+    </linearGradient>
+    <radialGradient id="ember">
+      <stop stop-color="#D27752" />
+      <stop offset=".35" stop-color="#B04A3A" stop-opacity=".75" />
+      <stop offset="1" stop-color="#B04A3A" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="warm-paper">
+      <stop stop-color="#EABB86" stop-opacity=".48" />
+      <stop offset=".4" stop-color="#B56947" stop-opacity=".23" />
+      <stop offset="1" stop-color="#B56947" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="ribbon" x1="0" y1="1" x2="1" y2="0">
+      <stop stop-color="#582A20" stop-opacity="0" />
+      <stop offset=".45" stop-color="#B04A3A" />
+      <stop offset=".68" stop-color="#FFB58B" />
+      <stop offset="1" stop-color="#FFDBAF" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="thread" x1="0" y1="1" x2="1" y2="0">
+      <stop stop-color="#DD8C66" stop-opacity="0" />
+      <stop offset=".63" stop-color="#F7C9A1" stop-opacity=".7" />
+      <stop offset="1" stop-color="#F7C9A1" stop-opacity="0" />
+    </linearGradient>
+  </defs>
+  <rect width="2400" height="900" fill="url(#ground)" />
+  <ellipse cx="1830" cy="444" rx="760" ry="670" fill="url(#ember)" opacity=".63" />
+  <ellipse cx="1710" cy="105" rx="720" ry="420" fill="url(#warm-paper)" />
+  <ellipse cx="650" cy="890" rx="1200" ry="460" fill="url(#warm-paper)" opacity=".45" />
+  <path d="M1265 1090 C1235 780 1505 665 1750 619 C2020 567 2305 434 2530 -110" fill="none" stroke="url(#ribbon)" stroke-width="180" filter="url(#soft-light)" opacity=".8" />
+  <path d="M1355 1040 C1325 775 1550 674 1803 609 C2100 532 2320 360 2510 -160" fill="none" stroke="url(#thread)" stroke-width="33" filter="url(#edge-light)" opacity=".5" />
+  <path d="M1190 -180 C1223 166 1513 240 1752 294 C2020 354 2266 540 2350 1000" fill="none" stroke="url(#ribbon)" stroke-width="98" filter="url(#soft-light)" opacity=".45" />
+  <path d="M1300 -140 C1330 150 1530 250 1784 304 C2055 362 2246 540 2320 996" fill="none" stroke="url(#thread)" stroke-width="19" filter="url(#edge-light)" opacity=".3" />
+  <rect width="2400" height="900" filter="url(#grain)" opacity=".62" />
+  <g id="brand-lockup" transform="translate(230 310) scale(2.06)">
+    <g transform="translate(0 0) scale(1)">
+      <g fill="#FFFFFF">
+        <path d="M87 2 C66 0 55 17 42 32 C29 46 10 52 3 68 C-3 79 1 90 8 90 C14 90 21 77 32 66 C42 55 49 53 57 54 C76 56 95 80 110 81 C122 82 131 66 132 48 C135 24 115 1 87 2 Z" />
+        <path d="M153.8 63.5 C152.3 64.3 147.4 70.2 142.8 76.6 C133 90.4 127.1 96 120 98.3 C108 102 99 98 83 87 C65 77 55 73 45 81 C35 89 32 105 34 117 C38 143 59 152 77 145 C88 141 94 132 109 122 C128 109 146 104 156 85 C162.9 73.5 163.8 67.9 161.6 64.5 C159.7 61.7 157.7 61.4 153.8 63.5 Z" />
+      </g>
+    </g>
+    <g transform="translate(187 40) scale(1)">
+      <g fill="#FFFFFF">
+        <g transform="translate(0 0)">
+          <path d="M0 22 H9 C10 22 11 24 11 27 C15 22 21 20 27 20 C44 20 54 31 54 49 V75 H43 V51 C43 38 37 31 27 31 C16 31 11 39 11 52 V75 H0 Z" />
+        </g>
+        <g transform="translate(60 0)">
+          <circle cx="28" cy="47" r="22.5" fill="none" stroke="#FFFFFF" stroke-width="11" />
+        </g>
+        <g transform="translate(123 0)">
+          <path d="M28 20 C44 20 57 32 57 47 C57 50 56 51 54 51 H11 C14 60 20 65 29 65 C37 65 42 61 46 57 C49 55 54 57 56 60 C51 70 40 75 28 75 C11 75 0 63 0 47 C0 32 12 20 28 20 Z M12 40 H45 C42 33 36 30 28 30 C20 30 15 33 12 40 Z" fill-rule="evenodd" />
+        </g>
+        <g transform="translate(187.5 0)">
+          <rect x="0" y="0" width="10.5" height="75" rx="2" />
+        </g>
+        <g transform="translate(209.5 0)">
+          <rect x="0" y="0" width="10.5" height="75" rx="2" />
+        </g>
+        <g transform="translate(227 0)">
+          <path d="M28 20 C44 20 57 32 57 47 C57 50 56 51 54 51 H11 C14 60 20 65 29 65 C37 65 42 61 46 57 C49 55 54 57 56 60 C51 70 40 75 28 75 C11 75 0 63 0 47 C0 32 12 20 28 20 Z M12 40 H45 C42 33 36 30 28 30 C20 30 15 33 12 40 Z" fill-rule="evenodd" />
+        </g>
+      </g>
+    </g>
+  </g>
+</svg>
