@@ -30,4 +30,4 @@ Content, contacts, approvals and recorded usage live in the configured database.
 
 ## How do I contribute?
 
-Open an issue or a focused pull request after reading [CONTRIBUTING.md](../CONTRIBUTING.md). The project uses [Apache 2.0](../LICENSE).
+Open an issue or a focused pull request after reading [CONTRIBUTING.md](../CONTRIBUTING.md). The project uses [MIT](../LICENSE).

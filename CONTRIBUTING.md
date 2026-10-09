@@ -28,4 +28,4 @@ Sending a social message is a real action. Use fixtures, disposable databases an
 - Reuse shared presentation and business rules, then migrate callers and remove replaced copies.
 - Use fictional data in examples and retain required third party notices.
 
-Contributions are accepted under the [Apache 2.0 license](LICENSE). Follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities through the process in [SECURITY.md](SECURITY.md).
+Contributions are accepted under the [MIT license](LICENSE). Follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities through the process in [SECURITY.md](SECURITY.md).
