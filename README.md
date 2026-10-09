@@ -29,4 +29,4 @@ Open [localhost:3001](http://127.0.0.1:3001). Supply your provider credentials t
 
 Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and [SECURITY.md](SECURITY.md) before reporting a vulnerability.
 
-Licensed under [Apache 2.0](LICENSE). Provider usage and social account access are configured by each installation.
+Licensed under [MIT](LICENSE). Provider usage and social account access are configured by each installation.
