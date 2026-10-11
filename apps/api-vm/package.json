@@ -19,7 +19,7 @@
     "@noelle/secrets": "workspace:*",
     "@noelle/types": "workspace:*",
     "@noelle/x-client": "workspace:*",
-    "ai": "^7.0.107",
+    "ai": "^7.0.127",
     "hono": "^4.6.10",
     "jose": "^5.9.6",
     "postgres": "^3.4.0",
